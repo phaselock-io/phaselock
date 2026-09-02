@@ -1,5 +1,5 @@
 {
-  "name": "@kurrent/phaselock-typespec-ts",
+  "name": "@phaselock/typespec-ts",
   "version": "0.1.0",
   "description": "TypeScript emitter for PhaseLock TypeSpec models",
   "type": "module",
@@ -14,11 +14,11 @@
     "build": "tsc -p ."
   },
   "peerDependencies": {
-    "@kurrent/phaselock-typespec": "workspace:*",
+    "@phaselock/typespec": "workspace:*",
     "@typespec/compiler": "^1.0.0"
   },
   "devDependencies": {
-    "@kurrent/phaselock-typespec": "workspace:*",
+    "@phaselock/typespec": "workspace:*",
     "@types/node": "^22.0.0",
     "@typespec/compiler": "^1.0.0",
     "typescript": "^5.6.0"

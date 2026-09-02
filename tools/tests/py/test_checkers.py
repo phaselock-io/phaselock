@@ -39,7 +39,7 @@ def _install_quickjs_stub() -> None:
 _install_quickjs_stub()
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_GEN = os.path.join(_HERE, "..", "tsp-output", "@kurrent", "phaselock-typespec-py")
+_GEN = os.path.join(_HERE, "..", "tsp-output", "@phaselock", "typespec-py")
 sys.path.insert(0, _GEN)
 
 import model  # noqa: E402

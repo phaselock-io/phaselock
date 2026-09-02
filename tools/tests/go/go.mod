@@ -1,4 +1,4 @@
-module kurrent.local/gochecks
+module phaselock.local/gochecks
 
 go 1.25
 

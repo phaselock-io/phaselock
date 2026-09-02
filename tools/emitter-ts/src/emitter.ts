@@ -11,37 +11,37 @@ import {
   GetField,
   GetIndex,
   HasField,
-  KArray,
-  KBool,
-  KDate,
-  KEngine,
-  KInt,
-  KJson,
-  KLiteral,
-  KNull,
-  KObject,
-  KQueries,
-  KQuery,
-  KStore,
-  KString,
-  KStruct,
-  KTuple,
-  KType,
-  KTypeRegistry,
-  KUnion,
+  PArray,
+  PBool,
+  PDate,
+  PEngine,
+  PInt,
+  PJson,
+  PLiteral,
+  PNull,
+  PObject,
+  PQueries,
+  PQuery,
+  PStore,
+  PString,
+  PStruct,
+  PTuple,
+  PType,
+  PTypeRegistry,
+  PUnion,
   LoweredProgram,
   Match,
   Solution,
   solveUnion,
-} from '@kurrent/phaselock-typespec';
+} from '@phaselock/typespec';
 
-type Annos = Map<KType, string>;
+type Annos = Map<PType, string>;
 /** a decoder maps a value expression to a decoding expression; null is the identity decoder */
 type Decoder = ((val: string) => string) | null;
-type Decoders = Map<KType, Decoder>;
+type Decoders = Map<PType, Decoder>;
 /** a checker maps (valueExpr, pathExpr) to TS statements appending to `problems`; noop → "" */
 type Checker = (val: string, path: string) => string;
-type Checkers = Map<KType, Checker>;
+type Checkers = Map<PType, Checker>;
 
 const NOOP: Checker = () => '';
 
@@ -49,23 +49,23 @@ function lowerFirst(name: string): string {
   return name[0].toLowerCase() + name.slice(1);
 }
 
-function generateAnnotations(d: Denter, annos: Annos, t: KType): void {
-  const visit = (t: KType): void => {
+function generateAnnotations(d: Denter, annos: Annos, t: PType): void {
+  const visit = (t: PType): void => {
     // visit each type only once
     if (annos.has(t)) return;
     // handle builtin types
     const builtin =
-      t instanceof KDate
+      t instanceof PDate
         ? 'Date'
-        : t instanceof KString
+        : t instanceof PString
           ? 'string'
-          : t instanceof KInt
+          : t instanceof PInt
             ? 'number'
-            : t instanceof KBool
+            : t instanceof PBool
               ? 'boolean'
-              : t instanceof KJson
+              : t instanceof PJson
                 ? 'unknown'
-                : t instanceof KNull
+                : t instanceof PNull
                   ? 'null'
                   : null;
     if (builtin !== null) {
@@ -73,28 +73,28 @@ function generateAnnotations(d: Denter, annos: Annos, t: KType): void {
       return;
     }
     // handle literals, which never need a type definition
-    if (t instanceof KLiteral) {
+    if (t instanceof PLiteral) {
       if (typeof t.value === 'string') annos.set(t, `"${t.value}"`);
       else if (typeof t.value === 'boolean') annos.set(t, t.value ? 'true' : 'false');
       else annos.set(t, String(t.value));
       return;
     }
     let anno: string;
-    if (t instanceof KArray) {
+    if (t instanceof PArray) {
       visit(t.itemType);
       anno = annos.get(t.itemType)! + '[]';
-    } else if (t instanceof KTuple) {
+    } else if (t instanceof PTuple) {
       for (const it of t.itemTypes) visit(it);
       anno = '[' + t.itemTypes.map((it) => annos.get(it)!).join(', ') + ']';
-    } else if (t instanceof KUnion) {
+    } else if (t instanceof PUnion) {
       for (const ut of t.types) visit(ut);
       anno = t.types.map((ut) => annos.get(ut)!).join(' | ');
-    } else if (t instanceof KStruct) {
+    } else if (t instanceof PStruct) {
       for (const ft of t.fields.values()) visit(ft);
-      const mkfield = (k: string, v: KType) =>
+      const mkfield = (k: string, v: PType) =>
         k + (t.maybes.has(k) ? '?' : '') + ': ' + annos.get(v)!;
       anno = '{' + [...t.fields].map(([k, v]) => mkfield(k, v)).join(', ') + '}';
-    } else if (t instanceof KObject) {
+    } else if (t instanceof PObject) {
       visit(t.valueType);
       anno = 'Record<string, ' + annos.get(t.valueType)! + '>';
     } else {
@@ -210,36 +210,36 @@ function decodeSolution(d: Denter, decoders: Decoders, solution: Solution): void
 
 function generateDecoders(
   d: Denter,
-  registry: KTypeRegistry,
+  registry: PTypeRegistry,
   annos: Annos,
   decoders: Decoders,
-  t: KType,
+  t: PType,
   anon: { n: number },
 ): void {
-  const visit = (t: KType): void => {
+  const visit = (t: PType): void => {
     if (decoders.has(t)) return;
 
     if (
-      t instanceof KString ||
-      t instanceof KInt ||
-      t instanceof KBool ||
-      t instanceof KNull ||
-      t instanceof KLiteral ||
-      t instanceof KJson
+      t instanceof PString ||
+      t instanceof PInt ||
+      t instanceof PBool ||
+      t instanceof PNull ||
+      t instanceof PLiteral ||
+      t instanceof PJson
     ) {
       decoders.set(t, null);
       // builtin types and their aliases need no decode{name}() function
       return;
     }
 
-    if (t instanceof KDate) {
+    if (t instanceof PDate) {
       decoders.set(t, (val) => `new Date(${val} as string)`);
       // no decode{name}() needed
       return;
     }
 
     let decoder: Decoder;
-    if (t instanceof KUnion) {
+    if (t instanceof PUnion) {
       for (const ut of t.types) visit(ut);
       if (t.types.every((ut) => decoders.get(ut) === null)) {
         decoder = null;
@@ -258,7 +258,7 @@ function generateDecoders(
         d.print(`}\n`);
         decoder = (val) => `decode${name}(${val})`;
       }
-    } else if (t instanceof KArray) {
+    } else if (t instanceof PArray) {
       visit(t.itemType);
       // calculate the decoding expression
       const itemDecoder = decoders.get(t.itemType)!;
@@ -268,7 +268,7 @@ function generateDecoders(
         const decodeItemX = itemDecoder('x');
         decoder = (val) => `${val}.map((x: any) => ${decodeItemX})`;
       }
-    } else if (t instanceof KTuple) {
+    } else if (t instanceof PTuple) {
       for (const it of t.itemTypes) visit(it);
       if (t.itemTypes.every((it) => decoders.get(it) === null)) {
         decoder = null;
@@ -283,7 +283,7 @@ function generateDecoders(
             .join(', ') +
           ']';
       }
-    } else if (t instanceof KStruct) {
+    } else if (t instanceof PStruct) {
       for (const ft of t.fields.values()) visit(ft);
       if ([...t.fields.values()].every((ft) => decoders.get(ft) === null)) {
         // all decoders are identity; identity decoder works for the whole struct
@@ -321,7 +321,7 @@ function generateDecoders(
         d.print(`}\n`);
         decoder = (val) => `decodeAnon${n}(${val})`;
       }
-    } else if (t instanceof KObject) {
+    } else if (t instanceof PObject) {
       visit(t.valueType);
       const vd = decoders.get(t.valueType)!;
       if (vd === null) {
@@ -346,7 +346,7 @@ function generateDecoders(
     // either define a named decoder or inline it
     if (t.name) {
       // we always export a named decoder (named unions with a solution already exported theirs)...
-      if (!(t instanceof KUnion && decoder !== null)) {
+      if (!(t instanceof PUnion && decoder !== null)) {
         const decodeVal = decoder === null ? 'val' : decoder('val');
         d.print(`\nexport function decode${t.name}(val: any): ${annos.get(t)} {\n`);
         d.print(`  return ${decodeVal} as ${annos.get(t)};\n`);
@@ -483,20 +483,20 @@ function checkSolution(d: Denter, checkers: Checkers, solution: Solution): void 
 
 function generateCheckers(
   d: Denter,
-  registry: KTypeRegistry,
+  registry: PTypeRegistry,
   checkers: Checkers,
-  t: KType,
+  t: PType,
   anon: { n: number },
   loop: { n: number },
 ): void {
-  const visit = (t: KType): void => {
+  const visit = (t: PType): void => {
     if (checkers.has(t)) return;
 
-    if (t instanceof KJson) {
+    if (t instanceof PJson) {
       checkers.set(t, NOOP);
       return;
     }
-    if (t instanceof KString) {
+    if (t instanceof PString) {
       checkers.set(
         t,
         (val, path) =>
@@ -506,7 +506,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KInt) {
+    if (t instanceof PInt) {
       checkers.set(
         t,
         (val, path) =>
@@ -516,7 +516,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KBool) {
+    if (t instanceof PBool) {
       checkers.set(
         t,
         (val, path) =>
@@ -526,7 +526,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KNull || (t instanceof KLiteral && t.value === null)) {
+    if (t instanceof PNull || (t instanceof PLiteral && t.value === null)) {
       checkers.set(
         t,
         (val, path) =>
@@ -536,7 +536,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KDate) {
+    if (t instanceof PDate) {
       checkers.set(
         t,
         (val, path) =>
@@ -546,7 +546,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KLiteral) {
+    if (t instanceof PLiteral) {
       if (typeof t.value === 'string') {
         checkers.set(
           t,
@@ -569,7 +569,7 @@ function generateCheckers(
     }
 
     let checker: Checker;
-    if (t instanceof KUnion) {
+    if (t instanceof PUnion) {
       for (const ut of t.types) visit(ut);
       const solution = solveUnion(registry, t.types);
       const name = t.name ? `check${t.name}` : `checkAnon${anon.n++}`;
@@ -581,7 +581,7 @@ function generateCheckers(
       d.dedent();
       d.print('}\n');
       checker = (val, path) => `problems.push(...${name}(${val}, ${path}));\n`;
-    } else if (t instanceof KArray) {
+    } else if (t instanceof PArray) {
       visit(t.itemType);
       checker = (val, path) => {
         const dd = new Denter();
@@ -609,7 +609,7 @@ function generateCheckers(
         dd.print('}\n');
         return dd.getvalue();
       };
-    } else if (t instanceof KTuple) {
+    } else if (t instanceof PTuple) {
       for (const it of t.itemTypes) visit(it);
       checker = (val, path) => {
         const dd = new Denter();
@@ -634,7 +634,7 @@ function generateCheckers(
         dd.print('}\n');
         return dd.getvalue();
       };
-    } else if (t instanceof KStruct) {
+    } else if (t instanceof PStruct) {
       for (const ft of t.fields.values()) visit(ft);
       let keys: string, func: string;
       if (t.name) {
@@ -675,7 +675,7 @@ function generateCheckers(
       d.dedent();
       d.print('}\n');
       checker = (val, path) => `problems.push(...${func}(${val}, ${path}));\n`;
-    } else if (t instanceof KObject) {
+    } else if (t instanceof PObject) {
       visit(t.valueType);
       checker = (val, path) => {
         const dd = new Denter();
@@ -706,7 +706,7 @@ function generateCheckers(
     }
 
     // named types without a function already defined get a wrapper now
-    if (t.name && !(t instanceof KUnion) && !(t instanceof KStruct)) {
+    if (t.name && !(t instanceof PUnion) && !(t instanceof PStruct)) {
       d.print(`\nexport function check${t.name}(val: any, path: string = "<root>"): string[] {\n`);
       d.indent('  ');
       d.print('const problems: string[] = [];\n');
@@ -780,11 +780,11 @@ function contextName(name: string): string {
  *
  * Therefore we can only create updaters for certain kinds of types.
  */
-function isUpdatable(t: KType): boolean {
-  if (t instanceof KArray || t instanceof KTuple || t instanceof KStruct || t instanceof KObject) {
+function isUpdatable(t: PType): boolean {
+  if (t instanceof PArray || t instanceof PTuple || t instanceof PStruct || t instanceof PObject) {
     return true;
   }
-  if (t instanceof KUnion) return t.types.every(isUpdatable);
+  if (t instanceof PUnion) return t.types.every(isUpdatable);
   return false;
 }
 
@@ -798,7 +798,7 @@ function printTemplate(
   d.print(si.chunks[si.chunks.length - 1]);
 }
 
-function printDecoder(d: Denter, decoders: Decoders, t: KType) {
+function printDecoder(d: Denter, decoders: Decoders, t: PType) {
   const decoder = decoders.get(t);
   if (decoder === null) {
     d.print('null');
@@ -807,7 +807,7 @@ function printDecoder(d: Denter, decoders: Decoders, t: KType) {
   }
 }
 
-function generateStore(d: Denter, annos: Annos, decoders: Decoders, store: KStore): void {
+function generateStore(d: Denter, annos: Annos, decoders: Decoders, store: PStore): void {
   const ctxName = contextName(store.name!);
   // Generate the QueryContext singleton.
   d.print(`\nexport const ${ctxName}QueryContext = {\n`);
@@ -942,7 +942,7 @@ function generateStore(d: Denter, annos: Annos, decoders: Decoders, store: KStor
   d.print(`\nexport type ${ctxName}RX = typeof ${ctxName}ReducerContext;\n`);
 }
 
-function generateEngine(d: Denter, annos: Annos, f: KEngine): void {
+function generateEngine(d: Denter, annos: Annos, f: PEngine): void {
   const eventType = annos.get(f.eventType)!;
   const commandType = annos.get(f.commandType)!;
   const ctxName = contextName(f.store.name!);
@@ -1032,7 +1032,7 @@ function queryStem(name: string): string {
 }
 
 /** the wire id of one query: unique across all interfaces a connection may carry */
-function queryId(kq: KQueries, q: KQuery): string {
+function queryId(kq: PQueries, q: PQuery): string {
   return `${kq.name}.${q.name}`;
 }
 
@@ -1043,7 +1043,7 @@ function queryId(kq: KQueries, q: KQuery): string {
  * decoder, and checker generation as any declared type, which is what gives the serving side
  * `check<Stem>Query` for ingress and `decode<Stem>Query` for typed dispatch.
  */
-function queryWireType(registry: KTypeRegistry, kq: KQueries): KType {
+function queryWireType(registry: PTypeRegistry, kq: PQueries): PType {
   const wire = registry.union(
     kq.queries.map((q) =>
       registry.tuple([
@@ -1064,15 +1064,15 @@ function queryWireType(registry: KTypeRegistry, kq: KQueries): KType {
  * LocalQuery results, which compose via awaitResult()), and the dispatcher a serving side
  * uses to route a decoded wire message into a provider.
  */
-function generateQueries(d: Denter, annos: Annos, decoders: Decoders, kq: KQueries): void {
+function generateQueries(d: Denter, annos: Annos, decoders: Decoders, kq: PQueries): void {
   const name = kq.name!;
   const stem = queryStem(name);
   const idsName = `${stem}QueryIds`;
   const defsName = `${stem}QueryDefs`;
 
-  const params = (q: KQuery) =>
+  const params = (q: PQuery) =>
     q.args.map(([an, at, opt]) => `${an}${opt ? '?' : ''}: ${annos.get(at)!}`).join(', ');
-  const result = (q: KQuery) => annos.get(q.result)!;
+  const result = (q: PQuery) => annos.get(q.result)!;
 
   // wire ids
   d.print(`\nexport const ${idsName} = {\n`);

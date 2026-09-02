@@ -1,6 +1,6 @@
 # TypeSpec DSL — design decisions
 
-Context for working on the TypeSpec model tooling (`@kurrent/phaselock-typespec` + the three
+Context for working on the TypeSpec model tooling (`@phaselock/typespec` + the three
 emitters).  See README.md for layout, build commands, and the test suite.
 
 ## Design decisions
@@ -15,8 +15,8 @@ emitters).  See README.md for layout, build commands, and the test suite.
   type-or-value).
 - **Queries are interfaces too**: `interface AdminQueries extends Queries { allPatrons(): AdminPatronInfo[]; }`
   declares a typed query contract — a message contract only, binding no store (which store backs
-  an implementation is the implementation's business).  Lowering collects them as `KQueries`
-  (one `KQuery` per op: name, args, result) on `LoweredProgram.queries` for the emitters to walk.
+  an implementation is the implementation's business).  Lowering collects them as `PQueries`
+  (one `PQuery` per op: name, args, result) on `LoweredProgram.queries` for the emitters to walk.
   The TS emitter generates the full query API from them: wire tuples, checkers/decoders, the
   `QueryDefs`/`Local*`/`Remote*`/`dispatch*` family.
 - **Commands stay a union** (`Engine<Events, Commands, Store>`).  Someday: allow a
@@ -50,9 +50,9 @@ emitters).  See README.md for layout, build commands, and the test suite.
   `skeleton` option overrides with a project-root-relative path; there is no skeleton-less mode
   (generated code requires the skeleton).  The assets are the canonical copies of the runtime
   skeletons — edit them here.
-- **Naming convention: `K` prefix (for Kurrent) on IR model nouns** — KType and subclasses, KStore,
-  KStoreItem, KEngine, plus KTypeRegistry (which creates KTypes).  Machinery stays unprefixed
-  (Denter, the solver's Match/Check* classes, LoweredProgram).  Documented in the ktypes.ts header.
+- **Naming convention: `P` prefix (for PhaseLock) on IR model nouns** — PType and subclasses, PStore,
+  PStoreItem, PEngine, plus PTypeRegistry (which creates PTypes).  Machinery stays unprefixed
+  (Denter, the solver's Match/Check* classes, LoweredProgram).  Documented in the ptypes.ts header.
 
 ## Behavior notes / gaps
 

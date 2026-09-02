@@ -1,7 +1,7 @@
 # The worked examples
 
 The other reference files use symbols from two example apps in the
-PhaseLock repository (github.com/kurrent-io/phaselock, under
+PhaseLock repository (github.com/phaselock-io/phaselock, under
 `examples/`). This file gives enough context to follow those symbols
 without the repository.
 

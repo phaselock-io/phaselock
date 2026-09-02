@@ -3,6 +3,14 @@ packages:
   - server
   - ui
 
+allowBuilds:
+  bufferutil: true
+  esbuild: true
+  lmdb: true
+  msgpackr-extract: true
+  protobufjs: true
+  unrs-resolver: true
+
 onlyBuiltDependencies:
   - bufferutil
   - esbuild

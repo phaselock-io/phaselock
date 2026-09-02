@@ -1,11 +1,11 @@
 ---
 name: phaselock
 description: >-
-  Build applications on Kurrent PhaseLock, an event-sourcing sync engine:
+  Build applications on PhaseLock, an event-sourcing sync engine:
   events stored in KurrentDB, TypeScript reducers deriving state, live
   queries, optimistic updates, offline-capable clients, and backend workers.
   Use when working with PhaseLock, a model.tsp data model,
-  @kurrent/phaselock-typespec, reducers, Engine classes, live queries, or a
+  @phaselock/typespec, reducers, Engine classes, live queries, or a
   KurrentDB-backed app. Covers defining data models, writing reducers and
   queries, building clients and servers, and running the business logic from
   other languages.
@@ -13,7 +13,7 @@ description: >-
 
 # PhaseLock
 
-Kurrent PhaseLock is tooling around a simple architecture:
+PhaseLock is tooling around a simple architecture:
 
 - An "event" is what happened, stored in KurrentDB.
 - A "command" is what a client submits, like an event but flowing towards
@@ -69,7 +69,7 @@ transport. Every wire protocol in the examples is app-defined.
 
 PhaseLock is in alpha: core features are implemented, tests are sparse,
 docs are missing. `ROADMAP.md` at the root of the PhaseLock repository
-(github.com/kurrent-io/phaselock) separates what is missing because it
+(github.com/phaselock-io/phaselock) separates what is missing because it
 is alpha from what is out of scope; every "see ROADMAP" in this skill
 refers to that file. When something seems absent (indexes over large
 collections, time-based triggers), check the roadmap and the "known
@@ -137,7 +137,7 @@ Load the reference for the layer you are working on:
 
 ## Examples
 
-The PhaseLock repository (github.com/kurrent-io/phaselock) contains three
+The PhaseLock repository (github.com/phaselock-io/phaselock) contains three
 examples under `examples/`, each with a README:
 
 - `todo-basic` — the smallest loop: TypeSpec model, one reducer, browser

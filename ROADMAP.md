@@ -13,18 +13,14 @@ There's still a lot to do:
 
 - Support aliases in TypeSpec... today they cause confusing/broken generated code.
 
-- Support official KurrentDB clients as inputs to Engine
-  - reduce the IO boilerplate needed to populate events from KurrentDB
-  - serve as canonical examples for the IO handling
-
 - Reimplement go and python bindings to match new cross-language plan:
   - No more JS wrapper types; native types should be fully-native
   - Native queries read native types directly from storage, no JS layer
   - Generate type registry per framework for handling conversions
   - StoreGenerator redesign around the type registry
-  - Eliminate "plain-json object" as central type in Engine UI.
+  - Eliminate "plain-json object" as central type in Engine API.
 
-- Support additional languages, starting with C#, Kotlin, and Swift
+- Support additional languages, starting with Kotlin and Swift
 
 - Additional frontend demos:
   - React Native
@@ -59,7 +55,3 @@ There's still a lot to do:
   - Snapshots can greatly reduce cold-start times
   - Snapshots may require per-user sanitization
   - How can we offer tooling to make this easier?
-
-- Investigate Kurrent integrations
-  - Run as part of KurrentDB?
-  - Run as part of kurrent.cloud?

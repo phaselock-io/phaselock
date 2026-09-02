@@ -11,7 +11,7 @@ function App() {
   return (
     <ConfigProvider theme={{ algorithm: darkAlgorithm }}>
       <div>
-        <h1>Kurrent Engine Demo</h1>
+        <h1>PhaseLock Demo</h1>
         <Flex wrap gap="small">
           <AdminWindow relayUrl={RELAY_URL} />
           <PatronWindow patronId="patron-1" relayUrl={RELAY_URL} />

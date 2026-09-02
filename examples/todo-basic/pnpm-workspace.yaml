@@ -3,6 +3,12 @@ packages:
   - server
   - ui
 
+allowBuilds:
+  bufferutil: true
+  esbuild: true
+  protobufjs: true
+  unrs-resolver: true
+
 onlyBuiltDependencies:
   - bufferutil
   - esbuild

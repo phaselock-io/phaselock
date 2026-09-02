@@ -44,7 +44,7 @@ importers:
 
   emitter-go:
     devDependencies:
-      '@kurrent/phaselock-typespec':
+      '@phaselock/typespec':
         specifier: workspace:*
         version: link:../engine
       '@types/node':
@@ -59,7 +59,7 @@ importers:
 
   emitter-py:
     devDependencies:
-      '@kurrent/phaselock-typespec':
+      '@phaselock/typespec':
         specifier: workspace:*
         version: link:../engine
       '@types/node':
@@ -74,7 +74,7 @@ importers:
 
   emitter-ts:
     devDependencies:
-      '@kurrent/phaselock-typespec':
+      '@phaselock/typespec':
         specifier: workspace:*
         version: link:../engine
       '@types/node':
@@ -98,16 +98,16 @@ importers:
 
   tests:
     dependencies:
-      '@kurrent/phaselock-typespec':
+      '@phaselock/typespec':
         specifier: workspace:*
         version: link:../engine
-      '@kurrent/phaselock-typespec-go':
+      '@phaselock/typespec-go':
         specifier: workspace:*
         version: link:../emitter-go
-      '@kurrent/phaselock-typespec-py':
+      '@phaselock/typespec-py':
         specifier: workspace:*
         version: link:../emitter-py
-      '@kurrent/phaselock-typespec-ts':
+      '@phaselock/typespec-ts':
         specifier: workspace:*
         version: link:../emitter-ts
       '@typespec/compiler':

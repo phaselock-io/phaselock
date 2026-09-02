@@ -50,16 +50,16 @@ importers:
 
   model:
     devDependencies:
-      '@kurrent/phaselock-typespec':
+      '@phaselock/typespec':
         specifier: link:../../../tools/engine
         version: link:../../../tools/engine
-      '@kurrent/phaselock-typespec-go':
+      '@phaselock/typespec-go':
         specifier: link:../../../tools/emitter-go
         version: link:../../../tools/emitter-go
-      '@kurrent/phaselock-typespec-py':
+      '@phaselock/typespec-py':
         specifier: link:../../../tools/emitter-py
         version: link:../../../tools/emitter-py
-      '@kurrent/phaselock-typespec-ts':
+      '@phaselock/typespec-ts':
         specifier: link:../../../tools/emitter-ts
         version: link:../../../tools/emitter-ts
       '@types/jest':

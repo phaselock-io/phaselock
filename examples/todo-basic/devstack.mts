@@ -7,11 +7,12 @@
 
    "Install" this tool by copy/pasting it into your project.
 
-   Original file licensed under Apache 2 license.  See:
+   Original file licensed under Apache License 2.0.  See:
 
-     <url here>
+     https://github.com/phaselock-io/phaselock/blob/master/LICENSE
 
    Copyright (c) 2026 Kurrent, Inc.  All rights reserved.
+   Copyright (c) 2026 PhaseLock, LLC.  All rights reserved.
 */
 
 main({
@@ -1414,9 +1415,9 @@ function advanceRender(): void {
 
 function renderBar(): string {
   const cols = view.cols;
-  // use kurrent colors on the status bar
-  const idle = foreHex('#ded9ff') + backHex('#631b3a');
-  const active = foreHex('#631b3a') + backHex('#ded9ff');
+  // phaselock colors on the status bar
+  const idle = foreHex('#2ee6a8') + backHex('#0a1f18');
+  const active = foreHex('#0a1f18') + backHex('#2ee6a8');
   const failed = foreHex('#000000') + backHex('#d00000');
 
   const names = ['dead', ...status.stages.map((s) => s.name)];

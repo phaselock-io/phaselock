@@ -7,27 +7,27 @@
 import { fileURLToPath } from 'node:url';
 
 import {
-  KArray,
-  KBool,
-  KDate,
-  KInt,
-  KLiteral,
-  KObject,
-  KString,
-  KStruct,
-  KTuple,
-  KType,
-  KUnion,
+  PArray,
+  PBool,
+  PDate,
+  PInt,
+  PLiteral,
+  PObject,
+  PString,
+  PStruct,
+  PTuple,
+  PType,
+  PUnion,
   LoweredProgram,
   lowerProgram,
-} from '@kurrent/phaselock-typespec';
+} from '@phaselock/typespec';
 import { type Program, resolvePath } from '@typespec/compiler';
 import { createTester } from '@typespec/compiler/testing';
 import { describe, expect, it } from 'vitest';
 
 const base = fileURLToPath(new URL('..', import.meta.url));
-const Tester = createTester(resolvePath(base), { libraries: ['@kurrent/phaselock-typespec'] })
-  .import('@kurrent/phaselock-typespec')
+const Tester = createTester(resolvePath(base), { libraries: ['@phaselock/typespec'] })
+  .import('@phaselock/typespec')
   .using('PhaseLock');
 
 interface Lowered {
@@ -42,7 +42,7 @@ async function lower(code: string): Promise<Lowered> {
 }
 
 /** Find the named root that lowered from a declaration. */
-function root(l: LoweredProgram, name: string): KType {
+function root(l: LoweredProgram, name: string): PType {
   const found = l.roots.find((t) => t.name === name);
   if (found === undefined)
     throw new Error(`no root named ${name} in [${l.roots.map((t) => t.name)}]`);
@@ -59,17 +59,17 @@ describe('lowerProgram — scalar and builtin mapping', () => {
         d: utcDateTime;
       }
     `);
-    const foo = root(lowered, 'Foo') as KStruct;
-    expect(foo).toBeInstanceOf(KStruct);
-    expect(foo.fields.get('a')).toBeInstanceOf(KInt);
-    expect(foo.fields.get('b')).toBeInstanceOf(KString);
-    expect(foo.fields.get('c')).toBeInstanceOf(KBool);
-    expect(foo.fields.get('d')).toBeInstanceOf(KDate);
+    const foo = root(lowered, 'Foo') as PStruct;
+    expect(foo).toBeInstanceOf(PStruct);
+    expect(foo.fields.get('a')).toBeInstanceOf(PInt);
+    expect(foo.fields.get('b')).toBeInstanceOf(PString);
+    expect(foo.fields.get('c')).toBeInstanceOf(PBool);
+    expect(foo.fields.get('d')).toBeInstanceOf(PDate);
   });
 
   it('records optional fields as maybes', async () => {
     const { lowered } = await lower(`model Foo { a: int32; b?: string; }`);
-    const foo = root(lowered, 'Foo') as KStruct;
+    const foo = root(lowered, 'Foo') as PStruct;
     expect(foo.always.has('a')).toBe(true);
     expect(foo.maybes.has('b')).toBe(true);
   });
@@ -84,33 +84,33 @@ describe('lowerProgram — collections', () => {
         pair: [string, int32];
       }
     `);
-    const foo = root(lowered, 'Foo') as KStruct;
-    const xs = foo.fields.get('xs') as KArray;
-    expect(xs).toBeInstanceOf(KArray);
-    expect(xs.itemType).toBeInstanceOf(KString);
-    const m = foo.fields.get('m') as KObject;
-    expect(m).toBeInstanceOf(KObject);
-    expect(m.valueType).toBeInstanceOf(KInt);
-    const pair = foo.fields.get('pair') as KTuple;
-    expect(pair).toBeInstanceOf(KTuple);
-    expect(pair.itemTypes.map((t) => t.constructor.name)).toEqual(['KString', 'KInt']);
+    const foo = root(lowered, 'Foo') as PStruct;
+    const xs = foo.fields.get('xs') as PArray;
+    expect(xs).toBeInstanceOf(PArray);
+    expect(xs.itemType).toBeInstanceOf(PString);
+    const m = foo.fields.get('m') as PObject;
+    expect(m).toBeInstanceOf(PObject);
+    expect(m.valueType).toBeInstanceOf(PInt);
+    const pair = foo.fields.get('pair') as PTuple;
+    expect(pair).toBeInstanceOf(PTuple);
+    expect(pair.itemTypes.map((t) => t.constructor.name)).toEqual(['PString', 'PInt']);
   });
 });
 
 describe('lowerProgram — unions and enums', () => {
   it('lowers a named union of literals', async () => {
     const { lowered } = await lower(`union Color { "red", "green", "blue" }`);
-    const color = root(lowered, 'Color') as KUnion;
-    expect(color).toBeInstanceOf(KUnion);
-    expect(color.types.every((t) => t instanceof KLiteral)).toBe(true);
-    expect(color.types.map((t) => (t as KLiteral).value).sort()).toEqual(['blue', 'green', 'red']);
+    const color = root(lowered, 'Color') as PUnion;
+    expect(color).toBeInstanceOf(PUnion);
+    expect(color.types.every((t) => t instanceof PLiteral)).toBe(true);
+    expect(color.types.map((t) => (t as PLiteral).value).sort()).toEqual(['blue', 'green', 'red']);
   });
 
   it('lowers an enum to a union of its member-name literals', async () => {
     const { lowered } = await lower(`enum Suit { hearts, spades }`);
-    const suit = root(lowered, 'Suit') as KUnion;
-    expect(suit).toBeInstanceOf(KUnion);
-    expect(suit.types.map((t) => (t as KLiteral).value).sort()).toEqual(['hearts', 'spades']);
+    const suit = root(lowered, 'Suit') as PUnion;
+    expect(suit).toBeInstanceOf(PUnion);
+    expect(suit.types.map((t) => (t as PLiteral).value).sort()).toEqual(['hearts', 'spades']);
   });
 });
 
@@ -121,7 +121,7 @@ describe('lowerProgram — interning across a program', () => {
       model Wrap { x: A; y: A; }
     `);
     const a = root(lowered, 'A');
-    const wrap = root(lowered, 'Wrap') as KStruct;
+    const wrap = root(lowered, 'Wrap') as PStruct;
     expect(wrap.fields.get('x')).toBe(a);
     expect(wrap.fields.get('y')).toBe(a);
   });
@@ -180,15 +180,15 @@ describe('lowerProgram — queries', () => {
 
     const [allPatrons, patronsNamed] = kq.queries;
     expect(allPatrons.args).toHaveLength(0);
-    expect(allPatrons.result).toBeInstanceOf(KArray);
+    expect(allPatrons.result).toBeInstanceOf(PArray);
     // arg and result types intern with the rest of the program
-    expect((allPatrons.result as KArray).itemType).toBe(root(lowered, 'PatronInfo'));
+    expect((allPatrons.result as PArray).itemType).toBe(root(lowered, 'PatronInfo'));
 
     expect(patronsNamed.args.map(([name]) => name)).toEqual(['name', 'limit']);
     const [[, nameType, nameOpt], [, limitType, limitOpt]] = patronsNamed.args;
-    expect(nameType).toBeInstanceOf(KString);
+    expect(nameType).toBeInstanceOf(PString);
     expect(nameOpt).toBe(false);
-    expect(limitType).toBeInstanceOf(KInt);
+    expect(limitType).toBeInstanceOf(PInt);
     expect(limitOpt).toBe(true);
   });
 

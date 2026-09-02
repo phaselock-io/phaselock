@@ -73,7 +73,7 @@ is well served by embedding the engine in the faster language.
 Official support for C#, Kotlin, and Swift is planned.  Requests for other
 languages: open a [GitHub issue][gh] or ask in [Discord][dc].
 
-[gh]: https://github.com/kurrent-io/phaselock
+[gh]: https://github.com/phaselock-io/phaselock
 [dc]: https://discord.gg/Phn9pmCw3t
 
 ## Bundling

@@ -1,5 +1,5 @@
 {
-  "name": "@kurrent/phaselock-typespec",
+  "name": "@phaselock/typespec",
   "version": "0.1.0",
   "description": "PhaseLock data-model vocabulary for TypeSpec: stores, key templates, engines",
   "type": "module",

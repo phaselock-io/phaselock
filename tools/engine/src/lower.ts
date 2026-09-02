@@ -1,16 +1,16 @@
 /**
- * Lowering: TypeSpec Program → Kurrent Engine IR.
+ * Lowering: TypeSpec Program → PhaseLock IR.
  *
  * Lowering consumes the checker's fully resolved type graph and translates it into the interned
  * IR, plus:
  *   - names: top-level declarations name the IR types they lower to (first name wins; a second
  *     declaration that resolves to the same structural type is a diagnostic)
- *   - stores: interfaces extending `PhaseLock.Store<Spec, Deps>` become KStore; the Spec
+ *   - stores: interfaces extending `PhaseLock.Store<Spec, Deps>` become PStore; the Spec
  *     model's property names are the key templates, Deps is a tuple of other Store interfaces
  *   - engines: interfaces extending `PhaseLock.Engine<Events, Commands, S>` become
- *     KEngine
- *   - queries: interfaces extending `PhaseLock.Queries` become KQueries; each operation
- *     becomes a KQuery carrying its name, arguments, and result type
+ *     PEngine
+ *   - queries: interfaces extending `PhaseLock.Queries` become PQueries; each operation
+ *     becomes a PQuery carrying its name, arguments, and result type
  *
  * Interfaces are deliberately the carrier for stores, engines, and queries: they are not
  * data types, so they can't leak into the model space the way decorated models could.
@@ -40,21 +40,21 @@ import type {
   Union,
 } from '@typespec/compiler';
 
-import { KEngine, KField, KQueries, KQuery, KStore, KType, KTypeRegistry } from './ktypes.js';
+import { PEngine, PField, PQueries, PQuery, PStore, PType, PTypeRegistry } from './ptypes.js';
 import { reportDiagnostic } from './lib.js';
 
 export interface LoweredProgram {
-  registry: KTypeRegistry;
+  registry: PTypeRegistry;
   /** all named data types, in creation (resolution) order */
-  roots: KType[];
+  roots: PType[];
   /** all stores, in declaration order */
-  stores: KStore[];
+  stores: PStore[];
   /** all engines, in declaration order */
-  engines: KEngine[];
+  engines: PEngine[];
   /** all queries interfaces, in declaration order */
-  queries: KQueries[];
+  queries: PQueries[];
   /** the first TypeSpec type that lowered to each IR type, for diagnostic targeting */
-  targets: Map<KType, Type>;
+  targets: Map<PType, Type>;
 }
 
 /**
@@ -87,12 +87,12 @@ function vocabSource(iface: Interface, name: string): Interface | undefined {
 }
 
 export function lowerProgram(program: Program): LoweredProgram {
-  const registry = new KTypeRegistry();
-  const typeCache = new Map<Type, KType>();
-  const storeCache = new Map<Interface, KStore>();
-  const targets = new Map<KType, Type>();
+  const registry = new PTypeRegistry();
+  const typeCache = new Map<Type, PType>();
+  const storeCache = new Map<Interface, PStore>();
+  const targets = new Map<PType, Type>();
 
-  function unsupported(target: Type, message: string): KType {
+  function unsupported(target: Type, message: string): PType {
     reportDiagnostic(program, {
       code: 'unsupported-type',
       format: { message },
@@ -109,7 +109,7 @@ export function lowerProgram(program: Program): LoweredProgram {
     });
   }
 
-  function lowerScalar(scalar: Scalar): KType {
+  function lowerScalar(scalar: Scalar): PType {
     // walk the extends chain up to a TypeSpec standard scalar
     for (let s: Scalar | undefined = scalar; s !== undefined; s = s.baseScalar) {
       if (s.namespace === undefined || !isStdNamespace(s.namespace)) continue;
@@ -142,27 +142,27 @@ export function lowerProgram(program: Program): LoweredProgram {
     return unsupported(scalar, `scalar ${scalar.name}`);
   }
 
-  function lowerModel(model: Model): KType {
+  function lowerModel(model: Model): PType {
     if (isArrayModelType(model)) {
       return registry.array(lowerType(model.indexer.value));
     }
     if (isRecordModelType(model)) {
       return registry.object(lowerType(model.indexer.value));
     }
-    const fields: KField[] = [];
+    const fields: PField[] = [];
     for (const prop of walkPropertiesInherited(model)) {
       fields.push([prop.name, lowerType(prop.type), prop.optional]);
     }
     return registry.struct(fields);
   }
 
-  function lowerEnum(en: Enum): KType {
+  function lowerEnum(en: Enum): PType {
     // an enum is sugar for a union of literals
     const literals = [...en.members.values()].map((m) => registry.literal(m.value ?? m.name));
     return registry.union(literals);
   }
 
-  function lowerType(type: Type): KType {
+  function lowerType(type: Type): PType {
     const cached = typeCache.get(type);
     if (cached !== undefined) return cached;
     const ct = lowerTypeUncached(type);
@@ -171,7 +171,7 @@ export function lowerProgram(program: Program): LoweredProgram {
     return ct;
   }
 
-  function lowerTypeUncached(type: Type): KType {
+  function lowerTypeUncached(type: Type): PType {
     switch (type.kind) {
       case 'Model':
         return lowerModel(type);
@@ -201,13 +201,13 @@ export function lowerProgram(program: Program): LoweredProgram {
     }
   }
 
-  /** Lower an interface extending PhaseLock.Store into a KStore. */
-  function lowerStore(iface: Interface): KStore {
+  /** Lower an interface extending PhaseLock.Store into a PStore. */
+  function lowerStore(iface: Interface): PStore {
     const cached = storeCache.get(iface);
     if (cached !== undefined) return cached;
 
     // memoize before validating so diagnostic paths don't recurse forever
-    const empty = new KStore([], []);
+    const empty = new PStore([], []);
     empty.name = iface.name;
     storeCache.set(iface, empty);
 
@@ -231,7 +231,7 @@ export function lowerProgram(program: Program): LoweredProgram {
       return empty;
     }
 
-    const deps: KStore[] = [];
+    const deps: PStore[] = [];
     for (const dep of (depsArg as Tuple).values) {
       if (dep.kind !== 'Interface' || vocabSource(dep, 'Store') === undefined) {
         reportDiagnostic(program, {
@@ -245,14 +245,14 @@ export function lowerProgram(program: Program): LoweredProgram {
     }
 
     // the Spec model's property names are the key templates
-    const specs: [string, KType][] = [];
+    const specs: [string, PType][] = [];
     for (const prop of specArg.properties.values()) {
       specs.push([prop.name, lowerType(prop.type)]);
     }
 
-    let store: KStore;
+    let store: PStore;
     try {
-      store = new KStore(specs, deps);
+      store = new PStore(specs, deps);
     } catch (e) {
       reportDiagnostic(program, {
         code: 'store-collision',
@@ -266,7 +266,7 @@ export function lowerProgram(program: Program): LoweredProgram {
     return store;
   }
 
-  function assignName(ct: KType, declName: string, target: Type): void {
+  function assignName(ct: PType, declName: string, target: Type): void {
     if (ct.name === null) {
       ct.name = declName;
     } else if (ct.name !== declName) {
@@ -304,9 +304,9 @@ export function lowerProgram(program: Program): LoweredProgram {
 
   // stores, engines, and queries are interfaces extending the PhaseLock vocabulary, in
   // source order
-  const stores: KStore[] = [];
-  const engines: KEngine[] = [];
-  const queries: KQueries[] = [];
+  const stores: PStore[] = [];
+  const engines: PEngine[] = [];
+  const queries: PQueries[] = [];
   const userInterfaces = sourceOrder(
     [...globalNs.interfaces.values()].filter((i) => !isTemplateDeclaration(i)),
   );
@@ -316,15 +316,15 @@ export function lowerProgram(program: Program): LoweredProgram {
       continue;
     }
     if (vocabSource(iface, 'Queries') !== undefined) {
-      const ops: KQuery[] = [];
+      const ops: PQuery[] = [];
       for (const op of iface.operations.values()) {
-        const args: KField[] = [];
+        const args: PField[] = [];
         for (const param of op.parameters.properties.values()) {
           args.push([param.name, lowerType(param.type), param.optional]);
         }
-        ops.push(new KQuery(op.name, args, lowerType(op.returnType)));
+        ops.push(new PQuery(op.name, args, lowerType(op.returnType)));
       }
-      const kq = new KQueries(ops);
+      const kq = new PQueries(ops);
       kq.name = iface.name;
       queries.push(kq);
       continue;
@@ -360,7 +360,7 @@ export function lowerProgram(program: Program): LoweredProgram {
       }
       void arg;
     }
-    const eng = new KEngine(eventType, commandType, lowerStore(storeArg));
+    const eng = new PEngine(eventType, commandType, lowerStore(storeArg));
     eng.name = iface.name;
     engines.push(eng);
   }

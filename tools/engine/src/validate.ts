@@ -6,7 +6,7 @@
 
 import { NoTarget, type Program } from '@typespec/compiler';
 
-import { KUnion } from './ktypes.js';
+import { PUnion } from './ptypes.js';
 import { reportDiagnostic } from './lib.js';
 import { lowerProgram } from './lower.js';
 import { solveUnion } from './solver.js';
@@ -23,7 +23,7 @@ export function $onValidate(program: Program): void {
   // distinguishable.  (Snapshot registry.all first: the arrays path of the solver can intern
   // new unions while we iterate.)
   for (const ct of [...lowered.registry.all]) {
-    if (!(ct instanceof KUnion)) continue;
+    if (!(ct instanceof PUnion)) continue;
     try {
       solveUnion(lowered.registry, ct.types);
     } catch (e) {

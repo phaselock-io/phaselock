@@ -1,4 +1,4 @@
-# Kurrent PhaseLock
+# PhaseLock
 
 No more polling for new data.  No more writing REST APIs.
 
@@ -6,13 +6,6 @@ Define your data types and how to process them once, and reuse that in your web
 app, your mobile apps, and your backend workers.
 
 ## How does PhaseLock work?
-
-An "event" is what happened, stored in KurrentDB.
-
-A "command" is what a client submits, like an event but flowing towards
-KurrentDB rather than read from it.
-
-A "reducer" is a function that reads events to derive current state.
 
      ______________________________
     |          Frontend            |
@@ -26,17 +19,23 @@ A "reducer" is a function that reads events to derive current state.
         | are                | are
         | read               | written
      ___|____________________v_____
-    |           Backend            |
-    |  __________________________  |
-    | |                          | |
-    | |         Server           | |
-    | |__________________________| |
-    |  __________________________  |
-    | |                          | |
-    | |        KurrentDB         | |
-    | |__________________________| |
+    |                              |
+    |   Backend holds event log    |
     |______________________________|
 
+PhaseLock assumes you save all your **events** (like, "user X
+did Y") in a log.
+
+Then you write a **reducer** function that reads events and
+builds state in a key-value store.
+
+Then the sync engine behavior is obvious:
+
+- An offline-capable client streams events since it last connected.
+- The reducer updates local state, triggering UI updates.
+- User actions (called **commands** until they're accepted as
+  events) are queued in an outbox until they can be sent.
+- Optimistic updates are calculated using the reducer you already wrote.
 
 PhaseLock is tooling around this simple architecture to unlock:
 
@@ -47,35 +46,40 @@ PhaseLock is tooling around this simple architecture to unlock:
 - Hybrid clients that read server-side state while hydrating local state
 - Backend workers that watch the event log to trigger side-effects
 
-## Do I need KurrentDB to use PhaseLock?
+Next step: check out one of our [examples][examples].
 
-Well technically no.
+## What database do I use for PhaseLock?
 
-PhaseLock is an "event sourcing" architecture, which is where events are
-_saved_ and state is _derived_.  So all PhaseLock needs is events, and how you
-produce those events is up to you.
+Today's examples run against KurrentDB, which works well for PhaseLock apps.
 
-But KurrentDB is the best event sourcing database, so... we're not sure why you
-wouldn't use KurrentDB.
+You could also make Postgres work, though we don't have examples of that yet.
 
 ## How do I start using PhaseLock?
 
-Kurrent PhaseLock is still in alpha.  Tests are sparse, docs are missing.
+PhaseLock is still in alpha.  Tests are sparse, docs are missing.
 
 Your coding agent can help until our docs are ready.  Try:
 
-- For Claude: `/plugin marketplace add kurrent-io/phaselock` (XXX, is that it?)
-- For XXX: `...`
+- For Claude (as a plugin):
 
-Then ask your agent: "How do I use PhaseLock to build \<decribe your app\>?"
+  ```
+  /plugin marketplace add phaselock-io/phaselock
+  /plugin install phaselock@phaselock
+  ```
+
+- For any agent (as a skill):
+  ```
+  npx skills add phaselock-io/phaselock
+  ```
+
+Then ask your agent: "How do I use PhaseLock to build \<describe your app\>?"
 
 Also check out our [examples][examples], which demonstrate many of the core
 capabilities.
 
-Finally, skim through [skeleton.ts][skeleton-ts], the backbone to all of PhaseLock.
+Finally, skim through [skeleton.ts][skeleton-ts], the backbone of all of PhaseLock.
 
-Open issues when you find them, and come say hi in [discord][discord]!
+Open issues when you find them, and [send us a 'hello' email](mailto:hello@phaselock.io)!
 
-[examples]: https://github.com/kurrent-io/phaselock/tree/master/examples
-[skeleton-ts]: https://github.com/kurrent-io/phaselock/blob/master/tools/emitter-ts/assets/skeleton.ts
-[discord]: https://discord.gg/Phn9pmCw3t
+[examples]: https://github.com/phaselock-io/phaselock/tree/master/examples
+[skeleton-ts]: https://github.com/phaselock-io/phaselock/blob/master/tools/emitter-ts/assets/skeleton.ts

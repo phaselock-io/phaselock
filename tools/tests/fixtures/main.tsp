@@ -6,7 +6,7 @@
 // string- and int-literal unions, plus a Store and Engine so the store-context and engine
 // generation paths are exercised too.  All three emitters read this same source.
 
-import "@kurrent/phaselock-typespec";
+import "@phaselock/typespec";
 
 using PhaseLock;
 

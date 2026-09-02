@@ -37,7 +37,7 @@ function handleWebsocketConnection(client: KurrentDBClient, socket: WebSocket) {
 
   socket.on('error', (e) => closeConnection('error', `websocket died: ${e}`));
 
-  // if client can't keep up with kurrent, pause subscriptions to not fill up memory
+  // if client can't keep up with KurrentDB, pause subscriptions to not fill up memory
   let nQueued = 0;
   const queueLimit = 64;
   let paused = false;

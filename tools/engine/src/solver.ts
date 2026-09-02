@@ -7,19 +7,19 @@
  */
 
 import {
-  KArray,
-  KLiteral,
-  KStruct,
-  KTuple,
-  KType,
-  KTypeRegistry,
+  PArray,
+  PLiteral,
+  PStruct,
+  PTuple,
+  PType,
+  PTypeRegistry,
   LitValue,
   members,
-} from './ktypes.js';
+} from './ptypes.js';
 
 /** Match means there is only one option remaining. */
 export class Match {
-  constructor(readonly typ: KType) {}
+  constructor(readonly typ: PType) {}
 }
 
 /** CheckJsonType means check the json type and proceed with solution = options.get(json_type). */
@@ -70,9 +70,9 @@ export class HasField {
 export type Solution =
   Match | CheckJsonType | CheckLiteral | CheckLength | GetIndex | GetField | HasField;
 
-export function solveUnion(registry: KTypeRegistry, types: Iterable<KType>): CheckJsonType {
+export function solveUnion(registry: PTypeRegistry, types: Iterable<PType>): CheckJsonType {
   // outer layer: check json type
-  const jtypes = new Map<string, KType[]>();
+  const jtypes = new Map<string, PType[]>();
   for (const t of types) {
     let arr = jtypes.get(t.jsonType);
     if (arr === undefined) jtypes.set(t.jsonType, (arr = []));
@@ -86,19 +86,19 @@ export function solveUnion(registry: KTypeRegistry, types: Iterable<KType>): Che
       out.set(jt, new Match(matches[0]));
     } else if (jt === 'string' || jt === 'boolean' || jt === 'int') {
       // union of multiple literals
-      if (!matches.every((t) => t instanceof KLiteral)) {
+      if (!matches.every((t) => t instanceof PLiteral)) {
         throw new Error(`unable to solve union between ${matches.join(', ')}`);
       }
-      out.set(jt, solveUnionLiterals(matches as KLiteral[]));
+      out.set(jt, solveUnionLiterals(matches as PLiteral[]));
     } else if (jt === 'object') {
       // union of multiple structs
-      if (!matches.every((t) => t instanceof KStruct)) {
+      if (!matches.every((t) => t instanceof PStruct)) {
         throw new Error(`unable to solve union of non-struct objects: ${matches.join(' | ')}`);
       }
-      out.set(jt, solveUnionStructs(matches as KStruct[]));
+      out.set(jt, solveUnionStructs(matches as PStruct[]));
     } else if (jt === 'array') {
       // union of tuples, or maybe of non-empty arrays
-      out.set(jt, solveUnionArrays(registry, matches as (KArray | KTuple)[]));
+      out.set(jt, solveUnionArrays(registry, matches as (PArray | PTuple)[]));
     } else {
       // null can't have union types because there's only one
       // float can't have union types because equality checks are flaky
@@ -111,13 +111,13 @@ export function solveUnion(registry: KTypeRegistry, types: Iterable<KType>): Che
   return new CheckJsonType(out);
 }
 
-function solveUnionLiterals(types: readonly KLiteral[]): CheckLiteral {
+function solveUnionLiterals(types: readonly PLiteral[]): CheckLiteral {
   const out = new Map<LitValue, Solution>();
   for (const t of types) out.set(t.value, new Match(t));
   return new CheckLiteral(out);
 }
 
-function solveUnionStructs(types: readonly KStruct[]): Solution {
+function solveUnionStructs(types: readonly PStruct[]): Solution {
   if (types.length === 1) return new Match(types[0]);
 
   // There could be a lot of ways to distinguish different structs, but for now I think we will
@@ -128,21 +128,25 @@ function solveUnionStructs(types: readonly KStruct[]): Solution {
 
   // first check for oneof unions, where each member has a single key and they're all different.
   if (types.every((t) => t.fields.size === 1 && t.always.size === 1)) {
-    const solutions = new Map<string, KStruct[]>();
+    const solutions = new Map<string, PStruct[]>();
     for (const t of types) {
       const field = t.fields.keys().next().value!;
       let arr = solutions.get(field);
       if (arr === undefined) solutions.set(field, (arr = []));
       arr.push(t);
     }
-    return new HasField([...solutions].map(([f, ts]) => [f, solveUnionStructs(ts)] as const));
+    // grouping must make progress; members all sharing one key fall through to the
+    // discriminator logic below
+    if (solutions.size > 1) {
+      return new HasField([...solutions].map(([f, ts]) => [f, solveUnionStructs(ts)] as const));
+    }
   }
 
   // then look for keys with literals that can distinguish our different elements (a "type" key)
   const litkeys = new Map<string, { count: number; values: Set<LitValue> }>();
   for (const t of types) {
     for (const [k, f] of t.fields) {
-      if (f instanceof KLiteral) {
+      if (f instanceof PLiteral) {
         let entry = litkeys.get(k);
         if (entry === undefined) litkeys.set(k, (entry = { count: 0, values: new Set() }));
         entry.count += 1;
@@ -179,7 +183,7 @@ function solveUnionStructs(types: readonly KStruct[]): Solution {
     const k = perfectKeys[0];
     const out = new Map<LitValue, Solution>();
     for (const t of types) {
-      out.set((t.fields.get(k) as KLiteral).value, new Match(t));
+      out.set((t.fields.get(k) as PLiteral).value, new Match(t));
     }
     return new GetField(k, new CheckLiteral(out));
   }
@@ -201,9 +205,9 @@ function solveUnionStructs(types: readonly KStruct[]): Solution {
 
   // build a map of discriminator value to subtypes
   const k = keys[0];
-  const valueToSubtypes = new Map<LitValue, KStruct[]>();
+  const valueToSubtypes = new Map<LitValue, PStruct[]>();
   for (const t of types) {
-    const v = (t.fields.get(k) as KLiteral).value;
+    const v = (t.fields.get(k) as PLiteral).value;
     let arr = valueToSubtypes.get(v);
     if (arr === undefined) valueToSubtypes.set(v, (arr = []));
     arr.push(t);
@@ -215,7 +219,7 @@ function solveUnionStructs(types: readonly KStruct[]): Solution {
   return new GetField(k, new CheckLiteral(out));
 }
 
-function solveUnionArrays(registry: KTypeRegistry, types: readonly (KArray | KTuple)[]): Solution {
+function solveUnionArrays(registry: PTypeRegistry, types: readonly (PArray | PTuple)[]): Solution {
   const out = new Map<number, Solution>();
   let remaining = [...types];
 
@@ -258,7 +262,7 @@ function solveUnionArrays(registry: KTypeRegistry, types: readonly (KArray | KTu
     // Well, start with the easy cases: try a union_solve on each index and hope one uniquely
     // identifies all matches.  This will probably almost always be the case.
     let solution: Solution | null = null;
-    let subtypes: KType[] = [];
+    let subtypes: PType[] = [];
     let index = -1;
     for (let i = 0; i < n; i++) {
       subtypes = matches.map((t) => t.typeat(i));
@@ -304,8 +308,8 @@ function solveUnionArrays(registry: KTypeRegistry, types: readonly (KArray | KTu
 // solver helpers
 
 /** Return true if any of the maybe-unions in subtypes have any overlap with any of the others. */
-function detectUnionOverlap(subtypes: readonly KType[]): boolean {
-  const alltypes = new Set<KType>();
+function detectUnionOverlap(subtypes: readonly PType[]): boolean {
+  const alltypes = new Set<PType>();
   for (const st of subtypes) {
     for (const t of members(st)) {
       if (alltypes.has(t)) return true;
@@ -325,23 +329,23 @@ function detectUnionOverlap(subtypes: readonly KType[]): boolean {
  */
 export function remapAndPrune(
   solution: Solution,
-  subtypes: readonly KType[],
-  matches: readonly KType[],
+  subtypes: readonly PType[],
+  matches: readonly PType[],
 ): Solution {
-  const remap = new Map<KType, KType>();
+  const remap = new Map<PType, PType>();
   subtypes.forEach((st, i) => {
     for (const t of members(st)) remap.set(t, matches[i]);
   });
 
   // returns a new [solution, possible]
-  function visit(solution: Solution): [Solution, Set<KType>] {
+  function visit(solution: Solution): [Solution, Set<PType>] {
     if (solution instanceof Match) {
       const typ = remap.get(solution.typ)!;
       return [new Match(typ), new Set([typ])];
     }
     // CheckJsonType and CheckLiteral happen to have identical logic
     if (solution instanceof CheckJsonType || solution instanceof CheckLiteral) {
-      const possible = new Set<KType>();
+      const possible = new Set<PType>();
       const out = new Map<any, Solution>();
       for (const [key, subsln] of solution.options) {
         const [newsubsln, subposs] = visit(subsln);
@@ -353,7 +357,7 @@ export function remapAndPrune(
       return [new cls(out), possible];
     }
     if (solution instanceof CheckLength) {
-      const possible = new Set<KType>();
+      const possible = new Set<PType>();
       const out = new Map<number, Solution>();
       for (const [length, subsln] of solution.options) {
         const [newsubsln, subposs] = visit(subsln);

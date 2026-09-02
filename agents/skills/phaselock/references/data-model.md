@@ -8,7 +8,7 @@ for each target language.
 Every model file starts:
 
 ```typespec
-import "@kurrent/phaselock-typespec";
+import "@phaselock/typespec";
 
 using PhaseLock;
 ```
@@ -262,8 +262,8 @@ emitters for the languages you target:
 ```json
 {
   "devDependencies": {
-    "@kurrent/phaselock-typespec": "...",
-    "@kurrent/phaselock-typespec-ts": "...",
+    "@phaselock/typespec": "...",
+    "@phaselock/typespec-ts": "...",
     "@typespec/compiler": "^1.0.0"
   },
   "scripts": { "gen": "tsp compile model.tsp" }
@@ -274,9 +274,9 @@ emitters for the languages you target:
 
 ```yaml
 emit:
-  - "@kurrent/phaselock-typespec-ts"
+  - "@phaselock/typespec-ts"
 options:
-  "@kurrent/phaselock-typespec-ts":
+  "@phaselock/typespec-ts":
     emitter-output-dir: "{project-root}"
     out-file: "model.gen.ts"
 ```

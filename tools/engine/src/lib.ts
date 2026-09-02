@@ -1,7 +1,7 @@
 import { createTypeSpecLibrary, paramMessage } from '@typespec/compiler';
 
 export const $lib = createTypeSpecLibrary({
-  name: '@kurrent/phaselock-typespec',
+  name: '@phaselock/typespec',
   diagnostics: {
     'invalid-key-template': {
       severity: 'error',
@@ -36,7 +36,7 @@ export const $lib = createTypeSpecLibrary({
     'unsupported-type': {
       severity: 'error',
       messages: {
-        default: paramMessage`unsupported type in Kurrent Engine model: ${'message'}`,
+        default: paramMessage`unsupported type in PhaseLock model: ${'message'}`,
       },
     },
   },

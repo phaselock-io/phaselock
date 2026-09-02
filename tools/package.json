@@ -1,10 +1,10 @@
 {
-  "name": "@kurrent/typespec-workspace",
+  "name": "@phaselock/typespec-workspace",
   "private": true,
   "version": "0.1.0",
   "scripts": {
     "build": "pnpm -r build",
-    "test": "pnpm -r build && pnpm --filter @kurrent/phaselock-typespec-tests gen && pnpm --filter @kurrent/phaselock-typespec-tests test",
+    "test": "pnpm -r build && pnpm --filter @phaselock/typespec-tests gen && pnpm --filter @phaselock/typespec-tests test",
     "check": "pnpm check:tsc && pnpm check:lint && pnpm check:fmt",
     "check:tsc": "pnpm -r build && tsc -p tests",
     "check:lint": "eslint .",

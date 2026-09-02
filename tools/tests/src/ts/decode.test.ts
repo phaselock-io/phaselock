@@ -10,7 +10,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import * as M from '../../tsp-output/@kurrent/phaselock-typespec-ts/fixtures.gen.ts';
+import * as M from '../../tsp-output/@phaselock/typespec-ts/fixtures.gen.ts';
 
 const ISO = '2024-01-02T03:04:05.000Z';
 const ISO2 = '2020-06-07T08:09:10.000Z';

@@ -15,33 +15,33 @@ import {
   GetField,
   GetIndex,
   HasField,
-  KArray,
-  KBool,
-  KDate,
-  KEngine,
-  KInt,
-  KJson,
-  KLiteral,
-  KNull,
-  KObject,
-  KStore,
-  KString,
-  KStruct,
-  KTuple,
-  KType,
-  KTypeRegistry,
-  KUnion,
+  PArray,
+  PBool,
+  PDate,
+  PEngine,
+  PInt,
+  PJson,
+  PLiteral,
+  PNull,
+  PObject,
+  PStore,
+  PString,
+  PStruct,
+  PTuple,
+  PType,
+  PTypeRegistry,
+  PUnion,
   LoweredProgram,
   Match,
   Solution,
   solveUnion,
-} from '@kurrent/phaselock-typespec';
+} from '@phaselock/typespec';
 
-type Annos = Map<KType, string>;
+type Annos = Map<PType, string>;
 type Converter = (varExpr: string) => string;
-type Converters = Map<KType, Converter>;
+type Converters = Map<PType, Converter>;
 type Checker = (varExpr: string, path: string) => string;
-type Checkers = Map<KType, Checker>;
+type Checkers = Map<PType, Checker>;
 
 interface Anon {
   n: number;
@@ -56,13 +56,13 @@ function getAnon(anon: Anon): string {
  * types use their own name; builtins have none, so we supply a conventional one, falling back to
  * an anonymous counter only for genuinely unnameable item types (e.g. literals).
  */
-function itemName(t: KType): string | null {
+function itemName(t: PType): string | null {
   if (t.name) return t.name;
-  if (t instanceof KString) return 'String';
-  if (t instanceof KInt) return 'Int';
-  if (t instanceof KBool) return 'Bool';
-  if (t instanceof KDate) return 'Date';
-  if (t instanceof KJson) return 'Json';
+  if (t instanceof PString) return 'String';
+  if (t instanceof PInt) return 'Int';
+  if (t instanceof PBool) return 'Bool';
+  if (t instanceof PDate) return 'Date';
+  if (t instanceof PJson) return 'Json';
   return null;
 }
 
@@ -96,8 +96,8 @@ function sortedEntries<K extends string | number | boolean, V>(m: Map<K, V>): [K
 function convertUnion(
   d: Denter,
   name: string,
-  t: KUnion,
-  registry: KTypeRegistry,
+  t: PUnion,
+  registry: PTypeRegistry,
   converters: Converters,
 ): Converter {
   d.print(`\nfunc To${name}(vm *goja.Runtime, value goja.Value) ${name} {\n`);
@@ -141,7 +141,7 @@ function convertUnion(
   const visit = (solution: Solution): void => {
     if (solution instanceof Match) {
       // null has no converter: the union's Go type is an interface, so null converts to nil
-      if (solution.typ instanceof KNull) {
+      if (solution.typ instanceof PNull) {
         d.print(`return nil\n`);
         return;
       }
@@ -280,37 +280,37 @@ function convertUnion(
 function generateTypes(
   d: Denter,
   imports: Set<string>,
-  registry: KTypeRegistry,
+  registry: PTypeRegistry,
   annos: Annos,
   converters: Converters,
   anon: Anon,
-  t: KType,
+  t: PType,
 ): void {
-  const visit = (t: KType, path: string): void => {
+  const visit = (t: PType, path: string): void => {
     if (annos.has(t)) return;
     // skip Null type; it should affect nullability, but not be used alone
-    if (t instanceof KNull) return;
+    if (t instanceof PNull) return;
 
     // builtin scalars
     const goname =
-      t instanceof KString
+      t instanceof PString
         ? 'string'
-        : t instanceof KInt
+        : t instanceof PInt
           ? 'int64'
-          : t instanceof KBool
+          : t instanceof PBool
             ? 'bool'
-            : t instanceof KJson
+            : t instanceof PJson
               ? 'goja.Value'
               : null;
     if (goname !== null) {
       const anno = goname;
-      const converter: Converter = t instanceof KJson ? (v) => v : (v) => `${v}.Export().(${anno})`;
+      const converter: Converter = t instanceof PJson ? (v) => v : (v) => `${v}.Export().(${anno})`;
       annos.set(t, anno);
       converters.set(t, converter);
       return;
     }
 
-    if (t instanceof KDate) {
+    if (t instanceof PDate) {
       imports.add('time');
       annos.set(t, 'time.Time');
       // converters run on decoded values, where timestamps are already JS Date objects
@@ -333,12 +333,12 @@ function generateTypes(
     let anno: string;
     let converter: Converter;
 
-    if (t instanceof KLiteral) {
+    if (t instanceof PLiteral) {
       if (typeof t.value === 'string') anno = `string /*${t.value}*/`;
       else if (typeof t.value === 'boolean') anno = `bool /*${t.value}*/`;
       else anno = `int64 /*${t.value}*/`;
       converter = (v) => `${v}.Export().(${anno})`;
-    } else if (t instanceof KArray) {
+    } else if (t instanceof PArray) {
       visit(t.itemType, path);
       anno = `[]${annos.get(t.itemType)}`;
       const it = itemName(t.itemType);
@@ -360,7 +360,7 @@ function generateTypes(
       d.dedent();
       d.print(`}\n`);
       converter = (v) => `to${name}(vm, ${v})`;
-    } else if (t instanceof KObject) {
+    } else if (t instanceof PObject) {
       visit(t.valueType, path);
       anno = `map[string]${annos.get(t.valueType)}`;
       const vt = itemName(t.valueType);
@@ -384,19 +384,19 @@ function generateTypes(
       d.dedent();
       d.print(`}\n`);
       converter = (v) => `to${name}(vm, ${v})`;
-    } else if (t instanceof KUnion) {
+    } else if (t instanceof PUnion) {
       t.types.forEach((ut, i) => visit(ut, path + String(i)));
       const name = pascal(t.name ?? path);
-      const nonNull = t.types.filter((ut) => !(ut instanceof KNull));
-      const allStructs = nonNull.length > 0 && nonNull.every((ut) => ut instanceof KStruct);
-      const literalBase = (lit: KLiteral): string =>
+      const nonNull = t.types.filter((ut) => !(ut instanceof PNull));
+      const allStructs = nonNull.length > 0 && nonNull.every((ut) => ut instanceof PStruct);
+      const literalBase = (lit: PLiteral): string =>
         typeof lit.value === 'string'
           ? 'string'
           : typeof lit.value === 'boolean'
             ? 'bool'
             : 'int64';
-      const bases = new Set(t.types.map((ut) => (ut instanceof KLiteral ? literalBase(ut) : null)));
-      const uniformLiteral = t.types.every((ut) => ut instanceof KLiteral) && bases.size === 1;
+      const bases = new Set(t.types.map((ut) => (ut instanceof PLiteral ? literalBase(ut) : null)));
+      const uniformLiteral = t.types.every((ut) => ut instanceof PLiteral) && bases.size === 1;
 
       if (allStructs) {
         // union of named struct types: an interface each member opts into.  The marker method is
@@ -411,7 +411,7 @@ function generateTypes(
         converter = convertUnion(d, name, t, registry, converters);
         // one-line funcs are blank-line separated so gofmt doesn't want their bodies aligned
         for (const ut of t.types) {
-          if (ut instanceof KNull) continue;
+          if (ut instanceof PNull) continue;
           d.print(`\nfunc (x ${annos.get(ut)}) is${name}() {}\n`);
         }
       } else if (uniformLiteral) {
@@ -438,7 +438,7 @@ function generateTypes(
         converter = (v) => `To${name}(vm, ${v})`;
       }
       anno = name;
-    } else if (t instanceof KStruct) {
+    } else if (t instanceof PStruct) {
       for (const [fn, ft] of t.fields) visit(ft, path + pascal(fn));
       const name = pascal(t.name ?? path);
       d.print(`\ntype ${name} goja.Object\n`);
@@ -469,7 +469,7 @@ function generateTypes(
         d.print(`}\n`);
       }
       anno = `*${name}`;
-    } else if (t instanceof KTuple) {
+    } else if (t instanceof PTuple) {
       t.itemTypes.forEach((it, i) => visit(it, path + String(i)));
       const name = pascal(t.name ?? path);
       d.print(`\ntype ${name} goja.Object\n`);
@@ -753,19 +753,19 @@ function checkSolution(d: Denter, checkers: Checkers, solution: Solution): void 
 
 function generateCheckers(
   d: Denter,
-  registry: KTypeRegistry,
+  registry: PTypeRegistry,
   annos: Annos,
   checkers: Checkers,
   anon: Anon,
-  t: KType,
+  t: PType,
 ): void {
-  const visit = (t: KType): void => {
+  const visit = (t: PType): void => {
     if (checkers.has(t)) return;
 
-    if (t instanceof KJson) {
-      throw new Error(`XXX: ${t}`);
+    if (t instanceof PJson) {
+      throw new Error(`JSON-like data is not supported by the go emitter: ${t}`);
     }
-    if (t instanceof KString) {
+    if (t instanceof PString) {
       checkers.set(
         t,
         (v, path) =>
@@ -775,7 +775,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KInt) {
+    if (t instanceof PInt) {
       checkers.set(
         t,
         (v, path) =>
@@ -785,7 +785,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KBool) {
+    if (t instanceof PBool) {
       checkers.set(
         t,
         (v, path) =>
@@ -795,7 +795,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KNull || (t instanceof KLiteral && t.value === null)) {
+    if (t instanceof PNull || (t instanceof PLiteral && t.value === null)) {
       checkers.set(
         t,
         (v, path) =>
@@ -805,7 +805,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KDate) {
+    if (t instanceof PDate) {
       checkers.set(
         t,
         (v, path) =>
@@ -817,7 +817,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KLiteral) {
+    if (t instanceof PLiteral) {
       if (typeof t.value === 'string') {
         checkers.set(
           t,
@@ -848,7 +848,7 @@ function generateCheckers(
     }
 
     let checker: Checker;
-    if (t instanceof KArray) {
+    if (t instanceof PArray) {
       visit(t.itemType);
       checker = (v, path) => {
         const dd = new Denter();
@@ -880,7 +880,7 @@ function generateCheckers(
         dd.print(`}\n`);
         return dd.getvalue();
       };
-    } else if (t instanceof KTuple) {
+    } else if (t instanceof PTuple) {
       for (const it of t.itemTypes) visit(it);
       checker = (v, path) => {
         const dd = new Denter();
@@ -917,7 +917,7 @@ function generateCheckers(
         dd.print(`}\n`);
         return dd.getvalue();
       };
-    } else if (t instanceof KObject) {
+    } else if (t instanceof PObject) {
       visit(t.valueType);
       checker = (v, path) => {
         const dd = new Denter();
@@ -941,7 +941,7 @@ function generateCheckers(
         dd.print(`}\n`);
         return dd.getvalue();
       };
-    } else if (t instanceof KUnion) {
+    } else if (t instanceof PUnion) {
       for (const ut of t.types) visit(ut);
       const solution = solveUnion(registry, t.types);
       const name = t.name ? `check${t.name}` : `check${getAnon(anon)}`;
@@ -952,7 +952,7 @@ function generateCheckers(
       d.dedent();
       d.print(`}\n`);
       checker = (v, path) => `errs = append(errs, ${name}(vm, ${v}, ${path})...)\n`;
-    } else if (t instanceof KStruct) {
+    } else if (t instanceof PStruct) {
       for (const ft of t.fields.values()) visit(ft);
       let keys: string, func: string;
       if (t.name) {
@@ -1040,7 +1040,7 @@ function contextName(name: string): string {
   return pascal(name.endsWith('Store') ? name.slice(0, -5) : name);
 }
 
-function generateStore(d: Denter, annos: Annos, converters: Converters, store: KStore): void {
+function generateStore(d: Denter, annos: Annos, converters: Converters, store: PStore): void {
   const iface = contextName(store.name!) + 'QueryContext';
   const impl = camel(iface);
   const byName = <T extends { name: string }>(a: T, b: T) =>
@@ -1099,7 +1099,7 @@ function engineName(name: string): string {
   return pascal(name.endsWith('Engine') ? name : name + 'Engine');
 }
 
-function generateEngine(d: Denter, annos: Annos, f: KEngine): void {
+function generateEngine(d: Denter, annos: Annos, f: PEngine): void {
   const name = engineName(f.name!);
   const QX = contextName(f.store.name!) + 'QueryContext';
   const E = annos.get(f.eventType);
@@ -1169,7 +1169,7 @@ export function generateGo(lowered: LoweredProgram, skeleton: string, pkg: strin
   for (const e of engines) generateEngine(sub, annos, e);
 
   const d = new Denter();
-  d.print(`// Code generated by @kurrent/phaselock-typespec-go. DO NOT EDIT.\n`);
+  d.print(`// Code generated by @phaselock/typespec-go. DO NOT EDIT.\n`);
   d.print(`\n`);
   d.print(`package ${pkg}\n`);
   d.print('\nimport (\n');

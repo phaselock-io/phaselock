@@ -33,7 +33,7 @@ const EmitterOptionsSchema: JSONSchemaType<GoEmitterOptions> = {
 };
 
 export const $lib = createTypeSpecLibrary({
-  name: '@kurrent/phaselock-typespec-go',
+  name: '@phaselock/typespec-go',
   diagnostics: {},
   emitter: { options: EmitterOptionsSchema },
 } as const);

@@ -115,7 +115,7 @@ class Appender:
 
         # First add any newly-created uuids.
         #
-        # We use kurrent's optimistic concurrency locks to ensure that each client-generated uuid is
+        # We use KurrentDB's optimistic concurrency locks to ensure that each client-generated uuid is
         # unique.  This comes at the cost of one tiny stream per uuid in the system, which is not
         # unbearable.  But we could reduce to something like 65K streams of one event each, by:
         #
@@ -220,7 +220,7 @@ class Subscriber:
 
     async def collect(self) -> None:
         """
-        XXX: this may not be doing what I want it to; what I want is to only apply backpressure to
+        TODO: this may not be doing what I want it to; what I want is to only apply backpressure to
         the network when there are 1000 unprocessed events in the queue... but what I think is
         happening is that the collector is always stopped while processing occurs.  This is unlike
         the go version, where different goroutines can actually run on different hardware threads.

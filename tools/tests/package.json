@@ -1,5 +1,5 @@
 {
-  "name": "@kurrent/phaselock-typespec-tests",
+  "name": "@phaselock/typespec-tests",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -8,14 +8,14 @@
     "gen": "tsp compile fixtures",
     "test": "vitest run",
     "test:py": "python3 py/test_checkers.py",
-    "test:go": "cp 'tsp-output/@kurrent/phaselock-typespec-go/model.go' go/model.go && cd go && go test ./...",
+    "test:go": "cp 'tsp-output/@phaselock/typespec-go/model.go' go/model.go && cd go && go test ./...",
     "watch": "vitest"
   },
   "dependencies": {
-    "@kurrent/phaselock-typespec": "workspace:*",
-    "@kurrent/phaselock-typespec-ts": "workspace:*",
-    "@kurrent/phaselock-typespec-py": "workspace:*",
-    "@kurrent/phaselock-typespec-go": "workspace:*",
+    "@phaselock/typespec": "workspace:*",
+    "@phaselock/typespec-ts": "workspace:*",
+    "@phaselock/typespec-py": "workspace:*",
+    "@phaselock/typespec-go": "workspace:*",
     "@typespec/compiler": "^1.0.0"
   },
   "devDependencies": {

@@ -1,4 +1,4 @@
-# Kurrent PhaseLock — repo guide
+# PhaseLock — repo guide
 
 PhaseLock is an event-sourcing sync engine: events live in KurrentDB,
 TypeScript reducers derive state everywhere (browser, Node, Python, Go),
@@ -28,7 +28,7 @@ examples/
   library/        Full architecture: Python relay, Go decider, forecasts,
                   per-audience stores. Root also has populate.py seed data.
 agents/           The "phaselock" agent plugin; canonical skill at
-                  agents/skills/phaselock/ (symlinked from .claude/skills/).
+                  agents/skills/phaselock/.
 .claude-plugin/   marketplace.json cataloging the plugin.
 ```
 
@@ -42,7 +42,7 @@ Tools (`cd tools`):
 
 - `pnpm install && pnpm -r build` — build vocabulary + emitters
 - `pnpm test` — regenerate fixtures, run the vitest suite
-- `pnpm --filter @kurrent/phaselock-typespec-tests test:py` / `test:go` —
+- `pnpm --filter @phaselock/typespec-tests test:py` / `test:go` —
   emitted-Python / emitted-Go checker suites
 
 Todo examples (`cd examples/todo-basic` or `todo-thin`):

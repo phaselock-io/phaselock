@@ -16,7 +16,7 @@ import (
 	"github.com/google/uuid"
 	"go.etcd.io/bbolt"
 
-	"github.com/kurrent-io/engine/go/model"
+	"github.com/phaselock-io/phaselock/go/model"
 )
 
 //go:embed decider.js

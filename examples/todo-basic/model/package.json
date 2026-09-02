@@ -9,9 +9,9 @@
         "./server": "./server.ts"
     },
     "devDependencies": {
-        "@kurrent/phaselock-typespec": "link:../../../tools/engine",
-        "@kurrent/phaselock-typespec-ts": "link:../../../tools/emitter-ts",
-        "@kurrent/phaselock-typespec-go": "link:../../../tools/emitter-go",
+        "@phaselock/typespec": "link:../../../tools/engine",
+        "@phaselock/typespec-ts": "link:../../../tools/emitter-ts",
+        "@phaselock/typespec-go": "link:../../../tools/emitter-go",
         "@typespec/compiler": "^1.0.0"
     }
 }

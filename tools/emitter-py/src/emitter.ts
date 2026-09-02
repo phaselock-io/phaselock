@@ -11,32 +11,32 @@ import {
   GetField,
   GetIndex,
   HasField,
-  KArray,
-  KBool,
-  KDate,
-  KEngine,
-  KInt,
-  KJson,
-  KLiteral,
-  KNull,
-  KObject,
-  KStore,
-  KString,
-  KStruct,
-  KTuple,
-  KType,
-  KTypeRegistry,
-  KUnion,
+  PArray,
+  PBool,
+  PDate,
+  PEngine,
+  PInt,
+  PJson,
+  PLiteral,
+  PNull,
+  PObject,
+  PStore,
+  PString,
+  PStruct,
+  PTuple,
+  PType,
+  PTypeRegistry,
+  PUnion,
   LoweredProgram,
   Match,
   Solution,
   solveUnion,
-} from '@kurrent/phaselock-typespec';
+} from '@phaselock/typespec';
 
-type Annos = Map<KType, string>;
+type Annos = Map<PType, string>;
 /** a checker maps (valueExpr, pathExpr) to Python statements appending to `problems`; noop → "" */
 type Checker = (val: string, path: string) => string;
-type Checkers = Map<KType, Checker>;
+type Checkers = Map<PType, Checker>;
 
 const NOOP: Checker = () => '';
 
@@ -68,23 +68,23 @@ function pascalCase(name: string): string {
 
 // annotations
 
-function generateAnnotations(d: Denter, annos: Annos, t: KType): void {
-  const visit = (t: KType, path: string): void => {
+function generateAnnotations(d: Denter, annos: Annos, t: PType): void {
+  const visit = (t: PType, path: string): void => {
     if (annos.has(t)) return;
 
     // builtin scalars
     const builtin =
-      t instanceof KString
+      t instanceof PString
         ? 'str'
-        : t instanceof KInt
+        : t instanceof PInt
           ? 'int'
-          : t instanceof KBool
+          : t instanceof PBool
             ? 'bool'
-            : t instanceof KJson
+            : t instanceof PJson
               ? 'JSON'
-              : t instanceof KNull
+              : t instanceof PNull
                 ? 'None'
-                : t instanceof KDate
+                : t instanceof PDate
                   ? 'datetime.datetime'
                   : null;
     if (builtin !== null) {
@@ -92,7 +92,7 @@ function generateAnnotations(d: Denter, annos: Annos, t: KType): void {
       return;
     }
 
-    if (t instanceof KLiteral) {
+    if (t instanceof PLiteral) {
       if (typeof t.value === 'string') annos.set(t, `Literal["${t.value}"]`);
       else if (typeof t.value === 'boolean')
         annos.set(t, t.value ? 'Literal[True]' : 'Literal[False]');
@@ -101,25 +101,25 @@ function generateAnnotations(d: Denter, annos: Annos, t: KType): void {
     }
 
     let anno = '';
-    if (t instanceof KArray) {
+    if (t instanceof PArray) {
       visit(t.itemType, path);
       anno = `list[${annos.get(t.itemType)}]`;
-    } else if (t instanceof KTuple) {
+    } else if (t instanceof PTuple) {
       for (const it of t.itemTypes) visit(it, path);
       anno = 'tuple[' + t.itemTypes.map((it) => annos.get(it)).join(', ') + ']';
-    } else if (t instanceof KUnion) {
+    } else if (t instanceof PUnion) {
       t.types.forEach((ut, i) => visit(ut, path + String(i)));
       anno = t.types.map((ut) => annos.get(ut)).join(' | ');
-    } else if (t instanceof KStruct) {
+    } else if (t instanceof PStruct) {
       for (const [fn, ft] of t.fields) visit(ft, path + pascalCase(fn));
-    } else if (t instanceof KObject) {
+    } else if (t instanceof PObject) {
       visit(t.valueType, path);
       anno = `dict[str, ${annos.get(t.valueType)}]`;
     } else {
       throw new Error(`unhandled type in generateAnnotations: ${t.constructor.name}`);
     }
 
-    if (t instanceof KStruct) {
+    if (t instanceof PStruct) {
       // define a class based on typing.Protocol
       const className = t.name ?? path;
       annos.set(t, className);
@@ -244,21 +244,21 @@ function checkSolution(d: Denter, checkers: Checkers, solution: Solution): void 
 
 function generateCheckers(
   d: Denter,
-  registry: KTypeRegistry,
+  registry: PTypeRegistry,
   annos: Annos,
   checkers: Checkers,
-  t: KType,
+  t: PType,
   anon: { n: number },
   loop: { n: number },
 ): void {
-  const visit = (t: KType): void => {
+  const visit = (t: PType): void => {
     if (checkers.has(t)) return;
 
-    if (t instanceof KJson) {
+    if (t instanceof PJson) {
       checkers.set(t, NOOP);
       return;
     }
-    if (t instanceof KString) {
+    if (t instanceof PString) {
       checkers.set(
         t,
         (val, path) =>
@@ -267,7 +267,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KInt) {
+    if (t instanceof PInt) {
       // bool is a subclass of int in Python, so the check must exclude it explicitly
       checkers.set(
         t,
@@ -277,7 +277,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KBool) {
+    if (t instanceof PBool) {
       checkers.set(
         t,
         (val, path) =>
@@ -286,7 +286,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KNull || (t instanceof KLiteral && t.value === null)) {
+    if (t instanceof PNull || (t instanceof PLiteral && t.value === null)) {
       checkers.set(
         t,
         (val, path) =>
@@ -295,7 +295,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KDate) {
+    if (t instanceof PDate) {
       // TypeError covers non-string values, which strptime rejects with the wrong exception
       checkers.set(
         t,
@@ -310,7 +310,7 @@ function generateCheckers(
       );
       return;
     }
-    if (t instanceof KLiteral) {
+    if (t instanceof PLiteral) {
       if (typeof t.value === 'string') {
         checkers.set(
           t,
@@ -338,7 +338,7 @@ function generateCheckers(
     }
 
     let checker: Checker;
-    if (t instanceof KUnion) {
+    if (t instanceof PUnion) {
       for (const ut of t.types) visit(ut);
       const solution = solveUnion(registry, t.types);
       const name = t.name ? `check_${camelToSnake(t.name)}` : `_check_anon_${anon.n++}`;
@@ -347,7 +347,7 @@ function generateCheckers(
       checkSolution(d, checkers, solution);
       d.dedent();
       checker = (val, path) => `problems += ${name}(${val}, ${path})\n`;
-    } else if (t instanceof KArray) {
+    } else if (t instanceof PArray) {
       visit(t.itemType);
       checker = (val, path) => {
         const dd = new Denter();
@@ -368,7 +368,7 @@ function generateCheckers(
         dd.print(checkers.get(t.itemType)!(ev, `${path} + f'[{${iv}}]'`));
         return dd.getvalue();
       };
-    } else if (t instanceof KTuple) {
+    } else if (t instanceof PTuple) {
       for (const it of t.itemTypes) visit(it);
       checker = (val, path) => {
         const dd = new Denter();
@@ -391,7 +391,7 @@ function generateCheckers(
         }
         return dd.getvalue();
       };
-    } else if (t instanceof KStruct) {
+    } else if (t instanceof PStruct) {
       for (const ft of t.fields.values()) visit(ft);
       let keys: string, func: string;
       if (t.name) {
@@ -427,7 +427,7 @@ function generateCheckers(
       d.dedent();
       d.print(`\n`);
       checker = (val, path) => `problems += ${func}(${val}, ${path})\n`;
-    } else if (t instanceof KObject) {
+    } else if (t instanceof PObject) {
       visit(t.valueType);
       checker = (val, path) => {
         const dd = new Denter();
@@ -449,7 +449,7 @@ function generateCheckers(
     }
 
     // named types without a function already defined get a wrapper now
-    if (t.name && !(t instanceof KUnion) && !(t instanceof KStruct)) {
+    if (t.name && !(t instanceof PUnion) && !(t instanceof PStruct)) {
       d.print(`\ndef check_${camelToSnake(t.name)}(val: Any, path: str = '<root>') -> list[str]:\n`);
       d.indent('    ');
       d.print('problems = []\n');
@@ -468,7 +468,7 @@ function contextName(name: string): string {
   return name.endsWith('Store') ? name.slice(0, -5) : name;
 }
 
-function generateStore(d: Denter, annos: Annos, store: KStore): void {
+function generateStore(d: Denter, annos: Annos, store: PStore): void {
   const supers = store.deps.length
     ? '(' + store.deps.map((dep) => `${contextName(dep.name!)}QueryContext`).join(', ') + ')'
     : '';
@@ -496,7 +496,7 @@ function engineName(name: string): string {
   return name.endsWith('Engine') ? name : name + 'Engine';
 }
 
-function generateEngine(d: Denter, annos: Annos, f: KEngine): void {
+function generateEngine(d: Denter, annos: Annos, f: PEngine): void {
   const QX = `${contextName(f.store.name!)}QueryContext`;
   const E = annos.get(f.eventType);
   const C = annos.get(f.commandType);

@@ -11,15 +11,15 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { lowerProgram } from '@kurrent/phaselock-typespec';
-import { generateTs } from '@kurrent/phaselock-typespec-ts';
+import { lowerProgram } from '@phaselock/typespec';
+import { generateTs } from '@phaselock/typespec-ts';
 import { resolvePath } from '@typespec/compiler';
 import { createTester } from '@typespec/compiler/testing';
 import { beforeAll, describe, expect, it } from 'vitest';
 
 const base = fileURLToPath(new URL('../..', import.meta.url));
-const Tester = createTester(resolvePath(base), { libraries: ['@kurrent/phaselock-typespec'] })
-  .import('@kurrent/phaselock-typespec')
+const Tester = createTester(resolvePath(base), { libraries: ['@phaselock/typespec'] })
+  .import('@phaselock/typespec')
   .using('PhaseLock');
 
 const SOURCE = `

@@ -1,11 +1,11 @@
 /**
- * KType and friends are intermediate representation (IR) layer that code generation consumes.
+ * PType and friends are intermediate representation (IR) layer that code generation consumes.
  *
- * KTypes are interned: identical types are represented by a single object, so object identity is
+ * PTypes are interned: identical types are represented by a single object, so object identity is
  * 1:1 with type equality.  The union solver and the decoder generators both rely on that.
  *
- * The 'K' in 'KType' is for Kurrent, and distinguishes e.g. KUnion from @typescript/compiler's
- * Union type, as well as distinguishing KEngine from our own user-facing Engine.
+ * The 'P' prefix marks IR types, and distinguishes e.g. PUnion from @typescript/compiler's
+ * Union type, as well as distinguishing PEngine from our own user-facing Engine.
  */
 
 export type JsonType = 'null' | 'int' | 'string' | 'boolean' | 'object' | 'array' | '*';
@@ -13,7 +13,7 @@ export type LitValue = string | number | boolean;
 
 let nextId = 0;
 
-export abstract class KType {
+export abstract class PType {
   readonly id: number = nextId++;
   name: string | null = null;
   abstract readonly jsonType: JsonType;
@@ -21,60 +21,60 @@ export abstract class KType {
 }
 
 /** Iterate union members, or the type itself for non-unions. */
-export function members(t: KType): readonly KType[] {
-  return t instanceof KUnion ? t.types : [t];
+export function members(t: PType): readonly PType[] {
+  return t instanceof PUnion ? t.types : [t];
 }
 
-export class KNull extends KType {
+export class PNull extends PType {
   readonly jsonType = 'null';
   toString() {
     return 'null';
   }
 }
 
-export class KInt extends KType {
+export class PInt extends PType {
   readonly jsonType = 'int';
   toString() {
     return 'int';
   }
 }
 
-export class KString extends KType {
+export class PString extends PType {
   readonly jsonType = 'string';
   toString() {
     return 'str';
   }
 }
 
-export class KBool extends KType {
+export class PBool extends PType {
   readonly jsonType = 'boolean';
   toString() {
     return 'bool';
   }
 }
 
-export class KDate extends KType {
+export class PDate extends PType {
   readonly jsonType = 'string';
   toString() {
     return 'Date';
   }
 }
 
-export class KJson extends KType {
+export class PJson extends PType {
   readonly jsonType = '*';
   toString() {
     return 'json';
   }
 }
 
-export class KLiteral extends KType {
+export class PLiteral extends PType {
   readonly jsonType: JsonType;
   constructor(readonly value: LitValue) {
     super();
     if (typeof value === 'boolean') this.jsonType = 'boolean';
     else if (typeof value === 'string') this.jsonType = 'string';
     else if (Number.isInteger(value)) this.jsonType = 'int';
-    else throw new Error(`illegal value for KLiteral(${value})`);
+    else throw new Error(`illegal value for PLiteral(${value})`);
   }
   toString() {
     if (typeof this.value === 'string') return `"${this.value}"`;
@@ -82,17 +82,17 @@ export class KLiteral extends KType {
   }
 }
 
-export type KField = readonly [name: string, type: KType, optional: boolean];
+export type PField = readonly [name: string, type: PType, optional: boolean];
 
-export class KStruct extends KType {
+export class PStruct extends PType {
   readonly jsonType = 'object';
   /** all fields, regardless of maybe status, in declaration order */
-  readonly fields: Map<string, KType>;
+  readonly fields: Map<string, PType>;
   /** only non-maybe fields */
-  readonly always: Map<string, KType>;
+  readonly always: Map<string, PType>;
   /** only maybe fields */
-  readonly maybes: Map<string, KType>;
-  constructor(fields: readonly KField[]) {
+  readonly maybes: Map<string, PType>;
+  constructor(fields: readonly PField[]) {
     super();
     this.fields = new Map(fields.map(([k, t]) => [k, t]));
     this.always = new Map(fields.filter(([, , opt]) => !opt).map(([k, t]) => [k, t]));
@@ -100,14 +100,14 @@ export class KStruct extends KType {
   }
   toString() {
     if (this.name) return this.name;
-    const mkfield = (k: string, v: KType) => `${k}${this.maybes.has(k) ? '?' : ''}: ${v}`;
+    const mkfield = (k: string, v: PType) => `${k}${this.maybes.has(k) ? '?' : ''}: ${v}`;
     return '{' + [...this.fields].map(([k, v]) => mkfield(k, v)).join(', ') + '}';
   }
 }
 
-export class KObject extends KType {
+export class PObject extends PType {
   readonly jsonType = 'object';
-  constructor(readonly valueType: KType) {
+  constructor(readonly valueType: PType) {
     super();
   }
   toString() {
@@ -115,15 +115,15 @@ export class KObject extends KType {
   }
 }
 
-export class KArray extends KType {
+export class PArray extends PType {
   readonly jsonType = 'array';
-  constructor(readonly itemType: KType) {
+  constructor(readonly itemType: PType) {
     super();
   }
   lengthRange(): [number, number] {
     return [0, Infinity];
   }
-  typeat(_i: number): KType {
+  typeat(_i: number): PType {
     return this.itemType;
   }
   toString() {
@@ -131,15 +131,15 @@ export class KArray extends KType {
   }
 }
 
-export class KTuple extends KType {
+export class PTuple extends PType {
   readonly jsonType = 'array';
-  constructor(readonly itemTypes: readonly KType[]) {
+  constructor(readonly itemTypes: readonly PType[]) {
     super();
   }
   lengthRange(): [number, number] {
     return [this.itemTypes.length, this.itemTypes.length];
   }
-  typeat(i: number): KType {
+  typeat(i: number): PType {
     return this.itemTypes[i];
   }
   toString() {
@@ -147,10 +147,10 @@ export class KTuple extends KType {
   }
 }
 
-export class KUnion extends KType {
-  /** members in first-seen order; never contains a nested KUnion */
-  readonly types: readonly KType[];
-  constructor(types: readonly KType[]) {
+export class PUnion extends PType {
+  /** members in first-seen order; never contains a nested PUnion */
+  readonly types: readonly PType[];
+  constructor(types: readonly PType[]) {
     super();
     this.types = types;
   }
@@ -165,7 +165,7 @@ export class KUnion extends KType {
 }
 
 /**
- * KTypeRegistry is the interning layer: every type is created through it, and structurally
+ * PTypeRegistry is the interning layer: every type is created through it, and structurally
  * identical types come back as the same object.
  *
  * Structural keys are built from child ids, which is sound because children are themselves
@@ -173,12 +173,12 @@ export class KUnion extends KType {
  * does not affect identity (the first creation wins the display order); union keys sort member
  * ids so that member order does not affect identity either.
  */
-export class KTypeRegistry {
+export class PTypeRegistry {
   /** every distinct type ever created, in creation order */
-  readonly all: KType[] = [];
-  private interned = new Map<string, KType>();
+  readonly all: PType[] = [];
+  private interned = new Map<string, PType>();
 
-  private intern<T extends KType>(key: string, create: () => T): T {
+  private intern<T extends PType>(key: string, create: () => T): T {
     const existing = this.interned.get(key);
     if (existing !== undefined) return existing as T;
     const val = create();
@@ -187,58 +187,58 @@ export class KTypeRegistry {
     return val;
   }
 
-  null_(): KNull {
-    return this.intern('null', () => new KNull());
+  null_(): PNull {
+    return this.intern('null', () => new PNull());
   }
-  int(): KInt {
-    return this.intern('int', () => new KInt());
+  int(): PInt {
+    return this.intern('int', () => new PInt());
   }
-  string(): KString {
-    return this.intern('string', () => new KString());
+  string(): PString {
+    return this.intern('string', () => new PString());
   }
-  bool(): KBool {
-    return this.intern('bool', () => new KBool());
+  bool(): PBool {
+    return this.intern('bool', () => new PBool());
   }
-  date(): KDate {
-    return this.intern('date', () => new KDate());
+  date(): PDate {
+    return this.intern('date', () => new PDate());
   }
-  json(): KJson {
-    return this.intern('json', () => new KJson());
-  }
-
-  literal(value: LitValue): KLiteral {
-    return this.intern(`lit:${typeof value}:${JSON.stringify(value)}`, () => new KLiteral(value));
+  json(): PJson {
+    return this.intern('json', () => new PJson());
   }
 
-  struct(fields: readonly KField[]): KStruct {
+  literal(value: LitValue): PLiteral {
+    return this.intern(`lit:${typeof value}:${JSON.stringify(value)}`, () => new PLiteral(value));
+  }
+
+  struct(fields: readonly PField[]): PStruct {
     const key =
       'struct:' +
       [...fields]
         .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
         .map(([k, t, opt]) => `${k}${opt ? '?' : ''}=${t.id}`)
         .join(',');
-    return this.intern(key, () => new KStruct(fields));
+    return this.intern(key, () => new PStruct(fields));
   }
 
-  object(valueType: KType): KObject {
-    return this.intern(`obj:${valueType.id}`, () => new KObject(valueType));
+  object(valueType: PType): PObject {
+    return this.intern(`obj:${valueType.id}`, () => new PObject(valueType));
   }
 
-  array(itemType: KType): KArray {
-    return this.intern(`arr:${itemType.id}`, () => new KArray(itemType));
+  array(itemType: PType): PArray {
+    return this.intern(`arr:${itemType.id}`, () => new PArray(itemType));
   }
 
-  tuple(itemTypes: readonly KType[]): KTuple {
-    return this.intern(`tup:${itemTypes.map((t) => t.id).join(',')}`, () => new KTuple(itemTypes));
+  tuple(itemTypes: readonly PType[]): PTuple {
+    return this.intern(`tup:${itemTypes.map((t) => t.id).join(',')}`, () => new PTuple(itemTypes));
   }
 
   /**
    * Create a union.  Nested unions are flattened and duplicate members dropped, so union members
    * are never themselves unions.  A single-member union resolves to the member itself.
    */
-  union(types: readonly KType[]): KType {
-    const flat: KType[] = [];
-    const seen = new Set<KType>();
+  union(types: readonly PType[]): PType {
+    const flat: PType[] = [];
+    const seen = new Set<PType>();
     for (const t of types) {
       for (const m of members(t)) {
         if (!seen.has(m)) {
@@ -255,7 +255,7 @@ export class KTypeRegistry {
         .map((t) => t.id)
         .sort((a, b) => a - b)
         .join(',');
-    return this.intern(key, () => new KUnion(flat));
+    return this.intern(key, () => new PUnion(flat));
   }
 }
 
@@ -263,24 +263,24 @@ export class KTypeRegistry {
 
 const TPL_PATTERN = /\{([^}]*)\}/g;
 
-export class KStoreItem {
+export class PStoreItem {
   private constructor(
     readonly tpl: string,
-    readonly type: KType,
-    readonly origin: KStore,
+    readonly type: PType,
+    readonly origin: PStore,
     readonly name: string,
     /** there is always one more chunk than params */
     readonly chunks: readonly string[],
     readonly params: readonly string[],
   ) {}
 
-  static fromSpec(tpl: string, type: KType, origin: KStore): KStoreItem {
+  static fromSpec(tpl: string, type: PType, origin: PStore): PStoreItem {
     const name = tpl.split('.')[0];
     if (name.includes('{')) {
       throw new Error(`store key template '${tpl}' does not have a name before a '.'`);
     }
-    const [chunks, params] = KStoreItem.parseTpl(tpl);
-    return new KStoreItem(tpl, type, origin, name, chunks, params);
+    const [chunks, params] = PStoreItem.parseTpl(tpl);
+    return new PStoreItem(tpl, type, origin, name, chunks, params);
   }
 
   static parseTpl(tpl: string): [string[], string[]] {
@@ -297,17 +297,17 @@ export class KStoreItem {
   }
 }
 
-export class KStore {
+export class PStore {
   name: string | null = null;
-  readonly deps: readonly KStore[];
+  readonly deps: readonly PStore[];
   /** all items including those of deps, sorted by name */
-  readonly items: readonly KStoreItem[];
+  readonly items: readonly PStoreItem[];
 
-  constructor(specs: readonly (readonly [string, KType])[], deps: readonly KStore[]) {
+  constructor(specs: readonly (readonly [string, PType])[], deps: readonly PStore[]) {
     this.deps = deps;
-    const items: KStoreItem[] = [];
-    const names = new Map<string, KStoreItem>();
-    const add = (si: KStoreItem) => {
+    const items: PStoreItem[] = [];
+    const names = new Map<string, PStoreItem>();
+    const add = (si: PStoreItem) => {
       const match = names.get(si.name);
       if (match !== undefined) {
         throw new Error(
@@ -320,13 +320,13 @@ export class KStore {
     for (const dep of deps) {
       for (const si of dep.items) add(si);
     }
-    for (const [tpl, type] of specs) add(KStoreItem.fromSpec(tpl, type, this));
+    for (const [tpl, type] of specs) add(PStoreItem.fromSpec(tpl, type, this));
     items.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     this.items = items;
   }
 
   /** items declared on this store itself (not inherited from deps), in sorted order */
-  get originalItems(): KStoreItem[] {
+  get originalItems(): PStoreItem[] {
     return this.items.filter((si) => si.origin === this);
   }
 
@@ -335,25 +335,25 @@ export class KStore {
   }
 }
 
-export class KEngine {
+export class PEngine {
   name: string | null = null;
   constructor(
-    readonly eventType: KType,
-    readonly commandType: KType,
-    readonly store: KStore,
+    readonly eventType: PType,
+    readonly commandType: PType,
+    readonly store: PStore,
   ) {}
 }
 
 /** One query declaration: its name, arguments, and result type. */
-export class KQuery {
+export class PQuery {
   constructor(
     readonly name: string,
-    readonly args: readonly KField[],
-    readonly result: KType,
+    readonly args: readonly PField[],
+    readonly result: PType,
   ) {}
 }
 
-export class KQueries {
+export class PQueries {
   name: string | null = null;
-  constructor(readonly queries: readonly KQuery[]) {}
+  constructor(readonly queries: readonly PQuery[]) {}
 }

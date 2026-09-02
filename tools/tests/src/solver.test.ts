@@ -1,7 +1,7 @@
 /**
- * Solver unit tests: build interned KTypes directly and assert the shape of the solution tree
+ * Solver unit tests: build interned PTypes directly and assert the shape of the solution tree
  * that solveUnion() produces for each discrimination strategy.  No TypeSpec compiler involved —
- * these exercise solver.ts and ktypes.ts in isolation.
+ * these exercise solver.ts and ptypes.ts in isolation.
  */
 
 import {
@@ -11,29 +11,29 @@ import {
   GetField,
   GetIndex,
   HasField,
-  KType,
-  KTypeRegistry,
+  PType,
+  PTypeRegistry,
   Match,
   members,
   Solution,
   solveUnion,
-} from '@kurrent/phaselock-typespec';
+} from '@phaselock/typespec';
 import { describe, expect, it } from 'vitest';
 
 /** Solve a union of the given members, returning the top-level CheckJsonType. */
-function solve(r: KTypeRegistry, types: KType[]): CheckJsonType {
+function solve(r: PTypeRegistry, types: PType[]): CheckJsonType {
   return solveUnion(r, members(r.union(types)));
 }
 
 /** Assert a solution is a Match on the expected type and return it. */
-function expectMatch(s: Solution | undefined, t: KType): void {
+function expectMatch(s: Solution | undefined, t: PType): void {
   expect(s).toBeInstanceOf(Match);
   expect((s as Match).typ).toBe(t);
 }
 
 describe('solveUnion — json-type layer', () => {
   it('routes distinct json types to a single Match each', () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const sln = solve(r, [r.int(), r.string()]);
     expect(sln).toBeInstanceOf(CheckJsonType);
     expect([...sln.options.keys()].sort()).toEqual(['int', 'string']);
@@ -42,7 +42,7 @@ describe('solveUnion — json-type layer', () => {
   });
 
   it('dispatches a mix of literal bucket and struct across json types', () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const a = r.struct([['n', r.int(), false]]);
     const sln = solve(r, [r.literal('x'), r.literal('y'), a]);
     // string bucket has two literals -> CheckLiteral; object bucket has one struct -> Match
@@ -55,7 +55,7 @@ describe('solveUnion — json-type layer', () => {
 
 describe('solveUnion — literal buckets', () => {
   it('solves a union of string literals', () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const a = r.literal('a');
     const b = r.literal('b');
     const lit = solve(r, [a, b]).options.get('string');
@@ -65,7 +65,7 @@ describe('solveUnion — literal buckets', () => {
   });
 
   it("solves a union of int literals (bucketed under 'int', not 'integer')", () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const one = r.literal(1);
     const two = r.literal(2);
     const sln = solve(r, [one, two]);
@@ -76,7 +76,7 @@ describe('solveUnion — literal buckets', () => {
   });
 
   it('solves a union of boolean literals', () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const t = r.literal(true);
     const f = r.literal(false);
     const lit = solve(r, [t, f]).options.get('boolean');
@@ -88,7 +88,7 @@ describe('solveUnion — literal buckets', () => {
 
 describe('solveUnion — struct discrimination', () => {
   it("discriminates on a common literal 'type' key", () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const a = r.struct([
       ['type', r.literal('a'), false],
       ['x', r.int(), false],
@@ -107,7 +107,7 @@ describe('solveUnion — struct discrimination', () => {
   });
 
   it('recurses into a [type, v] sub-discriminator', () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const a1 = r.struct([
       ['type', r.literal('a'), false],
       ['v', r.literal(1), false],
@@ -137,7 +137,7 @@ describe('solveUnion — struct discrimination', () => {
   });
 
   it('solves a one-of union via HasField (each member has a single distinct key)', () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const book = r.struct([['book', r.int(), false]]);
     const edition = r.struct([['edition', r.string(), false]]);
     const obj = solve(r, [book, edition]).options.get('object');
@@ -146,11 +146,40 @@ describe('solveUnion — struct discrimination', () => {
     expectMatch(entries.get('book'), book);
     expectMatch(entries.get('edition'), edition);
   });
+
+  it('discriminates single-key members sharing the key by their literal values', () => {
+    const r = new PTypeRegistry();
+    const yes = r.struct([['key', r.literal(true), false]]);
+    const no = r.struct([['key', r.literal(false), false]]);
+    const obj = solve(r, [yes, no]).options.get('object');
+    expect(obj).toBeInstanceOf(GetField);
+    expect((obj as GetField).key).toBe('key');
+    const lit = (obj as GetField).solution as CheckLiteral;
+    expectMatch(lit.options.get(true), yes);
+    expectMatch(lit.options.get(false), no);
+  });
+
+  it('solves a one-of union whose groups need a further literal split', () => {
+    const r = new PTypeRegistry();
+    const aTrue = r.struct([['a', r.literal(true), false]]);
+    const aFalse = r.struct([['a', r.literal(false), false]]);
+    const b = r.struct([['b', r.int(), false]]);
+    const obj = solve(r, [aTrue, aFalse, b]).options.get('object');
+    expect(obj).toBeInstanceOf(HasField);
+    const entries = new Map((obj as HasField).solutions);
+    expectMatch(entries.get('b'), b);
+    const byA = entries.get('a') as GetField;
+    expect(byA).toBeInstanceOf(GetField);
+    expect(byA.key).toBe('a');
+    const lit = byA.solution as CheckLiteral;
+    expectMatch(lit.options.get(true), aTrue);
+    expectMatch(lit.options.get(false), aFalse);
+  });
 });
 
 describe('solveUnion — arrays and tuples', () => {
   it('distinguishes tuples of different lengths via CheckLength', () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const t2 = r.tuple([r.int(), r.string()]);
     const t3 = r.tuple([r.int(), r.string(), r.bool()]);
     const arr = solve(r, [t2, t3]).options.get('array');
@@ -162,7 +191,7 @@ describe('solveUnion — arrays and tuples', () => {
   });
 
   it('distinguishes same-length tuples via GetIndex + remap to the tuple types', () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const ta = r.tuple([r.literal('a'), r.int()]);
     const tb = r.tuple([r.literal('b'), r.string()]);
     const cl = solve(r, [ta, tb]).options.get('array') as CheckLength;
@@ -179,7 +208,7 @@ describe('solveUnion — arrays and tuples', () => {
 
 describe('solveUnion — error paths', () => {
   it('rejects a struct union with no discriminator', () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const a = r.struct([
       ['x', r.int(), false],
       ['z', r.int(), false],
@@ -192,7 +221,7 @@ describe('solveUnion — error paths', () => {
   });
 
   it('rejects a discriminator that is not present on every member', () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const a = r.struct([
       ['type', r.literal('a'), false],
       ['x', r.int(), false],
@@ -205,7 +234,7 @@ describe('solveUnion — error paths', () => {
   });
 
   it('rejects a sole discriminator that does not uniquely identify all members', () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const a = r.struct([
       ['type', r.literal('same'), false],
       ['x', r.int(), false],
@@ -218,15 +247,22 @@ describe('solveUnion — error paths', () => {
     expect(() => solve(r, [a, b])).toThrow(/only discriminator \(type\)/);
   });
 
+  it('rejects single-key members sharing a key with nothing to distinguish them', () => {
+    const r = new PTypeRegistry();
+    const a = r.struct([['key', r.int(), false]]);
+    const b = r.struct([['key', r.string(), false]]);
+    expect(() => solve(r, [a, b])).toThrow(/without discriminator/);
+  });
+
   it('rejects a union of two possibly-empty arrays', () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const a = r.array(r.int());
     const b = r.array(r.string());
     expect(() => solve(r, [a, b])).toThrow(/possibly-empty arrays/);
   });
 
   it('rejects a union of non-struct objects', () => {
-    const r = new KTypeRegistry();
+    const r = new PTypeRegistry();
     const a = r.object(r.int());
     const b = r.object(r.string());
     expect(() => solve(r, [a, b])).toThrow(/non-struct objects/);

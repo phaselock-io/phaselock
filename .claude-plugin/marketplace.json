@@ -1,14 +1,14 @@
 {
-  "name": "kurrent",
+  "name": "phaselock",
   "owner": {
-    "name": "Kurrent, Inc.",
-    "url": "https://github.com/kurrent-io"
+    "name": "PhaseLock",
+    "url": "https://github.com/phaselock-io"
   },
   "plugins": [
     {
       "name": "phaselock",
       "source": "./agents",
-      "description": "Build applications on Kurrent PhaseLock: TypeSpec data models, reducers, live queries, optimistic updates, and KurrentDB-backed servers."
+      "description": "Build applications on PhaseLock: TypeSpec data models, reducers, live queries, and optimistic updates."
     }
   ]
 }

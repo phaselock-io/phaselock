@@ -1,6 +1,6 @@
 import { fileURLToPath } from 'node:url';
 
-import { lowerProgram } from '@kurrent/phaselock-typespec';
+import { lowerProgram } from '@phaselock/typespec';
 import { type EmitContext, emitFile, resolvePath } from '@typespec/compiler';
 
 import { generateGo } from './emitter.js';

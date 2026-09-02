@@ -1,15 +1,15 @@
 emit:
-  - "@kurrent/phaselock-typespec-ts"
-  - "@kurrent/phaselock-typespec-py"
-  - "@kurrent/phaselock-typespec-go"
+  - "@phaselock/typespec-ts"
+  - "@phaselock/typespec-py"
+  - "@phaselock/typespec-go"
 options:
-  "@kurrent/phaselock-typespec-ts":
+  "@phaselock/typespec-ts":
     emitter-output-dir: "{project-root}"
     out-file: "model.gen.ts"
-  "@kurrent/phaselock-typespec-py":
+  "@phaselock/typespec-py":
     emitter-output-dir: "{project-root}/../relay"
     out-file: "model.py"
-  "@kurrent/phaselock-typespec-go":
+  "@phaselock/typespec-go":
     emitter-output-dir: "{project-root}/../decider/model"
     package: "model"
     out-file: "model.go"

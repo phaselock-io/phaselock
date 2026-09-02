@@ -1,4 +1,4 @@
-module github.com/kurrent-io/engine/go
+module github.com/phaselock-io/phaselock/go
 
 go 1.25.5
 
