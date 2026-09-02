@@ -1,0 +1,34 @@
+{
+  "name": "@phaselock/typespec-core",
+  "version": "0.1.0",
+  "description": "PhaseLock data-model vocabulary for TypeSpec: stores, key templates, engines",
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "dist/src/index.js",
+  "tspMain": "lib/main.tsp",
+  "exports": {
+    ".": {
+      "typespec": "./lib/main.tsp",
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "prepack": "rm -rf dist && pnpm run build"
+  },
+  "peerDependencies": {
+    "@typespec/compiler": "^1.0.0"
+  },
+  "devDependencies": {
+    "@typespec/compiler": "^1.0.0",
+    "typescript": "^5.6.0"
+  },
+  "files": [
+    "lib/**/*.tsp",
+    "dist/**"
+  ]
+}

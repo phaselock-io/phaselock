@@ -579,7 +579,7 @@ def cancelable_request(fn: WsHandler) -> WsHandler:
 
 route = web.RouteTableDef()
 
-@route.get("/ws")
+@route.get("/ws")  # type: ignore
 @cancelable_request
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     eng = request.app["engine"]

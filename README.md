@@ -81,5 +81,11 @@ Finally, skim through [skeleton.ts][skeleton-ts], the backbone of all of PhaseLo
 
 Open issues when you find them, and [send us a 'hello' email](mailto:hello@phaselock.io)!
 
+## We're building a cloud!
+
+Deploy a PhaseLock app with a single command.  [Sign up][mailing-list] for
+development updates and to be the first to try it out.
+
 [examples]: https://github.com/phaselock-io/phaselock/tree/master/examples
-[skeleton-ts]: https://github.com/phaselock-io/phaselock/blob/master/tools/emitter-ts/assets/skeleton.ts
+[mailing-list]: https://buttondown.com/phaselock
+[skeleton-ts]: https://github.com/phaselock-io/phaselock/blob/master/typespec/ts/assets/skeleton.ts

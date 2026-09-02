@@ -8,7 +8,7 @@ for each target language.
 Every model file starts:
 
 ```typespec
-import "@phaselock/typespec";
+import "@phaselock/typespec-core";
 
 using PhaseLock;
 ```
@@ -262,7 +262,7 @@ emitters for the languages you target:
 ```json
 {
   "devDependencies": {
-    "@phaselock/typespec": "...",
+    "@phaselock/typespec-core": "...",
     "@phaselock/typespec-ts": "...",
     "@typespec/compiler": "^1.0.0"
   },

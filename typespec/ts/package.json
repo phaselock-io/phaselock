@@ -1,0 +1,35 @@
+{
+  "name": "@phaselock/typespec-ts",
+  "version": "0.1.0",
+  "description": "TypeScript emitter for PhaseLock TypeSpec models",
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "dist/src/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "prepack": "rm -rf dist && pnpm run build"
+  },
+  "peerDependencies": {
+    "@phaselock/typespec-core": "workspace:*",
+    "@typespec/compiler": "^1.0.0"
+  },
+  "devDependencies": {
+    "@phaselock/typespec-core": "workspace:*",
+    "@types/node": "^22.0.0",
+    "@typespec/compiler": "^1.0.0",
+    "typescript": "^5.6.0"
+  },
+  "files": [
+    "dist/**",
+    "assets/**"
+  ]
+}

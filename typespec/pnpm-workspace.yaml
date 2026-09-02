@@ -1,0 +1,13 @@
+packages:
+  - core
+  - ts
+  - py
+  - go
+  - tests
+
+allowBuilds:
+  esbuild: true
+  unrs-resolver: true
+
+onlyBuiltDependencies:
+  - unrs-resolver

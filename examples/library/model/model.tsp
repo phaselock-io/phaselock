@@ -32,7 +32,7 @@
 // circulated and restricted at the same time (for instance, there is a book
 // signed by the author that we want to keep as Restricted)
 
-import "@phaselock/typespec";
+import "@phaselock/typespec-core";
 
 using PhaseLock;
 

@@ -1,0 +1,12 @@
+{
+  "name": "phaselock",
+  "version": "0.0.1",
+  "description": "Placeholder for the PhaseLock CLI",
+  "license": "Apache-2.0",
+  "homepage": "https://phaselock.io",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/phaselock-io/phaselock.git",
+    "directory": "cli"
+  }
+}

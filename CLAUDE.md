@@ -12,16 +12,16 @@ Two kinds of work happen here; orient first:
   its reference files. That skill is the product documentation for
   agents; it also ships to end users, so keep it repo-agnostic when
   editing it.
-- **Changing PhaseLock itself** (`tools/` — the TypeSpec vocabulary,
-  emitters, and runtime skeletons): read `tools/CLAUDE.md` for settled
+- **Changing PhaseLock itself** (`typespec/` — the TypeSpec vocabulary,
+  emitters, and runtime skeletons): read `typespec/CLAUDE.md` for settled
   design decisions before touching anything there.
 
 ## Repo layout
 
 ```
-tools/            The product: TypeSpec vocabulary (engine/), emitters
-                  (emitter-{ts,py,go}/ with runtime skeletons in assets/),
-                  and their tests. See tools/CLAUDE.md and tools/README.md.
+typespec/         The product: TypeSpec vocabulary (core/), emitters
+                  ({ts,py,go}/ with runtime skeletons in assets/), and
+                  their tests. See typespec/CLAUDE.md and typespec/README.md.
 examples/
   todo-basic/     Smallest loop: browser engine + minimal TS relay server.
   todo-thin/      Same app, engine in the server, clients get query results.
@@ -32,13 +32,13 @@ agents/           The "phaselock" agent plugin; canonical skill at
 .claude-plugin/   marketplace.json cataloging the plugin.
 ```
 
-The runtime skeletons (`tools/emitter-*/assets/skeleton.{ts,py,go}`) are
-the canonical engine runtime — generated files embed a copy. Edit
-skeletons in `tools/`, never in generated output.
+The runtime skeletons (`typespec/{ts,py,go}/assets/skeleton.{ts,py,go}`)
+are the canonical engine runtime — generated files embed a copy. Edit
+skeletons in `typespec/`, never in generated output.
 
 ## Build and check
 
-Tools (`cd tools`):
+TypeSpec tooling (`cd typespec`):
 
 - `pnpm install && pnpm -r build` — build vocabulary + emitters
 - `pnpm test` — regenerate fixtures, run the vitest suite
@@ -58,13 +58,13 @@ Library example (`cd examples/library`):
 - `cd model && pnpm test` — reducer tests (jest, via ReducerTester)
 - `./devstack.mts` — run the stack (KurrentDB + decider + relay + UI)
 
-After changing any `.tsp` model or any codegen in `tools/`, regenerate
+After changing any `.tsp` model or any codegen in `typespec/`, regenerate
 and read the regenerated files rather than assuming their shape.
 
 The example build files are meant for external readers, so their gen
-steps don't depend on the contents of the tools changing.  The tools
-also don't have a proper build system.  When you work on `tools/` and
-want to test an example, manually `(cd tools && pnpm build)` and then
+steps don't depend on the contents of the tooling changing.  The tooling
+also doesn't have a proper build system.  When you work on `typespec/` and
+want to test an example, manually `(cd typespec && pnpm build)` and then
 `touch examples/library/model/model.tsp` (or equivalent) to force the
 example to regenerate.
 

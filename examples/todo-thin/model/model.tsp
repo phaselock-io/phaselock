@@ -1,6 +1,6 @@
 // TypeSpec model for the todo demo: a collaborative to-do list.
 
-import "@phaselock/typespec";
+import "@phaselock/typespec-core";
 
 using PhaseLock;
 

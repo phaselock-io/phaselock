@@ -5,7 +5,7 @@ description: >-
   events stored in KurrentDB, TypeScript reducers deriving state, live
   queries, optimistic updates, offline-capable clients, and backend workers.
   Use when working with PhaseLock, a model.tsp data model,
-  @phaselock/typespec, reducers, Engine classes, live queries, or a
+  @phaselock/typespec-core, reducers, Engine classes, live queries, or a
   KurrentDB-backed app. Covers defining data models, writing reducers and
   queries, building clients and servers, and running the business logic from
   other languages.
