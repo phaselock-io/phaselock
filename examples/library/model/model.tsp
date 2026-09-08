@@ -36,14 +36,14 @@ import "@phaselock/typespec-core";
 
 using PhaseLock;
 
-/////////////////
-// Store Layer //
-/////////////////
-
 alias Uuid = string;
 alias Isbn = string;
 
 model Setx is Record<true>;
+
+////////////////
+// Book Shard //
+////////////////
 
 model Edition {
   isbn: Isbn;
@@ -62,147 +62,44 @@ model Book {
   status?: { hold: Uuid } | { checkout: Uuid };
 }
 
-// servers and clients keep the same data
-interface BookStore extends Store<{
-  "edition.{edition_isbn}": Edition;
-  "editions": Setx;
-  "book.{book_uuid}": Book;
-}> {}
-
-model Patron {
-  id: Uuid;
-  name: string;
-  researcher: boolean;
-  checkouts: Setx;
-  holds: Setx;
-}
-
-// servers and clients keep data in the same shape, but unprivileged clients
-// will only have their own info here
-interface PatronStore extends Store<{
-  "patron.{patron_uuid}": Patron;
-  "patrons": Setx;
-}> {}
-
 model Hold {
   id: Uuid;
-  patron: Uuid;
   target: { book: Uuid } | { edition: Isbn };
   timestamp: utcDateTime;
   expires?: utcDateTime;
+  active?: true;
 }
 
 model Checkout {
   id: Uuid;
   book: Uuid;
-  patron: Uuid;
   expires: utcDateTime;
   overdue: boolean; // server determination based on expires
+  active?: true;
 }
 
-interface StatusStore extends Store<{
+alias BookStore {
+  "edition.{edition_isbn}": Edition;
+  "editions": Setx;
+  "book.{book_uuid}": Book;
   "hold.{hold_uuid}": Hold;
   "checkout.{checkout_uuid}": Checkout;
   "active_holds": Setx;
   "active_checkouts": Setx;
-}> {}
+};
 
-// "virtualized" hold, or maybe "view of hold", but just not the whole thing
-// this is what the server's virtualization layer emits to clients.  All clients
-// will see all holds but won't know who they belong to.  Also, clients will not
-// have enough information to evaluate if a TryHold event is valid.
-model VHold {
-  id: Uuid;
-  target: { book: Uuid } | { edition: Isbn };
-  timestamp: utcDateTime;
-  expires?: utcDateTime;
-  // contains your id or nothing
-  patron?: Uuid;
-  // this is only ever set to true by the userForecaster
-  forecasted?: true;
-}
+// Book commands + events //
 
-model VCheckout {
-  id: Uuid;
-  book: Uuid;
-  expires: utcDateTime;
-  overdue: boolean; // server determination based on expires
-  // contains your id or nothing
-  patron?: Uuid;
-}
-
-interface VStatusStore extends Store<{
-  "hold.{hold_uuid}": VHold;
-  "checkout.{checkout_uuid}": VCheckout;
-}> {}
-
-// Now construct the composed Stores.  Different system components have
-// different compositions of store.
-
-// The decider needs all state data, plus an output to store generated events:
-// - all book data,
-// - all patron data,
-// - all status data,
-// - a single key for new decider events
-interface DeciderStore extends Store<{
-  "decider_events": DeciderEvents[];
-}, [BookStore, PatronStore, StatusStore]> {}
-
-// The (unprivileged) user client will need:
-// - all book data
-// - a shard of the patron data, which is really just themselves
-//    - this can conveniently be typed the same as the full patron data
-// - all virtualized status data
-// - a place to store UI messages that originate in the reducers
-interface UserStore extends Store<{
-  "messages": string[];
-}, [BookStore, PatronStore, VStatusStore]> {}
-
-// The admin client will need all state, but it relies on State, not VState
-interface AdminStore extends Store<{}, [BookStore, PatronStore, StatusStore]> {}
-
-/////////////////
-// Event Layer //
-/////////////////
-
-// list of streams:
-// - books: all edition and book-related info
-// - patron.{patron_uuid}: all patron info, per-patron
-// - status: privileged stream of all checkpoints and holds
-// - vstatus: status decisions; relay will scrub and filter before forwarding to users
-//
-// extra streams:
-// - deciderState: where the decider stores its checkpoint data
-
-// editions: globally visible
-// stream: "books"
-model AddEdition {
-  type: "add-edition";
-  isbn: Isbn;
-  title: string;
-  timestamp: utcDateTime;
-}
-
-// stream: "books"
-model UpdateEditionTitle {
-  type: "update-edition-title";
-  isbn: Isbn;
-  title: string;
-  timestamp: utcDateTime;
-}
-
-// books: globally visible
-
-// stream: "books"
+// command, event
 model AddBook {
   type: "add-book";
-  id: Uuid;
+  id: @newID(Uuid);
   isbn: Isbn;
   restricted: boolean;
   timestamp: utcDateTime;
 }
 
-// stream: "books"
+// command, event
 model UpdateBookRestricted {
   type: "update-book-restricted";
   id: Uuid;
@@ -210,10 +107,114 @@ model UpdateBookRestricted {
   timestamp: utcDateTime;
 }
 
-// stream: "books"
+// command, event
 model RemoveBook {
   type: "remove-book";
   id: Uuid;
+  timestamp: utcDateTime;
+}
+
+// Edition commands + events //
+
+// command, event
+model AddEdition {
+  type: "add-edition";
+  isbn: @newID(Isbn);
+  title: string;
+  timestamp: utcDateTime;
+}
+
+// command, event
+model UpdateEditionTitle {
+  type: "update-edition-title";
+  isbn: Isbn;
+  title: string;
+  timestamp: utcDateTime;
+}
+
+// Hold commands + events //
+
+// command results in HoldOpened OR HoldFailed
+model TryHold {
+  type: "try-hold";
+  id: Uuid;
+  patron: Uuid;
+  // can hold a specific book or just any generic one
+  target: { book: Uuid } | { edition: Isbn };
+  open: boolean;
+  timestamp: utcDateTime;
+}
+
+model HoldOpened {
+  type: @newID("hold-opened");
+  id: Uuid;
+  target: { book: Uuid } | { edition: Isbn };
+  timestamp: utcDateTime;
+}
+
+// sent to patron stream
+model HoldFailed {
+  type: @newID("hold-failed");
+  id: Uuid;
+  reason: string;
+}
+
+// command, results in HoldClosed
+model ExpireHold {
+  type: "expire-hold";
+  id: Uuid;
+}
+
+// command, results in HoldClosed
+model CancelHold {
+  type: "expire-hold";
+  id: Uuid;
+}
+
+// event
+model HoldClosed {
+  type: "hold-closed";
+  id: Uuid;
+  reason: string;
+}
+
+// Checkout commands + events //
+
+// command, results in CheckoutOpened or CheckoutFailed
+model TryCheckout {
+  type: "try-checkout";
+  id: Uuid;
+  patron: Uuid;
+  book: Uuid;
+  timestamp: utcDateTime;
+}
+
+// event
+model CheckoutOpened {
+  type: "checkout-opened";
+  id: @newID(Uuid);
+  book: Uuid;
+  timestamp: utcDateTime;
+}
+
+// event
+model CheckoutFailed {
+  type: "checkout-failed";
+  id: @newID(Uuid);
+  reason: string;
+}
+
+// event
+model EndCheckout {
+  type: "end-checkout";
+  checkout: Uuid;
+  timestamp: utcDateTime;
+}
+
+// event, system-generated
+model OverdueCheckout {
+  type: "overdue-checkout";
+  checkout: Uuid;
   timestamp: utcDateTime;
 }
 
@@ -223,11 +224,33 @@ union BookEvents {
   AddBook,
   UpdateBookRestricted,
   RemoveBook,
+  TryHold,
+  CancelHold,
+  ExpireHold,
+  TryCheckout,
+  EndCheckout,
+  OverdueCheckout,
 }
 
-// patrons: same data in frontend and backend, but client can only view self
+interface BookShard extends Shard<"book", BookEvents, BookStore> {}
 
-// stream: "patron.{patron_uuid}"
+//////////////////
+// Patron Shard //
+//////////////////
+
+model Patron {
+  id: Uuid;
+  name: string;
+  researcher: boolean;
+  checkouts: Setx;
+  holds: Setx;
+}
+
+alias PatronStore = {
+  "patron": Patron;
+}
+
+// command, event
 model AddPatron {
   type: "add-patron";
   id: Uuid;
@@ -236,7 +259,7 @@ model AddPatron {
   timestamp: utcDateTime;
 }
 
-// stream: "patron.{patron_uuid}"
+// command, event
 model RenamePatron {
   type: "rename-patron";
   id: Uuid;
@@ -244,7 +267,7 @@ model RenamePatron {
   timestamp: utcDateTime;
 }
 
-// stream: "patron.{patron_uuid}"
+// command, event
 model AssignPatron {
   type: "assign-patron";
   id: Uuid;
@@ -256,146 +279,28 @@ union PatronEvents {
   AddPatron,
   RenamePatron,
   AssignPatron,
+  HoldSucceeded,
+  HoldFailed,
 }
 
-// holds: fully visible to hold owners; partially visible globally
+interface PatronShard extends Shard<"patron.{patron_uuid}", PatronEvents, PatronStore> {}
 
-// stream: "status"
-model TryHold {
-  type: "try-hold";
-  id: Uuid;
-  patron: Uuid;
-  // can hold a specific book or just any generic one
-  target: { book: Uuid } | { edition: Isbn };
-  open: boolean;
-  timestamp: utcDateTime;
+/////////////////
+// Admin shard //
+/////////////////
+
+alias AdminStore = {}
+
+union AdminEvents {
+  CheckoutFailed;
+  MessageAck;
 }
 
-// stream: "status"
-model CancelHold {
-  type: "cancel-hold";
-  id: Uuid;
-}
+interface AdminShard extends Shard<"admin", AdminEvents, AdminStore> {}
 
-// system-generated event
-// stream: "status"
-model ExpireHold {
-  type: "expire-hold";
-  id: Uuid;
-  timestamp: utcDateTime;
-}
-
-// checkouts: fully visible to hold owners; partially visible globally
-
-// only valid if it appears valid when reading the log
-// automatically cancels the relevant hold
-// stream: "status"
-model TryCheckout {
-  type: "try-checkout";
-  id: Uuid;
-  patron: Uuid;
-  book: Uuid;
-  timestamp: utcDateTime;
-}
-
-// stream: "status"
-model EndCheckout {
-  type: "end-checkout";
-  checkout: Uuid;
-  timestamp: utcDateTime;
-}
-
-// system-generated event
-// stream: "status"
-model OverdueCheckout {
-  type: "overdue-checkout";
-  checkout: Uuid;
-  timestamp: utcDateTime;
-}
-
-union StatusEvents {
-  TryHold,
-  CancelHold,
-  ExpireHold,
-  TryCheckout,
-  EndCheckout,
-  OverdueCheckout,
-}
-
-// virtualized status (or "view of" status): sanitized data for clients to view.
-//
-// In the backend, hold decisions are determined by the order in which TryHolds
-// arrive, relative to other holds, checkouts, and even assign-patron events.
-// But since clients can't know about each other, a virtualization layer is
-// necessary to tell clients about the hold decisions without exposing all the
-// data required to make those decisions.
-
-// stream: "vstatus"
-model NewVHold {
-  type: "new-vhold";
-  id: Uuid;
-  target: { book: Uuid } | { edition: Isbn };
-  open: boolean;
-  expires?: utcDateTime;
-  timestamp: utcDateTime;
-  // DB stores patron, but the server strips it before streaming it to clients.
-  patron?: Uuid;
-  // this is only ever set to true by the userForecaster
-  forecasted?: true;
-}
-
-// Similarly, since clients cannot have enough information to make hold decisions
-// on their own, they must be alerted to when their own holds were rejected.
-// stream: "vstatus"
-model VHoldRejected {
-  type: "vhold-rejected";
-  id: Uuid;
-  reason: string;
-  // A client will only see vhold-rejected for holds it has itself requested, so
-  // from the client perspective, `patron` will always be its own patron id
-  patron: Uuid;
-}
-
-// If a patron is demoted, their now-invalid holds get canceled by the system.  Other patrons won't
-// see the demotion so we need to broadcast this.
-model EndVHold {
-  type: "end-vhold";
-  id: Uuid;
-  timestamp: utcDateTime;
-}
-
-// Similar to NewVHold, but for checkouts.
-// stream: "vstatus"
-model NewVCheckout {
-  type: "new-vcheckout";
-  id: Uuid;
-  book: Uuid;
-  expires: utcDateTime;
-  // DB stores patron, but the server strips it before streaming it to clients.
-  patron?: Uuid;
-}
-
-// Note: there is no VCheckoutRejected because only the front desk, which has
-// admin privileges, can create checkouts in the first place.
-
-union DeciderEvents {
-  NewVHold,
-  VHoldRejected,
-  EndVHold,
-  NewVCheckout,
-}
-
-// union of all state-related events
-union LibraryEvents {
-  BookEvents,
-  PatronEvents,
-  StatusEvents,
-  DeciderEvents,
-}
-
-interface DeciderEngine extends Engine<LibraryEvents, LibraryEvents, DeciderStore> {}
-
-//////////////////
+////////////////////////
+// Engine definitions //
+////////////////////////
 
 // A patron has very limited write capabilities.  Each of these events may be written but only to
 // their own patron_uuid.
@@ -405,7 +310,7 @@ union UserCommands {
   CancelHold,
 }
 
-interface UserEngine extends Engine<LibraryEvents, UserCommands, UserStore> {}
+interface UserEngine extends Engine<[BookShard, PatronShard], UserCommands> {}
 
 // An admin (the librarian at the front desk) has most of the write capabilities in the system,
 // except they cannot create decider-specific events.
@@ -423,29 +328,14 @@ union AdminCommands {
   EndCheckout,
 }
 
-interface AdminEngine extends Engine<LibraryEvents, AdminCommands, AdminStore> {}
+interface AdminEngine extends Engine<[BookShard, PatronShard, AdminShard], AdminCommands> {}
 
-// ok, technically UserCommands is a subset of AdminCommands, but this expresses that the relay is
-// going to relay commands from both types of clients.  (It flattens to the same interned type as
-// AdminCommands, so the generated code uses that name — same as the Python DSL.)
-alias RelayCommands = UserCommands | AdminCommands;
+//////////////////
+// The Database //
+//////////////////
 
-model RelayHold {
-  patron: Uuid;
-}
-
-// The relay is mostly concerned with checking that all uuid references are valid, so it doesn't
-// have a lot of overlap with the store layout of the decider or the ui
-interface RelayStore extends Store<{
-  "edition.{isbn}": true;
-  "book.{book_uuid}": true;
-  "patron.{hold_uuid}": true;
-  "checkout.{checkout_uuid}": true;
-  "hold.{hold_uuid}": RelayHold;
-}> {}
-
-
-interface RelayEngine extends Engine<LibraryEvents, RelayCommands, RelayStore> {}
+// the DB holds all shards and its precommit function handles all commands
+interface DB extends Database<[UserEngine, AdminEngine]> {}
 
 /////////////////
 // Query Layer //

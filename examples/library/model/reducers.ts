@@ -70,45 +70,216 @@ import {
   VStatusRX,
 } from './model.gen';
 
-/* ----- migrations ----- */
+// XXX: migrations?
 
-function* migrateBooks(rx: BookRX): Reducer<void> {
-  yield* rx.set.editions((yield* rx.get.editions()) ?? {});
+////////////////////////
+// Precommit function //
+////////////////////////
+
+type AllEvents = BookEvents | PatronEvents | AdminEvents;
+type Committable = { stream: string, event: AllEvents};
+
+function* precommitTryCheckout(
+  rx: BookRX & PatronRX & AdminRX,
+  cmd: TryCheckout,
+): Reducer<string | Committable | Committable[] > {
+  /* the domain description does not mention if hold limits and overdue restrictions
+     apply to checkouts, but let us assume that they do */
+  const patron = yield* rx.get.patron(e.patron);
+  const book = yield* rx.get.book(e.book);
+  const edition = yield* rx.get.edition(book.isbn);
+
+  // sanity check
+  if (book.status && 'checkout' in book.status) {
+    return 'book is already checked out';
+  }
+
+  // restricted books cannot be checked out
+  if (!patron.researcher && book.restricted) {
+    return 'book is restricted';
+  }
+
+  // does this patron have a hold on this book?
+  let ourHold: string = '';
+  if (book.status?.hold) {
+    if (book.status.hold in patron.holds) {
+      ourHold = book.status.hold;
+    }
+  } else {
+    for (const hold of Object.keys(edition.holds)) {
+      if (hold in patron.holds) {
+        ourHold = hold;
+        break;
+      }
+    }
+  }
+
+  // would this patron exceed their limit of holds + checkouts?
+  if (!patron.researcher && !ourHold) {
+    const nholds = Object.keys(patron.holds).length;
+    const ncheckouts = Object.keys(patron.checkouts).length;
+    if (nholds + ncheckouts >= 5) {
+      // too many holds; ignore
+      return `too many holds (${nholds}) + checkouts (${ncheckouts})`;
+    }
+  }
+
+  // does this patron have too many overdue checkouts?
+  let overdue = 0;
+  for (const checkout_uuid of Object.keys(patron.checkouts)) {
+    const checkout = yield* rx.get.checkout(checkout_uuid);
+    if (checkout.overdue) overdue++;
+  }
+  if (overdue >= 2) {
+    return 'too many overdue checkouts';
+  }
+
+  // is book on hold by someone else?
+  if (!ourHold) {
+    if (book.status && 'hold' in book.status) {
+      return 'book is on hold by someone else';
+    }
+    if (!book.restricted) {
+      const books: Book[] = [];
+      for (const book_uuid of Object.keys(edition.books)) {
+        const book = yield* rx.get.book(book_uuid);
+        // ignore books which have book-level holds or are checked out
+        // also ignore restricted books, which must be held specifically
+        if (!book.status && !book.restricted) books.push(book);
+      }
+      if (Object.keys(edition.holds).length >= books.length) {
+        return 'all remaining books are already on hold';
+      }
+    }
+  }
+
+  // success!
+
+  return [
+    // make this checkout known in the public Book shard
+    { stream: "book",
+      event: {
+        type: 'checkout-opened',
+        id: cmd.id,
+        book: cmd.book,
+        timestamp: cmd.timestamp,
+      },
+    },
+    // tell this patron they own the checkout
+    { stream: `patron.${cmd.patron}`,
+      event: {
+        type: 'patron-checkout',
+        id: cmd.id,
+        patron: cmd.patron,
+      },
+    },
+  ];
 }
 
-function* migratePatrons(rx: PatronRX): Reducer<void> {
-  yield* rx.set.patrons((yield* rx.get.patrons()) ?? {});
+// precommit is NOT called if:
+//   - the commandId is not unique
+//   - the command is not structurally valid
+//
+// after postcommit, events are rejected if:
+//   - a NewUUID field is not unique
+//
+// precommit needs injected:
+//   - user identity
+function* precommit(
+  rx: BookRX & PatronRX & AdminRX,
+  cmd: UserCommands | AdminCommands,
+  user: UserIdentity,
+): Reducer<string | Committable | Committable[] > {
+  switch (cmd.data.type) {
+    // admin-only commands that can land directly as events
+    case 'add-edition':
+      if (!user.admin) return 'unauthorized';
+      return { stream: "book", event: cmd };
+
+    case 'update-edition-title':
+    case 'add-book':
+      if (!user.admin) return 'unauthorized';
+      if (!(yield* rx.get.edition(e.isbn))) return 'no such edition';
+      return { stream: "book", event: cmd };
+
+    case 'update-book-restricted':
+    case 'remove-book':
+      if (!user.admin) return 'unauthorized';
+      if (!(yield* rx.get.book(e.id))) return 'no such book';
+      return { stream: "book", event: cmd };
+
+    case 'end-checkout':
+      if (!user.admin) return 'unauthorized';
+      if (!(yield* rx.get.checkout(e.checkout))) return 'no such checkout';
+      return { stream: "book", event: cmd };
+
+    case 'add-patron':
+    case 'assign-patron':
+      if (!user.admin) return 'unauthorized';
+      return { stream: `patron.${cmd.id}`, event: cmd };
+
+    // admin-only commands which are not 1:1
+    case 'try-checkout':
+      if (!user.admin) return 'unauthorized';
+      if (!(yield* rx.get.patron(e.patron))) return 'no such patron';
+      if (!(yield* rx.get.book(e.book))) return 'no such book';
+      return precommitTryCheckout(rx, cmd);
+
+    // user or admin commands; user commands must be for their own patron id
+    case 'rename-patron':
+      if (!user.admin && cmd.id !== user.id) return 'unauthorized';
+      if (!(yield* rx.get.patron(e.patron))) return 'no such patron';
+      return { stream: `patron.${cmd.id}`, event: cmd };
+
+    case 'cancel-hold':
+      // for non-admins, they can only cancel one of their own holds
+      if (!user.admin || !(yield* rx.get.patron(user.id).holds).some((hold) => hold === cmd.hold)) {
+        return 'unauthorized';
+      }
+      if (!(yield* rx.get.hold(e.id))) return 'no such hold';
+      return { stream: "book", event: { type: 'hold-closed', id: cmd.id, reason: 'canceled' } };
+
+    case 'try-hold':
+      if (!(yield* rx.get.patron(e.patron))) return 'no such patron';
+      if ('book' in e.target) {
+        if (!(yield* rx.get.book(e.target.book))) return 'no such book';
+      } else {
+        if (!(yield* rx.get.edition(e.target.edition))) return 'no such edition';
+      }
+
+      // XXX
+
+
+
+    case 'rename-patron':
+      if (!(yield* rx.get.patron(e.id))) return 'no such patron';
+      return '';
+
+    case 'assign-patron':
+      if (!(yield* rx.get.patron(e.id))) return 'no such patron';
+      return '';
+
+    case 'try-hold':
+      // note: we do not worry about non-researcher patrons creating open holds at this point.
+      // Those could be caused by a race condition if a researcher places a hold while also being
+      // demoted.  Race conditions are handled by the decider, not by us.
+      newUuids.push(e.id);
+      return '';
+
+    case 'cancel-hold':
+      if (!(yield* rx.get.hold(e.id))) return 'no such hold';
+      return '';
+
+    default: {
+      const _typecheck: never = e;
+      return _typecheck;
+    }
+  }
 }
 
-function* migrateStatus(rx: StatusRX): Reducer<void> {
-  yield* rx.set.active_holds((yield* rx.get.active_holds()) ?? {});
-  yield* rx.set.active_checkouts((yield* rx.get.active_checkouts()) ?? {});
-}
-
-export function* deciderMigrate(rx: DeciderRX): Reducer<void> {
-  yield* migrateBooks(rx);
-  yield* migratePatrons(rx);
-  yield* migrateStatus(rx);
-  yield* rx.set.decider_events((yield* rx.get.decider_events()) ?? []);
-}
-
-export function* adminMigrate(rx: AdminRX): Reducer<void> {
-  yield* migrateBooks(rx);
-  yield* migratePatrons(rx);
-  yield* migrateStatus(rx);
-}
-
-export function* userMigrate(rx: UserRX): Reducer<void> {
-  yield* migrateBooks(rx);
-  yield* migratePatrons(rx);
-  yield* rx.set.messages([]);
-}
-
-export function* relayMigrate(_rx: RelayRX): Reducer<void> {
-  // noop for now
-}
-
-/* ----- individual reducers ----- */
+////////////////
+// Book Shard //
+////////////////
 
 function* reduceAddEdition(rx: BookRX, e: AddEdition): Reducer<void> {
   // add this edition
@@ -118,10 +289,6 @@ function* reduceAddEdition(rx: BookRX, e: AddEdition): Reducer<void> {
     books: {},
     holds: {},
   });
-  // create new edition
-  const editions = yield* rx.get.editions();
-  editions[e.isbn] = true;
-  yield* rx.set.editions(editions);
 }
 
 function* reduceUpdateEditionTitle(rx: BookRX, e: UpdateEditionTitle): Reducer<void> {
