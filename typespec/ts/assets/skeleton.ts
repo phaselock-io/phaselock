@@ -1234,11 +1234,17 @@ export type Format = 'js' | 'host' | 'msgpack';
 export type StoreValue = { [Format]: unknown } | { err: Error };
 export type StoreResult = { [Format]: unknown } | { err: Error };
 export type StoreDone = { value: true } | { err: Error };
+// the keys a prefix operation touched, for query invalidation
+export type StoreKeys = { keys: string[] } | { err: Error };
 
 export interface WTxn {
   get(key: string, type: string, want: Format | undefined, cb: (result: StoreResult) => void): void;
   set(key: string, value: StoreValue, type: string, cb: (result: StoreDone) => void): void;
   del(key: string, cb: (result: StoreDone) => void): void;
+  // delete every key under prefix; reports the keys deleted
+  delPrefix(prefix: string, cb: (result: StoreKeys) => void): void;
+  // rekey every key under src to dst, without decoding values; reports the keys as they now exist
+  move(src: string, dst: string, cb: (result: StoreKeys) => void): void;
 }
 
 export interface RTxn {
@@ -1253,6 +1259,10 @@ export type WStoreQuestion = {
   set?: Record<string, [StoreResult, string]>;
   // key-values to delete
   del?: Record<string, true>;
+  // prefixes to delete
+  delPrefix?: Record<string, true>;
+  // prefixes to rekey: src -> dst
+  move?: Record<string, string>;
 };
 
 export type RStoreQuestion = {
@@ -1267,6 +1277,10 @@ export type StoreAnswer = {
   set: Record<string, StoreDone>;
   // keys done deleting
   del: Record<string, StoreDone>;
+  // prefixes deleted, with the keys that went
+  delPrefix: Record<string, StoreKeys>;
+  // prefixes moved, keyed by src, with the keys as they now exist under dst
+  move: Record<string, StoreKeys>;
 };
 
 export type WStoreGenerator<T> = Generator<WStoreQuestion, T, StoreAnswer>;
@@ -1750,7 +1764,6 @@ export type Reducer<T> = Generator<ReducerQuestion, T, ReducerAnswer>;
 /** wrap a Reducer so it acts like a WStoreGenerator, returning a set of updated keys */
 export function* runReducer(
   g: Reducer<any[] | void>,
-  simulate?: boolean,
 ): WStoreGenerator<{ updates: string[]; markedSent: any[] }> {
   // our cache of get's we've already completed
   const old: Record<string, unknown> = Object.create(null);
@@ -1777,7 +1790,7 @@ export function* runReducer(
       }
     }
     // are there any store updates to make?
-    if (updates.length === 0 || simulate) return { updates, markedSent: retVal };
+    if (updates.length === 0) return { updates, markedSent: retVal };
     let nupdated = 0;
     while (nupdated < updates.length) {
       // actually yield the write request to the store
@@ -2346,17 +2359,22 @@ export class RemoteQueries {
 export type Backfill = {
   // what ref are we backfilling (stream name or prefix)
   ref: string;
-  // where is our live cursor
+  // the tail's exclusive upper bound: the cursor when this backfill started.  Anything at or
+  // above it arrives on the live stream and is parked.  Retries keep the original value.
   until: number;
-  // what previous backfill state are we resuming from?
-  // (position, seq) are from onHeaders, skip is how far into the snapshot we've read
-  resume: null | { position: number, seq: number, skip: number };
-  // Tell the Engine what streams and seqs are contained in this snapshot
-  onSeqs(seqs: Record<string, number>): void;
+  // what a previous attempt got through, or null for a fresh backfill.  skipBytes > 0 resumes
+  // the blob download, and the header's position must then equal position or the outcome is
+  // 'stale'; skipBytes === 0 fetches from the start and accepts any position.  The tail starts
+  // at max(fromPosition, header position), so a newer blob overrides the floor.
+  resume: null | { position: number; skipBytes: number; fromPosition: number };
+  // cancels this backfill alone; the connector's own signal cancels everything
+  signal: AbortSignal;
+  // Tell the Engine the position the snapshot was cut at and the seq of every stream in it
+  onHeader(position: number, seqs: Record<string, number>): Promise<void>;
   // Tell the Engine about a new value we read out of the snapshot.
-  onValues(values: Record<string, Uint8Array>[], skip: number): void;
+  onValues(values: [string, Uint8Array][], skip: number): Promise<void>;
   // Tell the Engine about a new event we loaded from the post-snapshot tail.
-  onEvents(events: Committed[]): void;
+  onEvents(events: DbEvent<Uint8Array>[]): Promise<void>;
 };
 
 export type ListVisibleResult = {
@@ -2366,26 +2384,49 @@ export type ListVisibleResult = {
   streams: string[];
 };
 
-export type CommandResult = {
-  code: number;
-  reason: string;
-}
+export type CommandResult =
+  | { kind: 'ack'; position: number }
+  | { kind: 'dup'; position: number }
+  | { kind: 'reject'; reason: string }
+  | { kind: 'conflict'; current: Record<string, number> };
+
+// 'stale' when the snapshot vanished, or a resumed fetch's PhaseLock-Position differs from
+// resume.position; the Engine discards what it parked and starts over.  Any other failure rejects,
+// and the Engine may retry with resume as persisted.
+export type BackfillOutcome = 'done' | 'stale';
 
 export interface Connector {
-  backfill(backfill: Backfill): Promise<void>;
+  backfill(backfill: Backfill): Promise<BackfillOutcome>;
   listVisible(): Promise<ListVisibleResult>;
-  sendCommand(commands: Identified[]): Promise<CommandResult[]>;
+  // Calls are applied in call order, and a call that fails also fails every call behind it,
+  // unsent, so the Engine's outbox order survives a retry.  Within a call, array order.
+  sendCommand(commands: Command<Uint8Array>[]): Promise<CommandResult[]>;
 }
 
 export interface ConnectorHooks {
-  // first view frame has neither grant nor revoke, and if token doesn't match a list-visible request is needed
-  onView(token: string, grant?: string[], revoke?: string[]): void;
-  onEvents(events: Committed[]): void;
+  // token is the view as of position.  changes is null for a connection's first view, where a
+  // token mismatch needs listVisible(); a frame at or below the list's position is then stale.
+  onView(
+    token: string,
+    position: number,
+    changes: null | { grants: string[]; revokes: string[] },
+  ): void;
+  onEvents(events: DbEvent<Uint8Array>[]): void;
+  // history done; live from here (sent once per connection)
+  onLive(position: number): void;
   onVouch(position: number): void;
   onEnd(code: number, reason: string): void;
 }
 
-export type ConnectorFactory = (signal: AbortSignal, hooks: ConnectorHooks) => Connector;
+// One Connector per connection: calling the factory is the connect attempt, since is the
+// Engine's checkpoint (-1 to bootstrap), and the connector reports exactly one onEnd.  The signal
+// is its lifetime; aborting it ends the connection and rejects any backfill or send in flight.
+export type ConnectorFactory = (
+  since: number,
+  wants: string[],
+  signal: AbortSignal,
+  hooks: ConnectorHooks,
+) => Connector;
 
 // engines ////////////////////////////////////////////////////////////////////
 
@@ -2398,25 +2439,25 @@ export interface Registry {
   hostToBytes();
 }
 
-/** Identified wraps a proto type T with a client id.  An Identified event may have originated from
-    KurrentDB, or it may have been emitted by a forecaster, or it may be a command we are about to
-    send. */
-export type Identified<T> = {
+/** Command wraps command data T with the client-minted id it will carry through the log. */
+export type Command<T> = {
   id: string;
   data: T;
 };
 
-/** Committed extends Identified with stream position data that originates from KurrentDB. */
-export type Committed<T> = Identified<T> & {
+/** DbEvent is event data T with the envelope the DB stamped on it when it was committed:
+    [position, stream, seq, id, servertime] on the wire.  The id is the command's. */
+export type DbEvent<T> = {
+  id: string;
+  data: T;
   position: number;
+  stream: string;
+  seq: number;
+  servertime: number;
 };
 
-export function decodeIdentified<T>(val: any, subdecoder: (val: any) => T): Identified<T> {
-  return { ...val, data: subdecoder(val.data) } as Identified<T>;
-}
-
-export function decodeCommitted<T>(val: any, subdecoder: (val: any) => T): Committed<T> {
-  return { ...val, data: subdecoder(val.data) } as Committed<T>;
+export function decodeDbEvent<T>(val: any, subdecoder: (val: any) => T): DbEvent<T> {
+  return { ...val, data: subdecoder(val.data) } as DbEvent<T>;
 }
 
 function matchSent<C>(tpl: any, cmd: C): boolean {
@@ -2531,11 +2572,11 @@ export class Engine<QX, RX, E, C> {
   #rx: RX;
   #store: Store;
   #decodeEvent: (raw: any) => E;
-  #decodeCommand: (raw: any) => Identified<C>;
+  #decodeCommand: (raw: any) => Command<C>;
   #migrate: null | ((rx: RX) => Reducer<void>);
   #reducer: (rx: RX, events: E[]) => Reducer<any[] | void>;
   #forecaster: null | ((commands: C) => E[]);
-  #onCommands: null | ((commands: Identified<any>[]) => void);
+  #onCommands: null | ((commands: Command<any>[]) => void);
   #reg: Registry;
 
   #live: boolean = false;
@@ -2550,9 +2591,9 @@ export class Engine<QX, RX, E, C> {
   // #reconnects is a list of promise resolve functions
   #reconnects: ((value: {
     checkpoint: number | undefined;
-    commands: Identified<any>[];
+    commands: Command<any>[];
   }) => void)[] = [];
-  #recvdEvents: Committed<E>[] = [];
+  #recvdEvents: DbEvent<E>[] = [];
   // commands that came to us from the client
   #sendCommands: C[] = [];
   // command ids the user explicitly marks as completed
@@ -2561,7 +2602,6 @@ export class Engine<QX, RX, E, C> {
   #unsent: Map<string, E[]> = new Map();
   // just a flag if new queries exist to be run; we don't store them here for typing purposes.
   #newQueries: boolean = false;
-  #simulates: (() => Reducer<void>)[] = [];
 
   constructor(
     qx: QX,
@@ -2586,7 +2626,7 @@ export class Engine<QX, RX, E, C> {
     this.#rx = rx;
     this.#store = store ?? new InMemStore();
     this.#decodeEvent = callbacks.decodeEvent;
-    this.#decodeCommand = (value: any) => decodeIdentified(value, callbacks.decodeCommand);
+    this.#decodeCommand = (value: any) => ({ ...value, data: callbacks.decodeCommand(value.data) });
     this.#migrate = callbacks.migrate ?? null;
     this.#reducer = callbacks.reducer;
     this.#forecaster = callbacks.forecaster ?? null;
@@ -2645,7 +2685,7 @@ export class Engine<QX, RX, E, C> {
 
   /** request info needed to resume a connection: last committed checkpoint and unsent commands */
   reconnect(
-    cb: (result: { checkpoint: number | undefined; commands: Identified<any>[] }) => void,
+    cb: (result: { checkpoint: number | undefined; commands: Command<any>[] }) => void,
   ): void {
     this.#reconnects.push(cb);
     this.#schedule();
@@ -2653,9 +2693,9 @@ export class Engine<QX, RX, E, C> {
 
   /** New events from the wire come here.  They must be in plain json format (the decodeEvent
       callback from the constructor is applied universally to the raw incoming events). */
-  recvEvents(raw: Committed<any>[]): void {
+  recvEvents(raw: DbEvent<any>[]): void {
     for (const r of raw) {
-      const event = decodeCommitted(r, this.#decodeEvent);
+      const event = decodeDbEvent(r, this.#decodeEvent);
       this.#recvdEvents.push(event);
     }
     this.#schedule();
@@ -2697,26 +2737,6 @@ export class Engine<QX, RX, E, C> {
     return this.#graph.newQuery(fn);
   }
 
-  /** simulate runs some events through the provided reducer-like function.  A temporary overlay is
-      used and the real Storage is unaffected.  The events should be provided in plain-json format,
-      the same as for recvEvents(). */
-  simulate<T>(
-    fn: (rx: RX, decodedEvents: E[]) => Reducer<T>,
-    cb: (result: T) => void,
-    undecodedEvents?: Identified<any>[],
-  ): void {
-    const self = this;
-    this.#simulates.push(function* () {
-      // unwrap and decode events
-      const decoded = (undecodedEvents ?? []).map((u) => self.#decodeEvent(u.data));
-      // run provided function
-      const result = yield* fn(self.#rx, decoded);
-      // send result
-      cb(result);
-    });
-    this.#schedule();
-  }
-
   //// end of public api ////
 
   #schedule(): void {
@@ -2740,13 +2760,13 @@ export class Engine<QX, RX, E, C> {
     }
 
     // load unsent commands from the store
-    const encoded: Identified<any>[] = [];
+    const encoded: Command<any>[] = [];
     yield* withRTxn(this.#fx, this.#store, function* () {
       // no decoding needed for `string[]` of command ids
       const index = ((yield* txnGet('.commands', null)) as string[]) ?? [];
       for (const id of index) {
         // commands are stored in their plain json form, which needs no decoding (yet)
-        const enc = (yield* txnGet(`.command-${id}`, null)) as Identified<any>;
+        const enc = (yield* txnGet(`.command-${id}`, null)) as Command<any>;
         encoded.push(enc);
       }
     });
@@ -2996,11 +3016,6 @@ export class Engine<QX, RX, E, C> {
         continue;
       }
 
-      if (this.#simulates.length > 0) {
-        yield* this.#onSimulates();
-        continue;
-      }
-
       // if we got here we probably had a spurious wakeup, or perhaps a newQuery() while not #live
       yield;
     }
@@ -3039,7 +3054,7 @@ export class Engine<QX, RX, E, C> {
           for (const id of self.#unsent.keys()) {
             if (id in toIgnore) continue;
             // commands are stored pre-encoded, so no decoder needed to load from store
-            const enc = (yield* txnGet(`.command-${id}`, null)) as Identified<C>;
+            const enc = (yield* txnGet(`.command-${id}`, null)) as Command<C>;
             for (const m of markedSent) {
               // but we need to decode it to run matchSent
               if (!matchSent(m, self.#decodeCommand(enc).data)) continue;
@@ -3090,7 +3105,7 @@ export class Engine<QX, RX, E, C> {
   *#onSendCommands(): Generator<void, void, void> {
     const self = this;
     // generate a uuid now for each event
-    const commands: Identified<C>[] = this.#sendCommands.map((c) => ({
+    const commands: Command<C>[] = this.#sendCommands.map((c) => ({
       id: generateUuid(),
       data: c,
     }));
@@ -3196,11 +3211,11 @@ export class Engine<QX, RX, E, C> {
   *#onReconnects(): Generator<void, void, void> {
     const { checkpoint, commands } = yield* withRTxn(this.#fx, this.#store, function* () {
       const checkpoint = (yield* txnGet('.checkpoint', null)) as number | undefined;
-      const commands: Identified<any>[] = [];
+      const commands: Command<any>[] = [];
       const index = ((yield* txnGet('.commands', null)) as string[]) ?? [];
       for (const id of index) {
         // commands are stored pre-encoded and need no decoder
-        const enc = (yield* txnGet(`.command-${id}`, null)) as Identified<any>;
+        const enc = (yield* txnGet(`.command-${id}`, null)) as Command<any>;
         commands.push(enc);
       }
       return { checkpoint, commands };
@@ -3211,16 +3226,6 @@ export class Engine<QX, RX, E, C> {
     this.#reconnects = [];
   }
 
-  *#onSimulates(): Generator<void, void, void> {
-    const simulates = this.#simulates;
-    this.#simulates = [];
-    // use a single read txn for all simulations, since runReducer() with simulate=true doesn't write
-    yield* withRTxn(this.#fx, this.#store, function* () {
-      for (const fn of simulates) {
-        yield* runReducer(fn(), true);
-      }
-    });
-  }
 }
 
 export class ReducerTester<RX, E, S> {

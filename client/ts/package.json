@@ -16,16 +16,19 @@
   },
   "scripts": {
     "build": "tsc -p .",
-    "check": "tsc -p . --noEmit && prettier --check \"src/**/*.ts\"",
-    "fmt": "prettier --write \"src/**/*.ts\"",
-    "prepack": "rm -rf dist && pnpm run build"
+    "check": "tsc -p tsconfig.test.json --noEmit && prettier --check \"src/**/*.ts\" \"test/**/*.ts\"",
+    "fmt": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
+    "prepack": "rm -rf dist && pnpm run build",
+    "test": "vitest run"
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.1.0"
   },
   "devDependencies": {
     "prettier": "^3.5.3",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.0",
+    "@types/node": "^22.0.0"
   },
   "files": [
     "dist/**"

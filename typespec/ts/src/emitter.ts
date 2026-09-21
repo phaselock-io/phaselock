@@ -967,7 +967,7 @@ export class ${f.name} extends Engine<${QX}, ${RX}, ${eventType}, ${commandType}
       // optional: forecast the events a server will send for a command
       forecaster?: (commands: ${commandType}) => ${eventType}[],
       // required if using sendCommands: receive events to send on the wire (in plain-json format)
-      onCommands?: (commands: Identified<any>[])=> void,
+      onCommands?: (commands: Command<any>[])=> void,
     },
   ) {
     super(${qx}, ${rx}, store, {
