@@ -1,0 +1,33 @@
+{
+  "name": "@phaselock/client",
+  "version": "0.1.0",
+  "description": "PhaseLock client library for JS-native hosts",
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "check": "tsc -p . --noEmit && prettier --check \"src/**/*.ts\"",
+    "fmt": "prettier --write \"src/**/*.ts\"",
+    "prepack": "rm -rf dist && pnpm run build"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.1.0"
+  },
+  "devDependencies": {
+    "prettier": "^3.5.3",
+    "typescript": "^5.9.3"
+  },
+  "files": [
+    "dist/**"
+  ]
+}
