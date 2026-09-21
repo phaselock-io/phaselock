@@ -1229,40 +1229,40 @@ export interface Store {
   withRTxn<T>(fx: FutureContext, fn: (txn: RTxn) => Future<T>): Future<T>;
 }
 
-export type StoreValue = { value: unknown } | { err: Error };
+export type Format = 'js' | 'host' | 'msgpack';
+
+export type StoreValue = { [Format]: unknown } | { err: Error };
+export type StoreResult = { [Format]: unknown } | { err: Error };
 export type StoreDone = { value: true } | { err: Error };
 
-/** Every .set can use the same encodeProto, but reads need to know what generated decoder to use.
-    null means "identity" */
-export type StoreDecoder = null | ((value: unknown) => unknown);
-
 export interface WTxn {
-  get(key: string, decoder: StoreDecoder, cb: (result: StoreValue) => void): void;
-  set(key: string, value: unknown, cb: (result: StoreDone) => void): void;
+  get(key: string, type: string, want: Format | undefined, cb: (result: StoreResult) => void): void;
+  set(key: string, value: StoreValue, type: string, cb: (result: StoreDone) => void): void;
   del(key: string, cb: (result: StoreDone) => void): void;
 }
 
 export interface RTxn {
-  get(key: string, decoder: StoreDecoder, cb: (result: StoreValue) => void): void;
+  // get may return a `value` or `host`, which may need conversion
+  get(key: string, type: string, want: Format | undefined, cb: (result: StoreResult) => void): void;
 }
 
 export type WStoreQuestion = {
-  // keys to look up, plus the generated decoder to take them from plain json -> rich types
-  get?: Record<string, StoreDecoder>;
-  // key-values to set (no encoder needed; encodeProto or protoStringify work on all storable types)
-  set?: Record<string, unknown>;
+  // keys to look up and their type name; any format returned is accepted and converted by caller
+  get?: Record<string, [string, { [Format]: true }]>;
+  // key-values to set, plus their type name; any format is allowed and converted by store
+  set?: Record<string, [StoreResult, string]>;
   // key-values to delete
   del?: Record<string, true>;
 };
 
 export type RStoreQuestion = {
-  // keys to look up
-  get?: Record<string, StoreDecoder>;
+  // keys to look up and their type name; any format returned is accepted and converted by caller
+  get?: Record<string, string>;
 };
 
 export type StoreAnswer = {
   // key-value lookup results
-  get: Record<string, StoreValue>;
+  get: Record<string, StoreResult>;
   // keys done setting
   set: Record<string, StoreDone>;
   // keys done deleting
@@ -1273,17 +1273,18 @@ export type WStoreGenerator<T> = Generator<WStoreQuestion, T, StoreAnswer>;
 export type RStoreGenerator<T> = Generator<RStoreQuestion, T, StoreAnswer>;
 
 /** function to interact with the StoreGenerator */
-export function* txnGet(key: string, decoder: StoreDecoder): RStoreGenerator<unknown> {
+export function* txnGet(key: string, type: string): RStoreGenerator<unknown> {
   const ans = (yield { get: { [key]: decoder } }).get[key];
   if ('err' in ans) {
     throw ans.err;
   }
+  // XXX: needs a registry to know how to convert from bytes or host to JS
   return ans.value;
 }
 
 /** a function to interact with the StoreGenerator */
 export function* txnSet(key: string, value: unknown): WStoreGenerator<void> {
-  const ans = (yield { set: { [key]: value } }).set[key];
+  const ans = (yield { set: { [key]: [value, '.json'] } }).set[key];
   if ('err' in ans) {
     throw ans.err;
   }
@@ -1459,7 +1460,7 @@ class IndexedDBTxn {
     this.#store = store;
   }
 
-  get(key: string, _decoder: StoreDecoder, cb: (result: StoreValue) => void): void {
+  get(key: string, _decoder: StoreDecoder, cb: (result: StoreResult) => void): void {
     const req = this.#store.get(key);
     req.onsuccess = () => {
       // IndexedDB does not need decoding
@@ -1533,7 +1534,7 @@ class InMemTxn {
     this.#updates = updates;
   }
 
-  get(key: string, _decoder: StoreDecoder, cb: (result: StoreValue) => void): void {
+  get(key: string, _decoder: StoreDecoder, cb: (result: StoreResult) => void): void {
     if (key in this.#updates) {
       cb({ value: this.#updates[key] });
     } else {
@@ -1601,7 +1602,7 @@ class OverlayTxn {
     this.#updates = updates;
   }
 
-  get(key: string, decoder: StoreDecoder, cb: (result: StoreValue) => void): void {
+  get(key: string, decoder: StoreDecoder, cb: (result: StoreResult) => void): void {
     if (key in this.#updates) {
       cb({ value: this.#updates[key] });
     } else if (key in this.#data) {
@@ -1681,7 +1682,7 @@ export class ExternalStore {
 
     const userTxn = yield* resolve(this.#txnFn(writable));
     const txn: WTxn = {
-      get: (key: string, decoder: StoreDecoder, cb: (result: StoreValue) => void) => {
+      get: (key: string, decoder: StoreDecoder, cb: (result: StoreResult) => void) => {
         toPromise(userTxn.get(key, decoder)).then(
           (result) => cb({ value: result }),
           (e: unknown) => cb({ err: e as Error }),
@@ -1727,20 +1728,17 @@ export class ExternalStore {
 // reducers /////////////////////////////////////////////////////////////////
 
 export type ReducerQuestion = {
-  // keys to look up
-  old?: Record<string, StoreDecoder>;
-  // keys to look up
-  get?: Record<string, StoreDecoder>;
-  // key-values to set
-  set?: Record<string, unknown>;
+  // keys to look up and their type name; any format returned is accepted and converted by caller
+  get?: Record<string, string>;
+  // key-values to set, plus their type name; any format is allowed and converted by store
+  set?: Record<string, [StoreResult, string]]>;
   // key-values to delete
   del?: Record<string, true>;
 };
 
 export type ReducerAnswer = {
-  old: Record<string, StoreValue>;
   // key-value lookup results
-  get: Record<string, StoreValue>;
+  get: Record<string, StoreResult>;
   // keys done setting
   set: Record<string, StoreDone>;
   // keys done deleting
@@ -1748,10 +1746,6 @@ export type ReducerAnswer = {
 };
 
 export type Reducer<T> = Generator<ReducerQuestion, T, ReducerAnswer>;
-// ReducerContext looks like:
-// yield* rx.set.project(key, val): set new value (you only get to set it once per txn)
-// yield* rx.get.project(key): get the current value for key, possibly setting it from old
-// yield* rx.old.project(key): explicitly get the old value for key
 
 /** wrap a Reducer so it acts like a WStoreGenerator, returning a set of updated keys */
 export function* runReducer(
@@ -1943,7 +1937,7 @@ export type QueryQuestion = {
 
 export type QueryAnswer = {
   // the value for each store lookup
-  store: Record<string, StoreValue>;
+  store: Record<string, StoreResult>;
   // the {result, dirty} for each asked query
   query: Record<string, { result: unknown; dirty: boolean }>;
 };
@@ -2342,7 +2336,193 @@ export class RemoteQueries {
   }
 }
 
+// connectors ////////////////////////////////////////////////////////////////////
+
+/*
+  Questions:
+  - who handles reconnects?  Is that transport-specific, or does it require some state? Or both?
+*/
+
+export type Backfill = {
+  // what ref are we backfilling (stream name or prefix)
+  ref: string;
+  // where is our live cursor
+  until: number;
+  // what previous backfill state are we resuming from?
+  // (position, seq) are from onHeaders, skip is how far into the snapshot we've read
+  resume: null | { position: number, seq: number, skip: number };
+  // Tell the Engine what streams and seqs are contained in this snapshot
+  onSeqs(seqs: Record<string, number>[]): void;
+  // Tell the Engine about a new value we read out of the snapshot.
+  onValues(values: Record<string, Uint8Array>[], skip: number): void;
+  // Tell the Engine about a new event we loaded from the post-snapshot tail.
+  onEvents(events: Committed[]): void;
+};
+
+export type ListVisibleResult = {
+  token: string;
+  position: number;
+  refs: string[];
+  streams: string[];
+};
+
+export type CommandResult = {
+  code: number;
+  reason: string;
+}
+
+export interface Connector {
+  backfill(backfill: Backfill): Promise<void>;
+  listVisible(): Promise<ListVisibleResult>;
+  sendCommand(commands: Identified[]): Promise<CommandResult[]>;
+}
+
+export interface ConnectorHooks {
+  // first view frame has neither grant nor revoke, and if token doesn't match a list-visible request is needed
+  onView(token: string, grant?: string[], revoke?: string[]): void;
+  onEvents(events: Committed[]): void;
+  onVouch(position: number): void;
+  onEnd(code: number, reason: string): void;
+}
+
+export type ConnectorFactory = (signal: AbortSignal, hooks: ConnectorHooks) => Connector;
+
+export class HTTPConnector {
+  #url: string;
+  #hooks: ConnectorHooks;
+  #signal: AbortSignal;
+
+  constructor(url: string, signal: AbortSignal, hooks: ConnectorHooks) {
+    this.url = url;
+    this.#signal = signal;
+    this.hooks = hooks;
+  }
+
+  async backfill(backfill: Backfill): Promise<void> {
+    const urlRef = encodeURIComponent(backfill.ref);
+    // retry loop, in case a snapshot goes stale on us
+    let lastUrl = "";
+    let until = backfill.until;
+    while (true) {
+      // if events after our snapshot disappear, we'll need to cancel the snapshot download
+      const abort = new AbortController();
+      const signal = AbortSignal.any([abort.signal, backfill.signal]);
+
+      // fetch either a snapshot, or a pointer to one
+      const resp = await fetch(`${url}/snapshot/${urlRef}`, {
+        signal,
+        headers: { Range: `bytes=${backfill.resume?.skip ?? 0}-` },
+      });
+
+      switch (resp.status) {
+        case 200: // full content
+        case 206: // partial content
+        case 416: // offset leaves no content
+          // proceed
+          break;
+
+        default:
+          throw new Error(`unexpected /snapshot response: ${resp.status} ${resp.statusText}`);
+      }
+
+      // figure out the position where this snapshot was taken
+      const pos = resp.headers.get("PhaseLock-Position");
+
+      // now download the chunks and the events simultaneously
+      let retry = false;
+
+      const getChunks = async () => {
+        // handle manual (non-3xx) redirects, since we need the headers from the origin
+        let body = resp.Body();
+        if (resp.headers.get("Content-Type") === "text/plain") {
+          const newUrl = await resp.text();
+          const r2 = await fetch(newUrl, { signal });
+          switch (r2.status) {
+            case 200: // full content
+            case 206: // partial content
+            case 416: // offset leaves no content
+              break;
+
+            case 404:
+              // snapshot is stale
+              if (newUrl === lastUrl) {
+                throw new Error(`snapshot doesn't exist (repeatedly) for ref=${backfill.ref}`);
+              }
+              // we'll need to retry
+              retry = true;
+              // kill the other process
+              abort.abort("snapshot is stale");
+              throw new Error("need retry");
+            default:
+              throw new Error(`unexpected blob response: ${r2.status} ${r2.statusText}`);
+          }
+          body = r2.body;
+        }
+
+        // now actually stream the body
+        // XXX use msgpack
+        backfill.onSeqs(...);
+        for (const [key, value, skip] of ...) {
+          backfil.onValues([{ [key]: value }], skip);
+        }
+      };
+
+      const getEvents = async () => {
+        while (true) {
+          const maxCount = 1000;
+          const resp = fetch(
+            `${url}/events/${urlRef}?max=${maxCount}&after=${pos}&before=${until}`,
+            { signal },
+          );
+          if (resp.status !== 200) {
+            throw new Error(`unexpected /events response: ${resp.status} ${resp.statusText}`);
+          }
+          // XXX use msgpack
+          const events = ...;
+          if (events.length === 0) {
+            // done with event tail
+            return;
+          }
+          for (const ev of events) {
+            bacfkill.onEvent(ev);
+          }
+        }
+        // XXX the Engine will have to check seq numbers and re-issue new Backfills as needed
+      };
+
+      try {
+        await Promise.all([getChunks(), getEvents()]);
+      } catch(e: unknown) {
+        if (!retry) throw e;
+      }
+
+      break;
+    };
+  }
+
+  async listVisible(): Promise<{ token: string, position: number, refs: string[], streams: string[] }> {
+    const resp = await fetch(`${url}/list`, { signal: this.#signal });
+    return msgpackParse(resp.bytes());
+  }
+
+  async sendCommand(): Promise<CommandResult> {
+  }
+}
+
+export function NewHTTPConnector(url: string): ConnectorFactory {
+  return (signal: AbortSignal, hooks: ConnectorHooks) => new HTTPConnector(url, signal, hooks);
+}
+
 // engines ////////////////////////////////////////////////////////////////////
+
+export interface Registry {
+  jsToHost(value: unknown, type: string): unknown;
+  bytesToHost(value: Uint8Array, type: string): unknown;
+  hostToJS();
+  bytesToJS();
+  jsToBytes();
+  hostToBytes();
+}
 
 /** Identified wraps a proto type T with a client id.  An Identified event may have originated from
     KurrentDB, or it may have been emitted by a forecaster, or it may be a command we are about to
@@ -2482,6 +2662,7 @@ export class Engine<QX, RX, E, C> {
   #reducer: (rx: RX, events: E[]) => Reducer<any[] | void>;
   #forecaster: null | ((commands: C) => E[]);
   #onCommands: null | ((commands: Identified<any>[]) => void);
+  #reg: Registry;
 
   #live: boolean = false;
   #setLive: boolean = false;
@@ -2545,6 +2726,47 @@ export class Engine<QX, RX, E, C> {
     // let the advancer begin initializing
     this.#fx.wakeup();
   }
+
+  ////////////////////////////////////////////////////////////////////////////////////////////
+
+
+  // onView receives either the initial visibility token, optionally with grants and revokes since
+  // the last check (if the transport offers that).
+  //
+  // If Engine detects a token mismatch, it will either use grant and revoke to update its own list
+  // of visible shards incrementally, or it will issue a listVisible() call to update its visible
+  // shards against the current full list.
+  #onView(token: string, grants?: string[], revokes?: string[]): void {
+    const self = this;
+    if (grant !== undefined && revoke != undefined) {
+      yield* withWTxn(this.#fx, this.#store, function* () {
+        // update our list of known shards
+        const known = yield* txnGet('/shards');
+        for (const shard of revokes) {
+          const res = yield* txnDelShard(shard);
+          delete self.known[shard];
+        }
+        // configure backfills for every new grant
+        for (const shard of grants) {
+          const g = (yield* txnGet(`/backfills.${shard}`)) ?? {};
+          yield* txnSet(`/backfills.${grant}`, {});
+          const res = yield* txnSet(`/backfills.${shard}`, g)
+        }
+
+        //
+
+      });
+    }
+  }
+
+  onView(token: string, grant?: string[], revoke?: string[]): ...;
+  onEvents(...): ...;
+  onVouch(...): ...;
+  onHorizon(...): ...;
+  onEnd(...): ...;
+
+
+  ////////////////////////////////////////////////////////////////////////////////////////////
 
   //// public api ////
 
@@ -2715,6 +2937,167 @@ export class Engine<QX, RX, E, C> {
         this.#live = false;
       }
 
+      // "anytime" actions:
+      // - they can tolerate running earlier or later than surrounding events
+      // - they are not tied to the same writetxn as reducers are
+      if (this.#backfillEvents.length > 0 | this.#backfillChunks.length > 0) {
+        yield* withWTxn(this.#fx, this.#store, function* () {
+          // handle backfill-events
+          // - order doesn't really matter
+          let b;
+          while (b = self.#backfillEvents.shift()) {
+            // always comes as bytes; no conversion necessary
+            // save to .park.$shard/event.$position
+          }
+
+          // handle backfill-chunks
+          // - order doesn't really matter
+          for (const c of this.#backfillChunks) {
+            // always comes as bytes
+            // may as well convert to rich type now, then do opaque copies later
+            // save to .park.$shard/chunk.$start-$finish
+          }
+
+          // continue just because we did something, so we don't hit the yield at the bottom of the
+          // while loop if any of these lists grew while we were iterating them
+          continue;
+        })
+      }
+
+      if (this.#events.length > 0 || this.#backfillDones.length > 0) {
+        yield* withWTxn(this.#fx, this.#store, function* () {
+          // handle backfill-dones
+          // - guarantees no more chunks or events are coming
+          // - needs to run before reducers because it injects events for reducers
+          // - needs the same writeTxn as reducers so backfill is cleaned up atomically
+          for (const d of this.#backfillDones) {
+            // - move keys and write to final prefix
+            // - dirty query graph
+            // - discard backfill state
+            // - update this.shards
+            // - feed events to reducers
+            // - this should dirty the query graph and may trigger new queries
+            // - possibly triggers a caughtup effect, for horizon-on-startup backfills
+          }
+
+          // handle events
+          // - non-birth events to unknown streams trigger a backfill; this is racy with grants
+          // - events to backfilling streams go to parking
+          for (const ev of this.#events) {
+          }
+          continue;
+        });
+      }
+
+      // handle vouches
+      for (const v of this.#vouches) {
+      }
+
+      // handle view changes (including revokes and grants)
+      // - handled one-at-a-time, in order
+      // - views without revokes/grants require async work to determine revokes/grants
+      // - the new token should be committed in the same txn as the revokes/grants
+      // - revokes may be applied after later events, but not before earlier events
+      //     - applying them too early makes unrevoked earlier events look like implicit grants
+      // - grants could be tolerate early application, but must commit atomically with revokes
+      for (const v of this.#views) {
+      }
+
+      // handle liveness
+      // - valid to handle any time after events
+      // - only really changes whether or not the query graph runs
+      if (!this.#live && this.#setLive) {
+      }
+
+      // query graph
+      if (this.#dirty) {
+      }
+
+      if (this.#recvdMsgs.length) > 0) {
+        // what needs to apply in-order, vs what can be sorted-then-applied:
+        // - revokes can be applied late but not early:
+        //    - revoke must be applied after events before it have been reduced, so we don't
+        //      accidentally think a pre-revoke event is an implicit grant
+        //    - a late revoke is fine, so long as it is before any future view changes
+        //        - that isn't guaranteed because views without revoke/grant are expanded async
+        //
+        // - grants can apply at any time at all:
+        //    - applying grant early is fine; it starts the backfill
+        //    - applying grant late is fine; the backfill may have been started implicitly
+        //    - grants won't affect the UI until after the backfill completes
+        //
+        // - view changes:
+        //    - I think views just need to be processed in-order
+        //    - token from the view should be committed in the same txn as grants and revokes
+        //
+        // - vouch: bumps the saved position without events
+        //    - cannot run before events before it, because then on crash you could skip events
+        //    - it can run after events after it as long as you make it idempotent
+        //    - has no effect on queries or any such UI-facing thing
+        //
+        // - creation and deletion are just special events should be processed in event order
+        //
+        // - backfill event handling and chunk handling need to be serialized with the main
+        //   event-handling code since they require writeTxn, but don't affect the UI any
+        //
+        // - backfill done handling should happen before reducers, since the snapshot-then-tail
+        //   pattern will trigger reducers.
+
+        ////////////////////////////////
+
+        // process received messages:
+        // - detect implicit grants
+        // - detect implicit horizons
+
+        // onView(token: string, grant?: string[], revoke?: string[]): ...;
+        // - update this.shards
+        // - delete revoked shards
+        // - delete revoked backfill state
+        // - ensure new grant's backfill state
+        //   - could appear new
+        //   - could appear mid-backfill
+        //   - could be backfilled already
+
+        // onEvents(...): ...;
+        // - handle creation and deletion events automatically
+        // - on creation:
+        //   - update this.shards
+        //   - nothing to migrate at this point
+        // - on deletion:
+        //   - update this.shards
+        //   - discard shard prefix from store
+        // - events from backfilling shards get parked
+        // - non-creation events from unknown shards trigger backfill:
+        //   - this is the race case vs an explicit grant
+        //   - update this.shards
+        //   - park event
+        //   - bootstrap backfill state
+        // - remaining events go to reducers
+
+        // onVouch(...): ...;
+        // - simply update cursor position
+
+        // onHorizon(...): ...;
+        // - only possible in backfills and pre-caughtup
+        // - for in-view, we should have received every event and retention cannot matter
+        // - when not after a grant, adds a backfill requirement to catchup
+
+        // onBackfillChunk
+        // - save to store
+        // - update backfill state
+
+        // onBackfillDone
+        // - load chunks and write to final prefix
+        // - dirty query graph
+        // - discard backfill state
+        // - update this.shards
+        // - feed events to reducers
+        // - this should dirty the query graph and may trigger new queries
+        // - possibly triggers a caughtup effect, for horizon-on-startup backfills
+
+        // onEnd(...): ...;
+      }
+
       if (this.#recvdEvents.length > 0) {
         yield* this.#onRecvEvents();
         continue;
@@ -2755,6 +3138,24 @@ export class Engine<QX, RX, E, C> {
       // if we got here we probably had a spurious wakeup, or perhaps a newQuery() while not #live
       yield;
     }
+  }
+
+  // #onHorizon() is called either by a backfill-after-grant or pre-caughtup
+  // - if in pre-caughtup phase, this adds a backfill requirement to catchup
+  *#onHorizon(wtxn: WTxn, prefix: string): WStoreGenerator<void> {
+    // delete
+        // - only possible in backfills and pre-caughtup
+        // - for in-view, we should have received every event and retention cannot matter
+        // - when not after a grant, adds a backfill requirement to catchup
+  }
+
+  *#onHorizons(): Generator<void, void, void> {
+    if (this.#horizons.length === 0) return;
+
+    // for each horizon message we received, delete
+
+
+
   }
 
   *#onRecvEvents(): Generator<void, void, void> {
