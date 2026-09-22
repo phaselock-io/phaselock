@@ -1237,6 +1237,26 @@ export type StoreDone = { value: true } | { err: Error };
 // the keys a prefix operation touched, for query invalidation
 export type StoreKeys = { keys: string[] } | { err: Error };
 
+/** A scan walks keys in byte order between a lower and an upper bound, either open or closed,
+    one batch at a time.  It is a walk, not a snapshot: a batch is a fresh seek from the resume
+    key, so a key written above the cursor inside the range is visited and one written below is
+    not.  A scan may therefore write anywhere except above its own cursor inside its range. */
+export type StoreRange = {
+  gte?: string;
+  gt?: string;
+  lt?: string;
+  lte?: string;
+  reverse?: boolean;
+  // entries per batch
+  limit: number;
+  // keys only, or values of this type in the wanted representation
+  values: false | { type: string; want: Format | undefined };
+};
+// one batch; next is the key to resume from (gt, or lt when reversed), null when the range is done
+export type StoreScan =
+  | { entries: [string, StoreResult | null][]; next: string | null }
+  | { err: Error };
+
 export interface WTxn {
   get(key: string, type: string, want: Format | undefined, cb: (result: StoreResult) => void): void;
   set(key: string, value: StoreValue, type: string, cb: (result: StoreDone) => void): void;
@@ -1245,11 +1265,13 @@ export interface WTxn {
   delPrefix(prefix: string, cb: (result: StoreKeys) => void): void;
   // rekey every key under src to dst, without decoding values; reports the keys as they now exist
   move(src: string, dst: string, cb: (result: StoreKeys) => void): void;
+  scan(range: StoreRange, cb: (result: StoreScan) => void): void;
 }
 
 export interface RTxn {
   // get may return a `value` or `host`, which may need conversion
   get(key: string, type: string, want: Format | undefined, cb: (result: StoreResult) => void): void;
+  scan(range: StoreRange, cb: (result: StoreScan) => void): void;
 }
 
 export type WStoreQuestion = {
@@ -1263,11 +1285,15 @@ export type WStoreQuestion = {
   delPrefix?: Record<string, true>;
   // prefixes to rekey: src -> dst
   move?: Record<string, string>;
+  // ranges to walk, one batch each
+  scan?: Record<string, StoreRange>;
 };
 
 export type RStoreQuestion = {
   // keys to look up and their type name; any format returned is accepted and converted by caller
   get?: Record<string, string>;
+  // ranges to walk, one batch each
+  scan?: Record<string, StoreRange>;
 };
 
 export type StoreAnswer = {
@@ -1281,6 +1307,8 @@ export type StoreAnswer = {
   delPrefix: Record<string, StoreKeys>;
   // prefixes moved, keyed by src, with the keys as they now exist under dst
   move: Record<string, StoreKeys>;
+  // one batch per asked range
+  scan: Record<string, StoreScan>;
 };
 
 export type WStoreGenerator<T> = Generator<WStoreQuestion, T, StoreAnswer>;
