@@ -1,9 +1,23 @@
 # PhaseLock Roadmap
 
-PhaseLock is currently in Alpha.  All the core features are implemented, a few
-of them are tested, and none of them are properly documented.
+PhaseLock is currently in Alpha.  All the core sync engine features are
+implemented, a few of them are tested, and none of them are properly
+documented.
 
 There's still a lot to do:
+
+- PhaseLockDB: the whole backend in a process
+  - user-defined plugins embed backend behaviors in the db:
+    - lookup() function to define authN
+    - maySee() to implement read-side autZ
+    - precommit() to implement the write path
+  - eventually view-stamped replication (revisited) for HA between nodes
+
+- PhaseLock cloud
+  - hosted PhaseLockDB instances
+  - hosted side-effects (sending email, sending/receiving webhooks, etc)
+  - free tier with auto-hibernation and periodic backups
+  - paid tier with HA and resource reservations
 
 - Documentation for:
   - the TypeSpec API
@@ -27,12 +41,6 @@ There's still a lot to do:
   - iOS
   - Android
   - PhaseLock engine in a Shared Worker serving multiple tabs
-
-- Additional backend demos:
-  - Pure TypeScript backend for library demo
-  - Cloudflare CDN-based log distribution
-  - Cloudflare CDN-based server-side queries
-    - Will require implementing a Store MVCC capability
 
 - Add indices as a formal concept in the PhaseLock Engine
   - possibly a plugin interface, for define-your-own index?
