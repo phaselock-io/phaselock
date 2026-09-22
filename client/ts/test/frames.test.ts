@@ -51,19 +51,17 @@ describe('parseFrame', () => {
   test('the other tags', () => {
     expect(parseFrame(encode(['live', 99]))).toEqual({ tag: 'live', position: 99 });
     expect(parseFrame(encode(['vouch', 100]))).toEqual({ tag: 'vouch', position: 100 });
-    expect(parseFrame(encode(['view', 'tok', 12, ['a'], ['b', 'c']]))).toEqual({
+    expect(parseFrame(encode(['view', 'tok', 12, ['a', 'b.*']]))).toEqual({
       tag: 'view',
       token: 'tok',
       position: 12,
-      grants: ['a'],
-      revokes: ['b', 'c'],
+      refs: ['a', 'b.*'],
     });
-    expect(parseFrame(encode(['view', 'tok', 0, [], []]))).toEqual({
+    expect(parseFrame(encode(['view', 'tok', 0, []]))).toEqual({
       tag: 'view',
       token: 'tok',
       position: 0,
-      grants: [],
-      revokes: [],
+      refs: [],
     });
     expect(parseFrame(encode(['end', 4, 'bye']))).toEqual({ tag: 'end', code: 4, reason: 'bye' });
   });
@@ -72,7 +70,7 @@ describe('parseFrame', () => {
     expect(() => parseFrame(encode([]))).toThrow(/empty frame/);
     expect(() => parseFrame(encode(['nope']))).toThrow(/unknown frame/);
     expect(() => parseFrame(encode(['live']))).toThrow(/truncated/);
-    expect(() => parseFrame(encode(['view', 'tok', 1, ['a']]))).toThrow(/truncated/);
+    expect(() => parseFrame(encode(['view', 'tok', 1]))).toThrow(/truncated/);
     expect(() => parseFrame(encode(['events', [[[1, 's', 1, 'i'], 'x']]]))).toThrow(
       /short envelope/,
     );

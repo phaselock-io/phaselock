@@ -95,8 +95,12 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
     let live: number | null = null;
     const ctl = new AbortController();
     const factory = NewHTTPConnector(url, () => token);
-    const conn = factory(-1, ['*'], ctl.signal, {
-      onView: (t, position, changes) => log.push(['view', t.length > 0, position, changes]),
+    let viewToken = '';
+    const conn = factory(-1, null, ['*'], ctl.signal, {
+      onView: (t, position, refs) => {
+        viewToken = t;
+        log.push(['view', t.length > 0, position, refs]);
+      },
       onEvents: (evs) =>
         log.push(['events', evs.map((e) => [e.position, e.stream, e.seq, decode(e.data)])]),
       onLive: (p) => {
@@ -108,7 +112,8 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
       },
     });
     await new Promise((r) => setTimeout(r, 300));
-    expect(log[0]).toEqual(['view', true, 0, null]);
+    // a bootstrap presents no token and gets the view as its first frame
+    expect(log[0]).toEqual(['view', true, 0, ['*']]);
     expect(live).toBe(0);
 
     // commands: ack, ack, dup, reject
@@ -139,13 +144,19 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
     expect(delivered.at(-1)![0]).toBe(cursor);
     expect((delivered[0][3] as { $sys: string }).$sys).toBe('birth');
 
-    const list = await conn.listVisible();
-    expect(list).toEqual({
-      position: cursor,
-      token: list.token,
-      refs: ['*'],
-      streams: ['patron.p1', 'patron.p2'],
+    // a reconnect presenting the current token gets no view frame at all
+    const again: unknown[][] = [];
+    const ctl2 = new AbortController();
+    factory(cursor, viewToken, ['*'], ctl2.signal, {
+      onView: (t, position, refs) => again.push(['view', t === viewToken, position, refs]),
+      onEvents() {},
+      onLive: (p) => again.push(['live', p]),
+      onVouch() {},
+      onEnd() {},
     });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(again).toEqual([['live', cursor]]);
+    ctl2.abort();
 
     // a family backfill: header, values, an empty tail (the live cut is at the cursor)
     const fam = await run(conn, 'patron.*', cursor);
@@ -186,7 +197,7 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
     expect(stale.outcome).toBe('stale');
 
     // coverage: anonymous sees book but not a patron
-    const anon = NewHTTPConnector(url)(-1, ['*'], ctl.signal, {
+    const anon = NewHTTPConnector(url)(-1, null, ['*'], ctl.signal, {
       onView() {},
       onEvents() {},
       onLive() {},

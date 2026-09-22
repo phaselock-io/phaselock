@@ -62,6 +62,7 @@ contract does not depend on.
 ```ts
 export type ConnectorFactory = (
   since: number,        // the Engine's checkpoint, -1 to bootstrap
+  view: string | null,  // the Engine's stored view token, null to bootstrap
   wants: string[],      // refs to intersect with the view
   signal: AbortSignal,  // the connector's lifetime
   hooks: ConnectorHooks,
@@ -86,16 +87,16 @@ connector.  Consequences:
 
 `wants` is the engine's compile-time mask: the refs of the shards the
 generated engine declares (`"book"`, `"patron.{id}"` lower to `book`,
-`patron.*`).  The Engine applies the same mask to grants in view frames
-and to refs from `listVisible`, so it never backfills what it cannot
-fold.  An app-level mask intersected with it is deliberately omitted
-until there is a use for one.
+`patron.*`).  The Engine applies the same mask to the refs in view
+frames, so it never backfills what it cannot fold.  An app-level
+mask intersected with it is deliberately omitted until there is a use
+for one.
 
 ## Hooks: the live stream
 
 ```ts
 export interface ConnectorHooks {
-  onView(token: string, position: number, changes: null | { grants: string[]; revokes: string[] }): void;
+  onView(token: string, position: number, refs: string[]): void;
   onEvents(events: DbEvent<Uint8Array>[]): void;
   onLive(position: number): void;
   onVouch(position: number): void;
@@ -103,13 +104,30 @@ export interface ConnectorHooks {
 }
 ```
 
-- `onView` with `changes: null` is a connection's first view (the
-  `PhaseLock-View` and `PhaseLock-Position` headers).  A token mismatch
-  there means the Engine calls `listVisible()`.  Every token comes with
-  the position it is the view at, so a view frame that crosses a list
-  answer can be ordered against it and discarded when stale.  Later
-  view frames carry grants and revokes as bare stream names, never
-  refs.
+- `onView` is the whole view: the token, the position it is the view
+  at, and the full set of refs.  The connector sends the Engine's
+  stored token as `view`; when it is current no view frame comes at
+  all, and when it is not the server's first frame is the view, ahead
+  of any history.  Every later change is another view frame, ahead of
+  the events of the commit that caused it.  The Engine always diffs
+  the set against what it holds: gone is cut by prefix, new is
+  backfilled.  There is no incremental form, because the set is small
+  by construction (a family is one ref), a whole set is idempotent
+  where a diff must be applied exactly once, and the Engine needs the
+  diffing code for the reconnect case anyway.
+- Everything about views is in stream order, and that is deliberate.
+  There is no list endpoint: an out-of-band answer could cross a view
+  frame, and applying it could cut a stream a later frame regranted or
+  backfill a ref an earlier frame revoked.  History is replayed under
+  the current view, so the Engine's held set at its checkpoint plus
+  the replay is complete whatever changed while it was away, which is
+  why a content-hashed token is enough to compare.  The Engine persists
+  its view only when a reconciliation commits; a crash before that
+  presents the old token again and gets the view again.
+- Refs, never stream names: a family grant is one ref and one
+  backfill, and the Engine learns the members from the blob.  Every
+  change to the set is sent, even one that leaves coverage as it was,
+  because the token hashes the set.
 - `onLive` is the `live` frame, once per connection: history done.
 - The live stream is assumed to keep up.  These hooks return `void`;
   there is no backpressure on the live path yet.
@@ -139,7 +157,6 @@ export type BackfillOutcome = 'done' | 'stale';
 
 export interface Connector {
   backfill(backfill: Backfill): Promise<BackfillOutcome>;
-  listVisible(): Promise<ListVisibleResult>;
   sendCommand(commands: Command<Uint8Array>[]): Promise<CommandResult[]>;
 }
 ```
@@ -163,7 +180,7 @@ and the connector frames them with a small msgpack cursor of its own
 (array and map headers, strings, ints, and skip): it decodes the tag
 and each envelope, skips over `data` to find its extent, and slices the
 bytes out.  The stock library decodes only whole small values: the blob
-header map, `/list`, command results.
+header map and command results.
 
 **Backpressure.**  `onHeader`, `onValues`, and `onEvents` resolve when
 the Engine has committed that batch, not when it has queued it.  The

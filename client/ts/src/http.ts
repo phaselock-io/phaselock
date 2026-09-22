@@ -10,7 +10,6 @@ import type {
   ConnectorFactory,
   ConnectorHooks,
   DbEvent,
-  ListVisibleResult,
 } from './contract.js';
 import { be, utf8, Writer } from './msgpack.js';
 import { crc32c, Fnv64, sameBytes } from './checksum.js';
@@ -50,6 +49,7 @@ export class HTTPConnector implements Connector {
     url: string,
     token: TokenSource,
     since: number,
+    view: string | null,
     wants: string[],
     signal: AbortSignal,
     hooks: ConnectorHooks,
@@ -58,7 +58,7 @@ export class HTTPConnector implements Connector {
     this.#token = token;
     this.#signal = signal;
     this.#hooks = hooks;
-    void this.#run(since, wants);
+    void this.#run(since, view, wants);
   }
 
   #headers(extra: Record<string, string> = {}): Record<string, string> {
@@ -74,9 +74,10 @@ export class HTTPConnector implements Connector {
     this.#hooks.onEnd(code, reason);
   }
 
-  async #run(since: number, wants: string[]): Promise<void> {
+  async #run(since: number, view: string | null, wants: string[]): Promise<void> {
     try {
       const q = new URLSearchParams({ since: String(since) });
+      if (view !== null) q.set('view', view);
       for (const w of wants) q.append('want', w);
       const resp = await fetch(`${this.#url}/stream?${q}`, {
         signal: this.#signal,
@@ -86,11 +87,6 @@ export class HTTPConnector implements Connector {
         this.#end(resp.status, await resp.text());
         return;
       }
-      this.#hooks.onView(
-        resp.headers.get('PhaseLock-View') ?? '',
-        Number(resp.headers.get('PhaseLock-Position')),
-        null,
-      );
       await frames(new ByteReader(resp.body), (f) => {
         switch (f.tag) {
           case 'events':
@@ -103,7 +99,7 @@ export class HTTPConnector implements Connector {
             this.#hooks.onVouch(f.position);
             return true;
           case 'view':
-            this.#hooks.onView(f.token, f.position, { grants: f.grants, revokes: f.revokes });
+            this.#hooks.onView(f.token, f.position, f.refs);
             return true;
           case 'end':
             this.#end(f.code, f.reason);
@@ -273,16 +269,6 @@ export class HTTPConnector implements Connector {
     }
   }
 
-  async listVisible(): Promise<ListVisibleResult> {
-    const resp = await fetch(`${this.#url}/list`, {
-      signal: this.#signal,
-      headers: this.#headers(),
-    });
-    if (resp.status !== 200) throw new Error(`list: ${resp.status} ${resp.statusText}`);
-    const out = decode(new Uint8Array(await resp.arrayBuffer())) as ListVisibleResult;
-    return { token: out.token, position: out.position, refs: out.refs, streams: out.streams };
-  }
-
   sendCommand(commands: Command<Uint8Array>[]): Promise<CommandResult[]> {
     return new Promise((resolve, reject) => {
       this.#sends.push({ commands, resolve, reject });
@@ -339,6 +325,6 @@ export class HTTPConnector implements Connector {
 }
 
 export function NewHTTPConnector(url: string, token: TokenSource = () => null): ConnectorFactory {
-  return (since, wants, signal, hooks) =>
-    new HTTPConnector(url, token, since, wants, signal, hooks);
+  return (since, view, wants, signal, hooks) =>
+    new HTTPConnector(url, token, since, view, wants, signal, hooks);
 }

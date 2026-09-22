@@ -39,13 +39,6 @@ export type Backfill = {
   onEvents(events: DbEvent<Uint8Array>[]): Promise<void>;
 };
 
-export type ListVisibleResult = {
-  token: string;
-  position: number;
-  refs: string[];
-  streams: string[];
-};
-
 export type CommandResult =
   | { kind: 'ack'; position: number }
   | { kind: 'dup'; position: number }
@@ -59,20 +52,16 @@ export type BackfillOutcome = 'done' | 'stale';
 
 export interface Connector {
   backfill(backfill: Backfill): Promise<BackfillOutcome>;
-  listVisible(): Promise<ListVisibleResult>;
   // Calls are applied in call order, and a call that fails also fails every call behind it,
   // unsent, so the Engine's outbox order survives a retry.  Within a call, array order.
   sendCommand(commands: Command<Uint8Array>[]): Promise<CommandResult[]>;
 }
 
 export interface ConnectorHooks {
-  // token is the view as of position.  changes is null for a connection's first view, where a
-  // token mismatch needs listVisible(); a frame at or below the list's position is then stale.
-  onView(
-    token: string,
-    position: number,
-    changes: null | { grants: string[]; revokes: string[] },
-  ): void;
+  // the whole view: token is its hash, position the commit it is the view at, refs the set.
+  // Sent first when the presented token was not current, and on every change, in stream order
+  // ahead of the events it applies to.  The Engine diffs refs against what it holds.
+  onView(token: string, position: number, refs: string[]): void;
   onEvents(events: DbEvent<Uint8Array>[]): void;
   // history done; live from here (sent once per connection)
   onLive(position: number): void;
@@ -85,6 +74,7 @@ export interface ConnectorHooks {
 // is its lifetime; aborting it ends the connection and rejects any backfill or send in flight.
 export type ConnectorFactory = (
   since: number,
+  view: string | null, // the Engine's stored view token; null to bootstrap
   wants: string[],
   signal: AbortSignal,
   hooks: ConnectorHooks,

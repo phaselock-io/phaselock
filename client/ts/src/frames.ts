@@ -8,7 +8,7 @@ export type Frame =
   | { tag: 'events'; events: DbEvent<Uint8Array>[] }
   | { tag: 'live'; position: number }
   | { tag: 'vouch'; position: number }
-  | { tag: 'view'; token: string; position: number; grants: string[]; revokes: string[] }
+  | { tag: 'view'; token: string; position: number; refs: string[] }
   | { tag: 'end'; code: number; reason: string };
 
 function strings(r: Reader): string[] {
@@ -56,8 +56,8 @@ export function parseFrame(bytes: Uint8Array): Frame {
       used = 2;
       break;
     case 'view':
-      frame = { tag, token: r.str(), position: r.int(), grants: strings(r), revokes: strings(r) };
-      used = 5;
+      frame = { tag, token: r.str(), position: r.int(), refs: strings(r) };
+      used = 4;
       break;
     case 'end':
       frame = { tag, code: r.int(), reason: r.str() };

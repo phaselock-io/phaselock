@@ -85,7 +85,7 @@ class Stub {
 
 function hooks(log: unknown[][]): ConnectorHooks {
   return {
-    onView: (token, position, changes) => log.push(['view', token, position, changes]),
+    onView: (token, position, refs) => log.push(['view', token, position, refs]),
     onEvents: (events) =>
       log.push(['events', events.map((e) => [e.position, e.stream, e.seq, decode(e.data)])]),
     onLive: (p) => log.push(['live', p]),
@@ -104,25 +104,24 @@ beforeEach(async () => {
 afterEach(() => stub.stop());
 
 describe('the live stream', () => {
-  test('first view from the header, frames to hooks, one end from the server', async () => {
+  test('frames to hooks, no view call when the token was current, one end from the server', async () => {
     const s = stub.stream('t1');
     const log: unknown[][] = [];
     const ctl = new AbortController();
-    NewHTTPConnector(stub.url, () => 'jwt')(-1, ['*', 'book'], ctl.signal, hooks(log));
+    NewHTTPConnector(stub.url, () => 'jwt')(-1, null, ['*', 'book'], ctl.signal, hooks(log));
     await s.opened;
     s.push(['live', 0]);
     s.push(['events', [[[1, 'book', 1, 'c1', 5], { $sys: 'birth' }]]]);
-    s.push(['view', 't2', 2, ['patron.p1'], []]);
+    s.push(['view', 't2', 2, ['book', 'patron.p1']]);
     s.push(['vouch', 3]);
     s.push(['end', 7, 'done']);
     s.push(['vouch', 4]); // after end: never delivered
     s.end();
     await settle();
     expect(log).toEqual([
-      ['view', 't1', 3, null],
       ['live', 0],
       ['events', [[1, 'book', 1, { $sys: 'birth' }]]],
-      ['view', 't2', 2, { grants: ['patron.p1'], revokes: [] }],
+      ['view', 't2', 2, ['book', 'patron.p1']],
       ['vouch', 3],
       ['end', 7, 'done'],
     ]);
@@ -136,22 +135,43 @@ describe('the live stream', () => {
     const s = stub.stream();
     const seen: string[] = [];
     stub.server.on('request', (req) => seen.push(req.url!));
-    NewHTTPConnector(stub.url)(42, ['book', 'patron.*'], new AbortController().signal, hooks([]));
+    NewHTTPConnector(stub.url)(
+      42,
+      'stored',
+      ['book', 'patron.*'],
+      new AbortController().signal,
+      hooks([]),
+    );
     await s.opened;
-    expect(seen[0]).toBe('/stream?since=42&want=book&want=patron.*');
+    expect(seen[0]).toBe('/stream?since=42&view=stored&want=book&want=patron.*');
     expect(stub.requests[0].headers.authorization).toBeUndefined();
+  });
+
+  test('a view frame first when the presented token was stale', async () => {
+    const s = stub.stream('t9', 7);
+    const log: unknown[][] = [];
+    NewHTTPConnector(stub.url)(5, 'stale', ['*'], new AbortController().signal, hooks(log));
+    await s.opened;
+    s.push(['view', 't9', 7, ['book', 'patron.*']]);
+    s.push(['live', 7]);
+    s.end();
+    await settle();
+    expect(log).toEqual([
+      ['view', 't9', 7, ['book', 'patron.*']],
+      ['live', 7],
+      ['end', 0, 'stream closed'],
+    ]);
   });
 
   test('a closed body without an end frame ends with code 0', async () => {
     const s = stub.stream();
     const log: unknown[][] = [];
-    NewHTTPConnector(stub.url)(-1, ['*'], new AbortController().signal, hooks(log));
+    NewHTTPConnector(stub.url)(-1, null, ['*'], new AbortController().signal, hooks(log));
     await s.opened;
     s.push(['live', 9]);
     s.end();
     await settle();
     expect(log).toEqual([
-      ['view', 'tok', 3, null],
       ['live', 9],
       ['end', 0, 'stream closed'],
     ]);
@@ -163,7 +183,7 @@ describe('the live stream', () => {
       res.end('token rejected');
     });
     const log: unknown[][] = [];
-    NewHTTPConnector(stub.url)(-1, ['*'], new AbortController().signal, hooks(log));
+    NewHTTPConnector(stub.url)(-1, null, ['*'], new AbortController().signal, hooks(log));
     await settle();
     expect(log).toEqual([['end', 401, 'token rejected']]);
   });
@@ -172,7 +192,7 @@ describe('the live stream', () => {
     const s = stub.stream();
     const log: unknown[][] = [];
     const ctl = new AbortController();
-    NewHTTPConnector(stub.url)(-1, ['*'], ctl.signal, hooks(log));
+    NewHTTPConnector(stub.url)(-1, null, ['*'], ctl.signal, hooks(log));
     await s.opened;
     ctl.abort();
     await settle();
@@ -209,6 +229,7 @@ describe('sendCommand', () => {
     });
     conn = NewHTTPConnector(stub.url, () => 'jwt')(
       -1,
+      null,
       ['*'],
       new AbortController().signal,
       hooks([]),
@@ -262,32 +283,6 @@ describe('sendCommand', () => {
       { kind: 'reject', reason: 'no' },
       { kind: 'conflict', current: { 'patron.p1': 4 } },
     ]);
-  });
-});
-
-describe('listVisible', () => {
-  test('returns the four fields', async () => {
-    stub.stream();
-    stub.routes.set('/list', (_req, _body, res) => {
-      res.writeHead(200);
-      res.end(
-        Buffer.from(
-          encode({
-            position: 5,
-            token: 't',
-            refs: ['book', 'patron.*'],
-            streams: ['book', 'patron.p1'],
-          }),
-        ),
-      );
-    });
-    const conn = NewHTTPConnector(stub.url)(-1, ['*'], new AbortController().signal, hooks([]));
-    expect(await conn.listVisible()).toEqual({
-      position: 5,
-      token: 't',
-      refs: ['book', 'patron.*'],
-      streams: ['book', 'patron.p1'],
-    });
   });
 });
 
@@ -378,6 +373,7 @@ describe('backfill', () => {
     stub.stream();
     conn = NewHTTPConnector(stub.url, () => 'jwt')(
       -1,
+      null,
       ['*'],
       new AbortController().signal,
       hooks([]),
