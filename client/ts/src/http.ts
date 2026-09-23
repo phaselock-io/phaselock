@@ -9,7 +9,7 @@ import type {
   Connector,
   ConnectorFactory,
   ConnectorHooks,
-  DbEvent,
+  WireEvent,
 } from './contract.js';
 import { be, utf8, Writer } from './msgpack.js';
 import { crc32c, Fnv64, sameBytes } from './checksum.js';
@@ -257,7 +257,7 @@ export class HTTPConnector implements Connector {
         throw new Error(`events ${b.ref}: ${resp.status} ${resp.statusText}`);
       }
       const scanned = Number(resp.headers.get('PhaseLock-Scanned'));
-      const events: DbEvent<Uint8Array>[] = [];
+      const events: WireEvent[] = [];
       await frames(new ByteReader(resp.body), (f) => {
         if (f.tag !== 'events') throw new Error(`events ${b.ref}: ${f.tag} frame`);
         events.push(...f.events);

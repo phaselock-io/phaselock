@@ -1,11 +1,11 @@
 // The frames of /stream and /events.
 
-import type { DbEvent } from './contract.js';
+import type { WireEvent } from './contract.js';
 import { Reader } from './msgpack.js';
 import type { ByteReader } from './bytes.js';
 
 export type Frame =
-  | { tag: 'events'; events: DbEvent<Uint8Array>[] }
+  | { tag: 'events'; events: WireEvent[] }
   | { tag: 'live'; position: number }
   | { tag: 'vouch'; position: number }
   | { tag: 'view'; token: string; position: number; refs: string[] }
@@ -30,21 +30,23 @@ export function parseFrame(bytes: Uint8Array): Frame {
   switch (tag) {
     case 'events': {
       const m = r.arrayHeader();
-      const events: DbEvent<Uint8Array>[] = [];
+      const events: WireEvent[] = [];
       for (let i = 0; i < m; i++) {
-        const pair = r.arrayHeader();
+        // the whole pair is sliced once; the envelope is read from it and data is a view into it
+        const raw = r.raw();
+        const p = new Reader(raw);
+        const pair = p.arrayHeader();
         if (pair < 2) throw new Error('event without data');
-        const env = r.arrayHeader();
+        const env = p.arrayHeader();
         if (env < 5) throw new Error('short envelope');
-        const position = r.int();
-        const stream = r.str();
-        const seq = r.int();
-        const id = r.str();
-        const servertime = r.int();
-        for (let k = 5; k < env; k++) r.skip();
-        const data = r.raw();
-        for (let k = 2; k < pair; k++) r.skip();
-        events.push({ id, data, position, stream, seq, servertime });
+        const position = p.int();
+        const stream = p.str();
+        const seq = p.int();
+        const id = p.str();
+        const servertime = p.int();
+        for (let k = 5; k < env; k++) p.skip();
+        const data = p.view();
+        events.push({ id, data, raw, position, stream, seq, servertime });
       }
       frame = { tag, events };
       used = 2;

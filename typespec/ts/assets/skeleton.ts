@@ -1204,43 +1204,64 @@ export class FutureContext {
 
 // store //////////////////////////////////////////////////////////////////////
 
-// an indexeddb-compatible, transactional key-value store built around generators.
-//
-// A note about typing: the Store interface must receive a rich value with .set() and return the
-// same rich value with .get().
-// type value with .get().  It must not matter which implementation of Store is in use.  However,
-// most of the access to the store is untyped.  So the store cannot get() and set() the real proto
-// values.  Instead, a Store implementation which stores anywhere other than in-memory must do
-// the type-to-store conversion internally.  Then any generated typed getters built around the
-// Store interface shall be merely typecasting wrappers.
+// A transactional key-value store built around generators, with values that travel as bundles
+// of representations and a Registry that converts between them.
 
-/** Store is the interface for creating read and write transasctions.  An implementation of Store
-    is callback-based and should support multiple parallel gets and sets at the API level, even if
-    they must be serialized internally.  The run{R,W}Txn functions are used to convert the callback
-    interface of WTxn and RTxn to the StoreGenerator protocol.
+/** The representations a value can be in: JS is the rich JS value, HOST the host language's,
+    MSGPACK the bytes.  They are bits, so a Wants is a mask of them: what an ask wants back, and
+    a store produces every wanted one it does not already hold, in one read.  0 means "as held",
+    which only move uses. */
+export const JS = 1;
+export const HOST = 2;
+export const MSGPACK = 4;
+export type Wants = number;
 
-    The store should accept rich values (including Date, Map, and Set) via .set() and it should
-    return rich values with .get(), even if it can't store them.  For sets, encodeProto and
-    protoStringify can help lower values to plain json objects or json string.  For gets, the
-    generated decoder is passed along with each .get() that can lift values from plain json objects
-    to rich objects. */
-export interface Store {
-  withWTxn<T>(fx: FutureContext, fn: (txn: WTxn) => Future<T>): Future<T>;
-  withRTxn<T>(fx: FutureContext, fn: (txn: RTxn) => Future<T>): Future<T>;
+/** A StoreValue is a value keyed by representation, in one, or in several when several were
+    wanted.  What arrives may not be what a caller asked for; a store converts to what it keeps
+    on the way in and to what was wanted on the way out. */
+export type StoreValue = { [JS]: unknown } | { [HOST]: unknown } | { [MSGPACK]: Uint8Array };
+
+/** Registry converts between representations of typed values and names the types the store
+    holds.  Types are model names from the TypeSpec, plus three reserved names: `.json` for the
+    Engine's own shapes; `.command` for the outbox envelope, its `data` converted through the
+    commands union; and `.event` for a parked event, the wire pair `[env, data]` in `msgpack` and a
+    DbEvent in `js`, its `data` converted through the union of the stream's slice. */
+export interface Registry {
+  /** the value of type `type` carrying every representation in `want`: present ones are kept,
+      the rest produced in one pass */
+  convert(type: string, value: StoreValue, want: Wants): StoreValue;
+  /** the commands union this engine may submit */
+  commands: string;
+  /** stream prefix (before the first dot) to the slice's events union */
+  eventTypes: Record<string, string>;
+  /** slicePrefix/subkeyPrefix (each before its first dot) to the store value's type */
+  storeTypes: Record<string, string>;
 }
 
-export type Format = 'js' | 'host' | 'msgpack';
+/** the type of a store key's value, from the Registry's storeTypes; undefined for a key no slice
+    declares */
+export function storeTypeOf(reg: Registry, key: string): string | undefined {
+  const slash = key.indexOf('/');
+  if (slash < 0) throw new Error(`invalid key has no '/': ${key}`);
+  const slice = key.slice(0, slash);
+  const sub = key.slice(slash + 1);
+  const dot = (x: string) => {
+    const i = x.indexOf('.');
+    return i < 0 ? x : x.slice(0, i);
+  };
+  return reg.storeTypes[`${dot(slice)}/${dot(sub)}`]!;
+}
 
-export type StoreValue = { [Format]: unknown } | { err: Error };
-export type StoreResult = { [Format]: unknown } | { err: Error };
+export type StoreResult = { value: StoreValue | undefined } | { err: Error };
 export type StoreDone = { value: true } | { err: Error };
 // the keys a prefix operation touched, for query invalidation
 export type StoreKeys = { keys: string[] } | { err: Error };
 
-/** A scan walks keys in byte order between a lower and an upper bound, either open or closed,
-    one batch at a time.  It is a walk, not a snapshot: a batch is a fresh seek from the resume
-    key, so a key written above the cursor inside the range is visited and one written below is
-    not.  A scan may therefore write anywhere except above its own cursor inside its range. */
+/** A scan walks keys in code-unit order between a lower and an upper bound, either open or
+    closed, one batch at a time.  It is a walk, not a snapshot: a batch is a fresh seek from the
+    resume key, so a key written above the cursor inside the range is visited and one written
+    below is not.  A scan may therefore write anywhere except above its own cursor inside its
+    range. */
 export type StoreRange = {
   gte?: string;
   gt?: string;
@@ -1250,54 +1271,74 @@ export type StoreRange = {
   // entries per batch
   limit: number;
   // keys only, or values of this type in the wanted representation
-  values: false | { type: string; want: Format | undefined };
+  values: false | { type: string; want: Wants };
 };
-// one batch; next is the key to resume from (gt, or lt when reversed), null when the range is done
+/** one batch; a keys-only scan carries undefined values; next is the key to resume from (gt, or
+    lt when reversed), null when the range is done */
 export type StoreScan =
-  | { entries: [string, StoreResult | null][]; next: string | null }
+  | { entries: [string, StoreValue | undefined][]; next: string | null }
   | { err: Error };
 
-export interface WTxn {
-  get(key: string, type: string, want: Format | undefined, cb: (result: StoreResult) => void): void;
-  set(key: string, value: StoreValue, type: string, cb: (result: StoreDone) => void): void;
-  del(key: string, cb: (result: StoreDone) => void): void;
-  // delete every key under prefix; reports the keys deleted
-  delPrefix(prefix: string, cb: (result: StoreKeys) => void): void;
-  // rekey every key under src to dst, without decoding values; reports the keys as they now exist
-  move(src: string, dst: string, cb: (result: StoreKeys) => void): void;
-  scan(range: StoreRange, cb: (result: StoreScan) => void): void;
+/** the exclusive upper bound of the keys sharing prefix; undefined for the empty prefix */
+export function prefixEnd(prefix: string): string | undefined {
+  if (prefix === '') return undefined;
+  const last = prefix.charCodeAt(prefix.length - 1);
+  return prefix.slice(0, -1) + String.fromCharCode(last + 1);
+}
+
+/** the range covering every key under a prefix */
+export function prefixRange(prefix: string, limit: number, values: StoreRange['values']): StoreRange {
+  const end = prefixEnd(prefix);
+  return end === undefined ? { gte: prefix, limit, values } : { gte: prefix, lt: end, limit, values };
 }
 
 export interface RTxn {
-  // get may return a `value` or `host`, which may need conversion
-  get(key: string, type: string, want: Format | undefined, cb: (result: StoreResult) => void): void;
+  /** the value at key in the wanted representation, converted by the store */
+  get(key: string, type: string, want: Wants, cb: (result: StoreResult) => void): void;
   scan(range: StoreRange, cb: (result: StoreScan) => void): void;
 }
 
-export type WStoreQuestion = {
-  // keys to look up and their type name; any format returned is accepted and converted by caller
-  get?: Record<string, [string, { [Format]: true }]>;
-  // key-values to set, plus their type name; any format is allowed and converted by store
-  set?: Record<string, [StoreResult, string]>;
-  // key-values to delete
+export interface WTxn extends RTxn {
+  /** persist the value in the representation the store keeps, converting from the one given */
+  set(key: string, type: string, value: StoreValue, cb: (result: StoreDone) => void): void;
+  del(key: string, cb: (result: StoreDone) => void): void;
+  /** delete every key under prefix; reports the keys deleted */
+  delPrefix(prefix: string, cb: (result: StoreKeys) => void): void;
+  /** rekey every key under src to dst, never decoding a value; reports the keys as they now
+      exist.  src and dst must not be prefixes of each other. */
+  move(src: string, dst: string, cb: (result: StoreKeys) => void): void;
+}
+
+/** Store is the interface for creating read and write transactions.  An implementation is
+    callback-based and should support multiple parallel operations at the API level, even if it
+    must serialize them internally.  A store holds a Registry and does its own conversions, in
+    the host language.  The runTxn function converts the callback interface of WTxn and RTxn to
+    the StoreGenerator protocol. */
+export interface Store {
+  withWTxn<T>(fx: FutureContext, fn: (txn: WTxn) => Future<T>): Future<T>;
+  withRTxn<T>(fx: FutureContext, fn: (txn: RTxn) => Future<T>): Future<T>;
+}
+
+export type RStoreQuestion = {
+  // keys to look up: their type, and the representation wanted back
+  get?: Record<string, { type: string; want: Wants }>;
+  // ranges to walk, one batch each
+  scan?: Record<string, StoreRange>;
+};
+
+export type WStoreQuestion = RStoreQuestion & {
+  // key-values to set, with their type; any corner is accepted
+  set?: Record<string, { type: string; value: StoreValue }>;
+  // keys to delete
   del?: Record<string, true>;
   // prefixes to delete
   delPrefix?: Record<string, true>;
   // prefixes to rekey: src -> dst
   move?: Record<string, string>;
-  // ranges to walk, one batch each
-  scan?: Record<string, StoreRange>;
-};
-
-export type RStoreQuestion = {
-  // keys to look up and their type name; any format returned is accepted and converted by caller
-  get?: Record<string, string>;
-  // ranges to walk, one batch each
-  scan?: Record<string, StoreRange>;
 };
 
 export type StoreAnswer = {
-  // key-value lookup results
+  // key-value lookup results, in the wanted representation
   get: Record<string, StoreResult>;
   // keys done setting
   set: Record<string, StoreDone>;
@@ -1311,91 +1352,147 @@ export type StoreAnswer = {
   scan: Record<string, StoreScan>;
 };
 
+const emptyAnswer = (): StoreAnswer => ({ get: {}, set: {}, del: {}, delPrefix: {}, move: {}, scan: {} });
+
 export type WStoreGenerator<T> = Generator<WStoreQuestion, T, StoreAnswer>;
 export type RStoreGenerator<T> = Generator<RStoreQuestion, T, StoreAnswer>;
 
-/** function to interact with the StoreGenerator */
-export function* txnGet(key: string, type: string): RStoreGenerator<unknown> {
-  const ans = (yield { get: { [key]: decoder } }).get[key];
-  if ('err' in ans) {
-    throw ans.err;
-  }
-  // XXX: needs a registry to know how to convert from bytes or host to JS
-  return ans.value;
+/** the value at key in the one wanted representation, undefined when absent */
+export function* txnGet(key: string, type: string, want: Wants = JS): RStoreGenerator<unknown> {
+  const ans = (yield { get: { [key]: { type, want } } }).get[key];
+  if ('err' in ans) throw ans.err;
+  return ans.value === undefined ? undefined : (ans.value as Record<number, unknown>)[want];
 }
 
-/** a function to interact with the StoreGenerator */
-export function* txnSet(key: string, value: unknown): WStoreGenerator<void> {
-  const ans = (yield { set: { [key]: [value, '.json'] } }).set[key];
-  if ('err' in ans) {
-    throw ans.err;
-  }
+export function* txnSet(key: string, type: string, value: StoreValue): WStoreGenerator<void> {
+  const ans = (yield { set: { [key]: { type, value } } }).set[key];
+  if ('err' in ans) throw ans.err;
 }
 
-/** a function to interact with the StoreGenerator */
 export function* txnDel(key: string): WStoreGenerator<void> {
   const ans = (yield { del: { [key]: true } }).del[key];
-  if ('err' in ans) {
-    throw ans.err;
+  if ('err' in ans) throw ans.err;
+}
+
+/** delete every key under prefix; returns the keys deleted */
+export function* txnDelPrefix(prefix: string): WStoreGenerator<string[]> {
+  const ans = (yield { delPrefix: { [prefix]: true } }).delPrefix[prefix];
+  if ('err' in ans) throw ans.err;
+  return ans.keys;
+}
+
+/** rekey every key under src to dst; returns the keys as they now exist */
+export function* txnMove(src: string, dst: string): WStoreGenerator<string[]> {
+  const ans = (yield { move: { [src]: dst } }).move[src];
+  if ('err' in ans) throw ans.err;
+  return ans.keys;
+}
+
+/** one batch of a scan.  Callers loop: resume with `gt: next` (or `lt: next` when reversed)
+    until next is null. */
+export function* txnScan(
+  range: StoreRange,
+): RStoreGenerator<{ entries: [string, StoreValue | undefined][]; next: string | null }> {
+  const ans = (yield { scan: { s: range } }).scan.s;
+  if ('err' in ans) throw ans.err;
+  return ans;
+}
+
+/** the range to resume a scan from after a batch */
+export function resumeRange(range: StoreRange, next: string): StoreRange {
+  const r = { ...range };
+  if (range.reverse) {
+    delete r.lte;
+    r.lt = next;
+  } else {
+    delete r.gte;
+    r.gt = next;
   }
+  return r;
 }
 
 /** a function to hide some of the boilerplate of opening a WTxn */
 export function* withWTxn<T>(fx: FutureContext, s: Store, fn: () => WStoreGenerator<T>): Future<T> {
   return yield* s.withWTxn(fx, function* (txn) {
-    return yield* runWTxn(fx, txn, fn());
+    return yield* runTxn(fx, txn, fn());
   });
 }
 
 /** a function to hide some of the boilerplate of opening a RTxn */
 export function* withRTxn<T>(fx: FutureContext, s: Store, fn: () => RStoreGenerator<T>): Future<T> {
   return yield* s.withRTxn(fx, function* (txn) {
-    return yield* runRTxn(fx, txn, fn());
+    return yield* runTxn(fx, txn, fn());
   });
 }
 
+const writeOps = ['set', 'del', 'delPrefix', 'move'] as const;
+
 // run a StoreGenerator to completion, converting potentially many parallel callbacks into a
-// generator interface.
-function* runWTxn<T>(fx: FutureContext, txn: WTxn, g: WStoreGenerator<T>): Future<T> {
+// generator interface.  Write questions require a transaction with write methods.
+function* runTxn<T>(fx: FutureContext, txn: RTxn, g: WStoreGenerator<T>): Future<T> {
   // ignore late callbacks
   let valid = true;
   try {
-    let ans: StoreAnswer = { get: {}, set: {}, del: {} };
+    let ans = emptyAnswer();
     let ready = false;
+    const done = () => {
+      ready = true;
+      fx.wakeup();
+    };
     while (true) {
-      const { value, done } = g.next(ans);
-      if (done) return value;
+      const { value, done: finished } = g.next(ans);
+      if (finished) return value;
 
-      ans = { get: {}, set: {}, del: {} };
+      ans = emptyAnswer();
       ready = false;
 
-      // start gets
-      for (const [key, decoder] of Object.entries(value.get ?? {})) {
-        txn.get(key, decoder, (result) => {
-          if (!valid) return; // ignore late callback
+      for (const op of writeOps) {
+        if (value[op] !== undefined && !(op in txn)) {
+          throw new Error(`${op} in a read transaction`);
+        }
+      }
+      const wtxn = txn as WTxn;
+
+      for (const [key, { type, want }] of Object.entries(value.get ?? {})) {
+        txn.get(key, type, want, (result) => {
+          if (!valid) return;
           ans.get[key] = result;
-          ready = true;
-          fx.wakeup();
+          done();
         });
       }
-
-      // start sets
-      for (const [key, val] of Object.entries(value.set ?? {})) {
-        txn.set(key, val, (result) => {
-          if (!valid) return; // ignore late callback
+      for (const [key, { type, value: val }] of Object.entries(value.set ?? {})) {
+        wtxn.set(key, type, val, (result) => {
+          if (!valid) return;
           ans.set[key] = result;
-          ready = true;
-          fx.wakeup();
+          done();
         });
       }
-
-      // start deletes
       for (const key of Object.keys(value.del ?? {})) {
-        txn.del(key, (result) => {
-          if (!valid) return; // ignore late callback
+        wtxn.del(key, (result) => {
+          if (!valid) return;
           ans.del[key] = result;
-          ready = true;
-          fx.wakeup();
+          done();
+        });
+      }
+      for (const prefix of Object.keys(value.delPrefix ?? {})) {
+        wtxn.delPrefix(prefix, (result) => {
+          if (!valid) return;
+          ans.delPrefix[prefix] = result;
+          done();
+        });
+      }
+      for (const [src, dst] of Object.entries(value.move ?? {})) {
+        wtxn.move(src, dst, (result) => {
+          if (!valid) return;
+          ans.move[src] = result;
+          done();
+        });
+      }
+      for (const [id, range] of Object.entries(value.scan ?? {})) {
+        txn.scan(range, (result) => {
+          if (!valid) return;
+          ans.scan[id] = result;
+          done();
         });
       }
 
@@ -1407,46 +1504,346 @@ function* runWTxn<T>(fx: FutureContext, txn: WTxn, g: WStoreGenerator<T>): Futur
   }
 }
 
-// run a StoreGenerator to completion, converting potentially many parallel callbacks into a
-// generator interface.
-function* runRTxn<T>(fx: FutureContext, txn: RTxn, g: RStoreGenerator<T>): Future<T> {
-  // ignore late callbacks
-  let valid = true;
-  try {
-    let ans: StoreAnswer = { get: {}, set: {}, del: {} };
-    let ready = false;
-    while (true) {
-      const { value, done } = g.next(ans);
-      if (done) return value;
+// in-memory layers /////////////////////////////////////////////////////////
 
-      ans = { get: {}, set: {}, del: {} };
-      ready = false;
+// The in-memory and overlay stores keep rich js values, converting through the Registry on the
+// way in and out, in a base map plus a map of pending updates (undefined marks a deletion), and
+// answer range operations by sorting keys.
 
-      // start gets
-      for (const [key, decoder] of Object.entries(value.get ?? {})) {
-        txn.get(key, decoder, (result) => {
-          if (!valid) return; // ignore late callback
-          ans.get[key] = result;
-          ready = true;
-          fx.wakeup();
-        });
+type Layer = Record<string, unknown>;
+
+/** the read half of a transaction object, what a read transaction hands out */
+function readHalf(txn: RTxn): RTxn {
+  return { get: (...a) => txn.get(...a), scan: (...a) => txn.scan(...a) };
+}
+
+// the js value to keep for a set, and the wanted representation of a kept value
+function toJs(reg: Registry, type: string, value: StoreValue): unknown {
+  return (reg.convert(type, value, JS) as Record<number, unknown>)[JS];
+}
+function fromJs(reg: Registry, type: string, js: unknown, want: Wants): StoreValue {
+  return reg.convert(type, { [JS]: js }, want);
+}
+
+function inRange(key: string, r: StoreRange): boolean {
+  if (r.gte !== undefined && key < r.gte) return false;
+  if (r.gt !== undefined && key <= r.gt) return false;
+  if (r.lte !== undefined && key > r.lte) return false;
+  if (r.lt !== undefined && key >= r.lt) return false;
+  return true;
+}
+
+// the live keys of updates over data, sorted in walk order, restricted to a range
+function layerKeys(data: Layer, updates: Layer, r: StoreRange): string[] {
+  const keys: string[] = [];
+  for (const k of Object.keys(data)) {
+    if (!(k in updates) && data[k] !== undefined && inRange(k, r)) keys.push(k);
+  }
+  for (const k of Object.keys(updates)) {
+    if (updates[k] !== undefined && inRange(k, r)) keys.push(k);
+  }
+  keys.sort();
+  if (r.reverse) keys.reverse();
+  return keys;
+}
+
+function layerGet(data: Layer, updates: Layer, key: string): unknown {
+  return key in updates ? updates[key] : data[key];
+}
+
+// one batch over sorted keys: cut to the limit, and name the resume key when more remain
+function batch(
+  reg: Registry,
+  keys: string[],
+  r: StoreRange,
+  get: (key: string) => unknown,
+): StoreScan {
+  const page = keys.slice(0, r.limit);
+  const v = r.values;
+  const entries: [string, StoreValue | undefined][] = page.map((k) => [
+    k,
+    v ? fromJs(reg, v.type, get(k), v.want) : undefined,
+  ]);
+  const next = keys.length > r.limit ? page[page.length - 1] : null;
+  return { entries, next };
+}
+
+function layerDelPrefix(data: Layer, updates: Layer, prefix: string): string[] {
+  const keys = layerKeys(data, updates, prefixRange(prefix, Infinity, false));
+  for (const k of keys) updates[k] = undefined;
+  return keys;
+}
+
+function layerMove(data: Layer, updates: Layer, src: string, dst: string): string[] {
+  if (src.startsWith(dst) || dst.startsWith(src)) throw new Error(`move: "${src}" and "${dst}" overlap`);
+  const keys = layerKeys(data, updates, prefixRange(src, Infinity, false));
+  const moved: string[] = [];
+  for (const k of keys) {
+    const to = dst + k.slice(src.length);
+    updates[to] = layerGet(data, updates, k);
+    updates[k] = undefined;
+    moved.push(to);
+  }
+  return moved;
+}
+
+export class InMemStore {
+  #reg: Registry;
+  #data: Layer;
+
+  constructor(reg: Registry, data?: Record<string, unknown>) {
+    this.#reg = reg;
+    this.#data = data !== undefined ? data : {};
+  }
+
+  *#withTxn<T>(writable: boolean, fn: (txn: WTxn) => Future<T>): Future<T> {
+    const updates: Layer = {};
+    const txn = new InMemTxn(this.#reg, this.#data, updates);
+    // abort case is that we don't catch the exception here:
+    const result = yield* fn(writable ? txn : (readHalf(txn) as WTxn));
+    // commit case
+    for (const [key, val] of Object.entries(updates)) {
+      if (val === undefined) {
+        delete this.#data[key];
+      } else {
+        this.#data[key] = val;
       }
-
-      // wait for a result
-      while (!ready) yield;
     }
-  } finally {
-    valid = false;
+    return result;
+  }
+
+  *withWTxn<T>(_fx: FutureContext, fn: (txn: WTxn) => Future<T>): Future<T> {
+    return yield* this.#withTxn(true, fn);
+  }
+
+  *withRTxn<T>(_fx: FutureContext, fn: (txn: RTxn) => Future<T>): Future<T> {
+    return yield* this.#withTxn(false, fn);
   }
 }
+
+class InMemTxn implements WTxn {
+  #reg: Registry;
+  #data: Layer;
+  #updates: Layer;
+
+  constructor(reg: Registry, data: Layer, updates: Layer) {
+    this.#reg = reg;
+    this.#data = data;
+    this.#updates = updates;
+  }
+
+  get(key: string, type: string, want: Wants, cb: (result: StoreResult) => void): void {
+    const js = layerGet(this.#data, this.#updates, key);
+    cb({ value: js === undefined ? undefined : fromJs(this.#reg, type, js, want) });
+  }
+
+  set(key: string, type: string, value: StoreValue, cb: (result: StoreDone) => void): void {
+    this.#updates[key] = toJs(this.#reg, type, value);
+    cb({ value: true });
+  }
+
+  del(key: string, cb: (result: StoreDone) => void): void {
+    this.#updates[key] = undefined;
+    cb({ value: true });
+  }
+
+  delPrefix(prefix: string, cb: (result: StoreKeys) => void): void {
+    cb({ keys: layerDelPrefix(this.#data, this.#updates, prefix) });
+  }
+
+  move(src: string, dst: string, cb: (result: StoreKeys) => void): void {
+    try {
+      cb({ keys: layerMove(this.#data, this.#updates, src, dst) });
+    } catch (e: unknown) {
+      cb({ err: e as Error });
+    }
+  }
+
+  scan(range: StoreRange, cb: (result: StoreScan) => void): void {
+    const keys = layerKeys(this.#data, this.#updates, range);
+    cb(batch(this.#reg, keys, range, (k) => layerGet(this.#data, this.#updates, k)));
+  }
+}
+
+export class OverlayStore {
+  #base: Store;
+  #reg: Registry;
+  #data: Layer = {};
+
+  constructor(base: Store, reg: Registry) {
+    this.#base = base;
+    this.#reg = reg;
+  }
+
+  keys(): string[] {
+    return Object.keys(this.#data);
+  }
+
+  *#withTxn<T>(fx: FutureContext, writable: boolean, fn: (txn: WTxn) => Future<T>): Future<T> {
+    // regardless of read/write status on the overlay txn, we only ever open a read txn on #base
+    const self = this;
+    return yield* this.#base.withRTxn(fx, function* (baseTxn) {
+      const updates: Layer = {};
+      const txn = new OverlayTxn(self.#reg, baseTxn, self.#data, updates);
+      // abort case is that we don't catch the exception here:
+      const result = yield* fn(writable ? txn : (readHalf(txn) as WTxn));
+      // commit case
+      for (const [key, val] of Object.entries(updates)) {
+        // note: we must keep undefined values rather than propagate deletions to base
+        self.#data[key] = val;
+      }
+      return result;
+    });
+  }
+
+  *withWTxn<T>(fx: FutureContext, fn: (txn: WTxn) => Future<T>): Future<T> {
+    return yield* this.#withTxn(fx, true, fn);
+  }
+
+  *withRTxn<T>(fx: FutureContext, fn: (txn: RTxn) => Future<T>): Future<T> {
+    return yield* this.#withTxn(fx, false, fn);
+  }
+}
+
+/** OverlayTxn reads through its two in-memory layers to a base read transaction.  Range
+    operations merge the layers with the base's answer: the base is walked in batches, and the
+    layers' keys inside each batch's span are merged in, the layers winning. */
+class OverlayTxn implements WTxn {
+  #reg: Registry;
+  #base: RTxn;
+  #data: Layer;
+  #updates: Layer;
+
+  constructor(reg: Registry, base: RTxn, data: Layer, updates: Layer) {
+    this.#reg = reg;
+    this.#base = base;
+    this.#data = data;
+    this.#updates = updates;
+  }
+
+  #has(key: string): boolean {
+    return key in this.#updates || key in this.#data;
+  }
+
+  get(key: string, type: string, want: Wants, cb: (result: StoreResult) => void): void {
+    if (this.#has(key)) {
+      const js = layerGet(this.#data, this.#updates, key);
+      cb({ value: js === undefined ? undefined : fromJs(this.#reg, type, js, want) });
+    } else {
+      this.#base.get(key, type, want, cb);
+    }
+  }
+
+  set(key: string, type: string, value: StoreValue, cb: (result: StoreDone) => void): void {
+    this.#updates[key] = toJs(this.#reg, type, value);
+    cb({ value: true });
+  }
+
+  del(key: string, cb: (result: StoreDone) => void): void {
+    this.#updates[key] = undefined;
+    cb({ value: true });
+  }
+
+  // every key under prefix, from the base and the layers, in walk order
+  #keysUnder(prefix: string, cb: (keys: string[] | Error) => void): void {
+    const all = new Set<string>();
+    const walk = (range: StoreRange) => {
+      this.#base.scan(range, (result) => {
+        if ('err' in result) return cb(result.err);
+        for (const [k] of result.entries) if (!this.#has(k)) all.add(k);
+        if (result.next !== null) return walk(resumeRange(range, result.next));
+        for (const k of layerKeys(this.#data, this.#updates, prefixRange(prefix, Infinity, false))) all.add(k);
+        cb([...all].sort());
+      });
+    };
+    walk(prefixRange(prefix, 1000, false));
+  }
+
+  delPrefix(prefix: string, cb: (result: StoreKeys) => void): void {
+    this.#keysUnder(prefix, (keys) => {
+      if (keys instanceof Error) return cb({ err: keys });
+      for (const k of keys) this.#updates[k] = undefined;
+      cb({ keys });
+    });
+  }
+
+  move(src: string, dst: string, cb: (result: StoreKeys) => void): void {
+    if (src.startsWith(dst) || dst.startsWith(src)) {
+      return cb({ err: new Error(`move: "${src}" and "${dst}" overlap`) });
+    }
+    this.#keysUnder(src, (keys) => {
+      if (keys instanceof Error) return cb({ err: keys });
+      const moved: string[] = [];
+      let pending = 0;
+      let failed = false;
+      const finish = () => {
+        if (pending === 0 && !failed) cb({ keys: moved });
+      };
+      for (const k of keys) {
+        const to = dst + k.slice(src.length);
+        moved.push(to);
+        if (this.#has(k)) {
+          this.#updates[to] = layerGet(this.#data, this.#updates, k);
+          this.#updates[k] = undefined;
+          continue;
+        }
+        // a base key: copy its value up into the layer under the new name, as the base holds it
+        pending++;
+        this.#base.get(k, '', 0, (result) => {
+          pending--;
+          if ('err' in result) {
+            failed = true;
+            return cb(result);
+          }
+          this.#updates[to] = result.value === undefined ? undefined : Object.values(result.value)[0];
+          this.#updates[k] = undefined;
+          finish();
+        });
+      }
+      finish();
+    });
+  }
+
+  scan(range: StoreRange, cb: (result: StoreScan) => void): void {
+    this.#base.scan(range, (result) => {
+      if ('err' in result) return cb(result);
+      // the span this batch covers: up to its last key when more follow, else the whole range
+      const span: StoreRange = { ...range, limit: Infinity };
+      if (result.next !== null) {
+        if (range.reverse) span.gte = result.next;
+        else span.lte = result.next;
+      }
+      // the base answers in the wanted representation; layer entries convert here
+      const merged = new Map<string, StoreValue | undefined>();
+      for (const [k, v] of result.entries) if (!this.#has(k)) merged.set(k, v);
+      const v = range.values;
+      for (const k of layerKeys(this.#data, this.#updates, span)) {
+        const js = layerGet(this.#data, this.#updates, k);
+        merged.set(k, v ? fromJs(this.#reg, v.type, js, v.want) : undefined);
+      }
+      const keys = [...merged.keys()].sort();
+      if (range.reverse) keys.reverse();
+      const page: StoreScan = {
+        entries: keys.slice(0, range.limit).map((k) => [k, merged.get(k)]),
+        next: keys.length > range.limit ? keys[range.limit - 1] : null,
+      };
+      if (!('err' in page) && page.next === null && result.next !== null) page.next = page.entries[page.entries.length - 1][0];
+      cb(page);
+    });
+  }
+}
+
+// IndexedDB /////////////////////////////////////////////////////////////////
 
 export class IndexedDBStore {
   #db: IDBDatabase;
   #store: string;
+  #reg: Registry;
 
-  constructor(db: IDBDatabase, store: string) {
+  constructor(db: IDBDatabase, store: string, reg: Registry) {
     this.#db = db;
     this.#store = store;
+    this.#reg = reg;
   }
 
   *#withTxn<T>(
@@ -1470,7 +1867,7 @@ export class IndexedDBStore {
       fx.wakeup();
     };
     const store = txn.objectStore(this.#store);
-    const indexedDBTxn = new IndexedDBTxn(store);
+    const indexedDBTxn = new IndexedDBTxn(this.#reg, store);
 
     // run the user function
     let result: T;
@@ -1495,188 +1892,132 @@ export class IndexedDBStore {
   }
 }
 
-class IndexedDBTxn {
+// the IDBKeyRange for a StoreRange, undefined when unbounded
+function keyRange(r: StoreRange): IDBKeyRange | undefined {
+  const lower = r.gte ?? r.gt;
+  const upper = r.lte ?? r.lt;
+  const lowerOpen = r.gte === undefined && r.gt !== undefined;
+  const upperOpen = r.lte === undefined && r.lt !== undefined;
+  if (lower !== undefined && upper !== undefined) return IDBKeyRange.bound(lower, upper, lowerOpen, upperOpen);
+  if (lower !== undefined) return IDBKeyRange.lowerBound(lower, lowerOpen);
+  if (upper !== undefined) return IDBKeyRange.upperBound(upper, upperOpen);
+  return undefined;
+}
+
+/** IndexedDBTxn keeps rich js values: structured clone preserves Date, Map, and Set, so the
+    store's representation is `js` and it converts only when asked for another. */
+class IndexedDBTxn implements WTxn {
+  #reg: Registry;
   #store: IDBObjectStore;
 
-  constructor(store: IDBObjectStore) {
+  constructor(reg: Registry, store: IDBObjectStore) {
+    this.#reg = reg;
     this.#store = store;
   }
 
-  get(key: string, _decoder: StoreDecoder, cb: (result: StoreResult) => void): void {
+  get(key: string, type: string, want: Wants, cb: (result: StoreResult) => void): void {
     const req = this.#store.get(key);
-    req.onsuccess = () => {
-      // IndexedDB does not need decoding
-      cb({ value: req.result });
-    };
-    req.onerror = () => {
-      cb({ err: new Error(`failed to look up "${key}"`) });
-    };
+    req.onsuccess = () =>
+      cb({ value: req.result === undefined ? undefined : fromJs(this.#reg, type, req.result, want) });
+    req.onerror = () => cb({ err: new Error(`failed to look up "${key}"`) });
   }
 
-  set(key: string, value: unknown, cb: (result: StoreDone) => void): void {
-    // IndexedDB does not need encoding
-    const req = this.#store.put(value, key);
-    req.onsuccess = () => {
-      cb({ value: true });
-    };
-    req.onerror = () => {
-      cb({ err: new Error(`failed to set "${key}"`) });
-    };
+  set(key: string, type: string, value: StoreValue, cb: (result: StoreDone) => void): void {
+    const req = this.#store.put(toJs(this.#reg, type, value), key);
+    req.onsuccess = () => cb({ value: true });
+    req.onerror = () => cb({ err: new Error(`failed to set "${key}"`) });
   }
 
   del(key: string, cb: (result: StoreDone) => void): void {
     const req = this.#store.delete(key);
+    req.onsuccess = () => cb({ value: true });
+    req.onerror = () => cb({ err: new Error(`failed to delete "${key}"`) });
+  }
+
+  // walk a range with a cursor; each returns false to stop
+  #cursor(
+    range: StoreRange,
+    each: (cursor: IDBCursorWithValue) => boolean,
+    end: (err?: Error) => void,
+  ): void {
+    const req = this.#store.openCursor(keyRange(range), range.reverse ? 'prev' : 'next');
     req.onsuccess = () => {
-      cb({ value: true });
+      const cursor = req.result;
+      if (!cursor) return end();
+      if (each(cursor)) cursor.continue();
+      else end();
     };
-    req.onerror = () => {
-      cb({ err: new Error(`failed to delete "${key}"`) });
-    };
-  }
-}
-
-export class InMemStore {
-  #data: Record<string, unknown>;
-
-  constructor(data?: Record<string, unknown>) {
-    this.#data = data !== undefined ? data : {};
+    req.onerror = () => end(new Error('cursor failed'));
   }
 
-  *#withTxn<T>(fn: (txn: WTxn) => Future<T>): Future<T> {
-    const updates: Record<string, unknown> = {};
-    const txn = new InMemTxn(this.#data, updates);
-    // abort case is that we don't catch the exception here:
-    const result = yield* fn(txn);
-    // commit case
-    for (const [key, val] of Object.entries(updates)) {
-      if (val === undefined) {
-        delete this.#data[key];
-      } else {
-        this.#data[key] = val;
-      }
+  delPrefix(prefix: string, cb: (result: StoreKeys) => void): void {
+    const keys: string[] = [];
+    this.#cursor(
+      prefixRange(prefix, Infinity, false),
+      (cursor) => {
+        keys.push(cursor.key as string);
+        cursor.delete();
+        return true;
+      },
+      (err) => cb(err ? { err } : { keys }),
+    );
+  }
+
+  move(src: string, dst: string, cb: (result: StoreKeys) => void): void {
+    if (src.startsWith(dst) || dst.startsWith(src)) {
+      return cb({ err: new Error(`move: "${src}" and "${dst}" overlap`) });
     }
-    return result;
+    const keys: string[] = [];
+    this.#cursor(
+      prefixRange(src, Infinity, false),
+      (cursor) => {
+        const to = dst + (cursor.key as string).slice(src.length);
+        this.#store.put(cursor.value, to);
+        cursor.delete();
+        keys.push(to);
+        return true;
+      },
+      (err) => cb(err ? { err } : { keys }),
+    );
   }
 
-  *withWTxn<T>(_fx: FutureContext, fn: (txn: WTxn) => Future<T>): Future<T> {
-    return yield* this.#withTxn(fn);
-  }
-
-  *withRTxn<T>(_fx: FutureContext, fn: (txn: RTxn) => Future<T>): Future<T> {
-    return yield* this.#withTxn(fn);
-  }
-}
-
-class InMemTxn {
-  #data: Record<string, unknown>;
-  #updates: Record<string, unknown>;
-
-  constructor(data: Record<string, unknown>, updates: Record<string, unknown>) {
-    this.#data = data;
-    this.#updates = updates;
-  }
-
-  get(key: string, _decoder: StoreDecoder, cb: (result: StoreResult) => void): void {
-    if (key in this.#updates) {
-      cb({ value: this.#updates[key] });
-    } else {
-      cb({ value: this.#data[key] });
-    }
-  }
-
-  set(key: string, value: unknown, cb: (result: StoreDone) => void): void {
-    this.#updates[key] = value;
-    cb({ value: true });
-  }
-
-  del(key: string, cb: (result: StoreDone) => void): void {
-    this.#updates[key] = undefined;
-    cb({ value: true });
+  scan(range: StoreRange, cb: (result: StoreScan) => void): void {
+    const entries: [string, StoreValue | undefined][] = [];
+    const v = range.values;
+    this.#cursor(
+      range,
+      (cursor) => {
+        entries.push([cursor.key as string, v ? fromJs(this.#reg, v.type, cursor.value, v.want) : undefined]);
+        return entries.length < range.limit;
+      },
+      (err) => {
+        if (err) return cb({ err });
+        // a full batch may have more behind it; the next batch says if it did
+        const next = entries.length === range.limit ? entries[entries.length - 1][0] : null;
+        cb({ entries, next });
+      },
+    );
   }
 }
 
-export class OverlayStore {
-  #base: Store;
-  #data: Record<string, unknown> = {};
-
-  constructor(base: Store) {
-    this.#base = base;
-  }
-
-  keys(): string[] {
-    return Object.keys(this.#data);
-  }
-
-  *#withTxn<T>(fx: FutureContext, fn: (txn: WTxn) => Future<T>): Future<T> {
-    // regardless of read/write status on the overlay txn, we only ever open a read txn on #base
-    const self = this;
-    return yield* this.#base.withRTxn(fx, function* (baseTxn) {
-      const updates: Record<string, unknown> = {};
-      const txn = new OverlayTxn(baseTxn, self.#data, updates);
-      // abort case is that we don't catch the exception here:
-      const result = yield* fn(txn);
-      // commit case
-      for (const [key, val] of Object.entries(updates)) {
-        // note: we must keep undefined values rather than propagate deletions to base
-        self.#data[key] = val;
-      }
-      return result;
-    });
-  }
-
-  *withWTxn<T>(fx: FutureContext, fn: (txn: WTxn) => Future<T>): Future<T> {
-    return yield* this.#withTxn(fx, fn);
-  }
-
-  *withRTxn<T>(fx: FutureContext, fn: (txn: RTxn) => Future<T>): Future<T> {
-    return yield* this.#withTxn(fx, fn);
-  }
-}
-
-class OverlayTxn {
-  #base: RTxn;
-  #data: Record<string, unknown>;
-  #updates: Record<string, unknown>;
-
-  constructor(base: RTxn, data: Record<string, unknown>, updates: Record<string, unknown>) {
-    this.#base = base;
-    this.#data = data;
-    this.#updates = updates;
-  }
-
-  get(key: string, decoder: StoreDecoder, cb: (result: StoreResult) => void): void {
-    if (key in this.#updates) {
-      cb({ value: this.#updates[key] });
-    } else if (key in this.#data) {
-      cb({ value: this.#data[key] });
-    } else {
-      this.#base.get(key, decoder, cb);
-    }
-  }
-
-  set(key: string, value: unknown, cb: (result: StoreDone) => void): void {
-    this.#updates[key] = value;
-    cb({ value: true });
-  }
-
-  del(key: string, cb: (result: StoreDone) => void): void {
-    this.#updates[key] = undefined;
-    cb({ value: true });
-  }
-}
-
-//
+// external stores ///////////////////////////////////////////////////////////
 
 type MaybePromise<T> = T | Promise<T>;
 
-/** ExternalStoreTxn is part of ExternalStore. */
+/** ExternalStoreTxn is one transaction of an ExternalStore.  The store converts: it persists
+    the representation it keeps and answers in the one wanted, undefined for an absent key. */
 export interface ExternalStoreTxn {
-  /** get gets a value (specific decoder is provided, if needed) */
-  get(key: string, decoder: StoreDecoder): MaybePromise<unknown>;
-  /** set sets a value (store backend may call encodeProto if needed) */
-  set(key: string, value: unknown): MaybePromise<void>;
-  /** del deletes a value */
+  get(key: string, type: string, want: Wants): MaybePromise<StoreValue | undefined>;
+  set(key: string, type: string, value: StoreValue): MaybePromise<void>;
   del(key: string): MaybePromise<void>;
+  /** delete every key under prefix; returns the keys deleted */
+  delPrefix(prefix: string): MaybePromise<string[]>;
+  /** rekey every key under src to dst; returns the keys as they now exist */
+  move(src: string, dst: string): MaybePromise<string[]>;
+  /** one batch of a range walk */
+  scan(
+    range: StoreRange,
+  ): MaybePromise<{ entries: [string, StoreValue | undefined][]; next: string | null }>;
   /** commit the transaction */
   commit(): MaybePromise<void>;
   /** abort the transaction.  You do not need to call abort() directly; it will be called
@@ -1685,7 +2026,7 @@ export interface ExternalStoreTxn {
 }
 
 /** ExternalStore implements Store with automatic conversions between native return values and
-    the generator-based reducers runtime */
+    the generator-based store protocol */
 export class ExternalStore {
   #txnFn: (writable: boolean) => MaybePromise<ExternalStoreTxn>;
 
@@ -1723,26 +2064,27 @@ export class ExternalStore {
     };
 
     const userTxn = yield* resolve(this.#txnFn(writable));
-    const txn: WTxn = {
-      get: (key: string, decoder: StoreDecoder, cb: (result: StoreResult) => void) => {
-        toPromise(userTxn.get(key, decoder)).then(
-          (result) => cb({ value: result }),
-          (e: unknown) => cb({ err: e as Error }),
-        );
-      },
-      set: (key: string, value: unknown, cb: (result: StoreDone) => void) => {
-        toPromise(userTxn.set(key, value)).then(
-          () => cb({ value: true }),
-          (e: unknown) => cb({ err: e as Error }),
-        );
-      },
-      del: (key: string, cb: (result: StoreDone) => void) => {
-        toPromise(userTxn.del(key)).then(
-          () => cb({ value: true }),
-          (e: unknown) => cb({ err: e as Error }),
-        );
-      },
+    // a user method's result or rejection, delivered to a callback
+    const deliver = <P, R>(p: MaybePromise<P>, ok: (p: P) => R, cb: (r: R | { err: Error }) => void) => {
+      toPromise(p).then(
+        (result) => cb(ok(result)),
+        (e: unknown) => cb({ err: e as Error }),
+      );
     };
+    const rtxn: RTxn = {
+      get: (key, type, want, cb) => deliver(userTxn.get(key, type, want), (value) => ({ value }), cb),
+      scan: (range, cb) => deliver(userTxn.scan(range), (r) => r, cb),
+    };
+    const txn: WTxn = writable
+      ? {
+          ...rtxn,
+          set: (key, type, value, cb) =>
+            deliver(userTxn.set(key, type, value), () => ({ value: true }) as const, cb),
+          del: (key, cb) => deliver(userTxn.del(key), () => ({ value: true }) as const, cb),
+          delPrefix: (prefix, cb) => deliver(userTxn.delPrefix(prefix), (keys) => ({ keys }), cb),
+          move: (src, dst, cb) => deliver(userTxn.move(src, dst), (keys) => ({ keys }), cb),
+        }
+      : (rtxn as WTxn);
 
     let result: T;
     try {
@@ -1770,17 +2112,17 @@ export class ExternalStore {
 // reducers /////////////////////////////////////////////////////////////////
 
 export type ReducerQuestion = {
-  // keys to look up and their type name; any format returned is accepted and converted by caller
+  // keys to look up, with their type; the answer is the rich js value
   get?: Record<string, string>;
-  // key-values to set, plus their type name; any format is allowed and converted by store
-  set?: Record<string, [StoreResult, string]]>;
-  // key-values to delete
+  // rich js values to set, with their type
+  set?: Record<string, { type: string; value: unknown }>;
+  // keys to delete
   del?: Record<string, true>;
 };
 
 export type ReducerAnswer = {
   // key-value lookup results
-  get: Record<string, StoreResult>;
+  get: Record<string, { value: unknown } | { err: Error }>;
   // keys done setting
   set: Record<string, StoreDone>;
   // keys done deleting
@@ -1789,18 +2131,19 @@ export type ReducerAnswer = {
 
 export type Reducer<T> = Generator<ReducerQuestion, T, ReducerAnswer>;
 
-/** wrap a Reducer so it acts like a WStoreGenerator, returning a set of updated keys */
-export function* runReducer(
-  g: Reducer<any[] | void>,
-): WStoreGenerator<{ updates: string[]; markedSent: any[] }> {
+/** wrap a Reducer so it acts like a WStoreGenerator, returning the set of updated keys.
+    Reducers work in rich js: every get asks the store for `js` and every set hands it `js`. */
+export function* runReducer(g: Reducer<void>): WStoreGenerator<{ updates: string[] }> {
   // our cache of get's we've already completed
   const old: Record<string, unknown> = Object.create(null);
   // our planned sets and dels that we submit at the end
   const cur: Record<string, unknown> = Object.create(null);
+  // the type of every key we set, for the store
+  const types: Record<string, string> = Object.create(null);
 
-  function* finish(retVal: any[]): WStoreGenerator<{ updates: string[]; markedSent: any[] }> {
+  function* finish(): WStoreGenerator<{ updates: string[] }> {
     const updates = [];
-    const question: WStoreQuestion = { get: {}, set: {}, del: {} };
+    const question: WStoreQuestion = { set: {}, del: {} };
     for (const [k, v] of Object.entries(cur)) {
       if (v === DELETED) {
         question.del![k] = true;
@@ -1814,11 +2157,11 @@ export function* runReducer(
         if (r === o) continue;
         // otherwise write the value to the store
         updates.push(k);
-        question.set![k] = r;
+        question.set![k] = { type: types[k], value: { [JS]: r } };
       }
     }
     // are there any store updates to make?
-    if (updates.length === 0) return { updates, markedSent: retVal };
+    if (updates.length === 0) return { updates };
     let nupdated = 0;
     while (nupdated < updates.length) {
       // actually yield the write request to the store
@@ -1833,43 +2176,25 @@ export function* runReducer(
         nupdated++;
       }
     }
-    return { updates, markedSent: retVal };
+    return { updates };
   }
 
-  let ans: ReducerAnswer = { old: {}, get: {}, set: {}, del: {} };
+  let ans: ReducerAnswer = { get: {}, set: {}, del: {} };
   // inflight is for gets we have submitted but haven't received
-  // (you can have many olds or gets in flight simultaneously, but only one set, and it cannot be
-  //  simultaneous with any gets)
   const inflight: Record<string, true> = {};
-  // pending is for answers we're trying to deliver
-  // {key: pending_ops}
-  const pending: Record<string, { old?: true; get?: true }> = {};
-  let storeQuestion: WStoreQuestion = { get: {}, set: {}, del: {} };
+  let storeQuestion: WStoreQuestion = { get: {} };
 
   // run the reducer to completion
   while (true) {
     let ready = true;
     while (ready) {
       const { value, done } = g.next(ans);
-      if (done) return yield* finish(value ?? []);
+      if (done) return yield* finish();
 
-      ans = { old: {}, get: {}, set: {}, del: {} };
+      ans = { get: {}, set: {}, del: {} };
       ready = false;
 
-      for (const [key, decoder] of Object.entries(value.old ?? {})) {
-        if (key in old) {
-          // we already know this one
-          // note that copyOnWrite() is applied inside the ReducerContext; not here
-          ans.old[key] = { value: old[key] };
-          ready = true;
-        } else if (!inflight[key]) {
-          inflight[key] = true;
-          storeQuestion.get![key] = decoder;
-          setdefault(pending, key, {}).old = true;
-        }
-      }
-
-      for (const [key, decoder] of Object.entries(value.get ?? {})) {
+      for (const [key, type] of Object.entries(value.get ?? {})) {
         if (key in cur) {
           // value was already set
           // TODO: let copyOnWrite() fork an existing copyOnWrite object, so we don't have to
@@ -1884,14 +2209,14 @@ export function* runReducer(
           ready = true;
         } else if (!inflight[key]) {
           inflight[key] = true;
-          storeQuestion.get![key] = decoder;
-          setdefault(pending, key, {}).get = true;
+          storeQuestion.get![key] = { type, want: JS };
         }
       }
 
-      for (const [key, val] of Object.entries(value.set ?? {})) {
+      for (const [key, { type, value: val }] of Object.entries(value.set ?? {})) {
         // just store this in memory for now
         cur[key] = val;
+        types[key] = type;
         ans.set[key] = { value: true };
         ready = true;
       }
@@ -1907,26 +2232,19 @@ export function* runReducer(
     // interact with the store until we have an answer to return to the reducers
     while (!ready) {
       const storeAnswer = yield storeQuestion;
-      storeQuestion = { get: {}, set: {}, del: {} };
+      storeQuestion = { get: {} };
 
       for (const [key, val] of Object.entries(storeAnswer.get)) {
-        // cache successful results
-        if ('value' in val) old[key] = val.value;
-        // done with this query
         delete inflight[key];
-        const pnd = pending[key];
-        // why did we need this again?
-        if (pnd.old) {
-          // note that copyOnWrite() is applied inside the ReducerContext; not here
-          ans.old[key] = val;
-          ready = true;
-        }
-        if (pnd.get) {
-          // note that copyOnWrite() is applied inside the ReducerContext; not here
+        if ('err' in val) {
           ans.get[key] = val;
-          ready = true;
+        } else {
+          // cache the rich value; undefined for an absent key
+          old[key] = val.value === undefined ? undefined : (val.value as Record<number, unknown>)[JS];
+          // note that copyOnWrite() is applied inside the ReducerContext; not here
+          ans.get[key] = { value: old[key] };
         }
-        delete pending[key];
+        ready = true;
       }
     }
   }
@@ -2402,7 +2720,7 @@ export type Backfill = {
   // Tell the Engine about a new value we read out of the snapshot.
   onValues(values: [string, Uint8Array][], skip: number): Promise<void>;
   // Tell the Engine about a new event we loaded from the post-snapshot tail.
-  onEvents(events: DbEvent<Uint8Array>[]): Promise<void>;
+  onEvents(events: WireEvent[]): Promise<void>;
 };
 
 export type CommandResult =
@@ -2428,7 +2746,7 @@ export interface ConnectorHooks {
   // Sent first when the presented token was not current, and on every change, in stream order
   // ahead of the events it applies to.  The Engine diffs refs against what it holds.
   onView(token: string, position: number, refs: string[]): void;
-  onEvents(events: DbEvent<Uint8Array>[]): void;
+  onEvents(events: WireEvent[]): void;
   // history done; live from here (sent once per connection)
   onLive(position: number): void;
   onVouch(position: number): void;
@@ -2448,15 +2766,6 @@ export type ConnectorFactory = (
 
 // engines ////////////////////////////////////////////////////////////////////
 
-export interface Registry {
-  jsToHost(value: unknown, type: string): unknown;
-  bytesToHost(value: Uint8Array, type: string): unknown;
-  hostToJS();
-  bytesToJS();
-  jsToBytes();
-  hostToBytes();
-}
-
 /** Command wraps command data T with the client-minted id it will carry through the log. */
 export type Command<T> = {
   id: string;
@@ -2473,6 +2782,11 @@ export type DbEvent<T> = {
   seq: number;
   servertime: number;
 };
+
+/** WireEvent is an event as a connector delivers it: the envelope decoded for routing, data as
+    the bytes the server sent, and the whole wire pair `[env, data]` so if needs to be parked, the
+    full msgpack format is readily available. */
+export type WireEvent = DbEvent<Uint8Array> & { raw: Uint8Array };
 
 export function decodeDbEvent<T>(val: any, subdecoder: (val: any) => T): DbEvent<T> {
   return { ...val, data: subdecoder(val.data) } as DbEvent<T>;
@@ -2689,10 +3003,10 @@ export class Engine<QX, RX, E, C> {
     }
   }
 
-  onView(token: string, grant?: string[], revoke?: string[]): ...;
-  onEvents(...): ...;
-  onVouch(...): ...;
-  onEnd(...): ...;
+  // onView(token: string, grant?: string[], revoke?: string[]): ...;
+  // onEvents(...): ...;
+  // onVouch(...): ...;
+  // onEnd(...): ...;
 
 
   ////////////////////////////////////////////////////////////////////////////////////////////
@@ -2921,7 +3235,7 @@ export class Engine<QX, RX, E, C> {
       if (this.#dirty) {
       }
 
-      if (this.#recvdMsgs.length) > 0) {
+      if (this.#recvdMsgs.length > 0) {
         // what needs to apply in-order, vs what can be sorted-then-applied:
         // - revokes can be applied late but not early:
         //    - revoke must be applied after events before it have been reduced, so we don't

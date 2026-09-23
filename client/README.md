@@ -46,9 +46,11 @@ export type DbEvent<T> = {
 ```
 
 A command is the client's until precommit turns it into events, so it
-has no stream; an event is the DB's.  Connectors carry `data` as the raw
-msgpack bytes the server sent, `DbEvent<Uint8Array>` in TypeScript, and
-take command data the same way, `Command<Uint8Array>`.  A connector
+has no stream; an event is the DB's.  Connectors deliver a `WireEvent`:
+the envelope decoded for routing, `data` as the raw msgpack bytes the
+server sent, and `raw`, the whole wire pair, so the Engine can park an
+event as a slice with no conversion.  They take command data as bytes
+the same way, `Command<Uint8Array>`.  A connector
 never decodes or encodes a payload and never sees a registry: the
 Engine converts bytes to rich values through the host's registry when
 it reduces, and parks bytes untouched when it parks.  How a host turns
@@ -97,7 +99,7 @@ for one.
 ```ts
 export interface ConnectorHooks {
   onView(token: string, position: number, refs: string[]): void;
-  onEvents(events: DbEvent<Uint8Array>[]): void;
+  onEvents(events: WireEvent[]): void;
   onLive(position: number): void;
   onVouch(position: number): void;
   onEnd(code: number, reason: string): void;
@@ -150,7 +152,7 @@ export type Backfill = {
   signal: AbortSignal;
   onHeader(position: number, seqs: Record<string, number>): Promise<void>;
   onValues(values: [string, Uint8Array][], skip: number): Promise<void>;
-  onEvents(events: DbEvent<Uint8Array>[]): Promise<void>;
+  onEvents(events: WireEvent[]): Promise<void>;
 };
 
 export type BackfillOutcome = 'done' | 'stale';

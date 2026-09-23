@@ -18,6 +18,10 @@ export type DbEvent<T> = {
   servertime: number;
 };
 
+/** WireEvent is an event as a connector delivers it: the envelope decoded for routing, data as
+    the bytes the server sent, and the whole wire pair `[env, data]` so parking it is a slice. */
+export type WireEvent = DbEvent<Uint8Array> & { raw: Uint8Array };
+
 export type Backfill = {
   // what ref are we backfilling (stream name or prefix)
   ref: string;
@@ -36,7 +40,7 @@ export type Backfill = {
   // Tell the Engine about a new value we read out of the snapshot.
   onValues(values: [string, Uint8Array][], skip: number): Promise<void>;
   // Tell the Engine about a new event we loaded from the post-snapshot tail.
-  onEvents(events: DbEvent<Uint8Array>[]): Promise<void>;
+  onEvents(events: WireEvent[]): Promise<void>;
 };
 
 export type CommandResult =
@@ -62,7 +66,7 @@ export interface ConnectorHooks {
   // Sent first when the presented token was not current, and on every change, in stream order
   // ahead of the events it applies to.  The Engine diffs refs against what it holds.
   onView(token: string, position: number, refs: string[]): void;
-  onEvents(events: DbEvent<Uint8Array>[]): void;
+  onEvents(events: WireEvent[]): void;
   // history done; live from here (sent once per connection)
   onLive(position: number): void;
   onVouch(position: number): void;

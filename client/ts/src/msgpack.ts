@@ -228,6 +228,15 @@ export class Reader {
     this.#pos = end;
   }
 
+  /** view returns the next value's bytes as a view into the buffer, undecoded */
+  view(): Uint8Array {
+    const end = measure(this.#buf, this.#pos, this.#end);
+    if (end < 0) throw new Error('truncated msgpack value');
+    const out = this.#buf.subarray(this.#pos, end);
+    this.#pos = end;
+    return out;
+  }
+
   /** raw returns a copy of the next value's bytes, undecoded */
   raw(): Uint8Array {
     const end = measure(this.#buf, this.#pos, this.#end);

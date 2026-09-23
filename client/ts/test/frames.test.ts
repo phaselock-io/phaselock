@@ -18,6 +18,12 @@ describe('parseFrame', () => {
       1700000000000,
     ]);
     expect(decode(e.data)).toEqual({ type: 'x', n: [1, 2] });
+    // raw is the whole pair, and data is a view into it
+    expect(decode(e.raw)).toEqual([
+      [7, 'patron.p1', 3, 'id-1', 1700000000000],
+      { type: 'x', n: [1, 2] },
+    ]);
+    expect(e.data.buffer).toBe(e.raw.buffer);
   });
 
   test('events: several events in one atom keep their order', () => {
