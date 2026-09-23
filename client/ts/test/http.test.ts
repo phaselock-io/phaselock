@@ -301,6 +301,7 @@ describe('backfill', () => {
     header: { position: number; seqs: Record<string, number> } | null;
     batches: { keys: string[]; skip: number }[];
     tails: [number, string, number][][];
+    done: ('values' | 'events')[];
   };
 
   async function run(
@@ -309,7 +310,7 @@ describe('backfill', () => {
     until: number,
     resume: Backfill['resume'] = null,
   ): Promise<Run> {
-    const got: Run = { outcome: 'done', header: null, batches: [], tails: [] };
+    const got: Run = { outcome: 'done', header: null, batches: [], tails: [], done: [] };
     got.outcome = await conn.backfill({
       ref,
       until,
@@ -321,8 +322,14 @@ describe('backfill', () => {
       onValues: async (values, skip) => {
         got.batches.push({ keys: values.map(([k]) => k), skip });
       },
+      onValuesDone: async () => {
+        got.done.push('values');
+      },
       onEvents: async (events) => {
         got.tails.push(events.map((e) => [e.position, e.stream, e.seq]));
+      },
+      onEventsDone: async () => {
+        got.done.push('events');
       },
     });
     return got;
@@ -395,7 +402,9 @@ describe('backfill', () => {
       n += b.keys.length;
       expect(b.skip).toBe(built.recordEnds[n - 1]);
     }
+    // each half ends with exactly one done call, and no empty batch is ever delivered
     expect(r.tails).toEqual([]);
+    expect(r.done.sort()).toEqual(['events', 'values']);
     const reqs = stub.requests.filter((q) => q.path.startsWith('/events/'));
     expect(reqs).toHaveLength(1);
     expect(reqs[0].headers.authorization).toBe('Bearer jwt');
@@ -409,6 +418,8 @@ describe('backfill', () => {
     expect(positions[0]).toBe(41);
     expect(positions.at(-1)).toBe(2599);
     expect(positions).toHaveLength(2559);
+    expect(r.tails).toHaveLength(3);
+    expect(r.done.filter((d) => d === 'events')).toEqual(['events']);
     const pages = stub.requests.filter((q) => q.path.startsWith('/events/')).map((q) => q.path);
     expect(pages).toHaveLength(3);
     const urls =
@@ -425,10 +436,22 @@ describe('backfill', () => {
       if (req.url!.startsWith('/events/'))
         seenAfter.push(Number(new URL(req.url!, stub.url).searchParams.get('after')));
     });
-    await run(conn, 'patron.*', 200, { position: 40, skipBytes: 0, fromPosition: 100 });
+    await run(conn, 'patron.*', 200, {
+      position: 40,
+      skipBytes: 0,
+      fromPosition: 100,
+      snapshotDone: false,
+      tailDone: false,
+    });
     expect(seenAfter).toEqual([100]);
     seenAfter.length = 0;
-    await run(conn, 'patron.*', 200, { position: 10, skipBytes: 0, fromPosition: 20 });
+    await run(conn, 'patron.*', 200, {
+      position: 10,
+      skipBytes: 0,
+      fromPosition: 20,
+      snapshotDone: false,
+      tailDone: false,
+    });
     expect(seenAfter).toEqual([40]);
   });
 
@@ -436,7 +459,13 @@ describe('backfill', () => {
     serveBlob();
     serveTail();
     const skip = built.recordEnds[1000];
-    const r = await run(conn, 'patron.*', 40, { position: 40, skipBytes: skip, fromPosition: 40 });
+    const r = await run(conn, 'patron.*', 40, {
+      position: 40,
+      skipBytes: skip,
+      fromPosition: 40,
+      snapshotDone: false,
+      tailDone: false,
+    });
     expect(r.outcome).toBe('done');
     expect(r.header).toBeNull();
     expect(r.batches.flatMap((b) => b.keys)).toEqual(Object.keys(records).sort().slice(1001));
@@ -458,6 +487,8 @@ describe('backfill', () => {
       position: 40,
       skipBytes: built.recordEnds[2400],
       fromPosition: 40,
+      snapshotDone: false,
+      tailDone: false,
     });
     expect(r.batches.flatMap((b) => b.keys)).toEqual(Object.keys(records).sort().slice(2401));
   });
@@ -469,15 +500,55 @@ describe('backfill', () => {
       position: 40,
       skipBytes: built.bytes.length,
       fromPosition: 40,
+      snapshotDone: false,
+      tailDone: false,
     });
     expect(r.outcome).toBe('done');
     expect(r.batches).toEqual([]);
+    expect(r.done).toContain('values');
+  });
+
+  test('resume: a finished half is skipped outright', async () => {
+    serveBlob();
+    serveTail();
+    const snapshotDone = {
+      position: 40,
+      skipBytes: 0,
+      fromPosition: 40,
+      snapshotDone: true,
+      tailDone: false,
+    };
+    const r = await run(conn, 'patron.*', 100, snapshotDone);
+    expect(r.outcome).toBe('done');
+    expect(r.header).toBeNull();
+    expect(r.batches).toEqual([]);
+    expect(r.done).toEqual(['events']);
+    expect(stub.requests.filter((q) => q.path.startsWith('/snapshot/'))).toHaveLength(0);
+    const tailDone = {
+      position: 40,
+      skipBytes: 0,
+      fromPosition: 99,
+      snapshotDone: false,
+      tailDone: true,
+    };
+    const r2 = await run(conn, 'patron.*', 100, tailDone);
+    expect(r2.outcome).toBe('done');
+    expect(r2.header!.position).toBe(40);
+    expect(r2.tails).toEqual([]);
+    expect(r2.done).toEqual(['values']);
+    expect(stub.requests.filter((q) => q.path.startsWith('/events/'))).toHaveLength(1);
   });
 
   test('stale: a resumed position that no longer matches', async () => {
     serveBlob(built.bytes, 41);
     serveTail();
-    const r = await run(conn, 'patron.*', 40, { position: 40, skipBytes: 100, fromPosition: 40 });
+    const r = await run(conn, 'patron.*', 40, {
+      position: 40,
+      skipBytes: 100,
+      fromPosition: 40,
+      snapshotDone: false,
+      tailDone: false,
+    });
     expect(r.outcome).toBe('stale');
     expect(r.header).toBeNull();
     expect(r.batches).toEqual([]);
@@ -586,7 +657,9 @@ describe('backfill', () => {
       signal: ctl.signal,
       onHeader: async () => {},
       onValues: async () => {},
+      onValuesDone: async () => {},
       onEvents: async () => {},
+      onEventsDone: async () => {},
     });
     ctl.abort();
     await expect(p).rejects.toThrow();
@@ -608,7 +681,9 @@ describe('backfill', () => {
         calls++;
         if (calls === 1) await gate;
       },
+      onValuesDone: async () => {},
       onEvents: async () => {},
+      onEventsDone: async () => {},
     });
     await settle();
     // the first batch is held; at most one more has been handed over

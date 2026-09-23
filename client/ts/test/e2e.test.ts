@@ -82,9 +82,11 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
         got.values.push(...values);
         got.skips.push(skip);
       },
+      onValuesDone: async () => {},
       onEvents: async (events) => {
         got.tails.push(events.map((e) => [e.position, e.stream, e.seq]));
       },
+      onEventsDone: async () => {},
     });
     return { outcome, ...got };
   }
@@ -180,6 +182,8 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
       position: cursor,
       skipBytes: p1.skips[0],
       fromPosition: cursor,
+      snapshotDone: false,
+      tailDone: false,
     });
     expect(back.outcome).toBe('done');
     expect(back.header).toBeNull();
@@ -193,6 +197,8 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
       position: cursor,
       skipBytes: 30,
       fromPosition: cursor,
+      snapshotDone: false,
+      tailDone: false,
     });
     expect(stale.outcome).toBe('stale');
 

@@ -1398,6 +1398,18 @@ export function* txnScan(
   return ans;
 }
 
+/** every entry of a range, batch by batch */
+export function* txnScanAll(range: StoreRange): RStoreGenerator<[string, StoreValue | undefined][]> {
+  const all: [string, StoreValue | undefined][] = [];
+  let r = range;
+  for (;;) {
+    const { entries, next } = yield* txnScan(r);
+    all.push(...entries);
+    if (next === null) return all;
+    r = resumeRange(r, next);
+  }
+}
+
 /** the range to resume a scan from after a batch */
 export function resumeRange(range: StoreRange, next: string): StoreRange {
   const r = { ...range };
@@ -2726,19 +2738,28 @@ export type Backfill = {
   // the tail's exclusive upper bound: the cursor when this backfill started.  Anything at or
   // above it arrives on the live stream and is parked.  Retries keep the original value.
   until: number;
-  // what a previous attempt got through, or null for a fresh backfill.  skipBytes > 0 resumes
-  // the blob download, and the header's position must then equal position or the outcome is
-  // 'stale'; skipBytes === 0 fetches from the start and accepts any position.  The tail starts
-  // at max(fromPosition, header position), so a newer blob overrides the floor.
-  resume: null | { position: number; skipBytes: number; fromPosition: number };
+  // what a previous attempt got through, or null for a fresh backfill.  A finished half is
+  // skipped outright.  Otherwise skipBytes > 0 resumes the blob download, and the header's
+  // position must then equal position or the outcome is 'stale'; skipBytes === 0 fetches from
+  // the start and accepts any position.  The tail starts at max(fromPosition, header position),
+  // so a newer blob overrides the floor.
+  resume: null | {
+    position: number;
+    skipBytes: number;
+    fromPosition: number;
+    snapshotDone: boolean;
+    tailDone: boolean;
+  };
   // cancels this backfill alone; the connector's own signal cancels everything
   signal: AbortSignal;
   // Tell the Engine the position the snapshot was cut at and the seq of every stream in it
   onHeader(position: number, seqs: Record<string, number>): Promise<void>;
-  // Tell the Engine about a new value we read out of the snapshot.
+  // Tell the Engine about values read out of the snapshot, and when the last of them is in
   onValues(values: [string, Uint8Array][], skip: number): Promise<void>;
-  // Tell the Engine about a new event we loaded from the post-snapshot tail.
+  onValuesDone(): Promise<void>;
+  // Tell the Engine about events loaded from the post-snapshot tail, and when the last is in
   onEvents(events: WireEvent[]): Promise<void>;
+  onEventsDone(): Promise<void>;
 };
 
 export type CommandResult =
@@ -2891,7 +2912,7 @@ export type CheckpointRecord = { epoch: number; position: number };
 /** a backfill in flight, as persisted at /backfill.{ref} */
 export type BackfillRecord = {
   until: number;
-  resume: null | { position: number; skipBytes: number; fromPosition: number };
+  resume: Backfill['resume'];
   replacing: boolean;
   children: string[];
 };
@@ -2902,7 +2923,15 @@ type BackfillEntry = {
   status: 'downloading' | 'waiting' | 'ready';
   parent: string | null;
 };
-/** what the connector delivered, in arrival order; the advancer drains it one item at a time */
+/** whether a wire ref covers a stream name or a narrower ref: `*` covers everything, `family.*`
+    covers names under `family.`, and a name covers itself */
+export function refCovers(ref: string, name: string): boolean {
+  if (ref === '*') return true;
+  if (ref.endsWith('.*')) return name.startsWith(ref.slice(0, -1));
+  return name === ref;
+}
+
+/** what the connector delivered, in arrival order */
 type Inbound =
   | { view: ViewRecord }
   | { events: WireEvent[] }
@@ -2915,7 +2944,6 @@ export class Engine<QX, C> {
   #reg: Registry;
   #connect: ConnectorFactory;
   #reducers: Record<string, SliceReducer>;
-  #migrate: null | (() => Reducer<void>);
   // runs against the overlay for every outbox command in order on every rebuild; a string is a
   // rejection and forecasts nothing
   #forecaster: null | ((qx: QX, command: C) => QueryGenerator<{ stream: string; event: unknown }[] | string>);
@@ -2939,7 +2967,8 @@ export class Engine<QX, C> {
   // the persisted state, held in memory and written through
   #view: ViewRecord | null = null;
   #checkpoint: CheckpointRecord | null = null;
-  // seq per held stream, or the marker for a stream under an in-flight ref
+  // seq per held stream, or the marker for a stream under an in-flight ref; the marker is
+  // persisted at /seq.{stream} on first sight during the backfill, in the transaction that parks
   #streams: Map<string, number | 'backfill'> = new Map();
   #backfills: Map<string, BackfillEntry> = new Map();
   // the outbox in send order: command id to its ordinal in /command.{ordinal}
@@ -2967,8 +2996,6 @@ export class Engine<QX, C> {
       reducers: Record<string, SliceReducer>;
       // injected by generated subclass: the refs of the shards the engine declares
       wants: string[];
-      // optional: configure store before any events arrive
-      migrate?: () => Reducer<void>;
       // optional: forecast the events the server will mint for a command, by stream, reading the
       // state the earlier outbox commands leave; a string is a rejection
       forecaster?: (qx: QX, command: C) => QueryGenerator<{ stream: string; event: unknown }[] | string>;
@@ -2981,7 +3008,6 @@ export class Engine<QX, C> {
     this.#connect = connect;
     this.#reducers = callbacks.reducers;
     this.#wants = callbacks.wants;
-    this.#migrate = callbacks.migrate ?? null;
     this.#forecaster = callbacks.forecaster ?? null;
     this.#signal = callbacks.signal ?? new AbortController().signal;
 
@@ -3027,57 +3053,65 @@ export class Engine<QX, C> {
     });
   }
 
+  // boot: load the persisted state into memory, rebuild the overlay, and connect
   *#initialize(): Generator<void, void, void> {
     const self = this;
+    const js = (v: StoreValue) => (v as Record<number, unknown>)[JS];
 
-    // run migration logic on the data store
-    if (self.#migrate) {
-      yield* withWTxn(this.#fx, this.#store, function* () {
-        yield* runReducer(self.#migrate!(self.#rx));
-        // ignore updated keys and don't trigger a run of the graph
-      });
-    }
-
-    // load unsent commands from the store
-    const encoded: Command<any>[] = [];
     yield* withRTxn(this.#fx, this.#store, function* () {
-      // no decoding needed for `string[]` of command ids
-      const index = ((yield* txnGet('.commands', null)) as string[]) ?? [];
-      for (const id of index) {
-        // commands are stored in their plain json form, which needs no decoding (yet)
-        const enc = (yield* txnGet(`.command-${id}`, null)) as Command<any>;
-        encoded.push(enc);
+      self.#checkpoint = ((yield* txnGet('/checkpoint', '.json')) as CheckpointRecord | undefined) ?? null;
+      self.#view = ((yield* txnGet('/view', '.json')) as ViewRecord | undefined) ?? null;
+
+      // the streams table: seq per held stream, or the marker for a stream under a backfill
+      for (const [key, value] of yield* txnScanAll(prefixRange('/seq.', 1000, { type: '.json', want: JS }))) {
+        self.#streams.set(key.slice('/seq.'.length), js(value!) as number | 'backfill');
+      }
+
+      // the outbox in ordinal order; the next ordinal continues from the last key
+      for (const [key, value] of yield* txnScanAll(prefixRange('/command.', 1000, { type: '.command', want: JS }))) {
+        const ordinal = Number(key.slice('/command.'.length));
+        self.#outbox.set((js(value!) as Command<C>).id, ordinal);
+        self.#nextOrdinal = ordinal + 1;
+      }
+
+      // backfills in flight, each with a fresh controller
+      for (const [key, value] of yield* txnScanAll(prefixRange('/backfill.', 1000, { type: '.json', want: JS }))) {
+        const record = js(value!) as BackfillRecord;
+        self.#backfills.set(key.slice('/backfill.'.length), {
+          record,
+          controller: new AbortController(),
+          status: 'downloading',
+          parent: null,
+        });
+        if (record.replacing) self.#replacing++;
       }
     });
-    if (encoded.length === 0) return;
-
-    if (!this.#forecaster) {
-      // reload just the list of unset event ids
-      for (const enc of encoded) {
-        this.#unsent.set(enc.id, []);
+    for (const [ref, entry] of this.#backfills) {
+      entry.parent = this.#parentOf(ref);
+      // a finished download waits on its children in flight, or is ready to land
+      const r = entry.record;
+      if (r.resume?.snapshotDone && r.resume.tailDone) {
+        const childInFlight = r.children.some((c) => this.#backfills.has(c));
+        entry.status = childInFlight ? 'waiting' : 'ready';
       }
-      return;
     }
 
-    // reload forecasted state
+    // the overlay: every outbox command forecast in order against the base
+    yield* this.#rebuildOverlay();
 
-    const forecasts: E[] = [];
-    for (const enc of encoded) {
-      // at this point we must decode the commands (which we stored in encoded form)
-      const command = this.#decodeCommand(enc);
-      // note that since the store may be in-memory, we must take care to preserve command.data
-      const c = copyOnWrite(command.data);
-      const fs = recover(this.#forecaster(c));
-      this.#unsent.set(command.id, fs);
-      forecasts.push(...fs);
+    // the first connection attempt
+    this.#connectNow = true;
+  }
+
+  // the most specific in-flight ref covering ref, other than itself: by the prefix rule any two
+  // refs are disjoint or nested, so this is the parent a child backfill merges into
+  #parentOf(ref: string): string | null {
+    let parent: string | null = null;
+    for (const other of this.#backfills.keys()) {
+      if (other === ref || !refCovers(other, ref)) continue;
+      if (parent === null || other.length > parent.length) parent = other;
     }
-    if (forecasts.length === 0) return;
-
-    // populate the initial overlay
-    yield* withWTxn(this.#fx, this.#overlay, function* () {
-      yield* runReducer(self.#reducer(self.#rx, forecasts));
-      // ignore updated keys and don't trigger a run of the graph
-    });
+    return parent;
   }
 
   // our main logic is implemented as a coroutine

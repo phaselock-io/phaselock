@@ -116,31 +116,45 @@ export class HTTPConnector implements Connector {
     // when one download fails the other is pointless
     const sibling = new AbortController();
     const signal = AbortSignal.any([b.signal, sibling.signal]);
-    const skip = b.resume?.skipBytes ?? 0;
-    const range: Record<string, string> = skip > 0 ? { Range: `bytes=${skip}-` } : {};
+    const r = b.resume;
 
-    const first = await fetch(`${this.#url}/snapshot/${b.ref}`, {
-      signal,
-      headers: this.#headers(range),
-    });
-    const okStatus = (r: Response) => r.status === 200 || r.status === 206 || r.status === 416;
-    if (!okStatus(first)) throw new Error(`snapshot ${b.ref}: ${first.status} ${first.statusText}`);
-    let blob = first;
-    if (first.headers.get('Content-Type')?.startsWith('text/plain')) {
-      // a pointer to the blob
-      const target = await first.text();
-      blob = await fetch(target, { signal, headers: range });
-      if (blob.status === 404 || blob.status === 410) return 'stale';
-      if (!okStatus(blob)) throw new Error(`snapshot ${b.ref}: ${blob.status} ${blob.statusText}`);
+    // the snapshot half, unless a previous attempt finished it
+    let position: number;
+    let snapshot: Promise<void> = Promise.resolve();
+    if (r?.snapshotDone) {
+      position = r.position;
+    } else {
+      const skip = r?.skipBytes ?? 0;
+      const range: Record<string, string> = skip > 0 ? { Range: `bytes=${skip}-` } : {};
+      const first = await fetch(`${this.#url}/snapshot/${b.ref}`, {
+        signal,
+        headers: this.#headers(range),
+      });
+      const okStatus = (r: Response) => r.status === 200 || r.status === 206 || r.status === 416;
+      if (!okStatus(first))
+        throw new Error(`snapshot ${b.ref}: ${first.status} ${first.statusText}`);
+      let blob = first;
+      if (first.headers.get('Content-Type')?.startsWith('text/plain')) {
+        // a pointer to the blob
+        const target = await first.text();
+        blob = await fetch(target, { signal, headers: range });
+        if (blob.status === 404 || blob.status === 410) return 'stale';
+        if (!okStatus(blob))
+          throw new Error(`snapshot ${b.ref}: ${blob.status} ${blob.statusText}`);
+      }
+      // the origin's response carries the position; a blob store owes only the bytes
+      position = Number(first.headers.get('PhaseLock-Position'));
+      if (!Number.isSafeInteger(position)) throw new Error(`snapshot ${b.ref}: no position`);
+      if (skip > 0 && position !== r!.position) return 'stale';
+      snapshot = this.#blob(b, blob, position, skip, signal);
     }
-    // the origin's response carries the position; a blob store owes only the bytes
-    const position = Number(first.headers.get('PhaseLock-Position'));
-    if (!Number.isSafeInteger(position)) throw new Error(`snapshot ${b.ref}: no position`);
-    if (skip > 0 && position !== b.resume!.position) return 'stale';
-    const from = Math.max(b.resume?.fromPosition ?? position, position);
+
+    // the tail half, unless a previous attempt finished it
+    const from = Math.max(r?.fromPosition ?? position, position);
+    const tail = r?.tailDone ? Promise.resolve() : this.#tail(b, from, signal);
 
     try {
-      await Promise.all([this.#blob(b, blob, position, skip, signal), this.#tail(b, from, signal)]);
+      await Promise.all([snapshot, tail]);
     } catch (e: unknown) {
       sibling.abort();
       throw e;
@@ -155,7 +169,11 @@ export class HTTPConnector implements Connector {
     skip: number,
     _signal: AbortSignal,
   ): Promise<void> {
-    if (resp.status === 416) return;
+    if (resp.status === 416) {
+      // skip is the end: every value was delivered already
+      await b.onValuesDone();
+      return;
+    }
     if (!resp.body) throw new Error(`snapshot ${b.ref}: no body`);
     const br = new ByteReader(resp.body, resp.status === 206 ? skip : 0);
     // a server that ignored the Range sent the whole blob; skip what we already have
@@ -243,6 +261,7 @@ export class HTTPConnector implements Connector {
     }
     if (batch.length > 0) await flush();
     await pending;
+    await b.onValuesDone();
   }
 
   async #tail(b: Backfill, from: number, signal: AbortSignal): Promise<void> {
@@ -264,7 +283,10 @@ export class HTTPConnector implements Connector {
         return true;
       });
       if (events.length > 0) await b.onEvents(events);
-      if (events.length < pageSize || !Number.isSafeInteger(scanned) || scanned >= b.until) return;
+      if (events.length < pageSize || !Number.isSafeInteger(scanned) || scanned >= b.until) {
+        await b.onEventsDone();
+        return;
+      }
       after = scanned;
     }
   }

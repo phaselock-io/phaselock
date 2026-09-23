@@ -28,19 +28,28 @@ export type Backfill = {
   // the tail's exclusive upper bound: the cursor when this backfill started.  Anything at or
   // above it arrives on the live stream and is parked.  Retries keep the original value.
   until: number;
-  // what a previous attempt got through, or null for a fresh backfill.  skipBytes > 0 resumes
-  // the blob download, and the header's position must then equal position or the outcome is
-  // 'stale'; skipBytes === 0 fetches from the start and accepts any position.  The tail starts
-  // at max(fromPosition, header position), so a newer blob overrides the floor.
-  resume: null | { position: number; skipBytes: number; fromPosition: number };
+  // what a previous attempt got through, or null for a fresh backfill.  A finished half is
+  // skipped outright.  Otherwise skipBytes > 0 resumes the blob download, and the header's
+  // position must then equal position or the outcome is 'stale'; skipBytes === 0 fetches from
+  // the start and accepts any position.  The tail starts at max(fromPosition, header position),
+  // so a newer blob overrides the floor.
+  resume: null | {
+    position: number;
+    skipBytes: number;
+    fromPosition: number;
+    snapshotDone: boolean;
+    tailDone: boolean;
+  };
   // cancels this backfill alone; the connector's own signal cancels everything
   signal: AbortSignal;
   // Tell the Engine the position the snapshot was cut at and the seq of every stream in it
   onHeader(position: number, seqs: Record<string, number>): Promise<void>;
-  // Tell the Engine about a new value we read out of the snapshot.
+  // Tell the Engine about values read out of the snapshot, and when the last of them is in
   onValues(values: [string, Uint8Array][], skip: number): Promise<void>;
-  // Tell the Engine about a new event we loaded from the post-snapshot tail.
+  onValuesDone(): Promise<void>;
+  // Tell the Engine about events loaded from the post-snapshot tail, and when the last is in
   onEvents(events: WireEvent[]): Promise<void>;
+  onEventsDone(): Promise<void>;
 };
 
 export type CommandResult =

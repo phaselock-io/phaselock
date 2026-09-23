@@ -148,11 +148,19 @@ not the client's job.
 export type Backfill = {
   ref: string;
   until: number;
-  resume: null | { position: number; skipBytes: number; fromPosition: number };
+  resume: null | {
+    position: number;
+    skipBytes: number;
+    fromPosition: number;
+    snapshotDone: boolean;
+    tailDone: boolean;
+  };
   signal: AbortSignal;
   onHeader(position: number, seqs: Record<string, number>): Promise<void>;
   onValues(values: [string, Uint8Array][], skip: number): Promise<void>;
+  onValuesDone(): Promise<void>;
   onEvents(events: WireEvent[]): Promise<void>;
+  onEventsDone(): Promise<void>;
 };
 
 export type BackfillOutcome = 'done' | 'stale';
@@ -208,7 +216,13 @@ construction and nothing is deduplicated.  Retries keep the original
 value.  The event that triggered a backfill sits at the cursor and is
 parked before the backfill starts.
 
-**`resume`** records what a previous attempt got through.
+**`resume`** records what a previous attempt got through.  Each half
+reports its own end with its own call, `onValuesDone` and
+`onEventsDone`, so a batch call always carries a batch; the Engine
+persists `snapshotDone` and `tailDone` from them, and a resumed
+backfill skips a finished half outright, which is what spares a
+live-cut blob a second full download when only the tail was open.  For
+an unfinished snapshot half,
 `skipBytes > 0` resumes the download, and the header's position must
 then equal `resume.position` or the outcome is `'stale'`;
 `skipBytes === 0` fetches from the start and accepts any position.
