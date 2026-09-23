@@ -2250,6 +2250,24 @@ export function* runReducer(g: Reducer<void>): WStoreGenerator<{ updates: string
   }
 }
 
+/** runReducers2 runs several slice reducers against one store transaction, one store question
+    per step.  It replaces runReducer once the reducer protocol is one ask per yield:
+
+    - ReducerQuestion becomes a union of one ask: { get, type } | { set, type, value } | { del }
+    - ReducerAnswer becomes { value } | { err }, a get answering the rich value or undefined
+    - each step: step every runnable generator, gather their single asks into one store question,
+      yield once, distribute the answers; a get is served from the reducer's own pending writes,
+      then its cache, else asked of the store
+    - every reducer's write set is merged into one batch at the end, with the noop check against
+      the cache as now
+    - a single reducer is the N=1 case
+
+    Slices are the axis that parallelizes: their key sets are disjoint by the slice rule, so the
+    land reduces many streams at once and IndexedDB pipelines one round trip per step. */
+export function* runReducers2(_gs: Reducer<void>[]): WStoreGenerator<{ updates: string[] }> {
+  throw new Error('runReducers2 is not built yet');
+}
+
 // queries ////////////////////////////////////////////////////////////////////
 
 /* Example query for loading all comments in a topic:
@@ -2792,46 +2810,6 @@ export function decodeDbEvent<T>(val: any, subdecoder: (val: any) => T): DbEvent
   return { ...val, data: subdecoder(val.data) } as DbEvent<T>;
 }
 
-function matchSent<C>(tpl: any, cmd: C): boolean {
-  if (typeof tpl !== typeof cmd) return false;
-  switch (typeof tpl) {
-    case 'boolean':
-    case 'bigint':
-    case 'number':
-    case 'string':
-    case 'undefined':
-      return tpl === cmd;
-
-    case 'function':
-      return tpl(cmd);
-
-    case 'object':
-      // null handled here
-      if (tpl === null) return cmd === null;
-      // general objects handled below
-      break;
-
-    case 'symbol':
-    default:
-      throw new Error(`mark of type "${typeof tpl}" not handled by matchSent`);
-  }
-
-  if (Array.isArray(tpl)) {
-    if (!Array.isArray(cmd)) return false;
-    if (tpl.length !== cmd.length) return false;
-    return tpl.every((v, i) => matchSent(v, cmd[i]));
-  }
-
-  if (tpl instanceof Map) {
-    throw new Error(`mark of type Map not handled by matchSent`);
-  }
-  if (tpl instanceof Set) {
-    throw new Error(`mark of type Set not handled by matchSent`);
-  }
-
-  return Object.entries(tpl).every(([k, v]) => matchSent(v, (cmd as Record<string, any>)[k]));
-}
-
 /** Engine builds a sync engine out of a Store implementation and a reducer to process incoming
    events.
 
@@ -2900,71 +2878,114 @@ function matchSent<C>(tpl: any, cmd: C): boolean {
 
        I: new commands also trigger the user's onCommands() hook so they can be sent over transport
 */
-export class Engine<QX, RX, E, C> {
-  #rx: RX;
-  #store: Store;
-  #decodeEvent: (raw: any) => E;
-  #decodeCommand: (raw: any) => Command<C>;
-  #migrate: null | ((rx: RX) => Reducer<void>);
-  #reducer: (rx: RX, events: E[]) => Reducer<any[] | void>;
-  #forecaster: null | ((commands: C) => E[]);
-  #onCommands: null | ((commands: Command<any>[]) => void);
-  #reg: Registry;
+/** one slice's reducer and the context it runs in, keyed by stream prefix in the Engine's table */
+export type SliceReducer = {
+  rx: unknown;
+  reducer: (rx: any, events: unknown[]) => Reducer<void>;
+};
 
-  #live: boolean = false;
-  #setLive: boolean = false;
+/** the view, as persisted at /view when a reconciliation commits */
+export type ViewRecord = { token: string; position: number; refs: string[] };
+/** the cursor, as persisted at /checkpoint with every batch and vouch */
+export type CheckpointRecord = { epoch: number; position: number };
+/** a backfill in flight, as persisted at /backfill.{ref} */
+export type BackfillRecord = {
+  until: number;
+  resume: null | { position: number; skipBytes: number; fromPosition: number };
+  replacing: boolean;
+  children: string[];
+};
+/** the in-memory side of a backfill: its record, written through, plus what the disk needs not */
+type BackfillEntry = {
+  record: BackfillRecord;
+  controller: AbortController;
+  status: 'downloading' | 'waiting' | 'ready';
+  parent: string | null;
+};
+/** what the connector delivered, in arrival order; the advancer drains it one item at a time */
+type Inbound =
+  | { view: ViewRecord }
+  | { events: WireEvent[] }
+  | { vouch: number }
+  | { live: number }
+  | { end: { code: number; reason: string } };
+
+export class Engine<QX, C> {
+  #store: Store;
+  #reg: Registry;
+  #connect: ConnectorFactory;
+  #reducers: Record<string, SliceReducer>;
+  #migrate: null | (() => Reducer<void>);
+  // runs against the overlay for every outbox command in order on every rebuild; a string is a
+  // rejection and forecasts nothing
+  #forecaster: null | ((qx: QX, command: C) => QueryGenerator<{ stream: string; event: unknown }[] | string>);
+  #wants: string[];
+  #signal: AbortSignal;
+
   #overlay: OverlayStore;
   #graph: QueryGraph<QX>;
   #coro: Generator<void, void, void>;
   #fx: FutureContext;
-
   #scheduled: boolean = false;
 
-  // #reconnects is a list of promise resolve functions
-  #reconnects: ((value: {
-    checkpoint: number | undefined;
-    commands: Command<any>[];
-  }) => void)[] = [];
-  #recvdEvents: DbEvent<E>[] = [];
-  // commands that came to us from the client
+  // the live connection: one connector per attempt, its lifetime (replaced as soon as it is
+  // spent), and the backoff between attempts
+  #connector: Connector | null = null;
+  #connectorAbort: AbortController = new AbortController();
+  #attempt: number = 0;
+  #retryTimer: ReturnType<typeof setTimeout> | null = null;
+  #connectNow: boolean = false;
+
+  // the persisted state, held in memory and written through
+  #view: ViewRecord | null = null;
+  #checkpoint: CheckpointRecord | null = null;
+  // seq per held stream, or the marker for a stream under an in-flight ref
+  #streams: Map<string, number | 'backfill'> = new Map();
+  #backfills: Map<string, BackfillEntry> = new Map();
+  // the outbox in send order: command id to its ordinal in /command.{ordinal}
+  #outbox: Map<string, number> = new Map();
+  #nextOrdinal: number = 0;
+
+  // liveness: the connector has delivered `live`, and no replacing backfill is in flight
+  #live: boolean = false;
+  #replacing: number = 0;
+
+  // work received from the connector, in arrival order
+  #inbox: Inbound[] = [];
+  // work received from the app
   #sendCommands: C[] = [];
-  // command ids the user explicitly marks as completed
-  #roundTripped: string[] = [];
-  // ordered map of command ids to the forecasted events from that command
-  #unsent: Map<string, E[]> = new Map();
-  // just a flag if new queries exist to be run; we don't store them here for typing purposes.
   #newQueries: boolean = false;
 
   constructor(
     qx: QX,
-    rx: RX,
     // if store is null, InMemStore is used
     store: Store | null,
+    reg: Registry,
+    connect: ConnectorFactory,
     callbacks: {
-      // injected by generated subclass: convert from json format to full type
-      decodeEvent: (raw: any) => E;
-      // injected by generated subclass: convert from store/wire format
-      decodeCommand: (raw: any) => C;
+      // injected by generated subclass: each slice's reducer and scoped context, by stream prefix
+      reducers: Record<string, SliceReducer>;
+      // injected by generated subclass: the refs of the shards the engine declares
+      wants: string[];
       // optional: configure store before any events arrive
-      migrate?: (rx: RX) => Reducer<void>;
-      // required: reduce a batch of events into the read model
-      reducer: (rx: RX, events: E[]) => Reducer<void | any[]>;
-      // optional: forecast the events a server will send for a batch of commands
-      forecaster?: (commands: C) => E[];
-      // required if using sendCommands: receive events to send on the wire (in plain-json format)
-      onCommands?: (commands: any[]) => void;
+      migrate?: () => Reducer<void>;
+      // optional: forecast the events the server will mint for a command, by stream, reading the
+      // state the earlier outbox commands leave; a string is a rejection
+      forecaster?: (qx: QX, command: C) => QueryGenerator<{ stream: string; event: unknown }[] | string>;
+      // optional: ends the Engine, its connector, and every backfill
+      signal?: AbortSignal;
     },
   ) {
-    this.#rx = rx;
-    this.#store = store ?? new InMemStore();
-    this.#decodeEvent = callbacks.decodeEvent;
-    this.#decodeCommand = (value: any) => ({ ...value, data: callbacks.decodeCommand(value.data) });
+    this.#store = store ?? new InMemStore(reg);
+    this.#reg = reg;
+    this.#connect = connect;
+    this.#reducers = callbacks.reducers;
+    this.#wants = callbacks.wants;
     this.#migrate = callbacks.migrate ?? null;
-    this.#reducer = callbacks.reducer;
     this.#forecaster = callbacks.forecaster ?? null;
-    this.#onCommands = callbacks.onCommands ?? null;
+    this.#signal = callbacks.signal ?? new AbortController().signal;
 
-    this.#overlay = new OverlayStore(this.#store);
+    this.#overlay = new OverlayStore(this.#store, reg);
     this.#graph = new QueryGraph(qx);
 
     this.#coro = this.#advancer();
@@ -2973,90 +2994,18 @@ export class Engine<QX, RX, E, C> {
     this.#fx.wakeup();
   }
 
-  ////////////////////////////////////////////////////////////////////////////////////////////
-
-
-  // onView receives either the initial visibility token, optionally with grants and revokes since
-  // the last check (if the transport offers that).
-  //
-  // Every view frame carries the whole set of refs; the Engine diffs it against what it holds.
-  #onView(token: string, grants?: string[], revokes?: string[]): void {
-    const self = this;
-    if (grant !== undefined && revoke != undefined) {
-      yield* withWTxn(this.#fx, this.#store, function* () {
-        // update our list of known shards
-        const known = yield* txnGet('/shards');
-        for (const shard of revokes) {
-          const res = yield* txnDelShard(shard);
-          delete self.known[shard];
-        }
-        // configure backfills for every new grant
-        for (const shard of grants) {
-          const g = (yield* txnGet(`/backfills.${shard}`)) ?? {};
-          yield* txnSet(`/backfills.${grant}`, {});
-          const res = yield* txnSet(`/backfills.${shard}`, g)
-        }
-
-        //
-
-      });
-    }
-  }
-
-  // onView(token: string, grant?: string[], revoke?: string[]): ...;
-  // onEvents(...): ...;
-  // onVouch(...): ...;
-  // onEnd(...): ...;
-
-
-  ////////////////////////////////////////////////////////////////////////////////////////////
-
   //// public api ////
 
-  /** request info needed to resume a connection: last committed checkpoint and unsent commands */
-  reconnect(
-    cb: (result: { checkpoint: number | undefined; commands: Command<any>[] }) => void,
-  ): void {
-    this.#reconnects.push(cb);
-    this.#schedule();
-  }
-
-  /** New events from the wire come here.  They must be in plain json format (the decodeEvent
-      callback from the constructor is applied universally to the raw incoming events). */
-  recvEvents(raw: DbEvent<any>[]): void {
-    for (const r of raw) {
-      const event = decodeDbEvent(r, this.#decodeEvent);
-      this.#recvdEvents.push(event);
-    }
-    this.#schedule();
-  }
-
-  fellBehind(): void {
-    this.#setLive = false;
-    this.#schedule();
-  }
-
-  caughtUp(): void {
-    this.#setLive = true;
-    this.#schedule();
-  }
-
-  /** After forecasting and saving to the store, these will appear in an onCommands() callback.
-      Note that the provided commands should be in rich format (Date, Maps, and Sets all intact),
-      but they will be encoded to plain json for the onCommands() callback. */
+  /** After forecasting and saving to the outbox, commands are sent through the connector in
+      order.  Commands are given in rich format (Date, Maps, and Sets intact). */
   sendCommands(commands: C[]): void {
-    if (!this.#onCommands) {
-      throw new Error('if sendCommands() is used, the onCommands callback is required');
-    }
     this.#sendCommands.push(...commands);
     this.#schedule();
   }
 
-  /** normally forecasted events are discarded when the event id that was submitted is observed in
-      recvEvents().  But if the command was rejected, then it may be necessary to explicitly flag the
-      command as sent, so the forecasted events from that rejected command can be discarded. */
-  markSent(...id: string[]): void {
-    this.#roundTripped.push(...id);
+  /** connect now rather than when the backoff timer fires */
+  reconnectNow(): void {
+    this.#connectNow = true;
     this.#schedule();
   }
 
