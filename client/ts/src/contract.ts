@@ -42,15 +42,19 @@ export type Backfill = {
   };
   // cancels this backfill alone; the connector's own signal cancels everything
   signal: AbortSignal;
-  // Tell the Engine the position the snapshot was cut at and the seq of every stream in it
-  onHeader(position: number, seqs: Record<string, number>): Promise<void>;
-  // Tell the Engine about values read out of the snapshot, and when the last of them is in
-  onValues(values: [string, Uint8Array][], skip: number): Promise<void>;
-  onValuesDone(): Promise<void>;
-  // Tell the Engine about events loaded from the post-snapshot tail, and when the last is in
-  onEvents(events: WireEvent[]): Promise<void>;
-  onEventsDone(): Promise<void>;
+  // one call per delivery, resolved once the Engine has committed it
+  push(item: BackfillItem): Promise<void>;
 };
+
+/** one delivery of a backfill: the blob's header (its cut position and the seq of every stream
+    in it), a batch of values with the byte offset after them, a page of tail events, or the end
+    of either half */
+export type BackfillItem =
+  | { header: { position: number; seqs: Record<string, number> } }
+  | { values: [string, Uint8Array][]; skip: number }
+  | { valuesDone: true }
+  | { events: WireEvent[] }
+  | { eventsDone: true };
 
 export type CommandResult =
   | { kind: 'ack'; position: number }

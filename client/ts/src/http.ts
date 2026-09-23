@@ -171,7 +171,7 @@ export class HTTPConnector implements Connector {
   ): Promise<void> {
     if (resp.status === 416) {
       // skip is the end: every value was delivered already
-      await b.onValuesDone();
+      await b.push({ valuesDone: true });
       return;
     }
     if (!resp.body) throw new Error(`snapshot ${b.ref}: no body`);
@@ -193,7 +193,7 @@ export class HTTPConnector implements Connector {
       if (crc !== crc32c(hdr)) throw new Error(`snapshot ${b.ref}: header crc`);
       const header = decode(hdr) as BlobHeader;
       if (header.position !== position) throw new Error(`snapshot ${b.ref}: position mismatch`);
-      await b.onHeader(position, header.streams ?? {});
+      await b.push({ header: { position, seqs: header.streams ?? {} } });
     }
 
     let batch: [string, Uint8Array][] = [];
@@ -209,7 +209,7 @@ export class HTTPConnector implements Connector {
       batch = [];
       bytes = 0;
       await pending;
-      pending = b.onValues(values, at);
+      pending = b.push({ values, skip: at });
     };
 
     // awaits only when the buffer runs dry, so they track chunks rather than records
@@ -261,7 +261,7 @@ export class HTTPConnector implements Connector {
     }
     if (batch.length > 0) await flush();
     await pending;
-    await b.onValuesDone();
+    await b.push({ valuesDone: true });
   }
 
   async #tail(b: Backfill, from: number, signal: AbortSignal): Promise<void> {
@@ -282,9 +282,9 @@ export class HTTPConnector implements Connector {
         events.push(...f.events);
         return true;
       });
-      if (events.length > 0) await b.onEvents(events);
+      if (events.length > 0) await b.push({ events });
       if (events.length < pageSize || !Number.isSafeInteger(scanned) || scanned >= b.until) {
-        await b.onEventsDone();
+        await b.push({ eventsDone: true });
         return;
       }
       after = scanned;

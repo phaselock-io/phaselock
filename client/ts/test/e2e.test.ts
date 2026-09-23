@@ -75,18 +75,14 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
       until,
       resume,
       signal,
-      onHeader: async (position, seqs) => {
-        got.header = { position, seqs };
+      push: async (item) => {
+        if ('header' in item) got.header = item.header;
+        else if ('values' in item) {
+          got.values.push(...item.values);
+          got.skips.push(item.skip);
+        } else if ('events' in item)
+          got.tails.push(item.events.map((e) => [e.position, e.stream, e.seq]));
       },
-      onValues: async (values, skip) => {
-        got.values.push(...values);
-        got.skips.push(skip);
-      },
-      onValuesDone: async () => {},
-      onEvents: async (events) => {
-        got.tails.push(events.map((e) => [e.position, e.stream, e.seq]));
-      },
-      onEventsDone: async () => {},
     });
     return { outcome, ...got };
   }

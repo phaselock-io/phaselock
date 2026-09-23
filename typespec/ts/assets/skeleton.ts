@@ -2752,15 +2752,19 @@ export type Backfill = {
   };
   // cancels this backfill alone; the connector's own signal cancels everything
   signal: AbortSignal;
-  // Tell the Engine the position the snapshot was cut at and the seq of every stream in it
-  onHeader(position: number, seqs: Record<string, number>): Promise<void>;
-  // Tell the Engine about values read out of the snapshot, and when the last of them is in
-  onValues(values: [string, Uint8Array][], skip: number): Promise<void>;
-  onValuesDone(): Promise<void>;
-  // Tell the Engine about events loaded from the post-snapshot tail, and when the last is in
-  onEvents(events: WireEvent[]): Promise<void>;
-  onEventsDone(): Promise<void>;
+  // one call per delivery, resolved once the Engine has committed it
+  push(item: BackfillItem): Promise<void>;
 };
+
+/** one delivery of a backfill: the blob's header (its cut position and the seq of every stream
+    in it), a batch of values with the byte offset after them, a page of tail events, or the end
+    of either half */
+export type BackfillItem =
+  | { header: { position: number; seqs: Record<string, number> } }
+  | { values: [string, Uint8Array][]; skip: number }
+  | { valuesDone: true }
+  | { events: WireEvent[] }
+  | { eventsDone: true };
 
 export type CommandResult =
   | { kind: 'ack'; position: number }
@@ -2931,6 +2935,9 @@ export function refCovers(ref: string, name: string): boolean {
   return name === ref;
 }
 
+/** one push from a backfill, queued for the advancer with the promise's resolvers */
+type BackfillWork = { ref: string; item: BackfillItem; resolve: () => void; reject: (e: unknown) => void };
+
 /** what the connector delivered, in arrival order */
 type Inbound =
   | { view: ViewRecord }
@@ -2981,6 +2988,12 @@ export class Engine<QX, C> {
 
   // work received from the connector, in arrival order
   #inbox: Inbound[] = [];
+  // backfill progress from the connector's hooks; each item resolves its promise after commit
+  #backfillWork: BackfillWork[] = [];
+  // how each backfill() call ended
+  #backfillOutcomes: { ref: string; outcome: BackfillOutcome | { failed: unknown } }[] = [];
+  // how each sendCommand() call ended, with the ids it carried in order
+  #commandOutcomes: { ids: string[]; results: CommandResult[] | { failed: unknown } }[] = [];
   // work received from the app
   #sendCommands: C[] = [];
   #newQueries: boolean = false;
@@ -3114,207 +3127,50 @@ export class Engine<QX, C> {
     return parent;
   }
 
-  // our main logic is implemented as a coroutine
+  // our main logic is implemented as a coroutine.  Each pass takes one kind of work, does it in
+  // its own transactions, and starts over, so the order of the branches is the priority: work
+  // that keeps the connector unblocked first, then the stream in order, then everything the
+  // stream's arrival implies, then the app.
   *#advancer(): Generator<void, void, void> {
     yield* this.#initialize();
 
-    // what are the different things we can have to do?
-    // - receive events,
-    //     - then shape them,
-    //     - then pass shaped events into reducers,
-    //     - then commit that result along with the checkpoint,
-    //     - then take the commit and pass it to the query graph
-    // - recieve sentCommands and update commands in the store
-    // - receive sendCommands
-    //     - then commit them to the store,
-    //         - then send those to onCommands hook
-    //     - then forecast events,
-    //     - then pass them to reducers,
-    //     - then commit that result to the overlay
-    //     - then pass that commit to the query graph
-    // - recieve a new query
-    //     - extend the graph
-    // - recieve a reconnect request
-    //     - then return the checkpoint in the store
     while (true) {
-      if (this.#live && !this.#setLive) {
-        // we fell behind; freeze graph and overlay, and when caughtUp() is called, we'll process
-        // all changes from now until then with a single run of the graph
-        this.#live = false;
+      if (this.#signal.aborted) {
+        // ends the connector and every backfill; nothing runs after
+        yield* this.#shutdown();
+        return;
       }
 
-      // "anytime" actions:
-      // - they can tolerate running earlier or later than surrounding events
-      // - they are not tied to the same writetxn as reducers are
-      if (this.#backfillEvents.length > 0 | this.#backfillChunks.length > 0) {
-        yield* withWTxn(this.#fx, this.#store, function* () {
-          // handle backfill-events
-          // - order doesn't really matter
-          let b;
-          while (b = self.#backfillEvents.shift()) {
-            // always comes as bytes; no conversion necessary
-            // save to .park.$shard/event.$position
-          }
-
-          // handle backfill-chunks
-          // - order doesn't really matter
-          for (const c of this.#backfillChunks) {
-            // always comes as bytes
-            // may as well convert to rich type now, then do opaque copies later
-            // save to .park.$shard/chunk.$start-$finish
-          }
-
-          // continue just because we did something, so we don't hit the yield at the bottom of the
-          // while loop if any of these lists grew while we were iterating them
-          continue;
-        })
-      }
-
-      if (this.#events.length > 0 || this.#backfillDones.length > 0) {
-        yield* withWTxn(this.#fx, this.#store, function* () {
-          // handle backfill-dones
-          // - guarantees no more chunks or events are coming
-          // - needs to run before reducers because it injects events for reducers
-          // - needs the same writeTxn as reducers so backfill is cleaned up atomically
-          for (const d of this.#backfillDones) {
-            // - move keys and write to final prefix
-            // - dirty query graph
-            // - discard backfill state
-            // - update this.shards
-            // - feed events to reducers
-            // - this should dirty the query graph and may trigger new queries
-          }
-
-          // handle events
-          // - non-birth events to unknown streams trigger a backfill; this is racy with grants
-          // - events to backfilling streams go to parking
-          for (const ev of this.#events) {
-          }
-          continue;
-        });
-      }
-
-      // handle vouches
-      for (const v of this.#vouches) {
-      }
-
-      // handle view changes (including revokes and grants)
-      // - handled one-at-a-time, in order
-      // - views without revokes/grants require async work to determine revokes/grants
-      // - the new token should be committed in the same txn as the revokes/grants
-      // - revokes may be applied after later events, but not before earlier events
-      //     - applying them too early makes unrevoked earlier events look like implicit grants
-      // - grants could be tolerate early application, but must commit atomically with revokes
-      for (const v of this.#views) {
-      }
-
-      // handle liveness
-      // - valid to handle any time after events
-      // - only really changes whether or not the query graph runs
-      if (!this.#live && this.#setLive) {
-      }
-
-      // query graph
-      if (this.#dirty) {
-      }
-
-      if (this.#recvdMsgs.length > 0) {
-        // what needs to apply in-order, vs what can be sorted-then-applied:
-        // - revokes can be applied late but not early:
-        //    - revoke must be applied after events before it have been reduced, so we don't
-        //      accidentally think a pre-revoke event is an implicit grant
-        //    - a late revoke is fine, so long as it is before any future view changes
-        //        - that isn't guaranteed because views without revoke/grant are expanded async
-        //
-        // - grants can apply at any time at all:
-        //    - applying grant early is fine; it starts the backfill
-        //    - applying grant late is fine; the backfill may have been started implicitly
-        //    - grants won't affect the UI until after the backfill completes
-        //
-        // - view changes:
-        //    - I think views just need to be processed in-order
-        //    - token from the view should be committed in the same txn as grants and revokes
-        //
-        // - vouch: bumps the saved position without events
-        //    - cannot run before events before it, because then on crash you could skip events
-        //    - it can run after events after it as long as you make it idempotent
-        //    - has no effect on queries or any such UI-facing thing
-        //
-        // - creation and deletion are just special events should be processed in event order
-        //
-        // - backfill event handling and chunk handling need to be serialized with the main
-        //   event-handling code since they require writeTxn, but don't affect the UI any
-        //
-        // - backfill done handling should happen before reducers, since the snapshot-then-tail
-        //   pattern will trigger reducers.
-
-        ////////////////////////////////
-
-        // process received messages:
-        // - detect implicit grants
-        // - detect seq gaps, which trigger a backfill of that stream
-
-        // onView(token: string, grant?: string[], revoke?: string[]): ...;
-        // - update this.shards
-        // - delete revoked shards
-        // - delete revoked backfill state
-        // - ensure new grant's backfill state
-        //   - could appear new
-        //   - could appear mid-backfill
-        //   - could be backfilled already
-
-        // onEvents(...): ...;
-        // - handle creation and deletion events automatically
-        // - on creation:
-        //   - update this.shards
-        //   - nothing to migrate at this point
-        // - on deletion:
-        //   - update this.shards
-        //   - discard shard prefix from store
-        // - events from backfilling shards get parked
-        // - non-creation events from unknown shards trigger backfill:
-        //   - this is the race case vs an explicit grant
-        //   - update this.shards
-        //   - park event
-        //   - bootstrap backfill state
-        // - remaining events go to reducers
-
-        // onVouch(...): ...;
-        // - simply update cursor position
-
-        // onBackfillChunk
-        // - save to store
-        // - update backfill state
-
-        // onBackfillDone
-        // - load chunks and write to final prefix
-        // - dirty query graph
-        // - discard backfill state
-        // - update this.shards
-        // - feed events to reducers
-        // - this should dirty the query graph and may trigger new queries
-
-        // onEnd(...): ...;
-      }
-
-      if (this.#recvdEvents.length > 0) {
-        yield* this.#onRecvEvents();
+      if (this.#backfillWork.length > 0) {
+        // header, values, events, and done marks from in-flight backfills: parked in their own
+        // transactions, each resolving the connector's promise after commit.  Anytime work: it
+        // orders against nothing in the inbox
+        yield* this.#onBackfillWork();
         continue;
       }
 
-      if (this.#roundTripped.length > 0) {
-        yield* this.#onRoundTripped();
+      if (this.#inbox.length > 0) {
+        // the stream, in arrival order: a run of event items is one wave, sorted by stream and
+        // reduced with the slices in parallel; a view, vouch, live, or end is handled alone
+        yield* this.#onInbox();
         continue;
       }
 
-      if (!this.#live && this.#setLive) {
-        // we caught up and processed all recvdEvents(); time to restart the query graphs
-        this.#live = true;
-        yield* this.#rebuildOverlay();
+      if (this.#backfillOutcomes.length > 0) {
+        // 'done', 'stale', or a rejection for a backfill: land attempts, retries with resume,
+        // discards, and children spawned by chain breaks
+        yield* this.#onBackfillOutcomes();
+        continue;
+      }
+
+      if (this.#commandOutcomes.length > 0) {
+        // ack, dup, reject, and conflict from sends: release the outbox and rebuild the overlay
+        yield* this.#onCommandOutcomes();
         continue;
       }
 
       if (this.#sendCommands.length > 0) {
+        // write to the outbox, forecast, send through the connector in order
         yield* this.#onSendCommands();
         continue;
       }
@@ -3324,12 +3180,13 @@ export class Engine<QX, C> {
         continue;
       }
 
-      if (this.#reconnects.length > 0) {
-        yield* this.#onReconnects();
+      if (this.#connector === null && (this.#connectNow || this.#retryTimer === null)) {
+        // one attempt: a new connector from the factory, or the next one after backoff
+        yield* this.#onConnect();
         continue;
       }
 
-      // if we got here we probably had a spurious wakeup, or perhaps a newQuery() while not #live
+      // nothing to do: wait for a hook, a timer, or the app
       yield;
     }
   }

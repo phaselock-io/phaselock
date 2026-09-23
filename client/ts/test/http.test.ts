@@ -316,20 +316,14 @@ describe('backfill', () => {
       until,
       resume,
       signal: new AbortController().signal,
-      onHeader: async (position, seqs) => {
-        got.header = { position, seqs };
-      },
-      onValues: async (values, skip) => {
-        got.batches.push({ keys: values.map(([k]) => k), skip });
-      },
-      onValuesDone: async () => {
-        got.done.push('values');
-      },
-      onEvents: async (events) => {
-        got.tails.push(events.map((e) => [e.position, e.stream, e.seq]));
-      },
-      onEventsDone: async () => {
-        got.done.push('events');
+      push: async (item) => {
+        if ('header' in item) got.header = item.header;
+        else if ('values' in item)
+          got.batches.push({ keys: item.values.map(([k]) => k), skip: item.skip });
+        else if ('valuesDone' in item) got.done.push('values');
+        else if ('events' in item)
+          got.tails.push(item.events.map((e) => [e.position, e.stream, e.seq]));
+        else got.done.push('events');
       },
     });
     return got;
@@ -655,11 +649,7 @@ describe('backfill', () => {
       until: 40,
       resume: null,
       signal: ctl.signal,
-      onHeader: async () => {},
-      onValues: async () => {},
-      onValuesDone: async () => {},
-      onEvents: async () => {},
-      onEventsDone: async () => {},
+      push: async () => {},
     });
     ctl.abort();
     await expect(p).rejects.toThrow();
@@ -676,14 +666,11 @@ describe('backfill', () => {
       until: 40,
       resume: null,
       signal: new AbortController().signal,
-      onHeader: async () => {},
-      onValues: async () => {
+      push: async (item) => {
+        if (!('values' in item)) return;
         calls++;
         if (calls === 1) await gate;
       },
-      onValuesDone: async () => {},
-      onEvents: async () => {},
-      onEventsDone: async () => {},
     });
     await settle();
     // the first batch is held; at most one more has been handed over

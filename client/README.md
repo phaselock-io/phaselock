@@ -156,12 +156,15 @@ export type Backfill = {
     tailDone: boolean;
   };
   signal: AbortSignal;
-  onHeader(position: number, seqs: Record<string, number>): Promise<void>;
-  onValues(values: [string, Uint8Array][], skip: number): Promise<void>;
-  onValuesDone(): Promise<void>;
-  onEvents(events: WireEvent[]): Promise<void>;
-  onEventsDone(): Promise<void>;
+  push(item: BackfillItem): Promise<void>;
 };
+
+export type BackfillItem =
+  | { header: { position: number; seqs: Record<string, number> } }
+  | { values: [string, Uint8Array][]; skip: number }
+  | { valuesDone: true }
+  | { events: WireEvent[] }
+  | { eventsDone: true };
 
 export type BackfillOutcome = 'done' | 'stale';
 
@@ -178,13 +181,13 @@ concurrently.
 **The snapshot.**  `GET /snapshot/<ref>` answers either the blob inline
 or a `text/plain` pointer to a URL to fetch with `Range`.  The header
 gives the cut position and the seq of every stream in the blob; deliver
-it with one `onHeader` call.  Then stream the records.
+it as one `header` item.  Then stream the records.
 
 **Memory.**  Snapshots need not fit in memory.  The blob's outer
 framing is length-prefixed binary, so the connector needs a byte cursor
 over the response body ("give me exactly n bytes, spanning chunks"), not
 a streaming msgpack decoder.  Values are never decoded by the connector:
-`onValues` hands the Engine raw bytes, which the store keeps in msgpack
+a `values` item hands the Engine raw bytes, which the store keeps in msgpack
 form.  `/events` pages and `/stream` are back-to-back msgpack values,
 and the connector frames them with a small msgpack cursor of its own
 (array and map headers, strings, ints, and skip): it decodes the tag
@@ -192,8 +195,10 @@ and each envelope, skips over `data` to find its extent, and slices the
 bytes out.  The stock library decodes only whole small values: the blob
 header map and command results.
 
-**Backpressure.**  `onHeader`, `onValues`, and `onEvents` resolve when
-the Engine has committed that batch, not when it has queued it.  The
+**Backpressure.**  Every delivery is one `push`, and it resolves when
+the Engine has committed that item, not when it has queued it.  One
+method carries the whole protocol, which is one method to implement in
+every language.  The
 connector batches records (a few hundred KB or a thousand records),
 allows one batch in flight at the Engine while it parses the next, and
 does not read the body further until the earlier batch resolves.  Not
@@ -217,9 +222,9 @@ value.  The event that triggered a backfill sits at the cursor and is
 parked before the backfill starts.
 
 **`resume`** records what a previous attempt got through.  Each half
-reports its own end with its own call, `onValuesDone` and
-`onEventsDone`, so a batch call always carries a batch; the Engine
-persists `snapshotDone` and `tailDone` from them, and a resumed
+reports its own end with its own item, `valuesDone` and `eventsDone`,
+so a batch item always carries a batch; the Engine persists
+`snapshotDone` and `tailDone` from them, and a resumed
 backfill skips a finished half outright, which is what spares a
 live-cut blob a second full download when only the tail was open.  For
 an unfinished snapshot half,
