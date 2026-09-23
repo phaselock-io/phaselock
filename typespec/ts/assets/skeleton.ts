@@ -2938,6 +2938,12 @@ export function refCovers(ref: string, name: string): boolean {
 /** one push from a backfill, queued for the advancer with the promise's resolvers */
 type BackfillWork = { ref: string; item: BackfillItem; resolve: () => void; reject: (e: unknown) => void };
 
+/** the key of a parked event: its stream, then its position zero-padded so a scan of the stream's
+    prefix walks in log order */
+export function parkedEventKey(stream: string, position: number): string {
+  return `/park.ev.${stream}/${String(position).padStart(20, '0')}`;
+}
+
 /** what the connector delivered, in arrival order */
 type Inbound =
   | { view: ViewRecord }
@@ -3191,6 +3197,67 @@ export class Engine<QX, C> {
     }
   }
 
+  // one push from a backfill, in its own transaction; the connector's promise resolves after the
+  // commit, which is the backpressure
+  *#onBackfillWork(): Generator<void, void, void> {
+    const self = this;
+    while (this.#backfillWork.length > 0) {
+      const { ref, item, resolve, reject } = this.#backfillWork.shift()!;
+      const entry = this.#backfills.get(ref);
+      if (entry === undefined) {
+        reject(new Error(`backfill ${ref} is no longer in flight`));
+        continue;
+      }
+      const record = entry.record;
+      try {
+        yield* withWTxn(this.#fx, this.#store, function* () {
+          if ('header' in item) {
+            const { position, seqs } = item.header;
+            // a resumed tail keeps its floor; a newer blob overrides it
+            const fromPosition = Math.max(record.resume?.fromPosition ?? position, position);
+            record.resume = { position, skipBytes: 0, fromPosition, snapshotDone: false, tailDone: false };
+            yield* txnSet(`/backfill-seqs.${ref}`, '.json', { [JS]: seqs });
+          } else if ('values' in item) {
+            for (const [key, bytes] of item.values) {
+              // a key no slice declares is from a newer vocabulary: dropped
+              const type = storeTypeOf(self.#reg, key);
+              if (type === undefined) continue;
+              yield* txnSet(`/park.kv.${key}`, type, { [MSGPACK]: bytes });
+              if (this.#streams.get(stream) !== 'backfill') {
+                yield* self.#markBackfilling(key.slice(0, key.indexOf('/')));
+              }
+            }
+            record.resume!.skipBytes = item.skip;
+          } else if ('valuesDone' in item) {
+            record.resume!.snapshotDone = true;
+          } else if ('events' in item) {
+            for (const ev of item.events) {
+              yield* txnSet(parkedEventKey(ev.stream, ev.position), '.event', { [MSGPACK]: ev.raw });
+              if (this.#streams.get(stream) !== 'backfill') {
+                yield* self.#markBackfilling(ev.stream);
+              }
+              record.resume!.fromPosition = Math.max(record.resume!.fromPosition, ev.position);
+            }
+          } else if ('tailDone' in item) {
+            record.resume!.tailDone = true;
+          } else {
+            throw new Error("unexpected snapshot");
+          }
+          yield* txnSet(`/backfill.${ref}`, '.json', { [JS]: record });
+        });
+        resolve();
+      } catch (e: unknown) {
+        reject(e);
+      }
+    }
+  }
+
+  // a stream seen under a backfill is marked in the streams table, in memory and at /seq.
+  *#markBackfilling(stream: string): WStoreGenerator<void> {
+    this.#streams.set(stream, 'backfill');
+    yield* txnSet(`/seq.${stream}`, '.json', { [JS]: 'backfill' });
+  }
+
   *#onRecvEvents(): Generator<void, void, void> {
     const self = this;
     // take events and latest checkpoint
@@ -3394,6 +3461,22 @@ export class Engine<QX, C> {
       resolve({ checkpoint, commands: deepCopy(commands) });
     }
     this.#reconnects = [];
+  }
+
+  // ends everything the Engine drives: the connection, its backfills, the retry timer, and the
+  // pushes waiting for a transaction they will never get.  Nothing is persisted; the store is
+  // already consistent at the last commit
+  *#shutdown(): Generator<void, void, void> {
+    if (this.#retryTimer !== null) {
+      clearTimeout(this.#retryTimer);
+      this.#retryTimer = null;
+    }
+    this.#connectorAbort.abort();
+    this.#connector = null;
+    for (const entry of this.#backfills.values()) entry.controller.abort();
+    const reason = new Error('engine shut down');
+    for (const work of this.#backfillWork) work.reject(reason);
+    this.#backfillWork = [];
   }
 
 }
