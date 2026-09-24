@@ -2909,7 +2909,8 @@ export function decodeDbEvent<T>(val: any, subdecoder: (val: any) => T): DbEvent
    keeps for itself starts with a slash, and the registry types it as `.json` unless noted:
 
        /view                      ViewRecord: the view token, its position, and the refs granted
-       /checkpoint                CheckpointRecord: the cursor, advanced with every batch and vouch
+       /checkpoint                CheckpointRecord: the cursor, advanced with every batch and
+                                  vouch, and how far the base is reduced
        /seq.{stream}              the stream's last held seq, or 'backfill' while a backfill
                                   covering it is in flight
        /command.{ordinal}         Command<C> (`.command`): the outbox, in send order
@@ -2930,7 +2931,7 @@ export type SliceReducer = {
 /** the view, as persisted at /view when a reconciliation commits */
 export type ViewRecord = { token: string; position: number; refs: string[] };
 /** the cursor, as persisted at /checkpoint with every batch and vouch */
-export type CheckpointRecord = { epoch: string; position: number };
+export type CheckpointRecord = { epoch: string; position: number; reduced: number };
 /** a backfill in flight, as persisted at /backfill.{ref} */
 export type BackfillRecord = {
   until: number;
@@ -3039,6 +3040,16 @@ export class Engine<QX, C> {
   // the outbox in send order: command id to its ordinal in /command.{ordinal}
   #outbox: Map<string, number> = new Map();
   #nextOrdinal: number = 0;
+  // outbox commands handed to the current connection with no outcome yet, and those acked, with
+  // the position they landed at, waiting for the checkpoint to reach it
+  #sent: Set<string> = new Set();
+  #acked: Map<string, number> = new Map();
+  // set by a release inside a transaction, read by the refresh after its commit
+  #outboxChanged: boolean = false;
+  // how far the base has been reduced, -1 for never: the checkpoint, except while frozen, when it
+  // stays at the last event that reduced.  Persisted in the checkpoint record.  An acked command
+  // at or below it is in the base, events or none
+  #reduced: number = -1;
 
   // liveness: the connector has delivered `live`, and no replacing backfill is in flight
   #live: boolean = false;
@@ -3166,6 +3177,8 @@ export class Engine<QX, C> {
       const r = entry.record;
       if (r.resume?.snapshotDone && r.resume.tailDone) entry.status = 'ready';
     }
+
+    this.#reduced = this.#checkpoint?.reduced ?? -1;
 
     // the overlay: every outbox command forecast in order against the base
     yield* this.#rebuildOverlay();
@@ -3427,7 +3440,6 @@ export class Engine<QX, C> {
     const self = this;
     const frozen = this.#replacing > 0;
     const dirty: string[] = [];
-    let landed = 0;
     yield* withWTxn(this.#fx, this.#store, function* () {
       for (const ref of [...self.#backfills.keys()]) {
         const entry = self.#backfills.get(ref)!;
@@ -3459,15 +3471,12 @@ export class Engine<QX, C> {
         if (pending || !frozenClean) return;
       }
       for (const ref of clean) yield* self.#landRefIn(ref, dirty);
-      landed = clean.length;
-      if (frozen) yield* self.#reduceParkedIn(null, {}, dirty);
+      if (frozen) {
+        yield* self.#reduceParkedIn(null, {}, dirty);
+        yield* self.#reducedTo(self.#checkpoint?.position ?? -1);
+      }
     });
-
-    // update graph and overlay
-    if (landed > 0) {
-      this.#graph.dirty(dirty);
-      if (this.#live) yield* this.#rebuildOverlay();
-    }
+    yield* this.#refresh(dirty);
   }
 
   // a ref's children still in flight
@@ -3669,7 +3678,8 @@ export class Engine<QX, C> {
 
   // one stream's run of events, in order, through its slice's reducer; births and deaths are the
   // Engine's: a death drops the stream's keys, the stream stays known so a rebirth chains, and
-  // neither reaches a reducer
+  // neither reaches a reducer.  This is where events enter the base, so an event carrying an
+  // outbox command's id is that command's round trip, whichever path parked or delivered it
   *#reduceStreamIn(
     stream: string, events: DbEvent<unknown>[], dirty: string[],
   ): WStoreGenerator<void> {
@@ -3682,6 +3692,7 @@ export class Engine<QX, C> {
       data = [];
     }.bind(this);
     for (const ev of events) {
+      if (this.#outbox.has(ev.id)) yield* this.#releaseIn([ev.id]);
       const sys = sysOf(ev.data);
       if (sys === 'death') {
         yield* reduce();
@@ -3723,6 +3734,7 @@ export class Engine<QX, C> {
       });
       if (replacing) this.#replacing++;
       if (!ref.endsWith('*')) yield* this.#maybeMarkBackfilling(ref, replacing);
+      if (replacing) yield* this.#markUnderIn(ref);
       this.#startBackfill(ref);
     }
     if (parent !== null) {
@@ -3806,6 +3818,7 @@ export class Engine<QX, C> {
     yield* withWTxn(this.#fx, this.#store, function* () {
       const seqs = new Map<string, number>();
       const runs = new Map<string, DbEvent<unknown>[]>();
+      let reduced = self.#reduced;
       for (const ev of events) {
         const held = self.#streams.get(ev.stream);
         let park = held === 'backfill';
@@ -3827,6 +3840,7 @@ export class Engine<QX, C> {
             seqs.set(ev.stream, ev.seq);
             if (!runs.has(ev.stream)) runs.set(ev.stream, []);
             runs.get(ev.stream)!.push(self.#decode(ev));
+            reduced = ev.position;
             continue;
           }
           yield* self.#spawnIn(self.#parentOf(ev.stream), [ev.stream], ev.position, true);
@@ -3840,10 +3854,23 @@ export class Engine<QX, C> {
         self.#streams.set(stream, seq);
         yield* txnSet(`/seq.${stream}`, '.json', { [JS]: seq });
       }
-      yield* self.#advanceCursorIn(events[events.length - 1].position);
+      const last = events[events.length - 1].position;
+      // a batch that froze part way reduced up to the event before the gap
+      yield* self.#reducedTo(self.#replacing > 0 ? reduced : last);
+      yield* self.#advanceCursorIn(last);
     });
+    yield* this.#refresh(dirty);
+  }
+
+  // after a commit: the graph learns what changed and runs when live.  Base changes reach
+  // queries only when not frozen; outbox changes always do, since forecasts are not base state
+  *#refresh(dirty: string[]): Generator<void, void, void> {
     this.#graph.dirty(dirty);
-    if (dirty.length > 0 && this.#live && this.#replacing === 0) yield* this.#rebuildOverlay();
+    const outbox = this.#outboxChanged;
+    this.#outboxChanged = false;
+    if (this.#live && (outbox || (dirty.length > 0 && this.#replacing === 0))) {
+      yield* this.#rebuildOverlay();
+    }
   }
 
   // a live event as the reducers see it
@@ -3856,16 +3883,77 @@ export class Engine<QX, C> {
   *#advanceCursorIn(position: number): WStoreGenerator<void> {
     if (this.#epoch === null) throw new Error('cursor with no epoch');
     if (this.#checkpoint !== null && position <= this.#checkpoint.position) return;
-    this.#checkpoint = { epoch: this.#epoch, position };
+    this.#checkpoint = { epoch: this.#epoch, position, reduced: this.#reduced };
     yield* txnSet('/checkpoint', '.json', { [JS]: this.#checkpoint });
   }
 
-  // a vouch, or the live mark: the cursor converges in its own transaction
+  // inside a transaction: the base has been reduced through position, never back, and every
+  // acked command at or below it is in the base, events or none, and leaves the outbox
+  *#reducedTo(position: number): WStoreGenerator<void> {
+    if (position <= this.#reduced) return;
+    this.#reduced = position;
+    if (this.#checkpoint !== null) {
+      this.#checkpoint = { ...this.#checkpoint, reduced: position };
+      yield* txnSet('/checkpoint', '.json', { [JS]: this.#checkpoint });
+    }
+    yield* this.#releaseAckedIn();
+  }
+
+  // inside a transaction: every acked command the base has reduced past leaves the outbox
+  *#releaseAckedIn(): WStoreGenerator<void> {
+    yield* this.#releaseIn([...this.#acked].filter(([, p]) => p <= this.#reduced).map(([id]) => id));
+  }
+
+  // inside a transaction: commands leave the outbox
+  *#releaseIn(ids: string[]): WStoreGenerator<void> {
+    for (const id of ids) {
+      const ordinal = this.#outbox.get(id);
+      if (ordinal === undefined) continue;
+      yield* txnDel(`/command.${ordinal}`);
+      this.#outbox.delete(id);
+      this.#sent.delete(id);
+      this.#acked.delete(id);
+      this.#outboxChanged = true;
+    }
+  }
+
+  // a vouch, or the live mark: the cursor converges in its own transaction, and unless frozen
+  // nothing below it was withheld, so the base is reduced through it
   *#onCursor(position: number): Generator<void, void, void> {
     const self = this;
     yield* withWTxn(this.#fx, this.#store, function* () {
+      if (self.#replacing === 0) yield* self.#reducedTo(position);
       yield* self.#advanceCursorIn(position);
     });
+    yield* this.#refresh([]);
+  }
+
+  // the results of one sendCommand call, or its failure.  An ack or dup names the position the
+  // command landed at, and the command is done once the checkpoint reaches it.  A reject or a
+  // conflict is final and the command goes at once.  A failed call leaves its commands unsent
+  // for the next connection to flush, in order
+  *#onCommandOutcomes(): Generator<void, void, void> {
+    const self = this;
+    const { ids, results } = this.#commandOutcomes.shift()!;
+    if ('failed' in results) {
+      for (const id of ids) this.#sent.delete(id);
+      return;
+    }
+    const drop: string[] = [];
+    results.forEach((r, i) => {
+      const id = ids[i];
+      if (r.kind === 'ack' || r.kind === 'dup') {
+        this.#acked.set(id, r.position);
+        if (r.position <= this.#reduced) drop.push(id);
+      } else {
+        drop.push(id);
+      }
+    });
+    if (drop.length === 0) return;
+    yield* withWTxn(this.#fx, this.#store, function* () {
+      yield* self.#releaseIn(drop);
+    });
+    yield* this.#refresh([]);
   }
 
   // a view frame, reconciled against state in one transaction.  Drops first: an in-flight ref
@@ -3889,21 +3977,26 @@ export class Engine<QX, C> {
       for (const stream of [...self.#streams.keys()]) {
         if (!covered(view.refs, stream)) yield* self.#dropStreamIn(stream, dirty);
       }
+      // the first view's grants replace an empty base: frozen until they land as a group, so
+      // the first frame shown is complete.  Every later grant is additive
+      const bootstrap = self.#view === null;
       const refs = [...view.refs].sort((a, b) => refPrefix(a).length - refPrefix(b).length);
       for (const ref of refs) {
         const entries = [...self.#backfills.keys()];
         if (entries.some((e) => refCovers(e, ref))) continue;
         const held = covered(old, ref) && !atStart.some((e) => refCovers(e, ref));
         if (held || typeof self.#streams.get(ref) === 'number') continue;
-        yield* self.#spawnIn(null, [ref], view.position, false);
+        yield* self.#spawnIn(null, [ref], view.position, bootstrap);
         yield* self.#adoptChildrenIn(ref);
       }
       yield* txnSet('/view', '.json', { [JS]: view });
       self.#view = view;
-      if (wasFrozen && self.#replacing === 0) yield* self.#reduceParkedIn(null, {}, dirty);
+      if (wasFrozen && self.#replacing === 0) {
+        yield* self.#reduceParkedIn(null, {}, dirty);
+        yield* self.#reducedTo(self.#checkpoint?.position ?? -1);
+      }
     });
-    this.#graph.dirty(dirty);
-    if (dirty.length > 0 && this.#live) yield* this.#rebuildOverlay();
+    yield* this.#refresh(dirty);
   }
 
   // the connection ended: the next attempt is scheduled with backoff, and every in-flight
