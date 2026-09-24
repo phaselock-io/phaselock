@@ -3242,12 +3242,47 @@ export class Engine<QX, C> {
 
       if (this.#connector === null && (this.#connectNow || this.#retryTimer === null)) {
         // one attempt: a new connector from the factory, or the next one after backoff
-        yield* this.#onConnect();
+        this.#onConnect();
         continue;
       }
 
       // nothing to do: wait for a hook, a timer, or the app
       yield;
+    }
+  }
+
+  // one connection attempt: the factory is called with the checkpoint, the stored view token,
+  // the wants, and this connection's signal.  Its hooks queue everything for the advancer, and a
+  // connector that has since been replaced is ignored.  Every backfill still downloading, and not
+  // waiting on its own backoff, starts on the new connection
+  #onConnect(): void {
+    this.#connectNow = false;
+    if (this.#retryTimer !== null) {
+      clearTimeout(this.#retryTimer);
+      this.#retryTimer = null;
+    }
+    const abort = this.#connectorAbort;
+    const push = (item: Inbound) => {
+      if (this.#connectorAbort !== abort) return;
+      this.#inbox.push(item);
+      this.#schedule();
+    };
+    this.#connector = this.#connect(
+      this.#checkpoint?.position ?? -1,
+      this.#view?.token ?? null,
+      this.#wants,
+      abort.signal,
+      {
+        onOpen: (epoch) => push({ open: epoch }),
+        onView: (token, position, refs) => push({ view: { token, position, refs } }),
+        onEvents: (events) => push({ events }),
+        onLive: (position) => push({ live: position }),
+        onVouch: (position) => push({ vouch: position }),
+        onEnd: (code, reason) => push({ end: { code, reason } }),
+      },
+    );
+    for (const [ref, entry] of this.#backfills) {
+      if (entry.status === 'downloading' && entry.retryTimer === null) this.#startBackfill(ref);
     }
   }
 
@@ -3334,9 +3369,11 @@ export class Engine<QX, C> {
         });
         this.#startBackfill(ref);
       } else {
-        // a rejection: ours, if the entry's signal fired, else a failure the Engine retries
+        // a rejection: ours, if the entry's signal fired; the connection's, if it ended, and the
+        // next one restarts the download; else a failure the Engine retries after backoff
         if (entry.controller.signal.aborted) continue;
         entry.status = 'downloading';
+        if (this.#connector === null) continue;
         const delay = backoffDelay(entry.attempts++);
         entry.retryTimer = setTimeout(() => {
           entry.retryTimer = null;
