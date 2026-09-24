@@ -1822,8 +1822,11 @@ class OverlayTxn implements WTxn {
       // the span this batch covers: up to its last key when more follow, else the whole range
       const span: StoreRange = { ...range, limit: Infinity };
       if (result.next !== null) {
-        if (range.reverse) span.gte = result.next;
-        else span.lte = result.next;
+        if (range.reverse) {
+          span.gte = result.next;
+        } else {
+          span.lte = result.next;
+        }
       }
       // the base answers in the wanted representation; layer entries convert here
       const merged = new Map<string, StoreValue | undefined>();
@@ -1956,8 +1959,11 @@ class IndexedDBTxn implements WTxn {
     req.onsuccess = () => {
       const cursor = req.result;
       if (!cursor) return end();
-      if (each(cursor)) cursor.continue();
-      else end();
+      if (each(cursor)) {
+        cursor.continue();
+      } else {
+        end();
+      }
     };
     req.onerror = () => end(new Error('cursor failed'));
   }
@@ -2902,6 +2908,22 @@ export function decodeDbEvent<T>(val: any, subdecoder: (val: any) => T): DbEvent
        H: new commands are also stored in an outbox in the store
 
        I: new commands also trigger the user's onCommands() hook so they can be sent over transport
+
+   Engine-owned store keys.  Slice state lives at `{stream}/{local key}`; everything the Engine
+   keeps for itself starts with a slash, and the registry types it as `.json` unless noted:
+
+       /view                      ViewRecord: the view token, its position, and the refs granted
+       /checkpoint                CheckpointRecord: the cursor, advanced with every batch and vouch
+       /seq.{stream}              the stream's last held seq, or 'backfill' while a backfill
+                                  covering it is in flight
+       /command.{ordinal}         Command<C> (`.command`): the outbox, in send order
+       /backfill.{ref}            BackfillRecord: an in-flight backfill's until, resume, replacing,
+                                  and children
+       /backfill-seqs.{ref}       the backfill blob's header seqs, stream name to seq
+       /park.ev.{stream}/{seq}    a parked event (`.event`), raw as delivered; seq zero-padded to
+                                  20 digits so a stream's range walks its chain
+       /park.kv.{key}             a parked slice value from a backfill blob, typed as its key is,
+                                  moved to {key} when the backfill lands
 */
 /** one slice's reducer and the context it runs in, keyed by stream prefix in the Engine's table */
 export type SliceReducer = {
@@ -2926,6 +2948,9 @@ type BackfillEntry = {
   controller: AbortController;
   status: 'downloading' | 'waiting' | 'ready';
   parent: string | null;
+  // failed attempts in a row, for backoff, and the retry waiting to run
+  attempts: number;
+  retryTimer: ReturnType<typeof setTimeout> | null;
 };
 /** whether a wire ref covers a stream name or a narrower ref: `*` covers everything, `family.*`
     covers names under `family.`, and a name covers itself */
@@ -2938,10 +2963,40 @@ export function refCovers(ref: string, name: string): boolean {
 /** one push from a backfill, queued for the advancer with the promise's resolvers */
 type BackfillWork = { ref: string; item: BackfillItem; resolve: () => void; reject: (e: unknown) => void };
 
-/** the key of a parked event: its stream, then its position zero-padded so a scan of the stream's
-    prefix walks in log order */
-export function parkedEventKey(stream: string, position: number): string {
-  return `/park.ev.${stream}/${String(position).padStart(20, '0')}`;
+/** the store key prefix a ref covers: everything for `*`, `family.` for a family, and the
+    stream's own keys for a stream */
+export function refPrefix(ref: string): string {
+  if (ref === '*') return '';
+  if (ref.endsWith('.*')) return ref.slice(0, -1);
+  return `${ref}/`;
+}
+
+/** the delay before the n-th retry in a row: exponential from half a second, capped at half a
+    minute, with jitter so a fleet does not retry in step */
+export function backoffDelay(attempt: number): number {
+  const base = Math.min(30_000, 500 * 2 ** Math.min(attempt, 10));
+  return base / 2 + Math.random() * (base / 2);
+}
+
+/** the `$sys` of a birth or death event's data, null for an ordinary event */
+export function sysOf(data: unknown): 'birth' | 'death' | null {
+  if (data !== null && typeof data === 'object' && '$sys' in data) {
+    const sys = (data as { $sys: unknown }).$sys;
+    if (sys === 'birth' || sys === 'death') return sys;
+  }
+  return null;
+}
+
+/** the key of a parked event: its stream, then its seq zero-padded so a scan of the stream's
+    prefix walks its chain in order; a re-parked event overwrites itself */
+export function parkedEventKey(stream: string, seq: number): string {
+  return `/park.ev.${stream}/${String(seq).padStart(20, '0')}`;
+}
+
+/** the stream and seq a parked event key names */
+export function parsePark(key: string): { stream: string; seq: number } {
+  const slash = key.lastIndexOf('/');
+  return { stream: key.slice('/park.ev.'.length, slash), seq: Number(key.slice(slash + 1)) };
 }
 
 /** what the connector delivered, in arrival order */
@@ -3101,6 +3156,8 @@ export class Engine<QX, C> {
           controller: new AbortController(),
           status: 'downloading',
           parent: null,
+          attempts: 0,
+          retryTimer: null,
         });
         if (record.replacing) self.#replacing++;
       }
@@ -3136,7 +3193,9 @@ export class Engine<QX, C> {
   // our main logic is implemented as a coroutine.  Each pass takes one kind of work, does it in
   // its own transactions, and starts over, so the order of the branches is the priority: work
   // that keeps the connector unblocked first, then the stream in order, then everything the
-  // stream's arrival implies, then the app.
+  // stream's arrival implies, then the app.  Anything thrown out of a pass ends the Engine: the
+  // transaction rolled back, so the store resumes from the same point on the next start, and
+  // memory changed inside a transaction is never read again.  Nothing catches and continues
   *#advancer(): Generator<void, void, void> {
     yield* this.#initialize();
 
@@ -3223,19 +3282,15 @@ export class Engine<QX, C> {
               const type = storeTypeOf(self.#reg, key);
               if (type === undefined) continue;
               yield* txnSet(`/park.kv.${key}`, type, { [MSGPACK]: bytes });
-              if (this.#streams.get(stream) !== 'backfill') {
-                yield* self.#markBackfilling(key.slice(0, key.indexOf('/')));
-              }
+              yield* self.#maybeMarkBackfilling(key.slice(0, key.indexOf('/')));
             }
             record.resume!.skipBytes = item.skip;
           } else if ('valuesDone' in item) {
             record.resume!.snapshotDone = true;
           } else if ('events' in item) {
             for (const ev of item.events) {
-              yield* txnSet(parkedEventKey(ev.stream, ev.position), '.event', { [MSGPACK]: ev.raw });
-              if (this.#streams.get(stream) !== 'backfill') {
-                yield* self.#markBackfilling(ev.stream);
-              }
+              yield* txnSet(parkedEventKey(ev.stream, ev.seq), '.event', { [MSGPACK]: ev.raw });
+              yield* self.#maybeMarkBackfilling(ev.stream);
               record.resume!.fromPosition = Math.max(record.resume!.fromPosition, ev.position);
             }
           } else if ('tailDone' in item) {
@@ -3253,9 +3308,314 @@ export class Engine<QX, C> {
   }
 
   // a stream seen under a backfill is marked in the streams table, in memory and at /seq.
-  *#markBackfilling(stream: string): WStoreGenerator<void> {
+  *#maybeMarkBackfilling(stream: string): WStoreGenerator<void> {
+    if (this.#streams.get(stream) === 'backfill') return;
     this.#streams.set(stream, 'backfill');
     yield* txnSet(`/seq.${stream}`, '.json', { [JS]: 'backfill' });
+  }
+
+  // how each backfill() call ended: a finished one waits on its children or is ready to land, a
+  // stale one starts its download over, a failed one retries after backoff
+  *#onBackfillOutcomes(): Generator<void, void, void> {
+    const self = this;
+    while (this.#backfillOutcomes.length > 0) {
+      const { ref, outcome } = this.#backfillOutcomes.shift()!;
+      const entry = this.#backfills.get(ref);
+      if (entry === undefined) continue;
+      if (outcome === 'done') {
+        entry.attempts = 0;
+        const childInFlight = entry.record.children.some((c) => this.#backfills.has(c));
+        entry.status = childInFlight ? 'waiting' : 'ready';
+      } else if (outcome === 'stale') {
+        // the blob is gone: the parked values go, the parked events stay, and the download starts
+        // over under the same `until`
+        entry.attempts = 0;
+        yield* withWTxn(this.#fx, this.#store, function* () {
+          yield* txnDelPrefix(`/park.kv.${refPrefix(ref)}`);
+          const r = entry.record.resume;
+          if (r !== null) entry.record.resume = { ...r, skipBytes: 0, snapshotDone: false };
+          yield* txnSet(`/backfill.${ref}`, '.json', { [JS]: entry.record });
+        });
+        this.#startBackfill(ref);
+      } else {
+        // a rejection: ours, if the entry's signal fired, else a failure the Engine retries
+        if (entry.controller.signal.aborted) continue;
+        entry.status = 'downloading';
+        const delay = backoffDelay(entry.attempts++);
+        entry.retryTimer = setTimeout(() => {
+          entry.retryTimer = null;
+          // the entry may have gone, or the Engine, while the timer ran
+          if (self.#backfills.get(ref) === entry && !self.#signal.aborted) self.#startBackfill(ref);
+        }, delay);
+      }
+    }
+    yield* this.#tryLand();
+  }
+
+  // one backfill() call on the current connector.  Its pushes and its outcome come back through
+  // the queues, so nothing here runs a transaction; without a connector nothing starts, and the
+  // next connection starts every backfill still downloading
+  #startBackfill(ref: string): void {
+    const entry = this.#backfills.get(ref)!;
+    if (this.#connector === null) return;
+    const self = this;
+    entry.status = 'downloading';
+    const backfill: Backfill = {
+      ref,
+      until: entry.record.until,
+      resume: entry.record.resume,
+      signal: AbortSignal.any([this.#connectorAbort.signal, entry.controller.signal]),
+      push: (item) =>
+        new Promise<void>((resolve, reject) => {
+          self.#backfillWork.push({ ref, item, resolve, reject });
+          self.#schedule();
+        }),
+    };
+    this.#connector.backfill(backfill).then(
+      (outcome) => {
+        self.#backfillOutcomes.push({ ref, outcome });
+        self.#schedule();
+      },
+      (e: unknown) => {
+        self.#backfillOutcomes.push({ ref, outcome: { failed: e } });
+        self.#schedule();
+      },
+    );
+  }
+
+  // land what can land in one transaction.  Every ready ref has its chain checked key-only; a
+  // broken one spawns its children or restarts at once.  A clean child merges into its parent,
+  // and a parent made ready by that is processed in the same pass.  While a replacing backfill
+  // is in flight the base is frozen: clean refs land only once no replacing ref is pending and
+  // the frozen events chain, and then the frozen events land with them
+  *#tryLand(): Generator<void, void, void> {
+    const self = this;
+    const queue = [...this.#backfills].filter(([, e]) => e.status === 'ready').map(([ref]) => ref);
+    if (queue.length === 0) return;
+    // the base is frozen if we're doing any replacing backfills
+    const frozen = this.#replacing > 0;
+    const dirty: string[] = [];
+    let landed = 0;
+    yield* withWTxn(this.#fx, this.#store, function* () {
+      let frozenClean = true;
+      if (frozen) {
+        const streams = yield* self.#brokenStreamsIn(null);
+        if (streams.length > 0) yield* self.#spawnChildrenIn(null, streams);
+        frozenClean = streams.length === 0;
+      }
+      const clean: string[] = [];
+      for (let i = 0; i < queue.length; i++) {
+        const ref = queue[i];
+        const entry = self.#backfills.get(ref)!;
+        const streams = yield* self.#brokenStreamsIn(ref);
+        if (streams.length > 0) {
+          if (streams[0] === ref) {
+            // broken seq chain in a single stream: just restart
+            yield* self.#restartIn(ref);
+          } else {
+            // broken seq chain in a child stream of a prefix ref; spawn a child for just that slice
+            yield* self.#spawnChildrenIn(ref, streams);
+          }
+        } else if (entry.parent !== null) {
+          yield* self.#mergeChildIn(ref);
+          if (self.#backfills.get(entry.parent)!.status === 'ready') queue.push(entry.parent);
+        } else {
+          clean.push(ref);
+        }
+      }
+      // a restarted or spawned replacing ref is pending again, so this is checked last
+      const pending = [...self.#backfills.values()].some((e) => e.record.replacing && e.status !== 'ready');
+      if (frozen && (pending || !frozenClean)) return;
+      for (const ref of clean) yield* self.#landRefIn(ref, dirty);
+      landed = clean.length;
+      // if base was frozen, land all the non-backfill events that got frozen too
+      if (frozen) yield* self.#reduceParkedIn(null, {}, dirty);
+    });
+
+    // update graph and overlay
+    if (landed > 0) {
+      this.#graph.dirty(dirty);
+      if (this.#live) yield* this.#rebuildOverlay();
+    }
+  }
+
+  // the parked event range of a ref, or of every stream for the frozen events (null)
+  #parkRange(ref: string | null, values: StoreRange['values']): StoreRange {
+    return prefixRange(`/park.ev.${ref === null ? '' : refPrefix(ref)}`, 1000, values);
+  }
+
+  // key-only: the streams among a ref's parked events whose chain does not continue from the
+  // blob's seq, or among the frozen events (null) from the held seq.  A stream under some other
+  // backfill is not ours and is skipped, and so is an event the base already covers
+  *#brokenStreamsIn(ref: string | null): RStoreGenerator<string[]> {
+    const header =
+      ref === null ? {} : (((yield* txnGet(`/backfill-seqs.${ref}`, '.json')) ?? {}) as Record<string, number>);
+    const broken: string[] = [];
+    let range = this.#parkRange(ref, false);
+    let stream = '';
+    let last = 0;
+    for (;;) {
+      const { entries, next } = yield* txnScan(range);
+      for (const [key] of entries) {
+        const park = parsePark(key);
+        const held = this.#streams.get(park.stream);
+        if (ref === null && held === 'backfill') continue;
+        if (park.stream !== stream) {
+          stream = park.stream;
+          last = header[stream] ?? (typeof held === 'number' ? held : 0);
+        }
+        // at or below the base the snapshot covers it
+        if (park.seq <= last) continue;
+        if (park.seq !== last + 1) {
+          if (!broken.includes(stream)) broken.push(stream);
+          continue;
+        }
+        last = park.seq;
+      }
+      if (next === null) return broken;
+      range = resumeRange(range, next);
+    }
+  }
+
+  // inside a landing transaction: a parentless ref's values move into place over the state they
+  // replace, its parked events reduce per stream from the blob's seqs, and its records and entry
+  // go
+  *#landRefIn(ref: string, dirty: string[]): WStoreGenerator<void> {
+    const prefix = refPrefix(ref);
+    const header = ((yield* txnGet(`/backfill-seqs.${ref}`, '.json')) ?? {}) as Record<string, number>;
+    dirty.push(...(yield* txnDelPrefix(prefix)));
+    dirty.push(...(yield* txnMove(`/park.kv.${prefix}`, prefix)));
+    yield* this.#reduceParkedIn(ref, header, dirty);
+    yield* txnDel(`/backfill.${ref}`);
+    yield* txnDel(`/backfill-seqs.${ref}`);
+    const entry = this.#backfills.get(ref)!;
+    this.#backfills.delete(ref);
+    if (entry.record.replacing) this.#replacing--;
+  }
+
+  // inside a landing transaction: a completed child folds into its parent.  The parent's header
+  // takes the child's seq for its stream, the child's records and entry go, and its parked ranges
+  // stay inside the parent's for the parent's land.  The parent is ready once its last child merged
+  *#mergeChildIn(ref: string): WStoreGenerator<void> {
+    const entry = this.#backfills.get(ref)!;
+    const parent = this.#backfills.get(entry.parent!)!;
+    const seqs = ((yield* txnGet(`/backfill-seqs.${ref}`, '.json')) ?? {}) as Record<string, number>;
+    const parentSeqs = ((yield* txnGet(`/backfill-seqs.${entry.parent}`, '.json')) ?? {}) as Record<string, number>;
+    yield* txnSet(`/backfill-seqs.${entry.parent}`, '.json', { [JS]: { ...parentSeqs, ...seqs } });
+    yield* txnDel(`/backfill.${ref}`);
+    yield* txnDel(`/backfill-seqs.${ref}`);
+    this.#backfills.delete(ref);
+    if (entry.record.replacing) this.#replacing--;
+    parent.record.children = parent.record.children.filter((c) => c !== ref);
+    yield* txnSet(`/backfill.${entry.parent}`, '.json', { [JS]: parent.record });
+    if (parent.record.children.length === 0) parent.status = 'ready';
+  }
+
+  // inside a landing transaction: reduce the parked events of a ref, or of every stream under no
+  // backfill for the frozen events (null), each stream's run in one reducer call, then clear the
+  // range.  An event the base already covers is skipped.  Every landed stream's seq is written
+  // once: the last walked for a stream with events, the blob's for a header stream without.
+  // Chains were checked before any write
+  *#reduceParkedIn(
+    ref: string | null, header: Record<string, number>, dirty: string[],
+  ): WStoreGenerator<void> {
+    const seqs = new Map(Object.entries(header));
+    let range = this.#parkRange(ref, { type: '.event', want: JS });
+    let stream = '';
+    let run: DbEvent<unknown>[] = [];
+    for (;;) {
+      const { entries, next } = yield* txnScan(range);
+      for (const [, value] of entries) {
+        const ev = (value as Record<number, unknown>)[JS] as DbEvent<unknown>;
+        const held = this.#streams.get(ev.stream);
+        if (ref === null && held === 'backfill') continue;
+        if (ev.seq <= (seqs.get(ev.stream) ?? (typeof held === 'number' ? held : 0))) continue;
+        if (ev.stream !== stream) {
+          if (run.length > 0) yield* this.#reduceStreamIn(stream, run, dirty);
+          stream = ev.stream;
+          run = [];
+        }
+        seqs.set(stream, ev.seq);
+        run.push(ev);
+      }
+      if (next === null) break;
+      range = resumeRange(range, next);
+    }
+    if (run.length > 0) yield* this.#reduceStreamIn(stream, run, dirty);
+    dirty.push(...(yield* txnDelPrefix(range.gte!)));
+    for (const [name, seq] of seqs) {
+      this.#streams.set(name, seq);
+      yield* txnSet(`/seq.${name}`, '.json', { [JS]: seq });
+    }
+  }
+
+  // one stream's run of events, in order, through its slice's reducer; births and deaths are the
+  // Engine's: a death drops the stream's keys, the stream stays known so a rebirth chains, and
+  // neither reaches a reducer
+  *#reduceStreamIn(
+    stream: string, events: DbEvent<unknown>[], dirty: string[],
+  ): WStoreGenerator<void> {
+    const slice = this.#reducers[stream.split('.')[0]];
+    let data: unknown[] = [];
+    const reduce = function* (this: Engine<QX, C>): WStoreGenerator<void> {
+      if (data.length === 0) return;
+      const { updates } = yield* runReducer(slice.reducer(slice.rx, data));
+      dirty.push(...updates);
+      data = [];
+    }.bind(this);
+    for (const ev of events) {
+      const sys = sysOf(ev.data);
+      if (sys === 'death') {
+        yield* reduce();
+        dirty.push(...(yield* txnDelPrefix(`${stream}/`)));
+      } else if (sys === null) {
+        data.push(ev.data);
+      }
+    }
+    yield* reduce();
+  }
+
+  // inside a landing transaction: an exact ref whose tail did not reach its parked live events
+  // drops its parked values and downloads again from a fresh snapshot, whose header seq is past
+  // the gap; the parked events stay and chain from the live cut
+  *#restartIn(ref: string): WStoreGenerator<void> {
+    const entry = this.#backfills.get(ref)!;
+    yield* txnDelPrefix(`/park.kv.${refPrefix(ref)}`);
+    entry.record.resume = null;
+    entry.status = 'downloading';
+    entry.attempts = 0;
+    yield* txnSet(`/backfill.${ref}`, '.json', { [JS]: entry.record });
+    this.#startBackfill(ref);
+  }
+
+  // inside a landing transaction: each broken stream becomes an exact-ref child of the ref it was
+  // found under (null for the frozen events), parked from the cursor on, and that parent waits.
+  // The child's blob is the truth for its stream, so the parent's parked values for it go
+  *#spawnChildrenIn(parent: string | null, streams: string[]): WStoreGenerator<void> {
+    const until = this.#checkpoint?.position ?? 0;
+    const p = parent === null ? undefined : this.#backfills.get(parent)!;
+    const replacing = p !== undefined && p.record.replacing;
+    for (const stream of streams) {
+      const record: BackfillRecord = { until, resume: null, replacing, children: [] };
+      yield* txnDelPrefix(`/park.kv.${stream}/`);
+      yield* txnSet(`/backfill.${stream}`, '.json', { [JS]: record });
+      this.#backfills.set(stream, {
+        record,
+        controller: new AbortController(),
+        status: 'downloading',
+        parent,
+        attempts: 0,
+        retryTimer: null,
+      });
+      if (replacing) this.#replacing++;
+      yield* this.#maybeMarkBackfilling(stream);
+      this.#startBackfill(stream);
+    }
+    if (p !== undefined) {
+      p.record.children.push(...streams);
+      p.status = 'waiting';
+      yield* txnSet(`/backfill.${parent}`, '.json', { [JS]: p.record });
+    }
   }
 
   *#onRecvEvents(): Generator<void, void, void> {
@@ -3473,7 +3833,10 @@ export class Engine<QX, C> {
     }
     this.#connectorAbort.abort();
     this.#connector = null;
-    for (const entry of this.#backfills.values()) entry.controller.abort();
+    for (const entry of this.#backfills.values()) {
+      entry.controller.abort();
+      if (entry.retryTimer !== null) clearTimeout(entry.retryTimer);
+    }
     const reason = new Error('engine shut down');
     for (const work of this.#backfillWork) work.reject(reason);
     this.#backfillWork = [];
