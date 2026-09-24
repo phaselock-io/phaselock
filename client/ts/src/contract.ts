@@ -75,6 +75,9 @@ export interface Connector {
 }
 
 export interface ConnectorHooks {
+  // first, once per connection, before any frame: the epoch from the response headers, the log
+  // every position on this connection belongs to
+  onOpen(epoch: string): void;
   // the whole view: token is its hash, position the commit it is the view at, refs the set.
   // Sent first when the presented token was not current, and on every change, in stream order
   // ahead of the events it applies to.  The Engine diffs refs against what it holds.

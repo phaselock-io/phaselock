@@ -2784,6 +2784,9 @@ export interface Connector {
 }
 
 export interface ConnectorHooks {
+  // first, once per connection, before any frame: the epoch from the response headers, the log
+  // every position on this connection belongs to
+  onOpen(epoch: string): void;
   // the whole view: token is its hash, position the commit it is the view at, refs the set.
   // Sent first when the presented token was not current, and on every change, in stream order
   // ahead of the events it applies to.  The Engine diffs refs against what it holds.
@@ -2927,7 +2930,7 @@ export type SliceReducer = {
 /** the view, as persisted at /view when a reconciliation commits */
 export type ViewRecord = { token: string; position: number; refs: string[] };
 /** the cursor, as persisted at /checkpoint with every batch and vouch */
-export type CheckpointRecord = { epoch: number; position: number };
+export type CheckpointRecord = { epoch: string; position: number };
 /** a backfill in flight, as persisted at /backfill.{ref} */
 export type BackfillRecord = {
   until: number;
@@ -2994,6 +2997,7 @@ export function parsePark(key: string): { stream: string; seq: number } {
 
 /** what the connector delivered, in arrival order */
 type Inbound =
+  | { open: string }
   | { view: ViewRecord }
   | { events: WireEvent[] }
   | { vouch: number }
@@ -3038,6 +3042,8 @@ export class Engine<QX, C> {
 
   // liveness: the connector has delivered `live`, and no replacing backfill is in flight
   #live: boolean = false;
+  // the log this connection's positions belong to, from its first hook; null between connections
+  #epoch: string | null = null;
   #replacing: number = 0;
 
   // work received from the connector, in arrival order
@@ -3510,7 +3516,10 @@ export class Engine<QX, C> {
         fresh.push(stream);
       }
     }
-    if (fresh.length > 0) yield* this.#spawnChildrenIn(ref, fresh);
+    if (fresh.length > 0) {
+      const replacing = ref !== null && this.#backfills.get(ref)!.record.replacing;
+      yield* this.#spawnIn(ref, fresh, this.#checkpoint?.position ?? 0, replacing);
+    }
   }
 
   // inside a landing transaction: a top-level ref's subtree lands as one.  Per stream under the
@@ -3660,17 +3669,14 @@ export class Engine<QX, C> {
     this.#startBackfill(ref);
   }
 
-  // inside a landing transaction: each broken stream becomes an exact-ref child of the ref it was
-  // found under (null for the frozen events), parked from the cursor on and downloading at once
-  // into its own values range; the parent lands when its children have too
-  *#spawnChildrenIn(parent: string | null, streams: string[]): WStoreGenerator<void> {
-    const until = this.#checkpoint?.position ?? 0;
-    const p = parent === null ? undefined : this.#backfills.get(parent)!;
-    const replacing = p !== undefined && p.record.replacing;
-    for (const stream of streams) {
+  // inside a transaction: new backfills, each downloading at once into its own values range.  A
+  // stream ref is marked; a family has nothing to mark.  With a parent they are its children and
+  // it lands when they have too
+  *#spawnIn(parent: string | null, refs: string[], until: number, replacing: boolean): WStoreGenerator<void> {
+    for (const ref of refs) {
       const record: BackfillRecord = { until, resume: null, replacing, children: [] };
-      yield* txnSet(`/backfill.${stream}`, '.json', { [JS]: record });
-      this.#backfills.set(stream, {
+      yield* txnSet(`/backfill.${ref}`, '.json', { [JS]: record });
+      this.#backfills.set(ref, {
         record,
         controller: new AbortController(),
         status: 'downloading',
@@ -3679,13 +3685,203 @@ export class Engine<QX, C> {
         retryTimer: null,
       });
       if (replacing) this.#replacing++;
-      yield* this.#maybeMarkBackfilling(stream, replacing);
-      this.#startBackfill(stream);
+      if (!ref.endsWith('*')) yield* this.#maybeMarkBackfilling(ref, replacing);
+      this.#startBackfill(ref);
     }
-    if (p !== undefined) {
-      p.record.children.push(...streams);
+    if (parent !== null) {
+      const p = this.#backfills.get(parent)!;
+      p.record.children.push(...refs);
       yield* txnSet(`/backfill.${parent}`, '.json', { [JS]: p.record });
     }
+  }
+
+  // inside a transaction: an in-flight backfill ends.  Its download is aborted, its values range
+  // and records go, and its children carry on with the parent they have left, if any
+  *#dropBackfillIn(ref: string): WStoreGenerator<void> {
+    const entry = this.#backfills.get(ref)!;
+    entry.controller.abort();
+    if (entry.retryTimer !== null) clearTimeout(entry.retryTimer);
+    yield* txnDelPrefix(`/park.kv.${ref}/`);
+    yield* txnDel(`/backfill.${ref}`);
+    yield* txnDel(`/backfill-seqs.${ref}`);
+    this.#backfills.delete(ref);
+    if (entry.record.replacing) this.#replacing--;
+    if (entry.parent !== null) {
+      const p = this.#backfills.get(entry.parent)!;
+      p.record.children = p.record.children.filter((c) => c !== ref);
+      yield* txnSet(`/backfill.${entry.parent}`, '.json', { [JS]: p.record });
+    }
+    for (const child of entry.record.children) {
+      const c = this.#backfills.get(child);
+      if (c === undefined) continue;
+      c.parent = this.#parentOf(child);
+      if (c.parent === null) continue;
+      const p = this.#backfills.get(c.parent)!;
+      p.record.children.push(child);
+      yield* txnSet(`/backfill.${c.parent}`, '.json', { [JS]: p.record });
+    }
+  }
+
+  // inside a transaction: a stream leaves the Engine: its state, its seq, and its parked events
+  *#dropStreamIn(stream: string, dirty: string[]): WStoreGenerator<void> {
+    dirty.push(...(yield* txnDelPrefix(`${stream}/`)));
+    yield* txnDel(`/seq.${stream}`);
+    yield* txnDelPrefix(`/park.ev.${stream}/`);
+    this.#streams.delete(stream);
+  }
+
+  // one inbound item from the connector, in arrival order
+  *#onInbox(): Generator<void, void, void> {
+    const item = this.#inbox.shift()!;
+    if ('events' in item) {
+      yield* this.#onEvents(item.events);
+    } else if ('open' in item) {
+      // a different epoch is a replaced log: positions held mean nothing there.  Dropping
+      // everything and backfilling every ref is the answer, and until that exists this ends
+      if (this.#checkpoint !== null && this.#checkpoint.epoch !== item.open) {
+        throw new Error(`epoch ${item.open}, checkpoint from ${this.#checkpoint.epoch}`);
+      }
+      this.#epoch = item.open;
+    } else if ('view' in item) {
+      yield* this.#onView(item.view);
+    } else if ('vouch' in item) {
+      yield* this.#onCursor(item.vouch);
+    } else if ('live' in item) {
+      yield* this.#onCursor(item.live);
+      this.#live = true;
+      this.#attempt = 0;
+      if (this.#replacing === 0) yield* this.#rebuildOverlay();
+    } else {
+      this.#onEnd();
+    }
+  }
+
+  // one atom's events in one transaction.  Routing is a streams-table lookup: a marked stream
+  // parks; an unknown stream under an in-flight ref is marked and parks; an unknown non-birth
+  // under no ref starts its own backfill and parks; while frozen everything else parks too; a
+  // held stream's next event joins its run, a repeat is dropped, and a jump is a gap, which
+  // starts a replacing backfill for the stream at once, under the in-flight ref covering it if
+  // any, and freezes the base from that event on.  Runs reduce per stream, the seqs and the
+  // checkpoint are written, and the graph runs when live and not frozen
+  *#onEvents(events: WireEvent[]): Generator<void, void, void> {
+    const self = this;
+    const dirty: string[] = [];
+    yield* withWTxn(this.#fx, this.#store, function* () {
+      const seqs = new Map<string, number>();
+      const runs = new Map<string, DbEvent<unknown>[]>();
+      for (const ev of events) {
+        const held = self.#streams.get(ev.stream);
+        let park = held === 'backfill';
+        if (held === undefined) {
+          const parent = self.#parentOf(ev.stream);
+          if (parent !== null) {
+            yield* self.#maybeMarkBackfilling(ev.stream, self.#backfills.get(parent)!.record.replacing);
+            park = true;
+          } else if (sysOf(self.#decode(ev).data) !== 'birth') {
+            yield* self.#spawnIn(null, [ev.stream], ev.position, false);
+            park = true;
+          }
+        }
+        if (!park && self.#replacing > 0) park = true;
+        if (!park) {
+          const last = seqs.get(ev.stream) ?? (typeof held === 'number' ? held : 0);
+          if (ev.seq <= last) continue;
+          if (ev.seq === last + 1) {
+            seqs.set(ev.stream, ev.seq);
+            if (!runs.has(ev.stream)) runs.set(ev.stream, []);
+            runs.get(ev.stream)!.push(self.#decode(ev));
+            continue;
+          }
+          yield* self.#spawnIn(self.#parentOf(ev.stream), [ev.stream], ev.position, true);
+          seqs.delete(ev.stream);
+          park = true;
+        }
+        yield* txnSet(parkedEventKey(ev.stream, ev.seq), '.event', { [MSGPACK]: ev.raw });
+      }
+      for (const [stream, run] of runs) yield* self.#reduceStreamIn(stream, run, dirty);
+      for (const [stream, seq] of seqs) {
+        self.#streams.set(stream, seq);
+        yield* txnSet(`/seq.${stream}`, '.json', { [JS]: seq });
+      }
+      yield* self.#advanceCursorIn(events[events.length - 1].position);
+    });
+    this.#graph.dirty(dirty);
+    if (dirty.length > 0 && this.#live && this.#replacing === 0) yield* this.#rebuildOverlay();
+  }
+
+  // a live event as the reducers see it
+  #decode(ev: WireEvent): DbEvent<unknown> {
+    const v = this.#reg.convert('.event', { [MSGPACK]: ev.raw }, JS);
+    return (v as Record<number, unknown>)[JS] as DbEvent<unknown>;
+  }
+
+  // inside a transaction: the checkpoint moves forward, never back, under the connection's epoch
+  *#advanceCursorIn(position: number): WStoreGenerator<void> {
+    if (this.#epoch === null) throw new Error('cursor with no epoch');
+    if (this.#checkpoint !== null && position <= this.#checkpoint.position) return;
+    this.#checkpoint = { epoch: this.#epoch, position };
+    yield* txnSet('/checkpoint', '.json', { [JS]: this.#checkpoint });
+  }
+
+  // a vouch, or the live mark: the cursor converges in its own transaction
+  *#onCursor(position: number): Generator<void, void, void> {
+    const self = this;
+    yield* withWTxn(this.#fx, this.#store, function* () {
+      yield* self.#advanceCursorIn(position);
+    });
+  }
+
+  // a view frame, reconciled against state in one transaction.  Drops first: an in-flight ref
+  // the new set does not fully cover ends, and a stream the new set does not cover goes.  Then
+  // every ref of the new set that nothing accounts for starts a backfill, broadest first so a
+  // covered ref finds its cover, and adopts the in-flight refs it covers.  A drop that ends the
+  // last replacing backfill lands the frozen events here.  The view is written only when this
+  // commits.  A revoke changes what queries may see, so the graph runs even while frozen: a new
+  // query would otherwise disagree with the results already delivered
+  *#onView(view: ViewRecord): Generator<void, void, void> {
+    const self = this;
+    const dirty: string[] = [];
+    const wasFrozen = this.#replacing > 0;
+    yield* withWTxn(this.#fx, this.#store, function* () {
+      const covered = (refs: string[], x: string) => refs.some((r) => refCovers(r, x));
+      const old = self.#view?.refs ?? [];
+      const atStart = [...self.#backfills.keys()];
+      for (const ref of atStart) {
+        if (!covered(view.refs, ref)) yield* self.#dropBackfillIn(ref);
+      }
+      for (const stream of [...self.#streams.keys()]) {
+        if (!covered(view.refs, stream)) yield* self.#dropStreamIn(stream, dirty);
+      }
+      const refs = [...view.refs].sort((a, b) => refPrefix(a).length - refPrefix(b).length);
+      for (const ref of refs) {
+        const entries = [...self.#backfills.keys()];
+        if (entries.some((e) => refCovers(e, ref))) continue;
+        const held = covered(old, ref) && !atStart.some((e) => refCovers(e, ref));
+        if (held || typeof self.#streams.get(ref) === 'number') continue;
+        yield* self.#spawnIn(null, [ref], view.position, false);
+        yield* self.#adoptChildrenIn(ref);
+      }
+      yield* txnSet('/view', '.json', { [JS]: view });
+      self.#view = view;
+      if (wasFrozen && self.#replacing === 0) yield* self.#reduceParkedIn(null, {}, dirty);
+    });
+    this.#graph.dirty(dirty);
+    if (dirty.length > 0 && this.#live) yield* this.#rebuildOverlay();
+  }
+
+  // the connection ended: the next attempt is scheduled with backoff, and every in-flight
+  // backfill call fails through its outcome and waits for the next connection
+  #onEnd(): void {
+    const self = this;
+    this.#connector = null;
+    this.#connectorAbort.abort();
+    this.#connectorAbort = new AbortController();
+    this.#live = false;
+    this.#epoch = null;
+    this.#retryTimer = setTimeout(() => {
+      self.#retryTimer = null;
+      self.#schedule();
+    }, backoffDelay(this.#attempt++));
   }
 
   *#onRecvEvents(): Generator<void, void, void> {

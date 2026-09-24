@@ -87,6 +87,12 @@ export class HTTPConnector implements Connector {
         this.#end(resp.status, await resp.text());
         return;
       }
+      const epoch = resp.headers.get('PhaseLock-Epoch');
+      if (epoch === null || epoch === '') {
+        this.#end(resp.status, 'stream: no epoch');
+        return;
+      }
+      this.#hooks.onOpen(epoch);
       await frames(new ByteReader(resp.body), (f) => {
         switch (f.tag) {
           case 'events':

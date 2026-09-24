@@ -94,7 +94,11 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
     const ctl = new AbortController();
     const factory = NewHTTPConnector(url, () => token);
     let viewToken = '';
+    let epoch = '';
     const conn = factory(-1, null, ['*'], ctl.signal, {
+      onOpen: (e) => {
+        epoch = e;
+      },
       onView: (t, position, refs) => {
         viewToken = t;
         log.push(['view', t.length > 0, position, refs]);
@@ -113,6 +117,7 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
     // a bootstrap presents no token and gets the view as its first frame
     expect(log[0]).toEqual(['view', true, 0, ['*']]);
     expect(live).toBe(0);
+    expect(epoch).toMatch(/^[0-9a-f]{32}$/);
 
     // commands: ack, ack, dup, reject
     const res = await conn.sendCommand([
@@ -146,6 +151,7 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
     const again: unknown[][] = [];
     const ctl2 = new AbortController();
     factory(cursor, viewToken, ['*'], ctl2.signal, {
+      onOpen() {},
       onView: (t, position, refs) => again.push(['view', t === viewToken, position, refs]),
       onEvents() {},
       onLive: (p) => again.push(['live', p]),
@@ -200,6 +206,7 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
 
     // coverage: anonymous sees book but not a patron
     const anon = NewHTTPConnector(url)(-1, null, ['*'], ctl.signal, {
+      onOpen() {},
       onView() {},
       onEvents() {},
       onLive() {},

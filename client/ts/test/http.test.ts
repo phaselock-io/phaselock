@@ -69,6 +69,7 @@ class Stub {
       res = r;
       r.writeHead(200, {
         'Content-Type': 'application/msgpack',
+        'PhaseLock-Epoch': 'e3',
         'PhaseLock-View': view,
         'PhaseLock-Position': String(position),
       });
@@ -85,6 +86,7 @@ class Stub {
 
 function hooks(log: unknown[][]): ConnectorHooks {
   return {
+    onOpen: (epoch) => log.push(['open', epoch]),
     onView: (token, position, refs) => log.push(['view', token, position, refs]),
     onEvents: (events) =>
       log.push(['events', events.map((e) => [e.position, e.stream, e.seq, decode(e.data)])]),
@@ -119,6 +121,7 @@ describe('the live stream', () => {
     s.end();
     await settle();
     expect(log).toEqual([
+      ['open', 'e3'],
       ['live', 0],
       ['events', [[1, 'book', 1, { $sys: 'birth' }]]],
       ['view', 't2', 2, ['book', 'patron.p1']],
@@ -157,6 +160,7 @@ describe('the live stream', () => {
     s.end();
     await settle();
     expect(log).toEqual([
+      ['open', 'e3'],
       ['view', 't9', 7, ['book', 'patron.*']],
       ['live', 7],
       ['end', 0, 'stream closed'],
@@ -172,9 +176,21 @@ describe('the live stream', () => {
     s.end();
     await settle();
     expect(log).toEqual([
+      ['open', 'e3'],
       ['live', 9],
       ['end', 0, 'stream closed'],
     ]);
+  });
+
+  test('a stream without an epoch header ends before any frame', async () => {
+    stub.routes.set('/stream', (_r, _b, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/msgpack' });
+      res.end();
+    });
+    const log: unknown[][] = [];
+    NewHTTPConnector(stub.url)(-1, null, ['*'], new AbortController().signal, hooks(log));
+    await settle();
+    expect(log).toEqual([['end', 200, 'stream: no epoch']]);
   });
 
   test('a refused handshake ends with the HTTP status', async () => {

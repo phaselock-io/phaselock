@@ -98,6 +98,7 @@ for one.
 
 ```ts
 export interface ConnectorHooks {
+  onOpen(epoch: string): void;
   onView(token: string, position: number, refs: string[]): void;
   onEvents(events: WireEvent[]): void;
   onLive(position: number): void;
@@ -106,6 +107,12 @@ export interface ConnectorHooks {
 }
 ```
 
+- `onOpen` comes first, once per connection, before any frame, with
+  `PhaseLock-Epoch` from the response headers: an opaque id for the log
+  every position on this connection belongs to.  The Engine writes no
+  checkpoint
+  without it, and a connection whose epoch differs from the stored
+  checkpoint's is a replaced log.
 - `onView` is the whole view: the token, the position it is the view
   at, and the full set of refs.  The connector sends the Engine's
   stored token as `view`; when it is current no view frame comes at
