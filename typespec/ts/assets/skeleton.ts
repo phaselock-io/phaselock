@@ -3271,7 +3271,7 @@ export class Engine<QX, C> {
               const type = storeTypeOf(self.#reg, key);
               if (type === undefined) continue;
               yield* txnSet(`/park.kv.${ref}/${key}`, type, { [MSGPACK]: bytes });
-              yield* self.#maybeMarkBackfilling(key.slice(0, key.indexOf('/')));
+              yield* self.#maybeMarkBackfilling(key.slice(0, key.indexOf('/')), record.replacing);
             }
             record.resume!.skipBytes = item.skip;
           } else if ('valuesDone' in item) {
@@ -3279,7 +3279,7 @@ export class Engine<QX, C> {
           } else if ('events' in item) {
             for (const ev of item.events) {
               yield* txnSet(parkedEventKey(ev.stream, ev.seq), '.event', { [MSGPACK]: ev.raw });
-              yield* self.#maybeMarkBackfilling(ev.stream);
+              yield* self.#maybeMarkBackfilling(ev.stream, record.replacing);
               record.resume!.fromPosition = Math.max(record.resume!.fromPosition, ev.position);
             }
           } else if ('tailDone' in item) {
@@ -3296,9 +3296,11 @@ export class Engine<QX, C> {
     }
   }
 
-  // a stream seen under a backfill is marked in the streams table, in memory and at /seq.
-  *#maybeMarkBackfilling(stream: string): WStoreGenerator<void> {
-    if (this.#streams.get(stream) === 'backfill') return;
+  // a stream seen under a backfill is marked in the streams table, in memory and at /seq., once.
+  // An additive backfill leaves a held stream held and lands around it; a replacing one takes it
+  *#maybeMarkBackfilling(stream: string, replacing: boolean): WStoreGenerator<void> {
+    const held = this.#streams.get(stream);
+    if (held === 'backfill' || (typeof held === 'number' && !replacing)) return;
     this.#streams.set(stream, 'backfill');
     yield* txnSet(`/seq.${stream}`, '.json', { [JS]: 'backfill' });
   }
@@ -3408,7 +3410,9 @@ export class Engine<QX, C> {
       }
       if (frozen) {
         const landing = new Set(clean.flatMap((ref) => self.#subtree(ref)));
-        const pending = [...self.#backfills].some(([ref, e]) => e.record.replacing && !landing.has(ref));
+        const pending = [...self.#backfills].some(
+          ([ref, e]) => e.record.replacing && !landing.has(ref)
+        );
         if (pending || !frozenClean) return;
       }
       for (const ref of clean) yield* self.#landRefIn(ref, dirty);
@@ -3435,7 +3439,10 @@ export class Engine<QX, C> {
 
   // whether a ref's whole subtree has finished downloading
   #landable(ref: string): boolean {
-    return this.#backfills.get(ref)!.status === 'ready' && this.#childrenOf(ref).every((c) => this.#landable(c));
+    return (
+      this.#backfills.get(ref)!.status === 'ready'
+      && this.#childrenOf(ref).every((c) => this.#landable(c))
+    );
   }
 
   // the parked event range of a ref, or of every stream for the frozen events (null)
@@ -3443,16 +3450,25 @@ export class Engine<QX, C> {
     return prefixRange(`/park.ev.${ref === null ? '' : refPrefix(ref)}`, 1000, values);
   }
 
-  // a subtree's seqs at its cuts: the ref's blob header, each child's laid over it for its streams
+  // a ref's blob header: the seq of every stream in its blob at the cut
+  *#headerOf(ref: string): RStoreGenerator<Record<string, number>> {
+    return ((yield* txnGet(`/backfill-seqs.${ref}`, '.json')) ?? {}) as Record<string, number>;
+  }
+
+  // a subtree's seqs at its cuts: the ref's blob header, each child's laid over it for its
+  // streams, the deepest winning
   *#mergedHeaderIn(ref: string): RStoreGenerator<Record<string, number>> {
-    let header = ((yield* txnGet(`/backfill-seqs.${ref}`, '.json')) ?? {}) as Record<string, number>;
-    for (const child of this.#childrenOf(ref)) header = { ...header, ...(yield* this.#mergedHeaderIn(child)) };
+    let header = yield* this.#headerOf(ref);
+    for (const child of this.#childrenOf(ref)) {
+      header = { ...header, ...(yield* this.#mergedHeaderIn(child)) };
+    }
     return header;
   }
 
   // key-only: the streams among a subtree's parked events whose chain does not continue from
-  // its cut, or among the frozen events (null) from the held seq.  A stream under some other
-  // backfill is not ours and is skipped, and so is an event the base already covers
+  // the state that will be in place, or among the frozen events (null) from the held seq.  A
+  // stream under some other backfill is not ours and is skipped, and so is an event the base
+  // already covers
   *#brokenStreamsIn(ref: string | null): RStoreGenerator<string[]> {
     const header = ref === null ? {} : yield* this.#mergedHeaderIn(ref);
     const broken: string[] = [];
@@ -3467,7 +3483,8 @@ export class Engine<QX, C> {
         if (ref === null && held === 'backfill') continue;
         if (park.stream !== stream) {
           stream = park.stream;
-          last = header[stream] ?? (typeof held === 'number' ? held : 0);
+          // the base is the newest state in place: the held seq or the cut, whichever is ahead
+          last = Math.max(typeof held === 'number' ? held : 0, header[stream] ?? 0);
         }
         // at or below the base the snapshot covers it
         if (park.seq <= last) continue;
@@ -3496,23 +3513,62 @@ export class Engine<QX, C> {
     if (fresh.length > 0) yield* this.#spawnChildrenIn(ref, fresh);
   }
 
-  // inside a landing transaction: a top-level ref's subtree lands as one.  The state under the
-  // ref goes, the values move in, each child's over its parent's for its streams, the parked
-  // events reduce per stream from the merged cuts, and every record and entry of the subtree goes
+  // inside a landing transaction: a top-level ref's subtree lands as one.  Per stream under the
+  // ref, the newest state wins: a held stream at or past the cut keeps its state and its blob
+  // values go, any other loses its state to the blob.  Then the values move in, each child's over
+  // its parent's for its streams, the parked events reduce per stream from the state in place,
+  // and every record and entry of the subtree goes
   *#landRefIn(ref: string, dirty: string[]): WStoreGenerator<void> {
     const header = yield* this.#mergedHeaderIn(ref);
-    dirty.push(...(yield* txnDelPrefix(refPrefix(ref))));
-    yield* this.#moveValuesIn(ref, dirty);
+    const subtree = this.#subtree(ref);
+    const kept = new Set<string>();
+    for (const [stream, held] of this.#streams) {
+      if (!refCovers(ref, stream)) continue;
+      if (typeof held === 'number' && held >= (header[stream] ?? 0)) {
+        kept.add(stream);
+        delete header[stream];
+        for (const r of subtree) yield* txnDelPrefix(`/park.kv.${r}/${stream}/`);
+      } else {
+        dirty.push(...(yield* txnDelPrefix(`${stream}/`)));
+      }
+    }
+    yield* this.#moveValuesIn(ref, dirty, kept);
     yield* this.#reduceParkedIn(ref, header, dirty);
     yield* this.#dropIn(ref);
   }
 
   // inside a landing transaction: a ref's parked values into place, then each child's over them
-  *#moveValuesIn(ref: string, dirty: string[]): WStoreGenerator<void> {
+  // for the streams in the child's blob, the deepest winning; a kept stream is never touched, and
+  // a stream only the parent's blob has keeps the parent's values
+  *#moveValuesIn(ref: string, dirty: string[], kept: Set<string>): WStoreGenerator<void> {
     dirty.push(...(yield* txnMove(`/park.kv.${ref}/`, '')));
     for (const child of this.#childrenOf(ref)) {
-      dirty.push(...(yield* txnDelPrefix(refPrefix(child))));
-      yield* this.#moveValuesIn(child, dirty);
+      for (const stream of Object.keys(yield* this.#headerOf(child))) {
+        if (!kept.has(stream)) dirty.push(...(yield* txnDelPrefix(`${stream}/`)));
+      }
+      yield* this.#moveValuesIn(child, dirty, kept);
+    }
+  }
+
+  // inside a transaction creating a ref: every in-flight top-level ref it covers becomes its
+  // child, downloading on in its own values range and landing over the new blob for its streams
+  *#adoptChildrenIn(ref: string): WStoreGenerator<void> {
+    const entry = this.#backfills.get(ref)!;
+    for (const [other, e] of this.#backfills) {
+      if (other === ref || e.parent !== null || !refCovers(ref, other)) continue;
+      e.parent = ref;
+      entry.record.children.push(other);
+    }
+    yield* txnSet(`/backfill.${ref}`, '.json', { [JS]: entry.record });
+  }
+
+  // inside a transaction creating a replacing ref: every held stream under it is marked, since
+  // the blob replaces them all and their events park from here
+  *#markUnderIn(ref: string): WStoreGenerator<void> {
+    for (const [stream, held] of this.#streams) {
+      if (typeof held === 'number' && refCovers(ref, stream)) {
+        yield* this.#maybeMarkBackfilling(stream, true);
+      }
     }
   }
 
@@ -3544,12 +3600,13 @@ export class Engine<QX, C> {
         const ev = (value as Record<number, unknown>)[JS] as DbEvent<unknown>;
         const held = this.#streams.get(ev.stream);
         if (ref === null && held === 'backfill') continue;
-        if (ev.seq <= (seqs.get(ev.stream) ?? (typeof held === 'number' ? held : 0))) continue;
         if (ev.stream !== stream) {
           if (run.length > 0) yield* this.#reduceStreamIn(stream, run, dirty);
           stream = ev.stream;
           run = [];
+          seqs.set(stream, Math.max(typeof held === 'number' ? held : 0, seqs.get(stream) ?? 0));
         }
+        if (ev.seq <= seqs.get(stream)!) continue;
         seqs.set(stream, ev.seq);
         run.push(ev);
       }
@@ -3622,7 +3679,7 @@ export class Engine<QX, C> {
         retryTimer: null,
       });
       if (replacing) this.#replacing++;
-      yield* this.#maybeMarkBackfilling(stream);
+      yield* this.#maybeMarkBackfilling(stream, replacing);
       this.#startBackfill(stream);
     }
     if (p !== undefined) {
