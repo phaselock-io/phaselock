@@ -4014,63 +4014,6 @@ export class Engine<QX, C> {
     }, backoffDelay(this.#attempt++));
   }
 
-  *#onRecvEvents(): Generator<void, void, void> {
-    const self = this;
-    // take events and latest checkpoint
-    const events = this.#recvdEvents;
-    const checkpoint = events.at(-1)!.position;
-    this.#recvdEvents = [];
-
-    // open a write txn to the real store
-    const updates = yield* withWTxn(this.#fx, this.#store, function* () {
-      // update our checkpoint when this txn finishes
-      yield* txnSet('.checkpoint', checkpoint);
-
-      // run the reducer with our new events
-      const eventsData = events.map((event) => event.data);
-      const { updates, markedSent } = yield* runReducer(self.#reducer(self.#rx, eventsData));
-
-      // discard unsent commands that we now know are sent
-      if (self.#unsent.size > 0) {
-        // discard commands we observed round-trip by matching event ids
-        for (const event of events) {
-          if (self.#unsent.has(event.id)) {
-            self.#roundTripped.push(event.id);
-          }
-        }
-        // discard commands that match what the reducer says was sent
-        if (markedSent.length > 0) {
-          const toIgnore = self.#roundTripped.reduce(
-            (acc, id) => ((acc[id] = true), acc),
-            {} as Record<string, true>,
-          );
-          for (const id of self.#unsent.keys()) {
-            if (id in toIgnore) continue;
-            // commands are stored pre-encoded, so no decoder needed to load from store
-            const enc = (yield* txnGet(`.command-${id}`, null)) as Command<C>;
-            for (const m of markedSent) {
-              // but we need to decode it to run matchSent
-              if (!matchSent(m, self.#decodeCommand(enc).data)) continue;
-              self.#roundTripped.push(enc.id);
-              break;
-            }
-          }
-        }
-      }
-      // discard commands based on calls to Engine.markSent()
-      yield* self.#discardRoundTripped();
-
-      return updates;
-    });
-    this.#graph.dirty(updates);
-    this.#roundTripped.map((id) => this.#unsent.delete(id));
-    this.#roundTripped = [];
-
-    if (this.#live) {
-      yield* this.#rebuildOverlay();
-    }
-  }
-
   *#rebuildOverlay(): Generator<void, void, void> {
     const self = this;
 
@@ -4157,41 +4100,6 @@ export class Engine<QX, C> {
     cbs();
   }
 
-  // discard this.#roundTripped within some externally-provided WTxn
-  // (you'll have to erase this.#roundTripped after the txn commits)
-  // return true if something was deleted (but it always processes this.#roundTripped)
-  *#discardRoundTripped(): WStoreGenerator<boolean> {
-    if (this.#roundTripped.length === 0) return false;
-    const roundTripped: Record<string, true> = {};
-    for (const id of this.#roundTripped) {
-      roundTripped[id] = true;
-    }
-    // load the index of batches of commands
-    const index = ((yield* txnGet('.commands', null)) as string[]) ?? [];
-    // decide what to delete
-    const toDelete = index.filter((id) => roundTripped[id]);
-    if (toDelete.length === 0) return false;
-    for (const id of toDelete) {
-      yield* txnDel(`.command-${id}`);
-    }
-    // update the index
-    const toKeep = index.filter((id) => !roundTripped[id]);
-    yield* txnSet('.commands', toKeep);
-    return true;
-  }
-
-  *#onRoundTripped(): Generator<void, void, void> {
-    const self = this;
-    const changed = yield* withWTxn(this.#fx, this.#store, function* () {
-      return yield* self.#discardRoundTripped();
-    });
-    this.#roundTripped.map((id) => this.#unsent.delete(id));
-    this.#roundTripped = [];
-    if (changed && this.#live) {
-      yield* this.#rebuildOverlay();
-    }
-  }
-
   *#onNewQueries(): Generator<void, void, void> {
     const self = this;
     const cbs = yield* withRTxn(this.#fx, this.#overlay, function* () {
@@ -4199,24 +4107,6 @@ export class Engine<QX, C> {
       return yield* self.#graph.extend();
     });
     cbs();
-  }
-
-  *#onReconnects(): Generator<void, void, void> {
-    const { checkpoint, commands } = yield* withRTxn(this.#fx, this.#store, function* () {
-      const checkpoint = (yield* txnGet('.checkpoint', null)) as number | undefined;
-      const commands: Command<any>[] = [];
-      const index = ((yield* txnGet('.commands', null)) as string[]) ?? [];
-      for (const id of index) {
-        // commands are stored pre-encoded and need no decoder
-        const enc = (yield* txnGet(`.command-${id}`, null)) as Command<any>;
-        commands.push(enc);
-      }
-      return { checkpoint, commands };
-    });
-    for (const resolve of this.#reconnects) {
-      resolve({ checkpoint, commands: deepCopy(commands) });
-    }
-    this.#reconnects = [];
   }
 
   // ends everything the Engine drives: the connection, its backfills, the retry timer, and the
