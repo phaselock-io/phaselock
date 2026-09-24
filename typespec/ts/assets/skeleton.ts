@@ -2990,6 +2990,12 @@ export function parkedEventKey(stream: string, seq: number): string {
   return `/park.ev.${stream}/${String(seq).padStart(20, '0')}`;
 }
 
+/** the key of an outbox command: its ordinal zero-padded so a scan walks the outbox in send
+    order */
+export function commandKey(ordinal: number): string {
+  return `/command.${String(ordinal).padStart(20, '0')}`;
+}
+
 /** the stream and seq a parked event key names */
 export function parsePark(key: string): { stream: string; seq: number } {
   const slash = key.lastIndexOf('/');
@@ -3068,6 +3074,10 @@ export class Engine<QX, C> {
   // work received from the app
   #sendCommands: C[] = [];
   #newQueries: boolean = false;
+  // the outbox is flushed on every new connection
+  #flush: boolean = false;
+  // the query context, handed to every query and every forecast
+  #qx: QX;
 
   constructor(
     qx: QX,
@@ -3087,6 +3097,7 @@ export class Engine<QX, C> {
       signal?: AbortSignal;
     },
   ) {
+    this.#qx = qx;
     this.#store = store ?? new InMemStore(reg);
     this.#reg = reg;
     this.#connect = connect;
@@ -3242,7 +3253,7 @@ export class Engine<QX, C> {
         continue;
       }
 
-      if (this.#sendCommands.length > 0) {
+      if (this.#sendCommands.length > 0 || this.#flush) {
         // write to the outbox, forecast, send through the connector in order
         yield* this.#onSendCommands();
         continue;
@@ -3297,6 +3308,7 @@ export class Engine<QX, C> {
     for (const [ref, entry] of this.#backfills) {
       if (entry.status === 'downloading' && entry.retryTimer === null) this.#startBackfill(ref);
     }
+    this.#flush = true;
   }
 
   // one push from a backfill, in its own transaction; the connector's promise resolves after the
@@ -4014,90 +4026,111 @@ export class Engine<QX, C> {
     }, backoffDelay(this.#attempt++));
   }
 
+  // the overlay is rebuilt from the outbox after any change under it: a fresh overlay over the
+  // base, every outbox command forecast in order against it, each seeing what the ones before
+  // left, and the graph run on the result.  A forecast that answers a reason, or throws, adds
+  // nothing: the command is still in flight and the server decides
   *#rebuildOverlay(): Generator<void, void, void> {
     const self = this;
-
-    // discard old overlay, start a new one
     this.#graph.dirty(this.#overlay.keys());
-    this.#overlay = new OverlayStore(this.#store);
-
-    // rebuild overlay with current forecasts
-    const forecasts = [...this.#unsent.values()].flat();
-    if (forecasts.length > 0) {
-      const { updates } = yield* withWTxn(this.#fx, this.#overlay, function* () {
-        return yield* runReducer(self.#reducer(self.#rx, forecasts));
+    this.#overlay = new OverlayStore(this.#store, this.#reg);
+    const forecaster = this.#forecaster;
+    if (forecaster !== null && this.#outbox.size > 0) {
+      const updates = yield* withWTxn(this.#fx, this.#overlay, function* () {
+        const dirty: string[] = [];
+        const rows = yield* txnScanAll(prefixRange('/command.', 1000, { type: '.command', want: JS }));
+        for (const [, value] of rows) {
+          const command = (value as Record<number, unknown>)[JS] as Command<C>;
+          const forecast = yield* self.#runForecast(forecaster(self.#qx, command.data));
+          if (typeof forecast === 'string') continue;
+          const runs = new Map<string, unknown[]>();
+          for (const { stream, event } of forecast) {
+            if (!runs.has(stream)) runs.set(stream, []);
+            runs.get(stream)!.push(event);
+          }
+          for (const [stream, events] of runs) {
+            const slice = self.#reducers[stream.split('.')[0]];
+            if (slice === undefined) continue;
+            dirty.push(...(yield* runReducer(slice.reducer(slice.rx, events))).updates);
+          }
+        }
+        return dirty;
       });
-      self.#graph.dirty(updates);
+      this.#graph.dirty(updates);
     }
-
     const cbs = yield* withRTxn(this.#fx, this.#overlay, function* () {
-      // this will run all queries, even new ones
       self.#newQueries = false;
       return yield* self.#graph.run();
     });
     cbs();
   }
 
+  // drives a forecast's query generator inside a transaction on the overlay: its store questions
+  // are answered from there, and a throw from the forecast itself is a reason.  A forecast
+  // cannot await another query
+  *#runForecast<T>(g: QueryGenerator<T | string>): RStoreGenerator<T | string> {
+    let ans: QueryAnswer = { store: {}, query: {} };
+    for (;;) {
+      let step: IteratorResult<QueryQuestion, T | string>;
+      try {
+        step = g.next(ans);
+      } catch (e: unknown) {
+        return `forecast threw: ${String(e)}`;
+      }
+      if (step.done) return step.value;
+      if (Object.keys(step.value.query ?? {}).length > 0) throw new Error('a forecast awaited a query');
+      const got = (yield { get: step.value.store ?? {} }).get;
+      ans = { store: got, query: {} };
+    }
+  }
+
+  // the app's new commands, and the outbox flush.  New commands take the next ordinals into the
+  // outbox in one transaction and are forecast at once.  Then every outbox command not yet handed
+  // to this connection is sent, in ordinal order, its results coming back through the outcomes;
+  // without a connector the next connection flushes
   *#onSendCommands(): Generator<void, void, void> {
     const self = this;
-    // generate a uuid now for each event
-    const commands: Command<C>[] = this.#sendCommands.map((c) => ({
-      id: generateUuid(),
-      data: c,
-    }));
-    this.#sendCommands = [];
-
-    // encode once now for both storage and the onCommands callback
-    const encoded = commands.map(encodeProto);
-
-    // open a write txn to the real store
-    yield* withWTxn(this.#fx, this.#store, function* () {
-      const added = [];
-      // write each command to the store
-      for (const enc of encoded) {
-        yield* txnSet(`.command-${enc.id}`, enc);
-        added.push(enc.id);
-      }
-      // update the index (which needs no encoder)
-      const index = ((yield* txnGet('.commands', null)) as string[]) ?? [];
-      yield* txnSet('.commands', [...index, ...added]);
-    });
-
-    // schedule a callback for the user to know it is time to send these commands
-    setTimeout(() => this.#onCommands!(deepCopy(encoded)));
-
-    // store those commands as unsent
-
-    // now forecast events based on those commands
-    if (!this.#forecaster) {
-      for (const command of commands) {
-        this.#unsent.set(command.id, []);
-      }
-      return;
+    const fresh = this.#sendCommands.splice(0);
+    this.#flush = false;
+    if (fresh.length > 0) {
+      yield* withWTxn(this.#fx, this.#store, function* () {
+        for (const data of fresh) {
+          const command: Command<C> = { id: generateUuid(), data };
+          const ordinal = self.#nextOrdinal++;
+          yield* txnSet(commandKey(ordinal), '.command', { [JS]: command });
+          self.#outbox.set(command.id, ordinal);
+        }
+      });
+      this.#outboxChanged = true;
+      yield* this.#refresh([]);
     }
-
-    const forecasts: E[] = [];
-    for (const command of commands) {
-      const c = copyOnWrite(command.data);
-      const fs = recover(this.#forecaster(c));
-      this.#unsent.set(command.id, fs);
-      forecasts.push(...fs);
-    }
-
-    if (forecasts.length === 0 || !this.#live) return;
-
-    // open a write txn against the existing overlay
-    const { updates } = yield* withWTxn(this.#fx, this.#overlay, function* () {
-      return yield* runReducer(self.#reducer(self.#rx, forecasts));
+    const connector = this.#connector;
+    if (connector === null) return;
+    const pending = [...this.#outbox]
+      .filter(([id]) => !this.#sent.has(id) && !this.#acked.has(id))
+      .sort((a, b) => a[1] - b[1]);
+    if (pending.length === 0) return;
+    const wire = yield* withRTxn(this.#fx, this.#store, function* () {
+      const out: Command<Uint8Array>[] = [];
+      for (const [id, ordinal] of pending) {
+        const command = (yield* txnGet(commandKey(ordinal), '.command')) as Command<C>;
+        const bytes = self.#reg.convert(self.#reg.commands, { [JS]: command.data }, MSGPACK);
+        out.push({ id, data: (bytes as Record<number, unknown>)[MSGPACK] as Uint8Array });
+      }
+      return out;
     });
-    this.#graph.dirty(updates);
-
-    const cbs = yield* withRTxn(this.#fx, this.#overlay, function* () {
-      // this will run all queries, even new ones
-      self.#newQueries = false;
-      return yield* self.#graph.run();
-    });
-    cbs();
+    const ids = wire.map((c) => c.id);
+    for (const id of ids) this.#sent.add(id);
+    connector.sendCommand(wire).then(
+      (results) => {
+        self.#commandOutcomes.push({ ids, results });
+        self.#schedule();
+      },
+      (e: unknown) => {
+        self.#commandOutcomes.push({ ids, results: { failed: e } });
+        self.#schedule();
+      },
+    );
   }
 
   *#onNewQueries(): Generator<void, void, void> {
