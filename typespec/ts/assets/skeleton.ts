@@ -1223,9 +1223,10 @@ export type StoreValue = { [JS]: unknown } | { [HOST]: unknown } | { [MSGPACK]: 
 
 /** Registry converts between representations of typed values and names the types the store
     holds.  Types are model names from the TypeSpec, plus three reserved names: `.json` for the
-    Engine's own shapes; `.command` for the outbox envelope, its `data` converted through the
-    commands union; and `.event` for a parked event, the wire pair `[env, data]` in `msgpack` and a
-    DbEvent in `js`, its `data` converted through the union of the stream's slice. */
+    Engine's own shapes; `.command` for the outbox envelope, `{id, data}` with `data` already the
+    command's wire bytes, so it needs no vocabulary to read; and `.event` for a parked event, the
+    wire pair `[env, data]` in `msgpack` and a DbEvent in `js`, its `data` converted through the
+    union of the stream's slice. */
 export interface Registry {
   /** the value of type `type` carrying every representation in `want`: present ones are kept,
       the rest produced in one pass */
@@ -2913,7 +2914,8 @@ export function decodeDbEvent<T>(val: any, subdecoder: (val: any) => T): DbEvent
                                   vouch, and how far the base is reduced
        /seq.{stream}              the stream's last held seq, or 'backfill' while a backfill
                                   covering it is in flight
-       /command.{ordinal}         Command<C> (`.command`): the outbox, in send order
+       /command.{ordinal}         Command<Uint8Array> (`.command`): the outbox, in send order,
+                                  each command's data as its wire bytes
        /backfill.{ref}            BackfillRecord: an in-flight backfill's until, resume, replacing,
                                   and children
        /backfill-seqs.{ref}       the backfill blob's header seqs, stream name to seq
@@ -3074,8 +3076,8 @@ export class Engine<QX, C> {
   // work received from the app
   #sendCommands: C[] = [];
   #newQueries: boolean = false;
-  // the outbox is flushed on every new connection
-  #flush: boolean = false;
+  // every new connection resends the outbox
+  #resend: boolean = false;
   // the query context, handed to every query and every forecast
   #qx: QX;
 
@@ -3166,7 +3168,7 @@ export class Engine<QX, C> {
       // the outbox in ordinal order; the next ordinal continues from the last key
       for (const [key, value] of yield* txnScanAll(prefixRange('/command.', 1000, { type: '.command', want: JS }))) {
         const ordinal = Number(key.slice('/command.'.length));
-        self.#outbox.set((js(value!) as Command<C>).id, ordinal);
+        self.#outbox.set((js(value!) as Command<Uint8Array>).id, ordinal);
         self.#nextOrdinal = ordinal + 1;
       }
 
@@ -3254,7 +3256,7 @@ export class Engine<QX, C> {
         continue;
       }
 
-      if (this.#sendCommands.length > 0 || this.#flush) {
+      if (this.#sendCommands.length > 0 || this.#resend) {
         // write to the outbox, forecast, send through the connector in order
         yield* this.#onSendCommands();
         continue;
@@ -3309,7 +3311,7 @@ export class Engine<QX, C> {
     for (const [ref, entry] of this.#backfills) {
       if (entry.status === 'downloading' && entry.retryTimer === null) this.#startBackfill(ref);
     }
-    this.#flush = true;
+    this.#resend = true;
   }
 
   // one push from a backfill, in its own transaction; the connector's promise resolves after the
@@ -3955,7 +3957,7 @@ export class Engine<QX, C> {
   // the results of one sendCommand call, or its failure.  An ack or dup names the position the
   // command landed at, and the command is done once the base has reduced through it.  A reject
   // or a conflict is final and the command goes at once.  A failed call leaves its commands
-  // unsent for the next connection to flush, in order; results from an ended connection are
+  // unsent for the next connection to resend, in order; results from an ended connection are
   // still the server's answers and count, its failures mean nothing
   *#onCommandOutcomes(): Generator<void, void, void> {
     const self = this;
@@ -4030,7 +4032,7 @@ export class Engine<QX, C> {
 
   // the connection ended: the next attempt is scheduled with backoff.  Every call in flight on
   // it is dead: backfills wait for the next connection to restart them, and commands handed to
-  // it are unsent again for the next flush
+  // it are unsent again for the next connection to resend
   #onEnd(): void {
     const self = this;
     this.#connector = null;
@@ -4059,8 +4061,13 @@ export class Engine<QX, C> {
         const dirty: string[] = [];
         const rows = yield* txnScanAll(prefixRange('/command.', 1000, { type: '.command', want: JS }));
         for (const [, value] of rows) {
-          const command = (value as Record<number, unknown>)[JS] as Command<C>;
-          const forecast = yield* self.#runForecast(forecaster(self.#qx, command.data));
+          const command = (value as Record<number, unknown>)[JS] as Command<Uint8Array>;
+
+          // a command this vocabulary cannot read is still sent; it just forecasts nothing
+          const data = self.#commandData(command.data);
+          if (data === undefined) continue;
+
+          const forecast = yield* self.#runForecast(forecaster(self.#qx, data));
           if (typeof forecast === 'string') continue;
           const runs = new Map<string, unknown[]>();
           for (const { stream, event } of forecast) {
@@ -4084,6 +4091,17 @@ export class Engine<QX, C> {
     cbs();
   }
 
+  // a command's wire bytes as the forecaster sees them, or undefined when the current vocabulary
+  // cannot read them: an outbox row written by an earlier build of the app
+  #commandData(bytes: Uint8Array): C | undefined {
+    try {
+      const v = this.#reg.convert(this.#reg.commands, { [MSGPACK]: bytes }, JS);
+      return (v as Record<number, unknown>)[JS] as C;
+    } catch {
+      return undefined;
+    }
+  }
+
   // drives a forecast's query generator inside a transaction on the overlay: its store questions
   // are answered from there, and a throw from the forecast itself is a reason.  A forecast
   // cannot await another query
@@ -4103,18 +4121,24 @@ export class Engine<QX, C> {
     }
   }
 
-  // the app's new commands, and the outbox flush.  New commands take the next ordinals into the
-  // outbox in one transaction and are forecast at once.  Then every outbox command not yet handed
-  // to this connection is sent, in ordinal order, its results coming back through the outcomes;
-  // without a connector the next connection flushes
+  // the app's new commands, and the outbox resend.  New commands are converted to their wire
+  // bytes here, by the vocabulary that made them, and take the next ordinals into the outbox in
+  // one transaction; then every outbox command not yet handed to this connection is sent as
+  // stored, in ordinal order, its results coming back through the outcomes.  Without a connector
+  // the next connection resends
   *#onSendCommands(): Generator<void, void, void> {
     const self = this;
     const fresh = this.#sendCommands.splice(0);
-    this.#flush = false;
+    this.#resend = false;
+
     if (fresh.length > 0) {
       yield* withWTxn(this.#fx, this.#store, function* () {
         for (const data of fresh) {
-          const command: Command<C> = { id: generateUuid(), data };
+          const bytes = self.#reg.convert(self.#reg.commands, { [JS]: data }, MSGPACK);
+          const command: Command<Uint8Array> = {
+            id: generateUuid(),
+            data: (bytes as Record<number, unknown>)[MSGPACK] as Uint8Array,
+          };
           const ordinal = self.#nextOrdinal++;
           yield* txnSet(commandKey(ordinal), '.command', { [JS]: command });
           self.#outbox.set(command.id, ordinal);
@@ -4123,18 +4147,19 @@ export class Engine<QX, C> {
       this.#outboxChanged = true;
       yield* this.#refresh([]);
     }
+
     const connector = this.#connector;
     if (connector === null) return;
     const pending = [...this.#outbox]
       .filter(([id]) => !this.#sent.has(id) && !this.#acked.has(id))
       .sort((a, b) => a[1] - b[1]);
     if (pending.length === 0) return;
+
+    // rows go on the wire as stored, whatever vocabulary wrote them
     const wire = yield* withRTxn(this.#fx, this.#store, function* () {
       const out: Command<Uint8Array>[] = [];
-      for (const [id, ordinal] of pending) {
-        const command = (yield* txnGet(commandKey(ordinal), '.command')) as Command<C>;
-        const bytes = self.#reg.convert(self.#reg.commands, { [JS]: command.data }, MSGPACK);
-        out.push({ id, data: (bytes as Record<number, unknown>)[MSGPACK] as Uint8Array });
+      for (const [, ordinal] of pending) {
+        out.push((yield* txnGet(commandKey(ordinal), '.command')) as Command<Uint8Array>);
       }
       return out;
     });

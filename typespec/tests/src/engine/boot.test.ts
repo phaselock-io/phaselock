@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 
 import { commandKey } from '../../../ts/assets/skeleton.ts';
 
-import { ev, keys, log, parkedEvent, rig, seq, settle, state } from './harness.ts';
+import { bytes, ev, keys, log, parkedEvent, parse, rig, seq, settle, state } from './harness.ts';
 
 /** a store as a crash left it: a held stream, a marked stream, a view, and a checkpoint */
 function persisted(): Record<string, unknown> {
@@ -107,9 +107,9 @@ describe('boot', () => {
   test('the outbox is rebuilt in ordinal order, flushed on connect, and the next ordinal continues', async () => {
     const data = {
       ...persisted(),
-      [commandKey(3)]: { id: 'c3', data: { type: 'bump', id: 'p1' } },
-      [commandKey(5)]: { id: 'c5', data: { type: 'bump', id: 'p1' } },
-      [commandKey(10)]: { id: 'c10', data: { type: 'bump', id: 'p1' } },
+      [commandKey(3)]: { id: 'c3', data: bytes({ type: 'bump', id: 'p1' }) },
+      [commandKey(5)]: { id: 'c5', data: bytes({ type: 'bump', id: 'p1' }) },
+      [commandKey(10)]: { id: 'c10', data: bytes({ type: 'bump', id: 'p1' }) },
     };
     const r = rig({ data });
     await settle();
@@ -123,7 +123,10 @@ describe('boot', () => {
       commandKey(10),
       commandKey(11),
     ]);
-    expect((r.data[commandKey(11)] as { data: unknown }).data).toEqual({ type: 'bump', id: 'p2' });
+    expect(parse((r.data[commandKey(11)] as { data: Uint8Array }).data)).toEqual({
+      type: 'bump',
+      id: 'p2',
+    });
     expect(r.server.sends.length).toBe(2);
     expect(r.server.sends[1].length).toBe(1);
   });

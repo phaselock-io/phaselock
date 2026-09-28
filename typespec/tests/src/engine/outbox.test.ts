@@ -120,11 +120,11 @@ const dup = (position: number): CommandResult => ({ kind: 'dup', position });
 const reject: CommandResult = { kind: 'reject', reason: 'no' };
 const conflict: CommandResult = { kind: 'conflict', current: {} };
 
-/** the outbox as stored: ordinal keys and their envelopes */
+/** the outbox as stored: ordinal keys and their envelopes, the wire bytes parsed back */
 function outbox(data: Record<string, unknown>): { key: string; id: string; data: unknown }[] {
   return keys(data, '/command.').map((key) => {
-    const c = data[key] as Command<unknown>;
-    return { key, id: c.id, data: c.data };
+    const c = data[key] as Command<Uint8Array>;
+    return { key, id: c.id, data: parse(c.data) };
   });
 }
 
@@ -221,6 +221,38 @@ describe('outbox rows and sends', () => {
     expect(r.server.sends.length).toBe(2);
     expect(r.server.sends[1].map((c) => parse(c.data))).toEqual([{ field: 'a' }, { field: 'b' }]);
     expect(calls.length).toBe(2);
+  });
+
+  test('a row an earlier build wrote, unreadable now, is still sent as stored and forecasts nothing', async () => {
+    const server = new FakeServer();
+    const calls = sendControl(server);
+    const stale = new TextEncoder().encode('not json');
+    const r = rig({
+      forecaster,
+      server,
+      data: {
+        '/view': { token: 't1', position: 10, refs: ['patron.*'] },
+        '/checkpoint': { epoch: 'e1', position: 10, reduced: 10 },
+        '/seq.patron.p1': 2,
+        'patron.p1/state': { count: 2, fields: {} },
+        '/command.00000000000000000000': { id: 'old', data: stale },
+      },
+    });
+    const w = watch(r, 'patron.p1');
+    await settle();
+    r.server.open();
+    r.server.live(10);
+    await settle();
+
+    // sent byte for byte, and the graph delivered the base with no forecast on it
+    expect(calls.length).toBe(1);
+    expect(calls[0].cmds).toEqual([{ id: 'old', data: stale }]);
+    expect(w.values.at(-1)).toEqual({ count: 2, fields: {} });
+
+    // acked like any other command
+    calls[0].resolve([ack(10)]);
+    await settle();
+    expect(keys(r.data, '/command.')).toEqual([]);
   });
 
   test('a new connection flushes every command not acked, in ordinal order, in one call', async () => {
