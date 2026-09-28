@@ -3067,10 +3067,10 @@ export class Engine<QX, C> {
   #inbox: Inbound[] = [];
   // backfill progress from the connector's hooks; each item resolves its promise after commit
   #backfillWork: BackfillWork[] = [];
-  // how each backfill() call ended
-  #backfillOutcomes: { ref: string; outcome: BackfillOutcome | { failed: unknown } }[] = [];
-  // how each sendCommand() call ended, with the ids it carried in order
-  #commandOutcomes: { ids: string[]; results: CommandResult[] | { failed: unknown } }[] = [];
+  // how each backfill() call ended, and on which connection
+  #backfillOutcomes: { ref: string; outcome: BackfillOutcome | { failed: unknown }; conn: AbortController }[] = [];
+  // how each sendCommand() call ended, with the ids it carried in order, and on which connection
+  #commandOutcomes: { ids: string[]; results: CommandResult[] | { failed: unknown }; conn: AbortController }[] = [];
   // work received from the app
   #sendCommands: C[] = [];
   #newQueries: boolean = false;
@@ -3105,6 +3105,7 @@ export class Engine<QX, C> {
     this.#wants = callbacks.wants;
     this.#forecaster = callbacks.forecaster ?? null;
     this.#signal = callbacks.signal ?? new AbortController().signal;
+    this.#signal.addEventListener('abort', () => this.#schedule(), { once: true });
 
     this.#overlay = new OverlayStore(this.#store, reg);
     this.#graph = new QueryGraph(qx);
@@ -3348,10 +3349,10 @@ export class Engine<QX, C> {
               yield* self.#maybeMarkBackfilling(ev.stream, record.replacing);
               record.resume!.fromPosition = Math.max(record.resume!.fromPosition, ev.position);
             }
-          } else if ('tailDone' in item) {
+          } else if ('eventsDone' in item) {
             record.resume!.tailDone = true;
           } else {
-            throw new Error("unexpected snapshot");
+            throw new Error('unexpected backfill item');
           }
           yield* txnSet(`/backfill.${ref}`, '.json', { [JS]: record });
         });
@@ -3376,7 +3377,9 @@ export class Engine<QX, C> {
   *#onBackfillOutcomes(): Generator<void, void, void> {
     const self = this;
     while (this.#backfillOutcomes.length > 0) {
-      const { ref, outcome } = this.#backfillOutcomes.shift()!;
+      const { ref, outcome, conn } = this.#backfillOutcomes.shift()!;
+      // a call from a connection that has ended: the next connection restarts the download
+      if (conn !== this.#connectorAbort) continue;
       const entry = this.#backfills.get(ref);
       if (entry === undefined) continue;
       if (outcome === 'done') {
@@ -3394,11 +3397,10 @@ export class Engine<QX, C> {
         });
         this.#startBackfill(ref);
       } else {
-        // a rejection: ours, if the entry's signal fired; the connection's, if it ended, and the
-        // next one restarts the download; else a failure the Engine retries after backoff
+        // a rejection: ours, if the entry's signal fired, else a failure the Engine retries after
+        // backoff
         if (entry.controller.signal.aborted) continue;
         entry.status = 'downloading';
-        if (this.#connector === null) continue;
         const delay = backoffDelay(entry.attempts++);
         entry.retryTimer = setTimeout(() => {
           entry.retryTimer = null;
@@ -3417,12 +3419,13 @@ export class Engine<QX, C> {
     const entry = this.#backfills.get(ref)!;
     if (this.#connector === null) return;
     const self = this;
+    const conn = this.#connectorAbort;
     entry.status = 'downloading';
     const backfill: Backfill = {
       ref,
       until: entry.record.until,
       resume: entry.record.resume,
-      signal: AbortSignal.any([this.#connectorAbort.signal, entry.controller.signal]),
+      signal: AbortSignal.any([conn.signal, entry.controller.signal]),
       push: (item) =>
         new Promise<void>((resolve, reject) => {
           self.#backfillWork.push({ ref, item, resolve, reject });
@@ -3431,11 +3434,11 @@ export class Engine<QX, C> {
     };
     this.#connector.backfill(backfill).then(
       (outcome) => {
-        self.#backfillOutcomes.push({ ref, outcome });
+        self.#backfillOutcomes.push({ ref, outcome, conn });
         self.#schedule();
       },
       (e: unknown) => {
-        self.#backfillOutcomes.push({ ref, outcome: { failed: e } });
+        self.#backfillOutcomes.push({ ref, outcome: { failed: e }, conn });
         self.#schedule();
       },
     );
@@ -3564,7 +3567,8 @@ export class Engine<QX, C> {
   }
 
   // inside a landing transaction: a broken stream with an entry restarts it, the rest become
-  // children of the ref checked (null for the frozen events)
+  // children of the ref checked.  A break among the frozen events (null) is a gap on a held
+  // stream, so its backfill replaces the stream and marks it
   *#repairIn(ref: string | null, streams: string[]): WStoreGenerator<void> {
     const fresh: string[] = [];
     for (const stream of streams) {
@@ -3575,7 +3579,7 @@ export class Engine<QX, C> {
       }
     }
     if (fresh.length > 0) {
-      const replacing = ref !== null && this.#backfills.get(ref)!.record.replacing;
+      const replacing = ref === null || this.#backfills.get(ref)!.record.replacing;
       yield* this.#spawnIn(ref, fresh, this.#checkpoint?.position ?? 0, replacing);
     }
   }
@@ -3651,13 +3655,14 @@ export class Engine<QX, C> {
 
   // inside a landing transaction: reduce the parked events of a subtree, or of every stream under
   // no backfill for the frozen events (null), each stream's run in one reducer call, then clear
-  // the range.  An event the base already covers is skipped.  Every landed stream's seq is
+  // each walked stream's range.  An event the base already covers is skipped.  Every landed stream's seq is
   // written once: the last walked for a stream with events, the cut's for a header stream
   // without.  Chains were checked before any write
   *#reduceParkedIn(
     ref: string | null, header: Record<string, number>, dirty: string[],
   ): WStoreGenerator<void> {
     const seqs = new Map(Object.entries(header));
+    const walked: string[] = [];
     let range = this.#parkRange(ref, { type: '.event', want: JS });
     let stream = '';
     let run: DbEvent<unknown>[] = [];
@@ -3671,6 +3676,7 @@ export class Engine<QX, C> {
           if (run.length > 0) yield* this.#reduceStreamIn(stream, run, dirty);
           stream = ev.stream;
           run = [];
+          walked.push(stream);
           seqs.set(stream, Math.max(typeof held === 'number' ? held : 0, seqs.get(stream) ?? 0));
         }
         if (ev.seq <= seqs.get(stream)!) continue;
@@ -3681,7 +3687,8 @@ export class Engine<QX, C> {
       range = resumeRange(range, next);
     }
     if (run.length > 0) yield* this.#reduceStreamIn(stream, run, dirty);
-    dirty.push(...(yield* txnDelPrefix(range.gte!)));
+    // only the streams walked: a skipped stream's events stay for its own backfill's land
+    for (const name of walked) yield* txnDelPrefix(`/park.ev.${name}/`);
     for (const [name, seq] of seqs) {
       this.#streams.set(name, seq);
       yield* txnSet(`/seq.${name}`, '.json', { [JS]: seq });
@@ -3830,11 +3837,13 @@ export class Engine<QX, C> {
     yield* withWTxn(this.#fx, this.#store, function* () {
       const seqs = new Map<string, number>();
       const runs = new Map<string, DbEvent<unknown>[]>();
+      // streams born in this atom: held ones are in seqs, parked ones here
+      const born = new Set<string>();
       let reduced = self.#reduced;
       for (const ev of events) {
         const held = self.#streams.get(ev.stream);
         let park = held === 'backfill';
-        if (held === undefined) {
+        if (held === undefined && !seqs.has(ev.stream) && !born.has(ev.stream)) {
           const parent = self.#parentOf(ev.stream);
           if (parent !== null) {
             yield* self.#maybeMarkBackfilling(ev.stream, self.#backfills.get(parent)!.record.replacing);
@@ -3844,7 +3853,10 @@ export class Engine<QX, C> {
             park = true;
           }
         }
-        if (!park && self.#replacing > 0) park = true;
+        if (!park && self.#replacing > 0) {
+          park = true;
+          if (held === undefined) born.add(ev.stream);
+        }
         if (!park) {
           const last = seqs.get(ev.stream) ?? (typeof held === 'number' ? held : 0);
           if (ev.seq <= last) continue;
@@ -3921,7 +3933,7 @@ export class Engine<QX, C> {
     for (const id of ids) {
       const ordinal = this.#outbox.get(id);
       if (ordinal === undefined) continue;
-      yield* txnDel(`/command.${ordinal}`);
+      yield* txnDel(commandKey(ordinal));
       this.#outbox.delete(id);
       this.#sent.delete(id);
       this.#acked.delete(id);
@@ -3941,19 +3953,24 @@ export class Engine<QX, C> {
   }
 
   // the results of one sendCommand call, or its failure.  An ack or dup names the position the
-  // command landed at, and the command is done once the checkpoint reaches it.  A reject or a
-  // conflict is final and the command goes at once.  A failed call leaves its commands unsent
-  // for the next connection to flush, in order
+  // command landed at, and the command is done once the base has reduced through it.  A reject
+  // or a conflict is final and the command goes at once.  A failed call leaves its commands
+  // unsent for the next connection to flush, in order; results from an ended connection are
+  // still the server's answers and count, its failures mean nothing
   *#onCommandOutcomes(): Generator<void, void, void> {
     const self = this;
-    const { ids, results } = this.#commandOutcomes.shift()!;
+    const { ids, results, conn } = this.#commandOutcomes.shift()!;
     if ('failed' in results) {
-      for (const id of ids) this.#sent.delete(id);
+      if (conn === this.#connectorAbort) {
+        for (const id of ids) this.#sent.delete(id);
+      }
       return;
     }
     const drop: string[] = [];
     results.forEach((r, i) => {
       const id = ids[i];
+      // a command already released, by its round trip or by an earlier answer to a resend
+      if (!this.#outbox.has(id)) return;
       if (r.kind === 'ack' || r.kind === 'dup') {
         this.#acked.set(id, r.position);
         if (r.position <= this.#reduced) drop.push(id);
@@ -4011,13 +4028,15 @@ export class Engine<QX, C> {
     yield* this.#refresh(dirty);
   }
 
-  // the connection ended: the next attempt is scheduled with backoff, and every in-flight
-  // backfill call fails through its outcome and waits for the next connection
+  // the connection ended: the next attempt is scheduled with backoff.  Every call in flight on
+  // it is dead: backfills wait for the next connection to restart them, and commands handed to
+  // it are unsent again for the next flush
   #onEnd(): void {
     const self = this;
     this.#connector = null;
     this.#connectorAbort.abort();
     this.#connectorAbort = new AbortController();
+    this.#sent.clear();
     this.#live = false;
     this.#epoch = null;
     this.#retryTimer = setTimeout(() => {
@@ -4120,14 +4139,15 @@ export class Engine<QX, C> {
       return out;
     });
     const ids = wire.map((c) => c.id);
+    const conn = this.#connectorAbort;
     for (const id of ids) this.#sent.add(id);
     connector.sendCommand(wire).then(
       (results) => {
-        self.#commandOutcomes.push({ ids, results });
+        self.#commandOutcomes.push({ ids, results, conn });
         self.#schedule();
       },
       (e: unknown) => {
-        self.#commandOutcomes.push({ ids, results: { failed: e } });
+        self.#commandOutcomes.push({ ids, results: { failed: e }, conn });
         self.#schedule();
       },
     );
@@ -4142,9 +4162,9 @@ export class Engine<QX, C> {
     cbs();
   }
 
-  // ends everything the Engine drives: the connection, its backfills, the retry timer, and the
-  // pushes waiting for a transaction they will never get.  Nothing is persisted; the store is
-  // already consistent at the last commit
+  // ends everything the Engine drives: the connection, and with it every backfill call in flight,
+  // the retry timers, and the pushes waiting for a transaction they will never get.  Nothing is
+  // persisted; the store is already consistent at the last commit
   *#shutdown(): Generator<void, void, void> {
     if (this.#retryTimer !== null) {
       clearTimeout(this.#retryTimer);
@@ -4153,7 +4173,6 @@ export class Engine<QX, C> {
     this.#connectorAbort.abort();
     this.#connector = null;
     for (const entry of this.#backfills.values()) {
-      entry.controller.abort();
       if (entry.retryTimer !== null) clearTimeout(entry.retryTimer);
     }
     const reason = new Error('engine shut down');
