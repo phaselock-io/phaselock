@@ -151,10 +151,7 @@ describe('boot', () => {
     expect(keys(r.data, '/command.').length).toBe(1);
   });
 
-  // fake timers so the Engine's throw surfaces from the timer advance instead of as an
-  // uncaught exception in a real timer callback
   test('a connection from another epoch ends the Engine', async () => {
-    vi.useFakeTimers();
     const r = rig({ data: persisted() });
     await settle();
     r.server.open('e2');

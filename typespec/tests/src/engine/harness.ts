@@ -347,8 +347,10 @@ export class FakeServer {
 
 // engine errors ////////////////////////////////////////////////////////////
 
-// anything thrown out of an advancer pass ends the Engine; the harness records it so `settle`
-// can fail the test with the Engine's own error instead of a silent hang
+// anything thrown out of an advancer pass ends the Engine.  The harness records it so `settle`
+// can fail the test with the Engine's own error instead of a silent hang, and swallows it
+// there, since the wakeup runs in a timer callback where a throw would be an uncaught exception
+// rather than a test failure.
 const errors: unknown[] = [];
 const wakeup = FutureContext.prototype.wakeup;
 FutureContext.prototype.wakeup = function (this: FutureContext) {
@@ -356,7 +358,6 @@ FutureContext.prototype.wakeup = function (this: FutureContext) {
     wakeup.call(this);
   } catch (e: unknown) {
     errors.push(e);
-    throw e;
   }
 };
 
