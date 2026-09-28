@@ -1204,8 +1204,8 @@ export class FutureContext {
 
 // store //////////////////////////////////////////////////////////////////////
 
-// A transactional key-value store built around generators, with values that travel as bundles
-// of representations and a Registry that converts between them.
+/* A transactional key-value store built around generators, with values that travel as bundles
+   of representations and a Registry that converts between them. */
 
 /** The representations a value can be in: JS is the rich JS value, HOST the host language's,
     MSGPACK the bytes.  They are bits, so a Wants is a mask of them: what an ask wants back, and
@@ -1288,9 +1288,14 @@ export function prefixEnd(prefix: string): string | undefined {
 }
 
 /** the range covering every key under a prefix */
-export function prefixRange(prefix: string, limit: number, values: StoreRange['values']): StoreRange {
+export function prefixRange(
+  prefix: string,
+  limit: number,
+  values: StoreRange['values'],
+): StoreRange {
   const end = prefixEnd(prefix);
-  return end === undefined ? { gte: prefix, limit, values } : { gte: prefix, lt: end, limit, values };
+  if (end === undefined) return { gte: prefix, limit, values };
+  return { gte: prefix, lt: end, limit, values };
 }
 
 export interface RTxn {
@@ -1353,7 +1358,14 @@ export type StoreAnswer = {
   scan: Record<string, StoreScan>;
 };
 
-const emptyAnswer = (): StoreAnswer => ({ get: {}, set: {}, del: {}, delPrefix: {}, move: {}, scan: {} });
+const emptyAnswer = (): StoreAnswer => ({
+  get: {},
+  set: {},
+  del: {},
+  delPrefix: {},
+  move: {},
+  scan: {},
+});
 
 export type WStoreGenerator<T> = Generator<WStoreQuestion, T, StoreAnswer>;
 export type RStoreGenerator<T> = Generator<RStoreQuestion, T, StoreAnswer>;
@@ -1400,7 +1412,9 @@ export function* txnScan(
 }
 
 /** every entry of a range, batch by batch */
-export function* txnScanAll(range: StoreRange): RStoreGenerator<[string, StoreValue | undefined][]> {
+export function* txnScanAll(
+  range: StoreRange,
+): RStoreGenerator<[string, StoreValue | undefined][]> {
   const all: [string, StoreValue | undefined][] = [];
   let r = range;
   for (;;) {
@@ -1440,8 +1454,8 @@ export function* withRTxn<T>(fx: FutureContext, s: Store, fn: () => RStoreGenera
 
 const writeOps = ['set', 'del', 'delPrefix', 'move'] as const;
 
-// run a StoreGenerator to completion, converting potentially many parallel callbacks into a
-// generator interface.  Write questions require a transaction with write methods.
+/* Run a StoreGenerator to completion, converting potentially many parallel callbacks into a
+   generator interface.  Write questions require a transaction with write methods. */
 function* runTxn<T>(fx: FutureContext, txn: RTxn, g: WStoreGenerator<T>): Future<T> {
   // ignore late callbacks
   let valid = true;
@@ -1519,9 +1533,9 @@ function* runTxn<T>(fx: FutureContext, txn: RTxn, g: WStoreGenerator<T>): Future
 
 // in-memory layers /////////////////////////////////////////////////////////
 
-// The in-memory and overlay stores keep rich js values, converting through the Registry on the
-// way in and out, in a base map plus a map of pending updates (undefined marks a deletion), and
-// answer range operations by sorting keys.
+/* The in-memory and overlay stores keep rich js values, converting through the Registry on the
+   way in and out, in a base map plus a map of pending updates (undefined marks a deletion), and
+   answer range operations by sorting keys. */
 
 type Layer = Record<string, unknown>;
 
@@ -1764,7 +1778,8 @@ class OverlayTxn implements WTxn {
         if ('err' in result) return cb(result.err);
         for (const [k] of result.entries) if (!this.#has(k)) all.add(k);
         if (result.next !== null) return walk(resumeRange(range, result.next));
-        for (const k of layerKeys(this.#data, this.#updates, prefixRange(prefix, Infinity, false))) all.add(k);
+        const layer = layerKeys(this.#data, this.#updates, prefixRange(prefix, Infinity, false));
+        for (const k of layer) all.add(k);
         cb([...all].sort());
       });
     };
@@ -1791,11 +1806,14 @@ class OverlayTxn implements WTxn {
       for (const k of keys) {
         const to = dst + k.slice(src.length);
         moved.push(to);
+
+        // a layer key moves within the layer
         if (this.#has(k)) {
           this.#updates[to] = layerGet(this.#data, this.#updates, k);
           this.#updates[k] = undefined;
           continue;
         }
+
         // a base key: copy its value up into the layer under the new name, as the base holds it
         pending++;
         this.#base.get(k, '', 0, (result) => {
@@ -1804,7 +1822,8 @@ class OverlayTxn implements WTxn {
             failed = true;
             return cb(result);
           }
-          this.#updates[to] = result.value === undefined ? undefined : Object.values(result.value)[0];
+          const held = result.value;
+          this.#updates[to] = held === undefined ? undefined : Object.values(held)[0];
           this.#updates[k] = undefined;
           finish();
         });
@@ -1816,7 +1835,7 @@ class OverlayTxn implements WTxn {
   scan(range: StoreRange, cb: (result: StoreScan) => void): void {
     this.#base.scan(range, (result) => {
       if ('err' in result) return cb(result);
-      // the span this batch covers: up to its last key when more follow, else the whole range
+      // the span this batch covers is up to its last key when more follow, else the whole range
       const span: StoreRange = { ...range, limit: Infinity };
       if (result.next !== null) {
         if (range.reverse) {
@@ -1825,7 +1844,8 @@ class OverlayTxn implements WTxn {
           span.lte = result.next;
         }
       }
-      // the base answers in the wanted representation; layer entries convert here
+      // merge the layers' keys in the span over the base's; the base already answers in the wanted
+      // representation, and layer entries convert here
       const merged = new Map<string, StoreValue | undefined>();
       for (const [k, v] of result.entries) if (!this.#has(k)) merged.set(k, v);
       const v = range.values;
@@ -1833,13 +1853,17 @@ class OverlayTxn implements WTxn {
         const js = layerGet(this.#data, this.#updates, k);
         merged.set(k, v ? fromJs(this.#reg, v.type, js, v.want) : undefined);
       }
+      // cut the merged keys to one batch
       const keys = [...merged.keys()].sort();
       if (range.reverse) keys.reverse();
       const page: StoreScan = {
         entries: keys.slice(0, range.limit).map((k) => [k, merged.get(k)]),
         next: keys.length > range.limit ? keys[range.limit - 1] : null,
       };
-      if (!('err' in page) && page.next === null && result.next !== null) page.next = page.entries[page.entries.length - 1][0];
+      // the base has more batches behind this span, so the walk resumes even if the merge fit
+      if (!('err' in page) && page.next === null && result.next !== null) {
+        page.next = page.entries[page.entries.length - 1][0];
+      }
       cb(page);
     });
   }
@@ -1910,14 +1934,16 @@ function keyRange(r: StoreRange): IDBKeyRange | undefined {
   const upper = r.lte ?? r.lt;
   const lowerOpen = r.gte === undefined && r.gt !== undefined;
   const upperOpen = r.lte === undefined && r.lt !== undefined;
-  if (lower !== undefined && upper !== undefined) return IDBKeyRange.bound(lower, upper, lowerOpen, upperOpen);
+  if (lower !== undefined && upper !== undefined) {
+    return IDBKeyRange.bound(lower, upper, lowerOpen, upperOpen);
+  }
   if (lower !== undefined) return IDBKeyRange.lowerBound(lower, lowerOpen);
   if (upper !== undefined) return IDBKeyRange.upperBound(upper, upperOpen);
   return undefined;
 }
 
 /** IndexedDBTxn keeps rich js values: structured clone preserves Date, Map, and Set, so the
-    store's representation is `js` and it converts only when asked for another. */
+    store's representation is `js` and it converts only when asked for another */
 class IndexedDBTxn implements WTxn {
   #reg: Registry;
   #store: IDBObjectStore;
@@ -1929,8 +1955,10 @@ class IndexedDBTxn implements WTxn {
 
   get(key: string, type: string, want: Wants, cb: (result: StoreResult) => void): void {
     const req = this.#store.get(key);
-    req.onsuccess = () =>
-      cb({ value: req.result === undefined ? undefined : fromJs(this.#reg, type, req.result, want) });
+    req.onsuccess = () => {
+      const js = req.result;
+      cb({ value: js === undefined ? undefined : fromJs(this.#reg, type, js, want) });
+    };
     req.onerror = () => cb({ err: new Error(`failed to look up "${key}"`) });
   }
 
@@ -1999,7 +2027,8 @@ class IndexedDBTxn implements WTxn {
     this.#cursor(
       range,
       (cursor) => {
-        entries.push([cursor.key as string, v ? fromJs(this.#reg, v.type, cursor.value, v.want) : undefined]);
+        const value = v ? fromJs(this.#reg, v.type, cursor.value, v.want) : undefined;
+        entries.push([cursor.key as string, value]);
         return entries.length < range.limit;
       },
       (err) => {
@@ -2077,14 +2106,19 @@ export class ExternalStore {
 
     const userTxn = yield* resolve(this.#txnFn(writable));
     // a user method's result or rejection, delivered to a callback
-    const deliver = <P, R>(p: MaybePromise<P>, ok: (p: P) => R, cb: (r: R | { err: Error }) => void) => {
+    const deliver = <P, R>(
+      p: MaybePromise<P>,
+      ok: (p: P) => R,
+      cb: (r: R | { err: Error }) => void,
+    ) => {
       toPromise(p).then(
         (result) => cb(ok(result)),
         (e: unknown) => cb({ err: e as Error }),
       );
     };
     const rtxn: RTxn = {
-      get: (key, type, want, cb) => deliver(userTxn.get(key, type, want), (value) => ({ value }), cb),
+      get: (key, type, want, cb) =>
+        deliver(userTxn.get(key, type, want), (value) => ({ value }), cb),
       scan: (range, cb) => deliver(userTxn.scan(range), (r) => r, cb),
     };
     const txn: WTxn = writable
@@ -2252,7 +2286,8 @@ export function* runReducer(g: Reducer<void>): WStoreGenerator<{ updates: string
           ans.get[key] = val;
         } else {
           // cache the rich value; undefined for an absent key
-          old[key] = val.value === undefined ? undefined : (val.value as Record<number, unknown>)[JS];
+          const held = val.value;
+          old[key] = held === undefined ? undefined : (held as Record<number, unknown>)[JS];
           // note that copyOnWrite() is applied inside the ReducerContext; not here
           ans.get[key] = { value: old[key] };
         }
@@ -2960,7 +2995,12 @@ export function refCovers(ref: string, name: string): boolean {
 }
 
 /** one push from a backfill, queued for the advancer with the promise's resolvers */
-type BackfillWork = { ref: string; item: BackfillItem; resolve: () => void; reject: (e: unknown) => void };
+type BackfillWork = {
+  ref: string;
+  item: BackfillItem;
+  resolve: () => void;
+  reject: (e: unknown) => void;
+};
 
 /** the store key prefix a ref covers: everything for `*`, `family.` for a family, and the
     stream's own keys for a stream */
@@ -3004,6 +3044,12 @@ export function parsePark(key: string): { stream: string; seq: number } {
   return { stream: key.slice('/park.ev.'.length, slash), seq: Number(key.slice(slash + 1)) };
 }
 
+/** the app's forecast of the events a command will produce, by stream; a string is a rejection */
+export type Forecaster<QX, C> = (
+  qx: QX,
+  command: C,
+) => QueryGenerator<{ stream: string; event: unknown }[] | string>;
+
 /** what the connector delivered, in arrival order */
 type Inbound =
   | { open: string }
@@ -3020,7 +3066,7 @@ export class Engine<QX, C> {
   #reducers: Record<string, SliceReducer>;
   // runs against the overlay for every outbox command in order on every rebuild; a string is a
   // rejection and forecasts nothing
-  #forecaster: null | ((qx: QX, command: C) => QueryGenerator<{ stream: string; event: unknown }[] | string>);
+  #forecaster: null | Forecaster<QX, C>;
   #wants: string[];
   #signal: AbortSignal;
 
@@ -3070,9 +3116,17 @@ export class Engine<QX, C> {
   // backfill progress from the connector's hooks; each item resolves its promise after commit
   #backfillWork: BackfillWork[] = [];
   // how each backfill() call ended, and on which connection
-  #backfillOutcomes: { ref: string; outcome: BackfillOutcome | { failed: unknown }; conn: AbortController }[] = [];
+  #backfillOutcomes: {
+    ref: string;
+    outcome: BackfillOutcome | { failed: unknown };
+    conn: AbortController;
+  }[] = [];
   // how each sendCommand() call ended, with the ids it carried in order, and on which connection
-  #commandOutcomes: { ids: string[]; results: CommandResult[] | { failed: unknown }; conn: AbortController }[] = [];
+  #commandOutcomes: {
+    ids: string[];
+    results: CommandResult[] | { failed: unknown };
+    conn: AbortController;
+  }[] = [];
   // work received from the app
   #sendCommands: C[] = [];
   #newQueries: boolean = false;
@@ -3094,7 +3148,7 @@ export class Engine<QX, C> {
       wants: string[];
       // optional: forecast the events the server will mint for a command, by stream, reading the
       // state the earlier outbox commands leave; a string is a rejection
-      forecaster?: (qx: QX, command: C) => QueryGenerator<{ stream: string; event: unknown }[] | string>;
+      forecaster?: Forecaster<QX, C>;
       // optional: ends the Engine, its connector, and every backfill
       signal?: AbortSignal;
     },
@@ -3151,29 +3205,37 @@ export class Engine<QX, C> {
     });
   }
 
-  // boot: load the persisted state into memory, rebuild the overlay, and connect
   *#initialize(): Generator<void, void, void> {
     const self = this;
     const js = (v: StoreValue) => (v as Record<number, unknown>)[JS];
 
+    // load the persisted state into memory
     yield* withRTxn(this.#fx, this.#store, function* () {
-      self.#checkpoint = ((yield* txnGet('/checkpoint', '.json')) as CheckpointRecord | undefined) ?? null;
+      const checkpoint = (yield* txnGet('/checkpoint', '.json')) as CheckpointRecord | undefined;
+      self.#checkpoint = checkpoint ?? null;
       self.#view = ((yield* txnGet('/view', '.json')) as ViewRecord | undefined) ?? null;
 
       // the streams table: seq per held stream, or the marker for a stream under a backfill
-      for (const [key, value] of yield* txnScanAll(prefixRange('/seq.', 1000, { type: '.json', want: JS }))) {
+      const seqRows = yield* txnScanAll(prefixRange('/seq.', 1000, { type: '.json', want: JS }));
+      for (const [key, value] of seqRows) {
         self.#streams.set(key.slice('/seq.'.length), js(value!) as number | 'backfill');
       }
 
       // the outbox in ordinal order; the next ordinal continues from the last key
-      for (const [key, value] of yield* txnScanAll(prefixRange('/command.', 1000, { type: '.command', want: JS }))) {
+      const commandRows = yield* txnScanAll(
+        prefixRange('/command.', 1000, { type: '.command', want: JS }),
+      );
+      for (const [key, value] of commandRows) {
         const ordinal = Number(key.slice('/command.'.length));
         self.#outbox.set((js(value!) as Command<Uint8Array>).id, ordinal);
         self.#nextOrdinal = ordinal + 1;
       }
 
-      // backfills in flight, each with a fresh controller
-      for (const [key, value] of yield* txnScanAll(prefixRange('/backfill.', 1000, { type: '.json', want: JS }))) {
+      // the backfills in flight, each with a fresh controller
+      const backfillRows = yield* txnScanAll(
+        prefixRange('/backfill.', 1000, { type: '.json', want: JS }),
+      );
+      for (const [key, value] of backfillRows) {
         const record = js(value!) as BackfillRecord;
         self.#backfills.set(key.slice('/backfill.'.length), {
           record,
@@ -3186,23 +3248,23 @@ export class Engine<QX, C> {
         if (record.replacing) self.#replacing++;
       }
     });
+
+    // a backfill whose download finished before the crash is ready to land
     for (const [ref, entry] of this.#backfills) {
       entry.parent = this.#parentOf(ref);
       const r = entry.record;
       if (r.resume?.snapshotDone && r.resume.tailDone) entry.status = 'ready';
     }
-
     this.#reduced = this.#checkpoint?.reduced ?? -1;
 
-    // the overlay: every outbox command forecast in order against the base
+    // forecast every outbox command onto a fresh overlay
     yield* this.#rebuildOverlay();
 
     // the first connection attempt
     this.#connectNow = true;
   }
 
-  // the most specific in-flight ref covering ref, other than itself: by the prefix rule any two
-  // refs are disjoint or nested, so this is the parent a child backfill merges into
+  // the most specific in-flight ref that covers ref, other than itself, so the parent of a child
   #parentOf(ref: string): string | null {
     let parent: string | null = null;
     for (const other of this.#backfills.keys()) {
@@ -3212,33 +3274,35 @@ export class Engine<QX, C> {
     return parent;
   }
 
-  // our main logic is implemented as a coroutine.  Each pass takes one kind of work, does it in
-  // its own transactions, and starts over, so the order of the branches is the priority: work
-  // that keeps the connector unblocked first, then the stream in order, then everything the
-  // stream's arrival implies, then the app.  Anything thrown out of a pass ends the Engine: the
-  // transaction rolled back, so the store resumes from the same point on the next start, and
-  // memory changed inside a transaction is never read again.  Nothing catches and continues
+  /* Our main logic is implemented as a coroutine.  Each pass takes one kind of work, does it in
+     its own transactions, and starts over, so the order of the branches is the priority: work
+     that keeps the connector unblocked first, then the stream in order, then everything the
+     stream's arrival implies, then the app.
+
+     Anything thrown out of a pass ends the Engine.  The transaction rolled back, so the store
+     resumes from the same point on the next start, and memory changed inside a transaction is
+     never read again.  Nothing catches and continues. */
   *#advancer(): Generator<void, void, void> {
     yield* this.#initialize();
 
     while (true) {
       if (this.#signal.aborted) {
-        // ends the connector and every backfill; nothing runs after
+        // the app ended us: end the connector and every backfill, and nothing runs after
         yield* this.#shutdown();
         return;
       }
 
       if (this.#backfillWork.length > 0) {
-        // header, values, events, and done marks from in-flight backfills: parked in their own
-        // transactions, each resolving the connector's promise after commit.  Anytime work: it
-        // orders against nothing in the inbox
+        // header, values, events, and done marks from in-flight backfills, parked in their own
+        // transactions, each resolving the connector's promise after commit.  This is anytime
+        // work: it orders against nothing in the inbox.
         yield* this.#onBackfillWork();
         continue;
       }
 
       if (this.#inbox.length > 0) {
-        // the stream, in arrival order: a run of event items is one wave, sorted by stream and
-        // reduced with the slices in parallel; a view, vouch, live, or end is handled alone
+        // the stream, in arrival order: events reduce or park, and a view, vouch, live, or end
+        // is handled alone
         yield* this.#onInbox();
         continue;
       }
@@ -3257,12 +3321,13 @@ export class Engine<QX, C> {
       }
 
       if (this.#sendCommands.length > 0 || this.#resend) {
-        // write to the outbox, forecast, send through the connector in order
+        // write to the outbox, forecast, and send through the connector in order
         yield* this.#onSendCommands();
         continue;
       }
 
       if (this.#newQueries && this.#live) {
+        // extend the graph with the app's new queries
         yield* this.#onNewQueries();
         continue;
       }
@@ -3278,16 +3343,16 @@ export class Engine<QX, C> {
     }
   }
 
-  // one connection attempt: the factory is called with the checkpoint, the stored view token,
-  // the wants, and this connection's signal.  Its hooks queue everything for the advancer, and a
-  // connector that has since been replaced is ignored.  Every backfill still downloading, and not
-  // waiting on its own backoff, starts on the new connection
+  // a new connection restarts every backfill that is still downloading and is not waiting on its
+  // own backoff timer, and resends the outbox
   #onConnect(): void {
     this.#connectNow = false;
     if (this.#retryTimer !== null) {
       clearTimeout(this.#retryTimer);
       this.#retryTimer = null;
     }
+
+    // hooks queue for the advancer; a hook from a connector we have since replaced is dropped
     const abort = this.#connectorAbort;
     const push = (item: Inbound) => {
       if (this.#connectorAbort !== abort) return;
@@ -3308,35 +3373,47 @@ export class Engine<QX, C> {
         onEnd: (code, reason) => push({ end: { code, reason } }),
       },
     );
+
+    // restart the downloads; one in backoff starts when its timer fires
     for (const [ref, entry] of this.#backfills) {
       if (entry.status === 'downloading' && entry.retryTimer === null) this.#startBackfill(ref);
     }
     this.#resend = true;
   }
 
-  // one push from a backfill, in its own transaction; the connector's promise resolves after the
-  // commit, which is the backpressure
+  // each push is its own transaction, and the connector's promise resolves after the commit,
+  // which is the backpressure
   *#onBackfillWork(): Generator<void, void, void> {
     const self = this;
     while (this.#backfillWork.length > 0) {
       const { ref, item, resolve, reject } = this.#backfillWork.shift()!;
+
+      // was the backfill dropped while this push was queued?
       const entry = this.#backfills.get(ref);
       if (entry === undefined) {
         reject(new Error(`backfill ${ref} is no longer in flight`));
         continue;
       }
+
       const record = entry.record;
       try {
         yield* withWTxn(this.#fx, this.#store, function* () {
           if ('header' in item) {
+            // a fresh download: a resumed tail keeps its floor, and a newer blob overrides it
             const { position, seqs } = item.header;
-            // a resumed tail keeps its floor; a newer blob overrides it
             const fromPosition = Math.max(record.resume?.fromPosition ?? position, position);
-            record.resume = { position, skipBytes: 0, fromPosition, snapshotDone: false, tailDone: false };
+            record.resume = {
+              position,
+              skipBytes: 0,
+              fromPosition,
+              snapshotDone: false,
+              tailDone: false,
+            };
             yield* txnSet(`/backfill-seqs.${ref}`, '.json', { [JS]: seqs });
           } else if ('values' in item) {
+            // park each value under this backfill's own range, and mark its stream
             for (const [key, bytes] of item.values) {
-              // a key no slice declares is from a newer vocabulary: dropped
+              // a key no slice declares is from a newer vocabulary, so it is dropped
               const type = storeTypeOf(self.#reg, key);
               if (type === undefined) continue;
               yield* txnSet(`/park.kv.${ref}/${key}`, type, { [MSGPACK]: bytes });
@@ -3346,6 +3423,7 @@ export class Engine<QX, C> {
           } else if ('valuesDone' in item) {
             record.resume!.snapshotDone = true;
           } else if ('events' in item) {
+            // park each event by stream and seq, and mark its stream
             for (const ev of item.events) {
               yield* txnSet(parkedEventKey(ev.stream, ev.seq), '.event', { [MSGPACK]: ev.raw });
               yield* self.#maybeMarkBackfilling(ev.stream, record.replacing);
@@ -3356,6 +3434,8 @@ export class Engine<QX, C> {
           } else {
             throw new Error('unexpected backfill item');
           }
+
+          // the record carries the resume point this push brought it to
           yield* txnSet(`/backfill.${ref}`, '.json', { [JS]: record });
         });
         resolve();
@@ -3365,8 +3445,7 @@ export class Engine<QX, C> {
     }
   }
 
-  // a stream seen under a backfill is marked in the streams table, in memory and at /seq., once.
-  // An additive backfill leaves a held stream held and lands around it; a replacing one takes it
+  // an additive backfill leaves a held stream held and lands around it; a replacing one takes it
   *#maybeMarkBackfilling(stream: string, replacing: boolean): WStoreGenerator<void> {
     const held = this.#streams.get(stream);
     if (held === 'backfill' || (typeof held === 'number' && !replacing)) return;
@@ -3374,22 +3453,26 @@ export class Engine<QX, C> {
     yield* txnSet(`/seq.${stream}`, '.json', { [JS]: 'backfill' });
   }
 
-  // how each backfill() call ended: a finished one waits on its children or is ready to land, a
-  // stale one starts its download over, a failed one retries after backoff
   *#onBackfillOutcomes(): Generator<void, void, void> {
     const self = this;
     while (this.#backfillOutcomes.length > 0) {
       const { ref, outcome, conn } = this.#backfillOutcomes.shift()!;
-      // a call from a connection that has ended: the next connection restarts the download
+
+      // an outcome from a connection that has ended means nothing; the next connection restarts
+      // the download
       if (conn !== this.#connectorAbort) continue;
+
+      // was the backfill dropped while its outcome was queued?
       const entry = this.#backfills.get(ref);
       if (entry === undefined) continue;
+
       if (outcome === 'done') {
+        // the download finished; it lands once its children have too
         entry.attempts = 0;
         entry.status = 'ready';
       } else if (outcome === 'stale') {
-        // the blob is gone: the parked values go, the parked events stay, and the download starts
-        // over under the same `until`
+        // the blob is gone: the parked values go, the parked events stay, and the download
+        // starts over under the same until
         entry.attempts = 0;
         yield* withWTxn(this.#fx, this.#store, function* () {
           yield* txnDelPrefix(`/park.kv.${ref}/`);
@@ -3399,8 +3482,7 @@ export class Engine<QX, C> {
         });
         this.#startBackfill(ref);
       } else {
-        // a rejection: ours, if the entry's signal fired, else a failure the Engine retries after
-        // backoff
+        // a rejection: ours, if the entry's signal fired, else a failure to retry after backoff
         if (entry.controller.signal.aborted) continue;
         entry.status = 'downloading';
         const delay = backoffDelay(entry.attempts++);
@@ -3411,18 +3493,21 @@ export class Engine<QX, C> {
         }, delay);
       }
     }
+
     yield* this.#tryLand();
   }
 
-  // one backfill() call on the current connector.  Its pushes and its outcome come back through
-  // the queues, so nothing here runs a transaction; without a connector nothing starts, and the
-  // next connection starts every backfill still downloading
+  // one backfill() call on the current connector; its pushes and its outcome come back through
+  // the advancer's queues.  Without a connector nothing starts, and the next connection restarts
+  // every backfill that is still downloading.
   #startBackfill(ref: string): void {
     const entry = this.#backfills.get(ref)!;
     if (this.#connector === null) return;
     const self = this;
     const conn = this.#connectorAbort;
     entry.status = 'downloading';
+
+    // the connector's cancellation is ours or the connection's
     const backfill: Backfill = {
       ref,
       until: entry.record.until,
@@ -3434,6 +3519,8 @@ export class Engine<QX, C> {
           self.#schedule();
         }),
     };
+
+    // the outcome is tagged with its connection, so a late one from an ended connection is known
     this.#connector.backfill(backfill).then(
       (outcome) => {
         self.#backfillOutcomes.push({ ref, outcome, conn });
@@ -3446,57 +3533,70 @@ export class Engine<QX, C> {
     );
   }
 
-  // land what can land in one transaction.  Chains are checked key-only before anything is
-  // written.  A ready child is checked on its own, so a broken one restarts without waiting on
-  // its parent.  A top-level ref whose whole subtree is ready is checked as one: a broken stream
-  // with an entry restarts it, one without becomes a child, and a clean subtree lands as one.
-  // While a replacing backfill is in flight the base is frozen: nothing lands unless every
-  // replacing entry is in a landing subtree and the frozen events chain, and then the frozen
-  // events land with them, so this is the transaction that unfreezes
+  /* Land what can land, in one transaction.  Chains are checked key-only before anything is
+     written.  While a replacing backfill is in flight the base is frozen: nothing lands unless
+     every replacing entry is in a landing subtree and the frozen events chain, and then the
+     frozen events land with them, so this is the transaction that unfreezes. */
   *#tryLand(): Generator<void, void, void> {
     const self = this;
+    // the base is frozen while any replacing backfill is in flight
     const frozen = this.#replacing > 0;
     const dirty: string[] = [];
+
     yield* withWTxn(this.#fx, this.#store, function* () {
+      // check every ready child on its own, so a broken one restarts without waiting on its parent
       for (const ref of [...self.#backfills.keys()]) {
         const entry = self.#backfills.get(ref)!;
         if (entry.parent === null || entry.status !== 'ready') continue;
         const streams = yield* self.#brokenStreamsIn(ref);
         if (streams.length > 0) yield* self.#repairIn(ref, streams);
       }
+
+      // check the frozen events; a break there is a gap on a held stream
       let frozenClean = true;
       if (frozen) {
         const streams = yield* self.#brokenStreamsIn(null);
         if (streams.length > 0) yield* self.#repairIn(null, streams);
         frozenClean = streams.length === 0;
       }
+
+      // check every top-level ref whose whole subtree is ready
       const clean: string[] = [];
       for (const ref of [...self.#backfills.keys()]) {
         if (self.#backfills.get(ref)!.parent !== null || !self.#landable(ref)) continue;
         const streams = yield* self.#brokenStreamsIn(ref);
         if (streams.length > 0) {
+          // a broken seq chain: a stream with an entry restarts, one without becomes a child
           yield* self.#repairIn(ref, streams);
         } else {
           clean.push(ref);
         }
       }
+
+      // frozen, and some replacing backfill is not landing in this pass?
       if (frozen) {
         const landing = new Set(clean.flatMap((ref) => self.#subtree(ref)));
         const pending = [...self.#backfills].some(
           ([ref, e]) => e.record.replacing && !landing.has(ref)
         );
+        // then nothing lands, or the base would show a partial replacement
         if (pending || !frozenClean) return;
       }
+
+      // land every clean subtree
       for (const ref of clean) yield* self.#landRefIn(ref, dirty);
+
+      // frozen, so this is the unfreeze: the frozen events land and the base catches up
       if (frozen) {
         yield* self.#reduceParkedIn(null, {}, dirty);
         yield* self.#reducedTo(self.#checkpoint?.position ?? -1);
       }
     });
+
     yield* this.#refresh(dirty);
   }
 
-  // a ref's children still in flight
+  // a ref's children that are still in flight
   #childrenOf(ref: string): string[] {
     return this.#backfills.get(ref)!.record.children.filter((c) => this.#backfills.has(c));
   }
@@ -3524,8 +3624,7 @@ export class Engine<QX, C> {
     return ((yield* txnGet(`/backfill-seqs.${ref}`, '.json')) ?? {}) as Record<string, number>;
   }
 
-  // a subtree's seqs at its cuts: the ref's blob header, each child's laid over it for its
-  // streams, the deepest winning
+  // a subtree's seqs at its cuts: the ref's header with each child's laid over it, deepest winning
   *#mergedHeaderIn(ref: string): RStoreGenerator<Record<string, number>> {
     let header = yield* this.#headerOf(ref);
     for (const child of this.#childrenOf(ref)) {
@@ -3534,29 +3633,35 @@ export class Engine<QX, C> {
     return header;
   }
 
-  // key-only: the streams among a subtree's parked events whose chain does not continue from
-  // the state that will be in place, or among the frozen events (null) from the held seq.  A
-  // stream under some other backfill is not ours and is skipped, and so is an event the base
-  // already covers
+  // the streams among a subtree's parked events, or among the frozen events (null), whose chain
+  // does not continue from the state that will be in place; key-only
   *#brokenStreamsIn(ref: string | null): RStoreGenerator<string[]> {
     const header = ref === null ? {} : yield* this.#mergedHeaderIn(ref);
     const broken: string[] = [];
     let range = this.#parkRange(ref, false);
     let stream = '';
     let last = 0;
+
+    // walk the parked keys in stream then seq order
     for (;;) {
       const { entries, next } = yield* txnScan(range);
       for (const [key] of entries) {
         const park = parsePark(key);
         const held = this.#streams.get(park.stream);
+
+        // a stream under some other backfill is not ours to check
         if (ref === null && held === 'backfill') continue;
+
+        // a new stream: its base is the newest state in place, the held seq or the cut
         if (park.stream !== stream) {
           stream = park.stream;
-          // the base is the newest state in place: the held seq or the cut, whichever is ahead
           last = Math.max(typeof held === 'number' ? held : 0, header[stream] ?? 0);
         }
-        // at or below the base the snapshot covers it
+
+        // at or below the base, the snapshot covers this event
         if (park.seq <= last) continue;
+
+        // does the chain continue?
         if (park.seq !== last + 1) {
           if (!broken.includes(stream)) broken.push(stream);
           continue;
@@ -3568,9 +3673,9 @@ export class Engine<QX, C> {
     }
   }
 
-  // inside a landing transaction: a broken stream with an entry restarts it, the rest become
-  // children of the ref checked.  A break among the frozen events (null) is a gap on a held
-  // stream, so its backfill replaces the stream and marks it
+  // a broken stream with an entry restarts it; the rest become children of the ref checked, or
+  // top-level replacing backfills for a break among the frozen events (null), which is a gap on a
+  // held stream
   *#repairIn(ref: string | null, streams: string[]): WStoreGenerator<void> {
     const fresh: string[] = [];
     for (const stream of streams) {
@@ -3586,36 +3691,38 @@ export class Engine<QX, C> {
     }
   }
 
-  // inside a landing transaction: a top-level ref's subtree lands as one.  Per stream under the
-  // ref, the newest state wins: a held stream at or past the cut keeps its state and its blob
-  // values go, any other loses its state to the blob.  Then the values move in, each child's over
-  // its parent's for its streams, the parked events reduce per stream from the state in place,
-  // and every record and entry of the subtree goes
+  // a top-level ref's subtree lands as one
   *#landRefIn(ref: string, dirty: string[]): WStoreGenerator<void> {
     const header = yield* this.#mergedHeaderIn(ref);
     const subtree = this.#subtree(ref);
+
+    // per stream under the ref, the newest state wins
     const kept = new Set<string>();
     for (const [stream, held] of this.#streams) {
       if (!refCovers(ref, stream)) continue;
       if (typeof held === 'number' && held >= (header[stream] ?? 0)) {
+        // a held stream at or past the cut keeps its state, and the blob values for it go
         kept.add(stream);
         delete header[stream];
         for (const r of subtree) yield* txnDelPrefix(`/park.kv.${r}/${stream}/`);
       } else {
+        // otherwise the stream loses its state to the blob
         dirty.push(...(yield* txnDelPrefix(`${stream}/`)));
       }
     }
+
+    // move the values in, reduce the parked events onto them, and forget the subtree
     yield* this.#moveValuesIn(ref, dirty, kept);
     yield* this.#reduceParkedIn(ref, header, dirty);
     yield* this.#dropIn(ref);
   }
 
-  // inside a landing transaction: a ref's parked values into place, then each child's over them
-  // for the streams in the child's blob, the deepest winning; a kept stream is never touched, and
-  // a stream only the parent's blob has keeps the parent's values
+  // a ref's parked values move into place, then each child's over them for the streams in the
+  // child's blob, the deepest winning; a kept stream is never touched
   *#moveValuesIn(ref: string, dirty: string[], kept: Set<string>): WStoreGenerator<void> {
     dirty.push(...(yield* txnMove(`/park.kv.${ref}/`, '')));
     for (const child of this.#childrenOf(ref)) {
+      // clear the parent's values for the child's streams, so a key the child's blob lacks goes too
       for (const stream of Object.keys(yield* this.#headerOf(child))) {
         if (!kept.has(stream)) dirty.push(...(yield* txnDelPrefix(`${stream}/`)));
       }
@@ -3623,8 +3730,7 @@ export class Engine<QX, C> {
     }
   }
 
-  // inside a transaction creating a ref: every in-flight top-level ref it covers becomes its
-  // child, downloading on in its own values range and landing over the new blob for its streams
+  // every in-flight top-level ref that a new ref covers becomes its child
   *#adoptChildrenIn(ref: string): WStoreGenerator<void> {
     const entry = this.#backfills.get(ref)!;
     for (const [other, e] of this.#backfills) {
@@ -3635,8 +3741,7 @@ export class Engine<QX, C> {
     yield* txnSet(`/backfill.${ref}`, '.json', { [JS]: entry.record });
   }
 
-  // inside a transaction creating a replacing ref: every held stream under it is marked, since
-  // the blob replaces them all and their events park from here
+  // a replacing ref takes every held stream under it, so their events park from here
   *#markUnderIn(ref: string): WStoreGenerator<void> {
     for (const [stream, held] of this.#streams) {
       if (typeof held === 'number' && refCovers(ref, stream)) {
@@ -3645,7 +3750,7 @@ export class Engine<QX, C> {
     }
   }
 
-  // inside a landing transaction: a subtree's records and entries go
+  // a landed subtree's records and entries go
   *#dropIn(ref: string): WStoreGenerator<void> {
     for (const child of this.#childrenOf(ref)) yield* this.#dropIn(child);
     yield* txnDel(`/backfill.${ref}`);
@@ -3655,25 +3760,31 @@ export class Engine<QX, C> {
     if (entry.record.replacing) this.#replacing--;
   }
 
-  // inside a landing transaction: reduce the parked events of a subtree, or of every stream under
-  // no backfill for the frozen events (null), each stream's run in one reducer call, then clear
-  // each walked stream's range.  An event the base already covers is skipped.  Every landed stream's seq is
-  // written once: the last walked for a stream with events, the cut's for a header stream
-  // without.  Chains were checked before any write
+  /* Reduce the parked events of a subtree, or of every stream under no backfill for the frozen
+     events (null), each stream's run in one reducer call, then clear each walked stream's range.
+     Chains were checked before any write.  Every landed stream's seq is written once: the last
+     walked for a stream with events, the cut's for a header stream without. */
   *#reduceParkedIn(
     ref: string | null, header: Record<string, number>, dirty: string[],
   ): WStoreGenerator<void> {
+    // {stream: seq}, the header seqs, then the last seq walked
     const seqs = new Map(Object.entries(header));
     const walked: string[] = [];
     let range = this.#parkRange(ref, { type: '.event', want: JS });
     let stream = '';
     let run: DbEvent<unknown>[] = [];
+
+    // walk the parked events in stream then seq order, reducing each stream's run as it ends
     for (;;) {
       const { entries, next } = yield* txnScan(range);
       for (const [, value] of entries) {
         const ev = (value as Record<number, unknown>)[JS] as DbEvent<unknown>;
         const held = this.#streams.get(ev.stream);
+
+        // a stream under some other backfill is not ours to land
         if (ref === null && held === 'backfill') continue;
+
+        // a new stream: reduce the last run, and start from the newest state in place
         if (ev.stream !== stream) {
           if (run.length > 0) yield* this.#reduceStreamIn(stream, run, dirty);
           stream = ev.stream;
@@ -3681,6 +3792,8 @@ export class Engine<QX, C> {
           walked.push(stream);
           seqs.set(stream, Math.max(typeof held === 'number' ? held : 0, seqs.get(stream) ?? 0));
         }
+
+        // at or below the base, the snapshot covers this event
         if (ev.seq <= seqs.get(stream)!) continue;
         seqs.set(stream, ev.seq);
         run.push(ev);
@@ -3689,33 +3802,42 @@ export class Engine<QX, C> {
       range = resumeRange(range, next);
     }
     if (run.length > 0) yield* this.#reduceStreamIn(stream, run, dirty);
-    // only the streams walked: a skipped stream's events stay for its own backfill's land
+
+    // clear only the streams walked; a skipped stream's events stay for its own backfill's land
     for (const name of walked) yield* txnDelPrefix(`/park.ev.${name}/`);
+
+    // hold every landed stream at its new seq
     for (const [name, seq] of seqs) {
       this.#streams.set(name, seq);
       yield* txnSet(`/seq.${name}`, '.json', { [JS]: seq });
     }
   }
 
-  // one stream's run of events, in order, through its slice's reducer; births and deaths are the
-  // Engine's: a death drops the stream's keys, the stream stays known so a rebirth chains, and
-  // neither reaches a reducer.  This is where events enter the base, so an event carrying an
-  // outbox command's id is that command's round trip, whichever path parked or delivered it
+  /* One stream's run of events, in order, through its slice's reducer.  Births and deaths are the
+     Engine's: a death drops the stream's keys, the stream stays known so a rebirth chains, and
+     neither reaches a reducer.  This is where events enter the base, so an event carrying an
+     outbox command's id is that command's round trip, whichever path parked or delivered it. */
   *#reduceStreamIn(
     stream: string, events: DbEvent<unknown>[], dirty: string[],
   ): WStoreGenerator<void> {
     const slice = this.#reducers[stream.split('.')[0]];
     let data: unknown[] = [];
+
+    // reduce the pending events, if any
     const reduce = function* (this: Engine<QX, C>): WStoreGenerator<void> {
       if (data.length === 0) return;
       const { updates } = yield* runReducer(slice.reducer(slice.rx, data));
       dirty.push(...updates);
       data = [];
     }.bind(this);
+
     for (const ev of events) {
+      // our own command's event: the round trip is observed
       if (this.#outbox.has(ev.id)) yield* this.#releaseIn([ev.id]);
+
       const sys = sysOf(ev.data);
       if (sys === 'death') {
+        // the stream died: reduce what came before, then drop its state
         yield* reduce();
         dirty.push(...(yield* txnDelPrefix(`${stream}/`)));
       } else if (sys === null) {
@@ -3725,9 +3847,8 @@ export class Engine<QX, C> {
     yield* reduce();
   }
 
-  // inside a landing transaction: a ref whose tail did not reach its parked live events drops its
-  // parked values and downloads again from a fresh snapshot, whose cut is past the gap; the
-  // parked events stay and chain from the live cut
+  // a ref whose tail did not reach its parked live events downloads again from a fresh snapshot,
+  // whose cut is past the gap; the parked events stay and chain from the live cut
   *#restartIn(ref: string): WStoreGenerator<void> {
     const entry = this.#backfills.get(ref)!;
     yield* txnDelPrefix(`/park.kv.${ref}/`);
@@ -3738,10 +3859,14 @@ export class Engine<QX, C> {
     this.#startBackfill(ref);
   }
 
-  // inside a transaction: new backfills, each downloading at once into its own values range.  A
-  // stream ref is marked; a family has nothing to mark.  With a parent they are its children and
-  // it lands when they have too
-  *#spawnIn(parent: string | null, refs: string[], until: number, replacing: boolean): WStoreGenerator<void> {
+  // new backfills, each downloading at once into its own values range; with a parent they are
+  // its children, and it lands when they have too
+  *#spawnIn(
+    parent: string | null,
+    refs: string[],
+    until: number,
+    replacing: boolean,
+  ): WStoreGenerator<void> {
     for (const ref of refs) {
       const record: BackfillRecord = { until, resume: null, replacing, children: [] };
       yield* txnSet(`/backfill.${ref}`, '.json', { [JS]: record });
@@ -3754,10 +3879,13 @@ export class Engine<QX, C> {
         retryTimer: null,
       });
       if (replacing) this.#replacing++;
+
+      // a stream ref is marked; a family has nothing to mark until its blob names its members
       if (!ref.endsWith('*')) yield* this.#maybeMarkBackfilling(ref, replacing);
       if (replacing) yield* this.#markUnderIn(ref);
       this.#startBackfill(ref);
     }
+
     if (parent !== null) {
       const p = this.#backfills.get(parent)!;
       p.record.children.push(...refs);
@@ -3765,8 +3893,8 @@ export class Engine<QX, C> {
     }
   }
 
-  // inside a transaction: an in-flight backfill ends.  Its download is aborted, its values range
-  // and records go, and its children carry on with the parent they have left, if any
+  // an in-flight backfill ends: its download is aborted, its values range and records go, and its
+  // children carry on under the parent they have left, if any
   *#dropBackfillIn(ref: string): WStoreGenerator<void> {
     const entry = this.#backfills.get(ref)!;
     entry.controller.abort();
@@ -3776,11 +3904,15 @@ export class Engine<QX, C> {
     yield* txnDel(`/backfill-seqs.${ref}`);
     this.#backfills.delete(ref);
     if (entry.record.replacing) this.#replacing--;
+
+    // leave the parent's children list
     if (entry.parent !== null) {
       const p = this.#backfills.get(entry.parent)!;
       p.record.children = p.record.children.filter((c) => c !== ref);
       yield* txnSet(`/backfill.${entry.parent}`, '.json', { [JS]: p.record });
     }
+
+    // re-parent each child to the next covering entry, if any
     for (const child of entry.record.children) {
       const c = this.#backfills.get(child);
       if (c === undefined) continue;
@@ -3792,7 +3924,7 @@ export class Engine<QX, C> {
     }
   }
 
-  // inside a transaction: a stream leaves the Engine: its state, its seq, and its parked events
+  // a stream leaves the Engine: its state, its seq, and its parked events
   *#dropStreamIn(stream: string, dirty: string[]): WStoreGenerator<void> {
     dirty.push(...(yield* txnDelPrefix(`${stream}/`)));
     yield* txnDel(`/seq.${stream}`);
@@ -3800,14 +3932,13 @@ export class Engine<QX, C> {
     this.#streams.delete(stream);
   }
 
-  // one inbound item from the connector, in arrival order
   *#onInbox(): Generator<void, void, void> {
     const item = this.#inbox.shift()!;
     if ('events' in item) {
       yield* this.#onEvents(item.events);
     } else if ('open' in item) {
-      // a different epoch is a replaced log: positions held mean nothing there.  Dropping
-      // everything and backfilling every ref is the answer, and until that exists this ends
+      // a different epoch is a replaced log, where the positions we hold mean nothing.  Dropping
+      // everything and backfilling every ref is the answer, and until that exists this ends.
       if (this.#checkpoint !== null && this.#checkpoint.epoch !== item.open) {
         throw new Error(`epoch ${item.open}, checkpoint from ${this.#checkpoint.epoch}`);
       }
@@ -3817,6 +3948,7 @@ export class Engine<QX, C> {
     } else if ('vouch' in item) {
       yield* this.#onCursor(item.vouch);
     } else if ('live' in item) {
+      // history is done: the graph runs once, unless frozen
       yield* this.#onCursor(item.live);
       this.#live = true;
       this.#attempt = 0;
@@ -3826,70 +3958,83 @@ export class Engine<QX, C> {
     }
   }
 
-  // one atom's events in one transaction.  Routing is a streams-table lookup: a marked stream
-  // parks; an unknown stream under an in-flight ref is marked and parks; an unknown non-birth
-  // under no ref starts its own backfill and parks; while frozen everything else parks too; a
-  // held stream's next event joins its run, a repeat is dropped, and a jump is a gap, which
-  // starts a replacing backfill for the stream at once, under the in-flight ref covering it if
-  // any, and freezes the base from that event on.  Runs reduce per stream, the seqs and the
-  // checkpoint are written, and the graph runs when live and not frozen
+  // one atom's events in one transaction; each event reduces or parks by a streams-table lookup
   *#onEvents(events: WireEvent[]): Generator<void, void, void> {
     const self = this;
     const dirty: string[] = [];
     yield* withWTxn(this.#fx, this.#store, function* () {
+      // {stream: seq} for every held stream that advanced, and {stream: events} to reduce
       const seqs = new Map<string, number>();
       const runs = new Map<string, DbEvent<unknown>[]>();
       // streams born in this atom: held ones are in seqs, parked ones here
       const born = new Set<string>();
       let reduced = self.#reduced;
+
+      // route each event
       for (const ev of events) {
         const held = self.#streams.get(ev.stream);
         let park = held === 'backfill';
+
+        // an unknown stream?
         if (held === undefined && !seqs.has(ev.stream) && !born.has(ev.stream)) {
           const parent = self.#parentOf(ev.stream);
           if (parent !== null) {
-            yield* self.#maybeMarkBackfilling(ev.stream, self.#backfills.get(parent)!.record.replacing);
+            // under an in-flight ref, whose land will chain it: mark it and park
+            const replacing = self.#backfills.get(parent)!.record.replacing;
+            yield* self.#maybeMarkBackfilling(ev.stream, replacing);
             park = true;
           } else if (sysOf(self.#decode(ev).data) !== 'birth') {
+            // a stream we missed the birth of: backfill it on its own, and park
             yield* self.#spawnIn(null, [ev.stream], ev.position, false);
             park = true;
           }
         }
+
+        // frozen, so everything else parks too
         if (!park && self.#replacing > 0) {
           park = true;
           if (held === undefined) born.add(ev.stream);
         }
+
+        // a held stream, or a birth: does the event chain?
         if (!park) {
           const last = seqs.get(ev.stream) ?? (typeof held === 'number' ? held : 0);
           if (ev.seq <= last) continue;
           if (ev.seq === last + 1) {
+            // the next event: it joins the stream's run
             seqs.set(ev.stream, ev.seq);
             if (!runs.has(ev.stream)) runs.set(ev.stream, []);
             runs.get(ev.stream)!.push(self.#decode(ev));
             reduced = ev.position;
             continue;
           }
+
+          // a gap: replace the stream, under the in-flight ref covering it if any, and park
           yield* self.#spawnIn(self.#parentOf(ev.stream), [ev.stream], ev.position, true);
           seqs.delete(ev.stream);
           park = true;
         }
+
         yield* txnSet(parkedEventKey(ev.stream, ev.seq), '.event', { [MSGPACK]: ev.raw });
       }
+
+      // reduce each stream's run and hold it at its new seq
       for (const [stream, run] of runs) yield* self.#reduceStreamIn(stream, run, dirty);
       for (const [stream, seq] of seqs) {
         self.#streams.set(stream, seq);
         yield* txnSet(`/seq.${stream}`, '.json', { [JS]: seq });
       }
+
+      // an atom that froze part way reduced up to the event before the gap
       const last = events[events.length - 1].position;
-      // a batch that froze part way reduced up to the event before the gap
       yield* self.#reducedTo(self.#replacing > 0 ? reduced : last);
       yield* self.#advanceCursorIn(last);
     });
     yield* this.#refresh(dirty);
   }
 
-  // after a commit: the graph learns what changed and runs when live.  Base changes reach
-  // queries only when not frozen; outbox changes always do, since forecasts are not base state
+  // after a commit, the graph learns what changed and runs when live; base changes reach queries
+  // only when not frozen, outbox changes always, since forecasts are not base state
   *#refresh(dirty: string[]): Generator<void, void, void> {
     this.#graph.dirty(dirty);
     const outbox = this.#outboxChanged;
@@ -3905,7 +4050,7 @@ export class Engine<QX, C> {
     return (v as Record<number, unknown>)[JS] as DbEvent<unknown>;
   }
 
-  // inside a transaction: the checkpoint moves forward, never back, under the connection's epoch
+  // the checkpoint moves forward, never back, under the connection's epoch
   *#advanceCursorIn(position: number): WStoreGenerator<void> {
     if (this.#epoch === null) throw new Error('cursor with no epoch');
     if (this.#checkpoint !== null && position <= this.#checkpoint.position) return;
@@ -3913,8 +4058,8 @@ export class Engine<QX, C> {
     yield* txnSet('/checkpoint', '.json', { [JS]: this.#checkpoint });
   }
 
-  // inside a transaction: the base has been reduced through position, never back, and every
-  // acked command at or below it is in the base, events or none, and leaves the outbox
+  // the base has been reduced through position, so every acked command at or below it is in the
+  // base, events or none, and leaves the outbox
   *#reducedTo(position: number): WStoreGenerator<void> {
     if (position <= this.#reduced) return;
     this.#reduced = position;
@@ -3925,12 +4070,12 @@ export class Engine<QX, C> {
     yield* this.#releaseAckedIn();
   }
 
-  // inside a transaction: every acked command the base has reduced past leaves the outbox
   *#releaseAckedIn(): WStoreGenerator<void> {
-    yield* this.#releaseIn([...this.#acked].filter(([, p]) => p <= this.#reduced).map(([id]) => id));
+    const done = [...this.#acked].filter(([, p]) => p <= this.#reduced).map(([id]) => id);
+    yield* this.#releaseIn(done);
   }
 
-  // inside a transaction: commands leave the outbox
+  // commands leave the outbox
   *#releaseIn(ids: string[]): WStoreGenerator<void> {
     for (const id of ids) {
       const ordinal = this.#outbox.get(id);
@@ -3943,8 +4088,8 @@ export class Engine<QX, C> {
     }
   }
 
-  // a vouch, or the live mark: the cursor converges in its own transaction, and unless frozen
-  // nothing below it was withheld, so the base is reduced through it
+  // a vouch, or the live mark: unless frozen, nothing below it was withheld, so the base is
+  // reduced through it
   *#onCursor(position: number): Generator<void, void, void> {
     const self = this;
     yield* withWTxn(this.#fx, this.#store, function* () {
@@ -3954,46 +4099,48 @@ export class Engine<QX, C> {
     yield* this.#refresh([]);
   }
 
-  // the results of one sendCommand call, or its failure.  An ack or dup names the position the
-  // command landed at, and the command is done once the base has reduced through it.  A reject
-  // or a conflict is final and the command goes at once.  A failed call leaves its commands
-  // unsent for the next connection to resend, in order; results from an ended connection are
-  // still the server's answers and count, its failures mean nothing
   *#onCommandOutcomes(): Generator<void, void, void> {
     const self = this;
     const { ids, results, conn } = this.#commandOutcomes.shift()!;
+
+    // a failed call leaves its commands unsent for the next resend, unless the connection it was
+    // on has already ended, which resent them
     if ('failed' in results) {
       if (conn === this.#connectorAbort) {
         for (const id of ids) this.#sent.delete(id);
       }
       return;
     }
+
+    // answers count from any connection, they are the server's
     const drop: string[] = [];
     results.forEach((r, i) => {
       const id = ids[i];
+
       // a command already released, by its round trip or by an earlier answer to a resend
       if (!this.#outbox.has(id)) return;
+
       if (r.kind === 'ack' || r.kind === 'dup') {
+        // the command landed at a position; it leaves once the base has reduced through it
         this.#acked.set(id, r.position);
         if (r.position <= this.#reduced) drop.push(id);
       } else {
+        // a reject or a conflict is final
         drop.push(id);
       }
     });
     if (drop.length === 0) return;
+
     yield* withWTxn(this.#fx, this.#store, function* () {
       yield* self.#releaseIn(drop);
     });
     yield* this.#refresh([]);
   }
 
-  // a view frame, reconciled against state in one transaction.  Drops first: an in-flight ref
-  // the new set does not fully cover ends, and a stream the new set does not cover goes.  Then
-  // every ref of the new set that nothing accounts for starts a backfill, broadest first so a
-  // covered ref finds its cover, and adopts the in-flight refs it covers.  A drop that ends the
-  // last replacing backfill lands the frozen events here.  The view is written only when this
-  // commits.  A revoke changes what queries may see, so the graph runs even while frozen: a new
-  // query would otherwise disagree with the results already delivered
+  /* A view frame, reconciled against state in one transaction.  Drops come first, then every ref
+     of the new set that nothing accounts for starts a backfill, and the view is written only when
+     this commits.  A revoke changes what queries may see, so the graph runs even while frozen: a
+     new query would otherwise disagree with the results already delivered. */
   *#onView(view: ViewRecord): Generator<void, void, void> {
     const self = this;
     const dirty: string[] = [];
@@ -4002,26 +4149,40 @@ export class Engine<QX, C> {
       const covered = (refs: string[], x: string) => refs.some((r) => refCovers(r, x));
       const old = self.#view?.refs ?? [];
       const atStart = [...self.#backfills.keys()];
+
+      // drop every in-flight ref the new set does not fully cover
       for (const ref of atStart) {
         if (!covered(view.refs, ref)) yield* self.#dropBackfillIn(ref);
       }
+
+      // drop every stream the new set does not cover
       for (const stream of [...self.#streams.keys()]) {
         if (!covered(view.refs, stream)) yield* self.#dropStreamIn(stream, dirty);
       }
-      // the first view's grants replace an empty base: frozen until they land as a group, so
-      // the first frame shown is complete.  Every later grant is additive
+
+      // grant, broadest first so a covered ref finds its cover.  The first view's grants replace
+      // an empty base: frozen until they land as a group, so the first frame shown is complete.
+      // Every later grant is additive.
       const bootstrap = self.#view === null;
       const refs = [...view.refs].sort((a, b) => refPrefix(a).length - refPrefix(b).length);
       for (const ref of refs) {
+        // does an entry already cover it?
         const entries = [...self.#backfills.keys()];
         if (entries.some((e) => refCovers(e, ref))) continue;
+
+        // is it held: covered by the old set, and by no entry at the start of the frame?
         const held = covered(old, ref) && !atStart.some((e) => refCovers(e, ref));
         if (held || typeof self.#streams.get(ref) === 'number') continue;
+
+        // otherwise it is new: backfill it, adopting the in-flight refs it covers
         yield* self.#spawnIn(null, [ref], view.position, bootstrap);
         yield* self.#adoptChildrenIn(ref);
       }
+
       yield* txnSet('/view', '.json', { [JS]: view });
       self.#view = view;
+
+      // did a drop end the last replacing backfill?  Then this is the unfreeze
       if (wasFrozen && self.#replacing === 0) {
         yield* self.#reduceParkedIn(null, {}, dirty);
         yield* self.#reducedTo(self.#checkpoint?.position ?? -1);
@@ -4030,9 +4191,8 @@ export class Engine<QX, C> {
     yield* this.#refresh(dirty);
   }
 
-  // the connection ended: the next attempt is scheduled with backoff.  Every call in flight on
-  // it is dead: backfills wait for the next connection to restart them, and commands handed to
-  // it are unsent again for the next connection to resend
+  // the connection ended.  Every call in flight on it is dead: backfills wait for the next
+  // connection to restart them, and commands handed to it are unsent again for the next resend.
   #onEnd(): void {
     const self = this;
     this.#connector = null;
@@ -4041,25 +4201,29 @@ export class Engine<QX, C> {
     this.#sent.clear();
     this.#live = false;
     this.#epoch = null;
+
+    // the next attempt, after backoff
     this.#retryTimer = setTimeout(() => {
       self.#retryTimer = null;
       self.#schedule();
     }, backoffDelay(this.#attempt++));
   }
 
-  // the overlay is rebuilt from the outbox after any change under it: a fresh overlay over the
-  // base, every outbox command forecast in order against it, each seeing what the ones before
-  // left, and the graph run on the result.  A forecast that answers a reason, or throws, adds
-  // nothing: the command is still in flight and the server decides
+  // a fresh overlay over the base, every outbox command forecast onto it in order, and the graph
+  // run on the result
   *#rebuildOverlay(): Generator<void, void, void> {
     const self = this;
     this.#graph.dirty(this.#overlay.keys());
     this.#overlay = new OverlayStore(this.#store, this.#reg);
+
+    // forecast each outbox command, each seeing what the ones before it left
     const forecaster = this.#forecaster;
     if (forecaster !== null && this.#outbox.size > 0) {
       const updates = yield* withWTxn(this.#fx, this.#overlay, function* () {
         const dirty: string[] = [];
-        const rows = yield* txnScanAll(prefixRange('/command.', 1000, { type: '.command', want: JS }));
+        const rows = yield* txnScanAll(
+          prefixRange('/command.', 1000, { type: '.command', want: JS }),
+        );
         for (const [, value] of rows) {
           const command = (value as Record<number, unknown>)[JS] as Command<Uint8Array>;
 
@@ -4067,8 +4231,11 @@ export class Engine<QX, C> {
           const data = self.#commandData(command.data);
           if (data === undefined) continue;
 
+          // a reason, or a throw, forecasts nothing: the command is in flight, the server decides
           const forecast = yield* self.#runForecast(forecaster(self.#qx, data));
           if (typeof forecast === 'string') continue;
+
+          // reduce the forecast events per stream through the slice reducers
           const runs = new Map<string, unknown[]>();
           for (const { stream, event } of forecast) {
             if (!runs.has(stream)) runs.set(stream, []);
@@ -4084,6 +4251,8 @@ export class Engine<QX, C> {
       });
       this.#graph.dirty(updates);
     }
+
+    // run the graph, new queries included
     const cbs = yield* withRTxn(this.#fx, this.#overlay, function* () {
       self.#newQueries = false;
       return yield* self.#graph.run();
@@ -4092,7 +4261,7 @@ export class Engine<QX, C> {
   }
 
   // a command's wire bytes as the forecaster sees them, or undefined when the current vocabulary
-  // cannot read them: an outbox row written by an earlier build of the app
+  // cannot read them, which is an outbox row written by an earlier build of the app
   #commandData(bytes: Uint8Array): C | undefined {
     try {
       const v = this.#reg.convert(this.#reg.commands, { [MSGPACK]: bytes }, JS);
@@ -4102,12 +4271,12 @@ export class Engine<QX, C> {
     }
   }
 
-  // drives a forecast's query generator inside a transaction on the overlay: its store questions
-  // are answered from there, and a throw from the forecast itself is a reason.  A forecast
-  // cannot await another query
+  // drives a forecast's query generator against the overlay; a throw from the forecast itself is
+  // a reason, and a forecast cannot await another query
   *#runForecast<T>(g: QueryGenerator<T | string>): RStoreGenerator<T | string> {
     let ans: QueryAnswer = { store: {}, query: {} };
     for (;;) {
+      // only the forecast's own step may throw; a store failure ends the Engine as usual
       let step: IteratorResult<QueryQuestion, T | string>;
       try {
         step = g.next(ans);
@@ -4115,22 +4284,25 @@ export class Engine<QX, C> {
         return `forecast threw: ${String(e)}`;
       }
       if (step.done) return step.value;
-      if (Object.keys(step.value.query ?? {}).length > 0) throw new Error('a forecast awaited a query');
+      if (Object.keys(step.value.query ?? {}).length > 0) {
+        throw new Error('a forecast awaited a query');
+      }
+
+      // answer its store questions from the overlay
       const got = (yield { get: step.value.store ?? {} }).get;
       ans = { store: got, query: {} };
     }
   }
 
-  // the app's new commands, and the outbox resend.  New commands are converted to their wire
-  // bytes here, by the vocabulary that made them, and take the next ordinals into the outbox in
-  // one transaction; then every outbox command not yet handed to this connection is sent as
-  // stored, in ordinal order, its results coming back through the outcomes.  Without a connector
-  // the next connection resends
+  // the app's new commands go into the outbox, and every outbox command not yet handed to this
+  // connection is sent in ordinal order
   *#onSendCommands(): Generator<void, void, void> {
     const self = this;
     const fresh = this.#sendCommands.splice(0);
     this.#resend = false;
 
+    // new commands are converted to wire bytes here, by the vocabulary that made them, and take
+    // the next ordinals in one transaction
     if (fresh.length > 0) {
       yield* withWTxn(this.#fx, this.#store, function* () {
         for (const data of fresh) {
@@ -4148,6 +4320,7 @@ export class Engine<QX, C> {
       yield* this.#refresh([]);
     }
 
+    // without a connector, the next connection resends
     const connector = this.#connector;
     if (connector === null) return;
     const pending = [...this.#outbox]
@@ -4163,6 +4336,8 @@ export class Engine<QX, C> {
       }
       return out;
     });
+
+    // the results come back through the outcomes, tagged with this connection
     const ids = wire.map((c) => c.id);
     const conn = this.#connectorAbort;
     for (const id of ids) this.#sent.add(id);
@@ -4187,19 +4362,22 @@ export class Engine<QX, C> {
     cbs();
   }
 
-  // ends everything the Engine drives: the connection, and with it every backfill call in flight,
-  // the retry timers, and the pushes waiting for a transaction they will never get.  Nothing is
-  // persisted; the store is already consistent at the last commit
+  // ends everything the Engine drives; nothing is persisted, since the store is already consistent
+  // at the last commit
   *#shutdown(): Generator<void, void, void> {
     if (this.#retryTimer !== null) {
       clearTimeout(this.#retryTimer);
       this.#retryTimer = null;
     }
+
+    // the connection, and with it every backfill call in flight
     this.#connectorAbort.abort();
     this.#connector = null;
     for (const entry of this.#backfills.values()) {
       if (entry.retryTimer !== null) clearTimeout(entry.retryTimer);
     }
+
+    // the pushes waiting for a transaction they will never get
     const reason = new Error('engine shut down');
     for (const work of this.#backfillWork) work.reject(reason);
     this.#backfillWork = [];
