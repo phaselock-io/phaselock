@@ -3275,9 +3275,10 @@ export class Engine<QX, C> {
   }
 
   /* Our main logic is implemented as a coroutine.  Each pass takes one kind of work, does it in
-     its own transactions, and starts over, so the order of the branches is the priority: work
-     that keeps the connector unblocked first, then the stream in order, then everything the
-     stream's arrival implies, then the app.
+     its own transactions, and starts over, so the order of the branches is the priority: what the
+     user is waiting on first, the app's commands and queries, then the live stream, then the
+     outcomes of our own calls, then background work that batches well and can wait, and a new
+     connection last.
 
      Anything thrown out of a pass ends the Engine.  The transaction rolled back, so the store
      resumes from the same point on the next start, and memory changed inside a transaction is
@@ -3287,16 +3288,21 @@ export class Engine<QX, C> {
 
     while (true) {
       if (this.#signal.aborted) {
-        // the app ended us: end the connector and every backfill, and nothing runs after
+        // the app ended us: end the connector and every backfill, and nothing runs after that
         yield* this.#shutdown();
         return;
       }
 
-      if (this.#backfillWork.length > 0) {
-        // header, values, events, and done marks from in-flight backfills, parked in their own
-        // transactions, each resolving the connector's promise after commit.  This is anytime
-        // work: it orders against nothing in the inbox.
-        yield* this.#onBackfillWork();
+      if (this.#sendCommands.length > 0 || this.#resend) {
+        // the tightest loop we serve: write to the outbox, forecast, and the UI sees the
+        // optimistic update; then send through the connector in order
+        yield* this.#onSendCommands();
+        continue;
+      }
+
+      if (this.#newQueries && this.#live) {
+        // a new page wants its first answer: extend the graph with the app's new queries
+        yield* this.#onNewQueries();
         continue;
       }
 
@@ -3307,6 +3313,12 @@ export class Engine<QX, C> {
         continue;
       }
 
+      if (this.#commandOutcomes.length > 0) {
+        // ack, dup, reject, and conflict from sends: release the outbox and rebuild the overlay
+        yield* this.#onCommandOutcomes();
+        continue;
+      }
+
       if (this.#backfillOutcomes.length > 0) {
         // 'done', 'stale', or a rejection for a backfill: land attempts, retries with resume,
         // discards, and children spawned by chain breaks
@@ -3314,21 +3326,11 @@ export class Engine<QX, C> {
         continue;
       }
 
-      if (this.#commandOutcomes.length > 0) {
-        // ack, dup, reject, and conflict from sends: release the outbox and rebuild the overlay
-        yield* this.#onCommandOutcomes();
-        continue;
-      }
-
-      if (this.#sendCommands.length > 0 || this.#resend) {
-        // write to the outbox, forecast, and send through the connector in order
-        yield* this.#onSendCommands();
-        continue;
-      }
-
-      if (this.#newQueries && this.#live) {
-        // extend the graph with the app's new queries
-        yield* this.#onNewQueries();
+      if (this.#backfillWork.length > 0) {
+        // header, values, events, and done marks from in-flight backfills, parked in their own
+        // transactions, each resolving the connector's promise after commit.  Background work:
+        // it orders against nothing above, and the connector waits on it while the app is busy.
+        yield* this.#onBackfillWork();
         continue;
       }
 
@@ -3341,6 +3343,74 @@ export class Engine<QX, C> {
       // nothing to do: wait for a hook, a timer, or the app
       yield;
     }
+  }
+
+  // the app's new commands go into the outbox, and every outbox command not yet handed to this
+  // connection is sent in ordinal order
+  *#onSendCommands(): Generator<void, void, void> {
+    const self = this;
+    const fresh = this.#sendCommands.splice(0);
+    this.#resend = false;
+
+    // new commands are converted to wire bytes here, by the vocabulary that made them, and take
+    // the next ordinals in one transaction
+    if (fresh.length > 0) {
+      yield* withWTxn(this.#fx, this.#store, function* () {
+        for (const data of fresh) {
+          const bytes = self.#reg.convert(self.#reg.commands, { [JS]: data }, MSGPACK);
+          const command: Command<Uint8Array> = {
+            id: generateUuid(),
+            data: (bytes as Record<number, unknown>)[MSGPACK] as Uint8Array,
+          };
+          const ordinal = self.#nextOrdinal++;
+          yield* txnSet(commandKey(ordinal), '.command', { [JS]: command });
+          self.#outbox.set(command.id, ordinal);
+        }
+      });
+      this.#outboxChanged = true;
+      yield* this.#refresh([]);
+    }
+
+    // without a connector, the next connection resends
+    const connector = this.#connector;
+    if (connector === null) return;
+    const pending = [...this.#outbox]
+      .filter(([id]) => !this.#sent.has(id) && !this.#acked.has(id))
+      .sort((a, b) => a[1] - b[1]);
+    if (pending.length === 0) return;
+
+    // rows go on the wire as stored, whatever vocabulary wrote them
+    const wire = yield* withRTxn(this.#fx, this.#store, function* () {
+      const out: Command<Uint8Array>[] = [];
+      for (const [, ordinal] of pending) {
+        out.push((yield* txnGet(commandKey(ordinal), '.command')) as Command<Uint8Array>);
+      }
+      return out;
+    });
+
+    // the results come back through the outcomes, tagged with this connection
+    const ids = wire.map((c) => c.id);
+    const conn = this.#connectorAbort;
+    for (const id of ids) this.#sent.add(id);
+    connector.sendCommand(wire).then(
+      (results) => {
+        self.#commandOutcomes.push({ ids, results, conn });
+        self.#schedule();
+      },
+      (e: unknown) => {
+        self.#commandOutcomes.push({ ids, results: { failed: e }, conn });
+        self.#schedule();
+      },
+    );
+  }
+
+  *#onNewQueries(): Generator<void, void, void> {
+    const self = this;
+    const cbs = yield* withRTxn(this.#fx, this.#overlay, function* () {
+      self.#newQueries = false;
+      return yield* self.#graph.extend();
+    });
+    cbs();
   }
 
   // a new connection restarts every backfill that is still downloading and is not waiting on its
@@ -4294,74 +4364,6 @@ export class Engine<QX, C> {
     }
   }
 
-  // the app's new commands go into the outbox, and every outbox command not yet handed to this
-  // connection is sent in ordinal order
-  *#onSendCommands(): Generator<void, void, void> {
-    const self = this;
-    const fresh = this.#sendCommands.splice(0);
-    this.#resend = false;
-
-    // new commands are converted to wire bytes here, by the vocabulary that made them, and take
-    // the next ordinals in one transaction
-    if (fresh.length > 0) {
-      yield* withWTxn(this.#fx, this.#store, function* () {
-        for (const data of fresh) {
-          const bytes = self.#reg.convert(self.#reg.commands, { [JS]: data }, MSGPACK);
-          const command: Command<Uint8Array> = {
-            id: generateUuid(),
-            data: (bytes as Record<number, unknown>)[MSGPACK] as Uint8Array,
-          };
-          const ordinal = self.#nextOrdinal++;
-          yield* txnSet(commandKey(ordinal), '.command', { [JS]: command });
-          self.#outbox.set(command.id, ordinal);
-        }
-      });
-      this.#outboxChanged = true;
-      yield* this.#refresh([]);
-    }
-
-    // without a connector, the next connection resends
-    const connector = this.#connector;
-    if (connector === null) return;
-    const pending = [...this.#outbox]
-      .filter(([id]) => !this.#sent.has(id) && !this.#acked.has(id))
-      .sort((a, b) => a[1] - b[1]);
-    if (pending.length === 0) return;
-
-    // rows go on the wire as stored, whatever vocabulary wrote them
-    const wire = yield* withRTxn(this.#fx, this.#store, function* () {
-      const out: Command<Uint8Array>[] = [];
-      for (const [, ordinal] of pending) {
-        out.push((yield* txnGet(commandKey(ordinal), '.command')) as Command<Uint8Array>);
-      }
-      return out;
-    });
-
-    // the results come back through the outcomes, tagged with this connection
-    const ids = wire.map((c) => c.id);
-    const conn = this.#connectorAbort;
-    for (const id of ids) this.#sent.add(id);
-    connector.sendCommand(wire).then(
-      (results) => {
-        self.#commandOutcomes.push({ ids, results, conn });
-        self.#schedule();
-      },
-      (e: unknown) => {
-        self.#commandOutcomes.push({ ids, results: { failed: e }, conn });
-        self.#schedule();
-      },
-    );
-  }
-
-  *#onNewQueries(): Generator<void, void, void> {
-    const self = this;
-    const cbs = yield* withRTxn(this.#fx, this.#overlay, function* () {
-      self.#newQueries = false;
-      return yield* self.#graph.extend();
-    });
-    cbs();
-  }
-
   // ends everything the Engine drives; nothing is persisted, since the store is already consistent
   // at the last commit
   *#shutdown(): Generator<void, void, void> {
@@ -4382,7 +4384,6 @@ export class Engine<QX, C> {
     for (const work of this.#backfillWork) work.reject(reason);
     this.#backfillWork = [];
   }
-
 }
 
 export class ReducerTester<RX, E, S> {
