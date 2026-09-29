@@ -331,5 +331,26 @@ describe('freeze and group land', () => {
     ]);
   });
 
+  test('a revoke while frozen leaves queries at once, though the freeze holds', async () => {
+    const r = await held();
+    const w = watch(r, 'book.b1');
+    await settle();
+    expect(w.values).toEqual([{ count: 1, fields: {} }]);
+    const { release } = await freeze(r);
+
+    // book.b1 is revoked while patron.p2's replacing backfill is still in flight
+    r.server.view('t2', 12, ['patron.*']);
+    await settle();
+    expect(seq(r.data, 'patron.p2')).toBe('backfill');
+    expect(state(r.data, 'book.b1')).toBeUndefined();
+    expect(w.values).toEqual([{ count: 1, fields: {} }, undefined]);
+
+    // the unfreeze delivers nothing more for it
+    release();
+    await settle();
+    expect(seq(r.data, 'patron.p2')).toBe(9);
+    expect(w.values).toEqual([{ count: 1, fields: {} }, undefined]);
+  });
+
   test.todo('a status-only query runs while frozen: no status key yet');
 });
