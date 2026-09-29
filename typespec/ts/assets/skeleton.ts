@@ -98,7 +98,13 @@ export function encodeProto(base: any): any {
 
 const copySym = Symbol();
 
-export function deepCopy<T>(base: T): T {
+// a value is a tree, so nothing legitimate nests this deep
+const MAX_DEPTH = 1000;
+
+/** A copy that shares nothing with the original, for values in the registry's JS form: plain
+    objects, arrays, Map, Set, Date, and byte arrays.  A cycle throws, and shared substructure is
+    copied once per reference, as a msgpack round trip would. */
+export function deepCopy<T>(base: T, depth = 0): T {
   switch (typeof base) {
     case 'boolean':
     case 'bigint':
@@ -119,26 +125,29 @@ export function deepCopy<T>(base: T): T {
     default:
       throw new Error(`base of type "${typeof base}" not handled by deepCopy`);
   }
+  if (depth > MAX_DEPTH) throw new Error('deepCopy: value too deep, a cycle?');
 
   // handle read-only and proxy objects in an efficient way
   const copier = (base as any)[copySym];
   if (copier) return copier();
 
   // object handling
-  if (Array.isArray(base)) return [...base].map(deepCopy) as T;
+  const d = depth + 1;
+  if (Array.isArray(base)) return base.map((v) => deepCopy(v, d)) as T;
   if (base instanceof Map) {
     const out = new Map();
-    for (const [k, v] of base) out.set(k, deepCopy(v));
+    for (const [k, v] of base) out.set(k, deepCopy(v, d));
     return out as T;
   }
   if (base instanceof Set) return new Set(base) as T; // object keys not allowed anyway
   if (base instanceof Date) return new Date(base) as T;
+  if (ArrayBuffer.isView(base)) return (base as unknown as Uint8Array).slice() as T;
   const proto = Object.getPrototypeOf(base);
   if (proto && proto !== Object.prototype) {
     throw new Error(`base has a nonstandard protoype`);
   }
 
-  return Object.fromEntries(Object.entries(base).map(([k, v]) => [k, deepCopy(v)])) as T;
+  return Object.fromEntries(Object.entries(base).map(([k, v]) => [k, deepCopy(v, d)])) as T;
 }
 
 export function readOnly<T>(base: T): Readonly<T> {
@@ -1318,8 +1327,10 @@ export interface WTxn extends RTxn {
 /** Store is the interface for creating read and write transactions.  An implementation is
     callback-based and should support multiple parallel operations at the API level, even if it
     must serialize them internally.  A store holds a Registry and does its own conversions, in
-    the host language.  The runTxn function converts the callback interface of WTxn and RTxn to
-    the StoreGenerator protocol. */
+    the host language.  Values cross the boundary by copy: what a get or scan hands out is the
+    caller's, and what set is given is the store's from that call on, converted or copied then.
+    The runTxn function converts the callback interface of WTxn and RTxn to the StoreGenerator
+    protocol. */
 export interface Store {
   withWTxn<T>(fx: FutureContext, fn: (txn: WTxn) => Future<T>): Future<T>;
   withRTxn<T>(fx: FutureContext, fn: (txn: RTxn) => Future<T>): Future<T>;
@@ -1567,6 +1578,17 @@ function fromJs(reg: Registry, type: string, js: unknown, want: Wants): StoreVal
   return reg.convert(type, { [JS]: js }, want);
 }
 
+/* The in-memory layers hand values across their boundary by copy.  On the way in, a JS value the
+   caller supplied is copied, and a conversion from another representation is already fresh; on
+   the way out, the kept value is copied before it is converted to the want. */
+function layerIn(reg: Registry, type: string, value: StoreValue): unknown {
+  const js = toJs(reg, type, value);
+  return JS in value ? deepCopy(js) : js;
+}
+function layerOut(reg: Registry, type: string, js: unknown, want: Wants): StoreValue {
+  return fromJs(reg, type, deepCopy(js), want);
+}
+
 function inRange(key: string, r: StoreRange): boolean {
   if (r.gte !== undefined && key < r.gte) return false;
   if (r.gt !== undefined && key <= r.gt) return false;
@@ -1628,6 +1650,9 @@ function layerMove(data: Layer, updates: Layer, src: string, dst: string): strin
   return moved;
 }
 
+/** InMemStore keeps values in their JS form in one object, the one given to the constructor if
+    any, so a test can seed the store and read it back through that object.  Values cross the
+    transaction boundary by copy; the constructor's object is the store's memory itself. */
 export class InMemStore {
   #reg: Registry;
   #data: Layer;
@@ -1675,11 +1700,11 @@ class InMemTxn implements WTxn {
 
   get(key: string, type: string, want: Wants, cb: (result: StoreResult) => void): void {
     const js = layerGet(this.#data, this.#updates, key);
-    cb({ value: js === undefined ? undefined : fromJs(this.#reg, type, js, want) });
+    cb({ value: js === undefined ? undefined : layerOut(this.#reg, type, js, want) });
   }
 
   set(key: string, type: string, value: StoreValue, cb: (result: StoreDone) => void): void {
-    this.#updates[key] = toJs(this.#reg, type, value);
+    this.#updates[key] = layerIn(this.#reg, type, value);
     cb({ value: true });
   }
 
@@ -1702,7 +1727,8 @@ class InMemTxn implements WTxn {
 
   scan(range: StoreRange, cb: (result: StoreScan) => void): void {
     const keys = layerKeys(this.#data, this.#updates, range);
-    cb(batch(this.#reg, keys, range, (k) => layerGet(this.#data, this.#updates, k)));
+    const get = (k: string) => deepCopy(layerGet(this.#data, this.#updates, k));
+    cb(batch(this.#reg, keys, range, get));
   }
 }
 
@@ -1769,14 +1795,14 @@ class OverlayTxn implements WTxn {
   get(key: string, type: string, want: Wants, cb: (result: StoreResult) => void): void {
     if (this.#has(key)) {
       const js = layerGet(this.#data, this.#updates, key);
-      cb({ value: js === undefined ? undefined : fromJs(this.#reg, type, js, want) });
+      cb({ value: js === undefined ? undefined : layerOut(this.#reg, type, js, want) });
     } else {
       this.#base.get(key, type, want, cb);
     }
   }
 
   set(key: string, type: string, value: StoreValue, cb: (result: StoreDone) => void): void {
-    this.#updates[key] = toJs(this.#reg, type, value);
+    this.#updates[key] = layerIn(this.#reg, type, value);
     cb({ value: true });
   }
 
@@ -1859,14 +1885,14 @@ class OverlayTxn implements WTxn {
           span.lte = result.next;
         }
       }
-      // merge the layers' keys in the span over the base's; the base already answers in the wanted
-      // representation, and layer entries convert here
+      // merge the layers' keys in the span over the base's; the base's answers are already the
+      // caller's in the wanted representation, and layer entries are copied and converted here
       const merged = new Map<string, StoreValue | undefined>();
       for (const [k, v] of result.entries) if (!this.#has(k)) merged.set(k, v);
       const v = range.values;
       for (const k of layerKeys(this.#data, this.#updates, span)) {
         const js = layerGet(this.#data, this.#updates, k);
-        merged.set(k, v ? fromJs(this.#reg, v.type, js, v.want) : undefined);
+        merged.set(k, v ? layerOut(this.#reg, v.type, js, v.want) : undefined);
       }
       // cut the merged keys to one batch
       const keys = [...merged.keys()].sort();
@@ -2212,11 +2238,7 @@ export function* runReducer(g: Reducer<void>): WStoreGenerator<{ updates: string
       } else {
         // de-copyOnWrite-ify the value
         const r = recover(v);
-        // get the old value
-        const o = old[k];
-        // detect noop
-        if (r === o) continue;
-        // otherwise write the value to the store
+        // a set is a write, whether or not the value changed
         updates.push(k);
         question.set![k] = { type: types[k], value: { [JS]: r } };
       }

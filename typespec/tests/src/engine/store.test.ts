@@ -3,6 +3,7 @@
 import { describe, expect, test } from 'vitest';
 
 import {
+  deepCopy,
   InMemStore,
   JS,
   OverlayStore,
@@ -248,5 +249,109 @@ describe('overlay', () => {
       }),
     );
     expect(gone).toBeUndefined();
+  });
+});
+
+describe('ownership', () => {
+  test('a get hands out a copy: mutating it changes neither the store nor a second get', () => {
+    const data: Record<string, unknown> = {};
+    const store = new InMemStore(registry, data);
+    run(
+      withWTxn(fx(), store, function* () {
+        yield* txnSet('k', T, js({ n: 1, list: [1] }));
+      }),
+    );
+    const read = () =>
+      run(
+        withRTxn(fx(), store, function* () {
+          return (yield* txnGet('k', T)) as { n: number; list: number[] };
+        }),
+      );
+    const first = read();
+    first.n = 2;
+    first.list.push(2);
+    expect(data['k']).toEqual({ n: 1, list: [1] });
+    const second = read();
+    expect(second).toEqual({ n: 1, list: [1] });
+    expect(second).not.toBe(first);
+  });
+
+  test('a set keeps a copy: mutating the object afterwards leaves the store as it was', () => {
+    const data: Record<string, unknown> = {};
+    const store = new InMemStore(registry, data);
+    const obj = { n: 1 };
+    run(
+      withWTxn(fx(), store, function* () {
+        yield* txnSet('k', T, js(obj));
+      }),
+    );
+    obj.n = 2;
+    expect(data['k']).toEqual({ n: 1 });
+  });
+
+  test('scan values are copies', () => {
+    const data = { k1: { n: 1 } };
+    const store = new InMemStore(registry, data);
+    const entries = run(
+      withRTxn(fx(), store, function* () {
+        return yield* txnScanAll(prefixRange('k', 10, { type: T, want: JS }));
+      }),
+    );
+    (asJs(entries[0][1]) as { n: number }).n = 2;
+    expect(data.k1).toEqual({ n: 1 });
+  });
+
+  test('the overlay copies its layer both ways, in gets and in scans', () => {
+    const base = seeded({}, 'k1');
+    const overlay = new OverlayStore(base, registry);
+    const obj = { n: 1 };
+    run(
+      withWTxn(fx(), overlay, function* () {
+        yield* txnSet('k2', T, js(obj));
+      }),
+    );
+    obj.n = 2;
+    const read = () =>
+      run(
+        withRTxn(fx(), overlay, function* () {
+          const got = (yield* txnGet('k2', T)) as { n: number };
+          const all = yield* txnScanAll(prefixRange('k', 10, { type: T, want: JS }));
+          return { got, scanned: asJs(all[1][1]) as { n: number }, base: asJs(all[0][1]) };
+        }),
+      );
+    const first = read();
+    expect(first).toEqual({ got: { n: 1 }, scanned: { n: 1 }, base: 'k1' });
+    first.got.n = 3;
+    first.scanned.n = 4;
+    expect(read()).toEqual({ got: { n: 1 }, scanned: { n: 1 }, base: 'k1' });
+  });
+});
+
+describe('deepCopy', () => {
+  test('copies the JS value universe and shares nothing with the original', () => {
+    const src = {
+      a: [1, { b: 2 }],
+      m: new Map([['k', { c: 3 }]]),
+      s: new Set([1, 2]),
+      d: new Date(5),
+      u: new Uint8Array([1, 2, 3]),
+    };
+    const out = deepCopy(src);
+    expect(out).toEqual(src);
+    expect(out.a[1]).not.toBe(src.a[1]);
+    expect(out.m.get('k')).not.toBe(src.m.get('k'));
+    expect(out.s).not.toBe(src.s);
+    expect(out.d).not.toBe(src.d);
+    expect(out.u.buffer).not.toBe(src.u.buffer);
+  });
+
+  test('shared substructure is copied once per reference, and a cycle throws', () => {
+    const shared = { x: 1 };
+    const out = deepCopy({ p: shared, q: shared });
+    expect(out.p).toEqual(shared);
+    expect(out.p).not.toBe(out.q);
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(() => deepCopy(cyclic)).toThrow(/too deep/);
   });
 });
