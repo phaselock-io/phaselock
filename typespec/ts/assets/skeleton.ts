@@ -3272,6 +3272,39 @@ export class Engine<QX, C> {
     }
     this.#reduced = this.#checkpoint?.reduced ?? -1;
 
+    // purge what this build does not want.  The wants are the refs this build can fold, and the
+    // server cuts the view down to them, so a stream, a backfill, or a view ref outside the wants
+    // is an earlier build's.  Every one goes now, so the view frame that answers our token finds
+    // the base as this build would have made it.
+    const wanted = (x: string) => this.#wants.some((w) => refCovers(w, x));
+    const wasFrozen = this.#replacing > 0;
+    const dirty: string[] = [];
+    yield* withWTxn(this.#fx, this.#store, function* () {
+      // every backfill outside the wants
+      for (const ref of [...self.#backfills.keys()]) {
+        if (!wanted(ref)) yield* self.#dropBackfillIn(ref);
+      }
+
+      // every stream outside the wants
+      for (const stream of [...self.#streams.keys()]) {
+        if (!wanted(stream)) yield* self.#dropStreamIn(stream, dirty);
+      }
+
+      // every view ref outside the wants, so the next frame grants what it covered afresh
+      if (self.#view !== null && !self.#view.refs.every(wanted)) {
+        self.#view = { ...self.#view, refs: self.#view.refs.filter(wanted) };
+        yield* txnSet('/view', '.json', { [JS]: self.#view });
+      }
+
+      // did the purge end the last replacing backfill?  Then this is the unfreeze.  Either way,
+      // whatever waits ready on disk lands now.
+      if (wasFrozen && self.#replacing === 0) {
+        yield* self.#unfreezeIn(dirty);
+      } else {
+        yield* self.#tryLandIn(dirty);
+      }
+    });
+
     // forecast every outbox command onto a fresh overlay
     yield* this.#rebuildOverlay();
 
@@ -3911,7 +3944,9 @@ export class Engine<QX, C> {
   *#reduceStreamIn(
     stream: string, events: DbEvent<unknown>[], dirty: string[],
   ): WStoreGenerator<void> {
+    // the server sends nothing outside the wants, and the wants are the families with reducers
     const slice = this.#reducers[stream.split('.')[0]];
+    if (slice === undefined) throw new Error(`no reducer for ${stream}`);
     let data: unknown[] = [];
 
     // reduce the pending events, if any
@@ -4287,12 +4322,16 @@ export class Engine<QX, C> {
 
     // did a drop end the last replacing backfill?  Then this is the unfreeze, and whatever
     // finished downloading during the freeze can land now
-    if (wasFrozen && this.#replacing === 0) {
-      yield* this.#reduceParkedIn(null, {}, dirty);
-      yield* this.#reducedTo(this.#checkpoint?.position ?? -1);
-      yield* this.#tryLandIn(dirty);
-    }
+    if (wasFrozen && this.#replacing === 0) yield* this.#unfreezeIn(dirty);
     return dirty.length > before;
+  }
+
+  // the last replacing backfill is gone: the frozen events land, the reduced position catches up
+  // to the checkpoint, and whatever finished downloading during the freeze lands
+  *#unfreezeIn(dirty: string[]): WStoreGenerator<void> {
+    yield* this.#reduceParkedIn(null, {}, dirty);
+    yield* this.#reducedTo(this.#checkpoint?.position ?? -1);
+    yield* this.#tryLandIn(dirty);
   }
 
   // the connection ended.  Every call in flight on it is dead: backfills wait for the next

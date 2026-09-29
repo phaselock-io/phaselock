@@ -257,6 +257,13 @@ describe('gap detection', () => {
     ]);
   });
 
+  test('an event of a family with no reducer ends the Engine', async () => {
+    const r = rig();
+    await bootstrap(r, ['*'], { '*': { position: 10, seqs: {}, values: [] } });
+    r.server.events(birth('author.a1', 1, 11));
+    await expect(settle()).rejects.toThrow(/no reducer for author.a1/);
+  });
+
   test('a duplicate event is ignored', async () => {
     const r = await held();
     r.server.events(ev('patron.p1', 2, 11), ev('patron.p1', 1, 11));

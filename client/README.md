@@ -65,7 +65,7 @@ contract does not depend on.
 export type ConnectorFactory = (
   since: number,        // the Engine's checkpoint, -1 to bootstrap
   view: string | null,  // the Engine's stored view token, null to bootstrap
-  wants: string[],      // refs to intersect with the view
+  wants: string[],      // refs the server cuts the view down to
   signal: AbortSignal,  // the connector's lifetime
   hooks: ConnectorHooks,
 ) => Connector;
@@ -89,10 +89,13 @@ connector.  Consequences:
 
 `wants` is the engine's compile-time mask: the refs of the shards the
 generated engine declares (`"book"`, `"patron.{id}"` lower to `book`,
-`patron.*`).  The Engine applies the same mask to the refs in view
-frames, so it never backfills what it cannot fold.  An app-level
-mask intersected with it is deliberately omitted until there is a use
-for one.
+`patron.*`).  The server cuts the view down to them and hashes the
+token from the result, so a build whose wants changed presents a
+stale token and gets the view frame, and the Engine never backfills
+what it cannot fold.  At boot the Engine purges whatever an earlier
+build held outside the current wants: streams, backfills, and view
+refs.  An app-level mask intersected with it is deliberately omitted
+until there is a use for one.
 
 ## Hooks: the live stream
 
