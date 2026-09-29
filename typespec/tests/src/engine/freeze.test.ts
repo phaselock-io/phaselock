@@ -352,5 +352,30 @@ describe('freeze and group land', () => {
     expect(w.values).toEqual([{ count: 1, fields: {} }, undefined]);
   });
 
+  test('an additive backfill that finished during a freeze lands when a revoke unfreezes', async () => {
+    const r = await held();
+    await freeze(r);
+
+    // book.b2 is granted and downloads during the freeze; done, ready, not landed
+    r.server.blobs.set('book.b2', {
+      position: 12,
+      seqs: { 'book.b2': 1 },
+      values: [['book.b2/state', { count: 1, fields: {} }]],
+    });
+    r.server.view('t2', 12, ['patron.*', 'book.b1', 'book.b2']);
+    await settle();
+    expect(record(r, 'book.b2')).toBeDefined();
+    expect(state(r.data, 'book.b2')).toBeUndefined();
+
+    // revoking the patrons drops the replacing backfill on patron.p2, and that unfreezes; the
+    // frame that unfroze lands book.b2 without waiting for any outcome
+    r.server.view('t3', 13, ['book.b1', 'book.b2']);
+    await settle();
+    expect(seq(r.data, 'patron.p2')).toBeUndefined();
+    expect(record(r, 'book.b2')).toBeUndefined();
+    expect(state(r.data, 'book.b2')).toEqual({ count: 1, fields: {} });
+    expect(seq(r.data, 'book.b2')).toBe(1);
+  });
+
   test.todo('a status-only query runs while frozen: no status key yet');
 });

@@ -3335,16 +3335,17 @@ export class Engine<QX, C> {
       }
 
       if (this.#backfillOutcomes.length > 0) {
-        // 'done', 'stale', or a rejection for a backfill: land attempts, retries with resume,
-        // discards, and children spawned by chain breaks
+        // 'done', 'stale', or a rejection for a backfill: retries with resume, and downloads
+        // that start over
         yield* this.#onBackfillOutcomes();
         continue;
       }
 
       if (this.#backfillWork.length > 0) {
-        // header, values, events, and done marks from in-flight backfills, parked in their own
-        // transactions, each resolving the connector's promise after commit.  Background work:
-        // it orders against nothing above, and the connector waits on it while the app is busy.
+        // header, values, events, and done marks from in-flight backfills, parked in one
+        // transaction that also lands whatever they completed, each resolving the connector's
+        // promise after commit.  Background work: it orders against nothing above, and the
+        // connector waits on it while the app is busy.
         yield* this.#onBackfillWork();
         continue;
       }
@@ -3365,49 +3366,45 @@ export class Engine<QX, C> {
   *#onSendCommands(): Generator<void, void, void> {
     const self = this;
     const fresh = this.#sendCommands.splice(0);
+    const connector = this.#connector;
     this.#resend = false;
 
-    // new commands are converted to wire bytes here, by the vocabulary that made them, and take
-    // the next ordinals in one transaction
-    if (fresh.length > 0) {
-      yield* withWTxn(this.#fx, this.#store, function* () {
-        for (const data of fresh) {
-          const bytes = self.#reg.convert(self.#reg.commands, { [JS]: data }, MSGPACK);
-          const command: Command<Uint8Array> = {
-            id: generateUuid(),
-            data: (bytes as Record<number, unknown>)[MSGPACK] as Uint8Array,
-          };
-          const ordinal = self.#nextOrdinal++;
-          yield* txnSet(commandKey(ordinal), '.command', { [JS]: command });
-          self.#outbox.set(command.id, ordinal);
-        }
-      });
-      this.#outboxChanged = true;
-      yield* this.#refresh([]);
-    }
+    const wire = yield* withWTxn(this.#fx, this.#store, function* () {
+      // new commands are converted to wire bytes here, by the vocabulary that made them, and take
+      // the next ordinals
+      for (const data of fresh) {
+        const bytes = self.#reg.convert(self.#reg.commands, { [JS]: data }, MSGPACK);
+        const command: Command<Uint8Array> = {
+          id: generateUuid(),
+          data: (bytes as Record<number, unknown>)[MSGPACK] as Uint8Array,
+        };
+        const ordinal = self.#nextOrdinal++;
+        yield* txnSet(commandKey(ordinal), '.command', { [JS]: command });
+        self.#outbox.set(command.id, ordinal);
+      }
 
-    // without a connector, the next connection resends
-    const connector = this.#connector;
-    if (connector === null) return;
-    const pending = [...this.#outbox]
-      .filter(([id]) => !this.#sent.has(id) && !this.#acked.has(id))
-      .sort((a, b) => a[1] - b[1]);
-    if (pending.length === 0) return;
+      // without a connector, the next connection resends
+      if (connector === null) return [];
+      const pending = [...self.#outbox]
+        .filter(([id]) => !self.#sent.has(id) && !self.#acked.has(id))
+        .sort((a, b) => a[1] - b[1]);
 
-    // rows go on the wire as stored, whatever vocabulary wrote them
-    const wire = yield* withRTxn(this.#fx, this.#store, function* () {
+      // rows go on the wire as stored, whatever vocabulary wrote them
       const out: Command<Uint8Array>[] = [];
       for (const [, ordinal] of pending) {
         out.push((yield* txnGet(commandKey(ordinal), '.command')) as Command<Uint8Array>);
       }
       return out;
     });
+    if (fresh.length > 0) this.#outboxChanged = true;
+    yield* this.#refresh([]);
+    if (wire.length === 0) return;
 
     // the results come back through the outcomes, tagged with this connection
     const ids = wire.map((c) => c.id);
     const conn = this.#connectorAbort;
     for (const id of ids) this.#sent.add(id);
-    connector.sendCommand(wire).then(
+    connector!.sendCommand(wire).then(
       (results) => {
         self.#commandOutcomes.push({ ids, results, conn });
         self.#schedule();
@@ -3466,11 +3463,12 @@ export class Engine<QX, C> {
     this.#resend = true;
   }
 
-  /* every queued push in one transaction; each connector promise resolves after the commit, which
-     is the backpressure */
+  /* every queued push in one transaction, and the land of whatever they completed; each connector
+     promise resolves after the commit, which is the backpressure */
   *#onBackfillWork(): Generator<void, void, void> {
     const self = this;
     const pushes: BackfillWork[] = [];
+    const dirty: string[] = [];
 
     // a push for a backfill that was dropped while it was queued fails on its own
     while (this.#backfillWork.length > 0) {
@@ -3483,22 +3481,26 @@ export class Engine<QX, C> {
     }
     if (pushes.length === 0) return;
 
-    // park every push, and settle every promise the way the transaction went
+    // park every push, land what completed, and settle every promise the way the transaction went
     try {
       yield* withWTxn(this.#fx, this.#store, function* () {
         for (const { ref, item } of pushes) yield* self.#parkPushIn(ref, item);
+        yield* self.#tryLandIn(dirty);
       });
     } catch (e: unknown) {
       for (const { reject } of pushes) reject(e);
       throw e;
     }
     for (const { resolve } of pushes) resolve();
+    yield* this.#refresh(dirty);
   }
 
   /* one push of a backfill: what it delivered is parked, and the record carries the resume point
-     it brought the download to */
+     it brought the download to.  The push that completes both halves makes the backfill ready, so
+     it lands in this same transaction: complete on disk and landed commit together, or neither. */
   *#parkPushIn(ref: string, item: BackfillItem): WStoreGenerator<void> {
-    const record = this.#backfills.get(ref)!.record;
+    const entry = this.#backfills.get(ref)!;
+    const record = entry.record;
     if ('header' in item) {
       // a fresh download: a resumed tail keeps its floor, and a newer blob overrides it
       const { position, seqs } = item.header;
@@ -3536,6 +3538,7 @@ export class Engine<QX, C> {
       throw new Error('unexpected backfill item');
     }
 
+    if (record.resume!.snapshotDone && record.resume!.tailDone) entry.status = 'ready';
     yield* txnSet(`/backfill.${ref}`, '.json', { [JS]: record });
   }
 
@@ -3547,10 +3550,10 @@ export class Engine<QX, C> {
     yield* txnSet(`/seq.${stream}`, '.json', { [JS]: 'backfill' });
   }
 
-  // every queued outcome, and then a land attempt, in one transaction
+  /* every queued outcome in one transaction.  Completion is known from the pushes themselves, so
+     a done outcome only clears the attempt count; stale and failure decide what downloads again. */
   *#onBackfillOutcomes(): Generator<void, void, void> {
     const self = this;
-    const dirty: string[] = [];
     yield* withWTxn(this.#fx, this.#store, function* () {
       while (self.#backfillOutcomes.length > 0) {
         const { ref, outcome, conn } = self.#backfillOutcomes.shift()!;
@@ -3564,9 +3567,7 @@ export class Engine<QX, C> {
         if (entry === undefined) continue;
 
         if (outcome === 'done') {
-          // the download finished; it lands once its children have too
           entry.attempts = 0;
-          entry.status = 'ready';
         } else if (outcome === 'stale') {
           // the blob is gone: the parked values go, the parked events stay, and the download
           // starts over under the same until
@@ -3590,10 +3591,7 @@ export class Engine<QX, C> {
           }, delay);
         }
       }
-
-      yield* self.#tryLandIn(dirty);
     });
-    yield* this.#refresh(dirty);
   }
 
   // one backfill() call on the current connector; its pushes and its outcome come back through
@@ -4287,10 +4285,12 @@ export class Engine<QX, C> {
     yield* txnSet('/view', '.json', { [JS]: view });
     this.#view = view;
 
-    // did a drop end the last replacing backfill?  Then this is the unfreeze
+    // did a drop end the last replacing backfill?  Then this is the unfreeze, and whatever
+    // finished downloading during the freeze can land now
     if (wasFrozen && this.#replacing === 0) {
       yield* this.#reduceParkedIn(null, {}, dirty);
       yield* this.#reducedTo(this.#checkpoint?.position ?? -1);
+      yield* this.#tryLandIn(dirty);
     }
     return dirty.length > before;
   }
