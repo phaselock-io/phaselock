@@ -258,10 +258,6 @@ describe('backfill lifecycle', () => {
     expect(keys(r.data, '/park.kv.')).toEqual([]);
   });
 
-  test.todo(
-    'a 403 is terminal: the record is dropped and nothing is retried (not built: every rejection retries)',
-  );
-
   test('a revoke of an in-flight ref aborts it and drops its values, record, and uncovered streams', async () => {
     const r = await held();
     r.server.hold('book.*');

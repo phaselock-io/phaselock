@@ -1,5 +1,14 @@
 // utils //////////////////////////////////////////////////////////////////////
 
+// the global's type, since the tooling has no Node types
+declare const process: { env: Record<string, string | undefined> };
+
+/** DEV is the switch every bundler and host honors.  Dev mode adds checks that catch app mistakes
+    production would let pass, and never changes results.  Bundlers replace the expression at build
+    time, Node reads the variable, and a host without `process` defines it before loading the
+    bundle. */
+export const DEV = process.env.NODE_ENV !== 'production';
+
 /** jsonTypeof returns the json type of a value that came out of parsing json
     (so 'undefined' is not handled, since it isn't allowed in json) */
 export function jsonTypeof(val: any): string {
@@ -150,7 +159,16 @@ export function deepCopy<T>(base: T, depth = 0): T {
   return Object.fromEntries(Object.entries(base).map(([k, v]) => [k, deepCopy(v, d)])) as T;
 }
 
-export function readOnly<T>(base: T): Readonly<T> {
+// what a read-only proxy throws: the path names the value as the query saw it
+function readOnlyError(label: string, op: string, prop?: PropertyKey): never {
+  const at = prop === undefined ? label : `${label}.${String(prop)}`;
+  throw new Error(`${at} is read-only: ${op}`);
+}
+
+/** A view of a value that throws on any mutation, naming the path from `label`.  Typed arrays are
+    the one kind handed through as they are: nothing short of a Proxy catches a write to one, and a
+    Proxy is not a typed array to native code, so a write to bytes goes uncaught. */
+export function readOnly<T>(base: T, label = 'value'): Readonly<T> {
   switch (typeof base) {
     case 'boolean':
     case 'bigint':
@@ -173,35 +191,33 @@ export function readOnly<T>(base: T): Readonly<T> {
   }
 
   // object handling
-  if (Array.isArray(base)) return readOnlyArray(base) as T;
-  if (base instanceof Map) return readOnlyMap(base) as T;
-  if (base instanceof Set) return readOnlySet(base) as T;
-  if (base instanceof Date) return readOnlyDate(base) as T;
+  if (Array.isArray(base)) return readOnlyArray(base, label) as T;
+  if (base instanceof Map) return readOnlyMap(base, label) as T;
+  if (base instanceof Set) return readOnlySet(base, label) as T;
+  if (base instanceof Date) return readOnlyDate(base, label) as T;
+  if (ArrayBuffer.isView(base)) return base;
   const proto = Object.getPrototypeOf(base);
   if (proto && proto !== Object.prototype) {
     throw new Error(`base has a nonstandard protoype`);
   }
 
-  return readOnlyObject(base as any) as T;
+  return readOnlyObject(base as any, label) as T;
 }
 
-function throwReadOnlyError(): any {
-  throw new Error('object is read-only and may not be modified');
-}
-
-function readOnlyObject<T>(base: Record<string, T>): Readonly<Record<string, T>> {
+function readOnlyObject<T>(base: Record<string, T>, label: string): Readonly<Record<string, T>> {
   const cache: Record<string, any> = {};
+  const at = (prop: PropertyKey) => `${label}.${String(prop)}`;
 
   return new Proxy(base, {
-    defineProperty: throwReadOnlyError,
-    deleteProperty: throwReadOnlyError,
-    set: throwReadOnlyError,
+    defineProperty: (_, prop) => readOnlyError(label, 'defineProperty', prop),
+    deleteProperty: (_, prop) => readOnlyError(label, 'delete', prop),
+    set: (_, prop) => readOnlyError(label, 'set', prop),
     get(_, prop: any) {
       if (prop === copySym) return () => deepCopy(base);
 
       if (Object.hasOwn(cache, prop)) return cache[prop];
       if (Object.hasOwn(base, prop)) {
-        const value = readOnly(base[prop]);
+        const value = readOnly(base[prop], at(prop));
         cache[prop] = value;
         return value;
       }
@@ -216,21 +232,22 @@ function readOnlyObject<T>(base: Record<string, T>): Readonly<Record<string, T>>
         return (...args: any[]) => value.apply(base, args);
       }
 
-      const ro = readOnly(value);
+      const ro = readOnly(value, at(prop));
       cache[prop] = ro;
       return ro;
     },
   });
 }
 
-function readOnlyArray<T>(base: T[]): Readonly<T[]> {
+function readOnlyArray<T>(base: T[], label: string): Readonly<T[]> {
   const cache = Array(base.length);
   let filled = false;
+  const at = (n: PropertyKey) => `${label}[${String(n)}]`;
 
   function dirty1(n: number): T | undefined {
     if (Object.hasOwn(cache, n)) return cache[n];
     if (!Object.hasOwn(base, n)) return undefined;
-    const ro = readOnly(base[n]);
+    const ro = readOnly(base[n], at(n));
     cache[n] = ro;
     return ro;
   }
@@ -280,28 +297,28 @@ function readOnlyArray<T>(base: T[]): Readonly<T[]> {
     toString: (...args: any) => (base as any).toString(...args),
 
     // disallowed
-    push: throwReadOnlyError,
-    pop: throwReadOnlyError,
-    shift: throwReadOnlyError,
-    reverse: throwReadOnlyError,
-    copyWithin: throwReadOnlyError,
-    fill: throwReadOnlyError,
-    sort: throwReadOnlyError,
-    splice: throwReadOnlyError,
-    unshift: throwReadOnlyError,
+    push: () => readOnlyError(label, 'push'),
+    pop: () => readOnlyError(label, 'pop'),
+    shift: () => readOnlyError(label, 'shift'),
+    reverse: () => readOnlyError(label, 'reverse'),
+    copyWithin: () => readOnlyError(label, 'copyWithin'),
+    fill: () => readOnlyError(label, 'fill'),
+    sort: () => readOnlyError(label, 'sort'),
+    splice: () => readOnlyError(label, 'splice'),
+    unshift: () => readOnlyError(label, 'unshift'),
   };
 
   return new Proxy(base, {
-    defineProperty: throwReadOnlyError,
-    deleteProperty: throwReadOnlyError,
-    set: throwReadOnlyError,
+    defineProperty: (_, prop) => readOnlyError(label, 'defineProperty', prop),
+    deleteProperty: (_, prop) => readOnlyError(label, 'delete', prop),
+    set: (_, prop) => readOnlyError(label, 'set', prop),
 
     get(_, prop: any) {
       if (prop === copySym) return () => deepCopy(base);
 
       if (Object.hasOwn(cache, prop)) return cache[prop];
       if (Object.hasOwn(base, prop)) {
-        const value = readOnly(base[prop]);
+        const value = readOnly(base[prop], at(prop));
         cache[prop] = value;
         return value;
       }
@@ -314,41 +331,51 @@ function readOnlyArray<T>(base: T[]): Readonly<T[]> {
   });
 }
 
-const roDatePrototype = {
-  setDate: throwReadOnlyError,
-  setFullYear: throwReadOnlyError,
-  setHours: throwReadOnlyError,
-  setMilliseconds: throwReadOnlyError,
-  setMinutes: throwReadOnlyError,
-  setMonth: throwReadOnlyError,
-  setSeconds: throwReadOnlyError,
-  setTime: throwReadOnlyError,
-  setUTCDate: throwReadOnlyError,
-  setUTCFullYear: throwReadOnlyError,
-  setUTCHours: throwReadOnlyError,
-  setUTCMilliseconds: throwReadOnlyError,
-  setUTCMinutes: throwReadOnlyError,
-  setUTCMonth: throwReadOnlyError,
-  setUTCSeconds: throwReadOnlyError,
-  setYear: throwReadOnlyError,
-};
+// a read-only Date carries its label on itself, since the setters live on one shared prototype
+const labelSym = Symbol();
+const DATE_SETTERS = [
+  'setDate',
+  'setFullYear',
+  'setHours',
+  'setMilliseconds',
+  'setMinutes',
+  'setMonth',
+  'setSeconds',
+  'setTime',
+  'setUTCDate',
+  'setUTCFullYear',
+  'setUTCHours',
+  'setUTCMilliseconds',
+  'setUTCMinutes',
+  'setUTCMonth',
+  'setUTCSeconds',
+  'setYear',
+];
+const roDatePrototype: Record<string, unknown> = {};
+for (const m of DATE_SETTERS) {
+  roDatePrototype[m] = function (this: Record<symbol, string>) {
+    return readOnlyError(this[labelSym], m);
+  };
+}
 Object.setPrototypeOf(roDatePrototype, Date.prototype);
 
-function readOnlyDate(base: Date): Readonly<Date> {
+function readOnlyDate(base: Date, label: string): Readonly<Date> {
   // copy instead of proxy
   const out = new Date(base);
   Object.setPrototypeOf(out, roDatePrototype);
+  (out as unknown as Record<symbol, string>)[labelSym] = label;
   return out;
 }
 
-function readOnlyMap<K, V>(base: Map<K, V>): Readonly<Map<K, Readonly<V>>> {
+function readOnlyMap<K, V>(base: Map<K, V>, label: string): Readonly<Map<K, Readonly<V>>> {
   const cache: Map<K, Readonly<V>> = new Map();
   let filled = false;
+  const at = (k: K) => `${label}[${String(k)}]`;
 
   function dirty1(k: K): V | undefined {
     if (filled || cache.has(k)) return cache.get(k);
     if (!base.has(k)) return undefined;
-    const ro = readOnly(base.get(k)!);
+    const ro = readOnly(base.get(k)!, at(k));
     cache.set(k, ro);
     return ro;
   }
@@ -358,7 +385,7 @@ function readOnlyMap<K, V>(base: Map<K, V>): Readonly<Map<K, Readonly<V>>> {
     filled = true;
     for (const k of base.keys()) {
       if (cache.has(k)) continue;
-      cache.set(k, readOnly(base.get(k)!));
+      cache.set(k, readOnly(base.get(k)!, at(k)));
     }
     return cache;
   }
@@ -378,18 +405,18 @@ function readOnlyMap<K, V>(base: Map<K, V>): Readonly<Map<K, Readonly<V>>> {
     keys: (...args: any[]) => (base as any).keys(...args),
 
     // mutators
-    clear: throwReadOnlyError,
-    delete: throwReadOnlyError,
-    getOrInsert: throwReadOnlyError,
-    getOrInsertComputed: throwReadOnlyError,
-    set: throwReadOnlyError,
+    clear: () => readOnlyError(label, 'clear'),
+    delete: () => readOnlyError(label, 'delete'),
+    getOrInsert: () => readOnlyError(label, 'getOrInsert'),
+    getOrInsertComputed: () => readOnlyError(label, 'getOrInsertComputed'),
+    set: () => readOnlyError(label, 'set'),
   };
   Object.setPrototypeOf(roMapMethods, null);
 
   return new Proxy(base, {
-    defineProperty: throwReadOnlyError,
-    deleteProperty: throwReadOnlyError,
-    set: throwReadOnlyError,
+    defineProperty: (_, prop) => readOnlyError(label, 'defineProperty', prop),
+    deleteProperty: (_, prop) => readOnlyError(label, 'delete', prop),
+    set: (_, prop) => readOnlyError(label, 'set', prop),
 
     get(_, prop: any) {
       if (prop === copySym) return () => deepCopy(base);
@@ -402,17 +429,19 @@ function readOnlyMap<K, V>(base: Map<K, V>): Readonly<Map<K, Readonly<V>>> {
 }
 
 // no cache needed, since we don't support object keys and there are no values
-function readOnlySet<K>(base: Set<K>): Readonly<Set<K>> {
+function readOnlySet<K>(base: Set<K>, label: string): Readonly<Set<K>> {
   return new Proxy(base, {
-    defineProperty: throwReadOnlyError,
-    deleteProperty: throwReadOnlyError,
-    set: throwReadOnlyError,
+    defineProperty: (_, prop) => readOnlyError(label, 'defineProperty', prop),
+    deleteProperty: (_, prop) => readOnlyError(label, 'delete', prop),
+    set: (_, prop) => readOnlyError(label, 'set', prop),
 
     get(_, prop: any) {
       if (prop === copySym) return () => deepCopy(base);
 
       // just disallow mutations
-      if (prop === 'add' || prop === 'delete' || prop === 'clear') return throwReadOnlyError;
+      if (prop === 'add' || prop === 'delete' || prop === 'clear') {
+        return () => readOnlyError(label, prop);
+      }
 
       const value = (base as any)[prop];
       if (value instanceof Function) {
@@ -1580,13 +1609,15 @@ function fromJs(reg: Registry, type: string, js: unknown, want: Wants): StoreVal
 
 /* The in-memory layers hand values across their boundary by copy.  On the way in, a JS value the
    caller supplied is copied, and a conversion from another representation is already fresh; on
-   the way out, the kept value is copied before it is converted to the want. */
+   the way out, the kept value is copied before it is converted to the want.  copyValue is the one
+   place to point at a host's own clone, should one measure faster. */
+const copyValue = <T>(v: T): T => deepCopy(v);
 function layerIn(reg: Registry, type: string, value: StoreValue): unknown {
   const js = toJs(reg, type, value);
-  return JS in value ? deepCopy(js) : js;
+  return JS in value ? copyValue(js) : js;
 }
 function layerOut(reg: Registry, type: string, js: unknown, want: Wants): StoreValue {
-  return fromJs(reg, type, deepCopy(js), want);
+  return fromJs(reg, type, copyValue(js), want);
 }
 
 function inRange(key: string, r: StoreRange): boolean {
@@ -1727,7 +1758,7 @@ class InMemTxn implements WTxn {
 
   scan(range: StoreRange, cb: (result: StoreScan) => void): void {
     const keys = layerKeys(this.#data, this.#updates, range);
-    const get = (k: string) => deepCopy(layerGet(this.#data, this.#updates, k));
+    const get = (k: string) => copyValue(layerGet(this.#data, this.#updates, k));
     cb(batch(this.#reg, keys, range, get));
   }
 }
@@ -2396,6 +2427,13 @@ export type QueryQuestion = {
   query?: Record<string, true>;
 };
 
+// in dev mode a query reads through a read-only proxy, so a mutation of a result throws where it
+// happens, naming the key; the JS representation is the one the app touches
+function readOnlyResult(result: StoreResult, key: string): StoreResult {
+  if (!('value' in result) || result.value === undefined || !(JS in result.value)) return result;
+  return { value: { ...result.value, [JS]: readOnly(result.value[JS], key) } };
+}
+
 export type QueryAnswer = {
   // the value for each store lookup
   store: Record<string, StoreResult>;
@@ -2640,8 +2678,9 @@ class GraphRun<QX> {
         throw new Error('empty answer');
       }
       for (const [key, value] of answerEntries) {
+        const shared = DEV ? readOnlyResult(value, key) : value;
         for (const qid of wantAnswers[key][1]) {
-          setdefault(runnable, qid, { query: {}, store: {} }).store[key] = value;
+          setdefault(runnable, qid, { query: {}, store: {} }).store[key] = shared;
         }
         delete wantAnswers[key];
       }
@@ -4455,6 +4494,9 @@ export class Engine<QX, C> {
 
       // answer its store questions from the overlay
       const got = (yield { get: step.value.store ?? {} }).get;
+      if (DEV) {
+        for (const key of Object.keys(got)) got[key] = readOnlyResult(got[key], key);
+      }
       ans = { store: got, query: {} };
     }
   }
