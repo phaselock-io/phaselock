@@ -14,13 +14,11 @@ import {
   type ConnectorHooks,
   type DbEvent,
   Engine,
-  type Future,
-  FutureContext,
   InMemStore,
   JS,
   MSGPACK,
   type QueryGenerator,
-  type Reducer,
+  type ReducerTxn,
   type Registry,
   type SliceReducer,
   type StoreValue,
@@ -84,26 +82,19 @@ export type State = { count: number; fields: Record<string, unknown> };
     `{family}.{id}/log`, so a test can assert what was applied and in what order */
 function familyReducer(family: string): SliceReducer {
   return {
-    rx: family,
-    reducer: function* (rx: string, events: unknown[]): Reducer<void> {
+    reducer(txn: ReducerTxn, events: unknown[]): void {
       for (const e of events as TestEvent[]) {
-        const stream = `${rx}.${e.id}`;
-        const got = yield { get: { [`${stream}/state`]: 'state', [`${stream}/log`]: 'log' } };
-        const s = got.get[`${stream}/state`];
-        const l = got.get[`${stream}/log`];
-        if ('err' in s || 'err' in l) throw new Error('reducer get failed');
-        const state = (s.value as State | undefined) ?? { count: 0, fields: {} };
-        const log = (l.value as string[] | undefined) ?? [];
-        const next: State = { count: state.count, fields: { ...state.fields } };
-        if (e.type === 'set') next.fields[e.field] = e.value;
-        if (e.type === 'bump') next.count++;
-        const entry = e.type === 'set' ? `set ${e.field}=${String(e.value)}` : e.type;
-        yield {
-          set: {
-            [`${stream}/state`]: { type: 'state', value: next },
-            [`${stream}/log`]: { type: 'log', value: [...log, entry] },
-          },
+        const stream = `${family}.${e.id}`;
+        const state = (txn.get(`${stream}/state`, 'state') as State | undefined) ?? {
+          count: 0,
+          fields: {},
         };
+        const log = (txn.get(`${stream}/log`, 'log') as string[] | undefined) ?? [];
+        if (e.type === 'set') state.fields[e.field] = e.value;
+        if (e.type === 'bump') state.count++;
+        log.push(e.type === 'set' ? `set ${e.field}=${String(e.value)}` : e.type);
+        txn.set(`${stream}/state`, 'state', state);
+        txn.set(`${stream}/log`, 'log', log);
       }
     },
   };
@@ -347,36 +338,14 @@ export class FakeServer {
 
 // engine errors ////////////////////////////////////////////////////////////
 
-// anything thrown out of an advancer pass ends the Engine.  The harness records it so `settle`
-// can fail the test with the Engine's own error instead of a silent hang, and swallows it
-// there, since the wakeup runs in a timer callback where a throw would be an uncaught exception
-// rather than a test failure.
+/* Anything thrown out of an advancer pass ends the Engine.  The harness takes it through onError
+   so `settle` can fail the test with the Engine's own error instead of a silent hang; thrown
+   from the timer callback, it would be an uncaught exception rather than a test failure. */
 const errors: unknown[] = [];
-const wakeup = FutureContext.prototype.wakeup;
-FutureContext.prototype.wakeup = function (this: FutureContext) {
-  try {
-    wakeup.call(this);
-  } catch (e: unknown) {
-    errors.push(e);
-  }
-};
 
 /** the Engine's error, if it ended; clears it */
 export function engineError(): unknown {
   return errors.shift();
-}
-
-/** run a Future to completion synchronously (the in-memory store never waits) */
-export function run<T>(f: Future<T>): T {
-  for (;;) {
-    const { value, done } = f.next();
-    if (done) return value;
-  }
-}
-
-/** a FutureContext for driving store generators outside an Engine */
-export function fx(): FutureContext {
-  return new FutureContext((function* () {})());
 }
 
 // the engine ////////////////////////////////////////////////////////////////
@@ -416,6 +385,7 @@ export function rig(
       wants: opts.wants ?? ['*'],
       forecaster: opts.forecaster,
       signal: abort.signal,
+      onError: (e) => errors.push(e),
     },
   );
   return { server, data, engine, abort };

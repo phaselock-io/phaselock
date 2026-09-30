@@ -978,54 +978,6 @@ export class ${f.name} extends Engine<${QX}, ${RX}, ${eventType}, ${commandType}
   }
 }
 `);
-
-  // Then generate a TestData helper.  This could use typescript's "constrained mixins", but why
-  // complicate code that's only used for testing?
-  d.print(`\nexport class ${ctxName}TestData {\n`);
-  d.indent('  ');
-  d.print(`data: Record<string, any>;\n`);
-  d.print(`\n`);
-  d.print(`constructor(data: Record<string, any>){\n`);
-  d.indent('  ');
-  d.print(`this.data = data;\n`);
-  d.dedent();
-  d.print(`}\n`);
-
-  for (const si of f.store.items) {
-    d.print(`\n${si.name}(`);
-    d.print(si.params.map((p) => p + ': string').join(', '));
-    d.print(`): ${annos.get(si.type)} {\n`);
-    d.indent('  ');
-    d.print('return this.data[`');
-    printTemplate(d, si);
-    d.print(`\`] as ${annos.get(si.type)}\n`);
-    d.dedent();
-    d.print(`}\n`);
-  }
-
-  d.dedent();
-  d.print(`}\n`);
-
-  // Then generate a ReducerTester matching this Engine
-  d.print(`
-export class ${ctxName}ReducerTester extends ReducerTester<${RX}, ${eventType}, ${ctxName}TestData> {
-  constructor(
-    migrateOrInitialData: ((rx: ${RX}) => Reducer<void>) | Record<string, any>,
-    reducer: (rx: ${RX}, events: ${eventType}[]) => Reducer<void | any[]>,
-  ) {
-    let migrate: null | ((rx: ${RX}) => Reducer<void>);
-    let data: Record<string, any>;
-    if (migrateOrInitialData instanceof Function) {
-        migrate = migrateOrInitialData;
-        data = {};
-    } else {
-        migrate = null;
-        data = migrateOrInitialData;
-    }
-    super(${rx}, migrate, reducer, new InMemStore(data), new ${ctxName}TestData(data));
-  }
-}
-`);
 }
 
 /** "AdminQueries" → "Admin"; the stem names the per-interface artifacts */
