@@ -3,21 +3,9 @@ import { createTypeSpecLibrary, paramMessage } from '@typespec/compiler';
 export const $lib = createTypeSpecLibrary({
   name: '@phaselock/typespec-core',
   diagnostics: {
-    'invalid-key-template': {
-      severity: 'error',
-      messages: {
-        default: paramMessage`store key template '${'tpl'}' does not have a name before a '.'`,
-      },
-    },
     'store-collision': {
       severity: 'error',
       messages: { default: paramMessage`${'message'}` },
-    },
-    'not-a-store': {
-      severity: 'error',
-      messages: {
-        default: paramMessage`'${'name'}' is not a Store (expected an interface extending PhaseLock.Store)`,
-      },
     },
     'invalid-template-args': {
       severity: 'error',
@@ -37,6 +25,114 @@ export const $lib = createTypeSpecLibrary({
       severity: 'error',
       messages: {
         default: paramMessage`unsupported type in PhaseLock model: ${'message'}`,
+      },
+    },
+    'invalid-slice-family': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`slice family '${'family'}' must be a name of A-Z a-z 0-9 _ -, followed only by .{param} segments`,
+      },
+    },
+    'slice-events-not-named': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`the events of slice '${'name'}' must be a named union`,
+      },
+    },
+    'slice-event-not-model': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`every event of slice '${'name'}' must be a named model (found ${'found'})`,
+      },
+    },
+    'duplicate-key-param': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`key template '${'tpl'}' in slice '${'name'}' repeats the family parameter '${'param'}'`,
+      },
+    },
+    'not-a-slice': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`'${'name'}' is not a Slice (expected an interface extending PhaseLock.Slice)`,
+      },
+    },
+    'not-an-engine': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`'${'name'}' is not an Engine (expected an interface extending PhaseLock.Engine)`,
+      },
+    },
+    'not-a-command': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`'${'name'}' is listed as a command of '${'owner'}' but has no @command`,
+      },
+    },
+    'key-name-collision': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`key name '${'key'}' of slice '${'slice'}' collides with slice '${'other'}' in '${'owner'}'`,
+      },
+    },
+    'family-collision': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`slices '${'slice'}' and '${'other'}' in '${'owner'}' share the family '${'family'}'`,
+      },
+    },
+    'invalid-command-output': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`the @command output of '${'name'}' may only combine event models, Death, unions, tuples, and arrays (found ${'found'})`,
+      },
+    },
+    'command-output-not-event': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`the @command output of '${'name'}' names '${'event'}', which no slice folds`,
+      },
+    },
+    'command-output-outside-db': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`command '${'name'}' of '${'db'}' emits '${'event'}', which no slice of '${'db'}' folds`,
+      },
+    },
+    'death-placement': {
+      severity: 'error',
+      messages: {
+        default: `Death may only appear in a @command output`,
+      },
+    },
+    'intake-placement': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`intake type ${'kind'} may only be a top-level field of a command (found in ${'where'})`,
+      },
+    },
+    'intake-requires-online': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`command '${'name'}' carries ${'kind'} and so must be @online`,
+      },
+    },
+    'brand-in-command': {
+      severity: 'error',
+      messages: {
+        default: paramMessage`command '${'name'}' carries ${'brand'}, which only intake may produce`,
+      },
+    },
+    'unreachable-slice': {
+      severity: 'warning',
+      messages: {
+        default: paramMessage`slice '${'name'}' is in no Database`,
+      },
+    },
+    'unreachable-command': {
+      severity: 'warning',
+      messages: {
+        default: paramMessage`command '${'name'}' is in no Database`,
       },
     },
   },

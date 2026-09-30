@@ -3,8 +3,8 @@
 // The models here are chosen to exercise every solver / codegen branch independently of the
 // demos: plain identity decode, date decode (required + optional), nested-struct recursion,
 // arrays, tuples, records, discriminated unions (by `type` and by `[type, v]`), one-of unions,
-// string- and int-literal unions, plus a Store and Engine so the store-context and engine
-// generation paths are exercised too.  All three emitters read this same source.
+// string- and int-literal unions, plus a Slice, commands, and an Engine so the context and engine
+// generation paths are exercised too.  The TypeScript emitter reads this source.
 
 import "@phaselock/typespec-core";
 
@@ -143,11 +143,13 @@ union Events {
   Other,
 }
 
+@command(Alpha | Beta)
 model DoThing {
   type: "do-thing";
   when: utcDateTime;
 }
 
+@command(Other)
 model Undo {
   type: "undo";
 }
@@ -157,12 +159,16 @@ union Commands {
   Undo,
 }
 
-// --- store + engine ---------------------------------------------------------
+// --- slice + engine ---------------------------------------------------------
 
-interface DemoStore
-  extends Store<{
-    `plain.{id}`: Plain;
-    `timed.{id}`: Timed;
-  }> {}
+interface DemoSlice
+  extends Slice<
+    "demo",
+    Events,
+    {
+      `plain.{id}`: Plain;
+      `timed.{id}`: Timed;
+    }
+  > {}
 
-interface DemoEngine extends Engine<Events, Commands, DemoStore> {}
+interface DemoEngine extends Engine<[DemoSlice], Commands> {}

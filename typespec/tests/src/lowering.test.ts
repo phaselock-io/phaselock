@@ -1,14 +1,10 @@
 /**
  * Lowering unit tests: compile small TypeSpec programs in-memory and assert that lowerProgram()
  * translates them into the expected interned IR — type mapping, naming, interning identity, and
- * store/engine discovery.
+ * queries discovery.  Slices, engines, databases, and commands are in vocabulary.test.ts.
  */
 
-import { fileURLToPath } from 'node:url';
-
 import {
-  LoweredProgram,
-  lowerProgram,
   PArray,
   PBool,
   PDate,
@@ -18,36 +14,11 @@ import {
   PString,
   PStruct,
   PTuple,
-  PType,
   PUnion,
 } from '@phaselock/typespec-core';
-import { type Program, resolvePath } from '@typespec/compiler';
-import { createTester } from '@typespec/compiler/testing';
 import { describe, expect, it } from 'vitest';
 
-const base = fileURLToPath(new URL('..', import.meta.url));
-const Tester = createTester(resolvePath(base), { libraries: ['@phaselock/typespec-core'] })
-  .import('@phaselock/typespec-core')
-  .using('PhaseLock');
-
-interface Lowered {
-  program: Program;
-  diagnostics: readonly { code: string }[];
-  lowered: LoweredProgram;
-}
-
-async function lower(code: string): Promise<Lowered> {
-  const [result, diagnostics] = await Tester.compileAndDiagnose(code);
-  return { program: result.program, diagnostics, lowered: lowerProgram(result.program) };
-}
-
-/** Find the named root that lowered from a declaration. */
-function root(l: LoweredProgram, name: string): PType {
-  const found = l.roots.find((t) => t.name === name);
-  if (found === undefined)
-    throw new Error(`no root named ${name} in [${l.roots.map((t) => t.name)}]`);
-  return found;
-}
+import { lower, root } from './lower-harness.ts';
 
 describe('lowerProgram — scalar and builtin mapping', () => {
   it('maps builtin scalars to their IR primitives', async () => {
@@ -131,36 +102,7 @@ describe('lowerProgram — interning across a program', () => {
       model A { n: int32; }
       model B { n: int32; }
     `);
-    expect(diagnostics.some((d) => d.code.endsWith('/duplicate-name'))).toBe(true);
-  });
-});
-
-describe('lowerProgram — stores', () => {
-  it('discovers a store, its name, and its key templates', async () => {
-    const { lowered } = await lower(`
-      model Book { id: string; }
-      model BookSpec { \`book.{id}\`: Book; }
-      interface BookStore extends Store<BookSpec> {}
-    `);
-    expect(lowered.stores).toHaveLength(1);
-    const store = lowered.stores[0];
-    expect(store.name).toBe('BookStore');
-    expect(store.items.map((i) => i.name)).toEqual(['book']);
-    expect(store.items[0].tpl).toBe('book.{id}');
-  });
-
-  it('inherits items from dependency stores', async () => {
-    const { lowered } = await lower(`
-      model Book { id: string; }
-      model Patron { id: string; }
-      model BookSpec { \`book.{id}\`: Book; }
-      model PatronSpec { \`patron.{id}\`: Patron; }
-      interface BookStore extends Store<BookSpec> {}
-      interface BigStore extends Store<PatronSpec, [BookStore]> {}
-    `);
-    const big = lowered.stores.find((s) => s.name === 'BigStore')!;
-    expect(big.items.map((i) => i.name).sort()).toEqual(['book', 'patron']);
-    expect(big.originalItems.map((i) => i.name)).toEqual(['patron']);
+    expect(diagnostics.some((d) => d.code === 'duplicate-name')).toBe(true);
   });
 });
 
@@ -202,35 +144,12 @@ describe('lowerProgram — queries', () => {
     expect(lowered.queries[1].queries[0].result).toBe(root(lowered, 'Info'));
   });
 
-  it('keeps queries interfaces out of stores and engines', async () => {
+  it('keeps queries interfaces out of slices and engines', async () => {
     const { lowered } = await lower(`
       model Info { id: string; }
       interface AdminQueries extends Queries { allInfos(): Info[]; }
     `);
-    expect(lowered.stores).toHaveLength(0);
+    expect(lowered.slices).toHaveLength(0);
     expect(lowered.engines).toHaveLength(0);
-  });
-});
-
-describe('lowerProgram — engines', () => {
-  it('discovers an engine and its event, command, and store types', async () => {
-    const { lowered } = await lower(`
-      model E1 { type: "e1"; }
-      model E2 { type: "e2"; }
-      model C1 { type: "c1"; }
-      model C2 { type: "c2"; }
-      union Events { E1, E2 }
-      union Commands { C1, C2 }
-      model Book { id: string; }
-      model BookSpec { \`book.{id}\`: Book; }
-      interface BookStore extends Store<BookSpec> {}
-      interface MyEngine extends Engine<Events, Commands, BookStore> {}
-    `);
-    expect(lowered.engines).toHaveLength(1);
-    const eng = lowered.engines[0];
-    expect(eng.name).toBe('MyEngine');
-    expect(eng.eventType.name).toBe('Events');
-    expect(eng.commandType.name).toBe('Commands');
-    expect(eng.store.name).toBe('BookStore');
   });
 });

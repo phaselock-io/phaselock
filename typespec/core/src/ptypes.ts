@@ -165,6 +165,46 @@ export class PUnion extends PType {
 }
 
 /**
+ * A value only the database's intake produces, such as a PasswordHash: it travels as its base
+ * type, and the brand keeps anything else from passing for one.
+ */
+export class PBrand extends PType {
+  constructor(
+    readonly brand: string,
+    readonly base: PType,
+  ) {
+    super();
+  }
+  get jsonType(): JsonType {
+    return this.base.jsonType;
+  }
+  toString() {
+    return this.brand;
+  }
+}
+
+/**
+ * A command field the database transforms at intake, before precommit runs: the client sends
+ * `wire`, and precommit sees `result`.  `kind` names the vocabulary type, e.g. 'NewPassword'.
+ */
+export class PIntake extends PType {
+  constructor(
+    readonly kind: string,
+    readonly wire: PType,
+    readonly result: PBrand,
+  ) {
+    super();
+  }
+  get jsonType(): JsonType {
+    const kinds = new Set(members(this.wire).map((t) => t.jsonType));
+    return kinds.size === 1 ? [...kinds][0] : '*';
+  }
+  toString() {
+    return this.kind;
+  }
+}
+
+/**
  * PTypeRegistry is the interning layer: every type is created through it, and structurally
  * identical types come back as the same object.
  *
@@ -232,6 +272,17 @@ export class PTypeRegistry {
     return this.intern(`tup:${itemTypes.map((t) => t.id).join(',')}`, () => new PTuple(itemTypes));
   }
 
+  brand(brand: string, base: PType): PBrand {
+    return this.intern(`brand:${brand}:${base.id}`, () => new PBrand(brand, base));
+  }
+
+  intake(kind: string, wire: PType, result: PBrand): PIntake {
+    return this.intern(
+      `intake:${kind}:${wire.id}:${result.id}`,
+      () => new PIntake(kind, wire, result),
+    );
+  }
+
   /**
    * Create a union.  Nested unions are flattened and duplicate members dropped, so union members
    * are never themselves unions.  A single-member union resolves to the member itself.
@@ -259,7 +310,7 @@ export class PTypeRegistry {
   }
 }
 
-// Store, Engine, and Queries IR
+// Slice, Command, Engine, Database, and Queries IR
 
 const TPL_PATTERN = /\{([^}]*)\}/g;
 
@@ -267,20 +318,19 @@ export class PStoreItem {
   private constructor(
     readonly tpl: string,
     readonly type: PType,
-    readonly origin: PStore,
     readonly name: string,
     /** there is always one more chunk than params */
     readonly chunks: readonly string[],
     readonly params: readonly string[],
   ) {}
 
-  static fromSpec(tpl: string, type: PType, origin: PStore): PStoreItem {
+  static fromSpec(tpl: string, type: PType): PStoreItem {
     const name = tpl.split('.')[0];
     if (name.includes('{')) {
       throw new Error(`store key template '${tpl}' does not have a name before a '.'`);
     }
     const [chunks, params] = PStoreItem.parseTpl(tpl);
-    return new PStoreItem(tpl, type, origin, name, chunks, params);
+    return new PStoreItem(tpl, type, name, chunks, params);
   }
 
   static parseTpl(tpl: string): [string[], string[]] {
@@ -297,17 +347,16 @@ export class PStoreItem {
   }
 }
 
+/** The key layout of one slice: its templates, which are local to one stream. */
 export class PStore {
-  name: string | null = null;
-  readonly deps: readonly PStore[];
-  /** all items including those of deps, sorted by name */
+  /** sorted by name */
   readonly items: readonly PStoreItem[];
 
-  constructor(specs: readonly (readonly [string, PType])[], deps: readonly PStore[]) {
-    this.deps = deps;
+  constructor(specs: readonly (readonly [string, PType])[]) {
     const items: PStoreItem[] = [];
     const names = new Map<string, PStoreItem>();
-    const add = (si: PStoreItem) => {
+    for (const [tpl, type] of specs) {
+      const si = PStoreItem.fromSpec(tpl, type);
       const match = names.get(si.name);
       if (match !== undefined) {
         throw new Error(
@@ -316,18 +365,9 @@ export class PStore {
       }
       items.push(si);
       names.set(si.name, si);
-    };
-    for (const dep of deps) {
-      for (const si of dep.items) add(si);
     }
-    for (const [tpl, type] of specs) add(PStoreItem.fromSpec(tpl, type, this));
     items.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     this.items = items;
-  }
-
-  /** items declared on this store itself (not inherited from deps), in sorted order */
-  get originalItems(): PStoreItem[] {
-    return this.items.filter((si) => si.origin === this);
   }
 
   toString() {
@@ -335,13 +375,80 @@ export class PStore {
   }
 }
 
-export class PEngine {
-  name: string | null = null;
+/**
+ * One family of event streams and the state folded from them.  `family` and `params` come from
+ * the family template: `"chat.{org}.{channel}"` is family 'chat' with params ['org', 'channel'].
+ */
+export class PSlice {
   constructor(
-    readonly eventType: PType,
-    readonly commandType: PType,
+    readonly name: string,
+    readonly family: string,
+    readonly params: readonly string[],
+    /** the named events union */
+    readonly events: PType,
     readonly store: PStore,
   ) {}
+
+  /** the family template, e.g. 'patron.{patron}' */
+  get template(): string {
+    return [this.family, ...this.params.map((p) => `{${p}}`)].join('.');
+  }
+
+  /** the event models, in declaration order */
+  get eventTypes(): readonly PType[] {
+    return members(this.events);
+  }
+}
+
+/**
+ * What a command's precommit handler returns, from its `@command`: one event labelled with a
+ * stream of any of the slices that fold it, a death, exactly one of several options, each of
+ * several items in order, or any number of one item.
+ */
+export type POutput =
+  | { kind: 'event'; type: PType; slices: readonly PSlice[] }
+  | { kind: 'death' }
+  | { kind: 'oneOf'; options: readonly POutput[] }
+  | { kind: 'all'; items: readonly POutput[] }
+  | { kind: 'many'; item: POutput };
+
+/** A model carrying `@command`: its type, its declared output, and whether it is `@online`. */
+export class PCommand {
+  constructor(
+    readonly name: string,
+    readonly type: PType,
+    readonly output: POutput,
+    readonly online: boolean,
+  ) {}
+}
+
+/** One audience's view of the database: the slices it syncs and the commands it may send. */
+export class PEngine {
+  constructor(
+    readonly name: string,
+    readonly slices: readonly PSlice[],
+    /** the named commands union, or the one named command */
+    readonly commandType: PType,
+    readonly commands: readonly PCommand[],
+  ) {}
+}
+
+/** The database: its engines, and the slices and commands it keeps for itself. */
+export class PDatabase {
+  /** every slice of every engine, then the database's own, each once */
+  readonly slices: readonly PSlice[];
+  /** every command of every engine, then the database's own, each once */
+  readonly commands: readonly PCommand[];
+
+  constructor(
+    readonly name: string,
+    readonly engines: readonly PEngine[],
+    readonly extraSlices: readonly PSlice[],
+    readonly extraCommands: readonly PCommand[],
+  ) {
+    this.slices = [...new Set([...engines.flatMap((e) => e.slices), ...extraSlices])];
+    this.commands = [...new Set([...engines.flatMap((e) => e.commands), ...extraCommands])];
+  }
 }
 
 /** One query declaration: its name, arguments, and result type. */

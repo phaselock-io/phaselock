@@ -1,47 +1,50 @@
 import "../dist/src/index.js";
 
+using TypeSpec.Reflection;
+
 namespace PhaseLock;
 
 /**
- * A Store defines the layout of key-value storage.  Keys are defined as template strings and values
- * have declared types.  For example:
+ * A Slice is one family of event streams and the state its reducer folds from them.  `Family`
+ * names the streams: `"book"` is a single stream, and `"patron.{patron}"` or
+ * `"chat.{org}.{channel}"` is one stream per value of each parameter.  `Events` is the named union
+ * of the event models the slice folds, and `Spec` lays out its state as key templates:
  *
  * ```typespec
- * interface BookStore extends Store<{
- *   "edition.{edition_isbn}": Edition;
- *   "editions": Setx;
+ * interface PatronSlice extends Slice<"patron.{patron}", PatronEvents, {
+ *   "patron": Patron;
+ *   "patron_hold.{hold}": PatronHold;
  * }> {}
  * ```
  *
- * `Spec` is a model whose property names are store key templates.  Each `{param}` in a
- * template becomes a typed accessor parameter in the generated store contexts, and the part
- * of the template before the first '.' names the item.
- *
- * `Deps` is a tuple of other Store interfaces whose items are all included in this store.  The
- * generated contexts reuse the dependency stores' accessors, so a reducer written against a
- * dependency also works against any store that includes it:
- *
- * ```typespec
- * interface LibraryStore extends Store<{
- *   "decider_events": DeciderEvents[];
- * }, [BookStore, PatronStore, StatusStore]> {}
- * ```
+ * Key templates are local to one stream: the machinery owns the `{stream}/` prefix, so a
+ * reducer names `patron_hold.{hold}` and never the patron it belongs to.  The part of a template
+ * before its first '.' names the item, and must be unique among the slices composed together.
  */
-interface Store<Spec extends {} = {}, Deps extends unknown[] = []> {}
+interface Slice<Family extends string, Events, Spec extends {}> {}
 
 /**
- * A concrete Engine definition, binding the three pieces a system component needs: the
- * events it consumes, the commands it may send, and the store its reducers read and write.
- * Code generation produces an Engine class (with typed reducer/query contexts, decoders, and
- * test helpers) for each declaration:
+ * An Engine is one audience's view of the database: the slices it syncs and folds, and the
+ * commands it may send.
  *
  * ```typespec
- * interface RelayEngine extends Engine<LibraryEvents, RelayCommands, RelayStore> {}
+ * interface UserEngine extends Engine<[BookSlice, PatronSlice], UserCommands> {}
  * ```
  *
- * `Events` and `Commands` are named unions; `S` is a Store interface.
+ * `Commands` is a named union of `@command` models, or a single one.
  */
-interface Engine<Events, Commands, S> {}
+interface Engine<Slices extends unknown[], Commands> {}
+
+/**
+ * A Database holds every slice its engines sync and decides every command they send, plus the
+ * slices and commands it keeps for itself: slices no client syncs (credentials, uniqueness
+ * indexes), and commands no engine sends.
+ *
+ * ```typespec
+ * interface LibraryDB extends Database<[UserEngine, AdminEngine], [LoginSlice], DatabaseCommands> {}
+ * ```
+ */
+interface Database<Engines extends unknown[], Slices extends unknown[] = [], Commands = never> {}
 
 /**
  * A Queries interface declares a typed query contract: each operation names a query, with its
@@ -59,3 +62,81 @@ interface Engine<Events, Commands, S> {}
  * the typed query interfaces.
  */
 interface Queries {}
+
+/**
+ * Marks a model as a command and declares what its precommit handler returns, taken literally:
+ * `@command(HoldOpened | HoldFailed)` returns exactly one of the two, a tuple returns each of its
+ * members, and an array any number.  Each event is labelled with a stream of a slice that folds it.
+ * A passthrough names its own type, `@command(AddBook)` on `AddBook`; `Death` ends the stream it
+ * is labelled with.
+ */
+extern dec command(target: Model, output: unknown);
+
+/**
+ * Marks a command that only makes sense online: its UI waits on the ack, not on the round trip
+ * through sync, so it is sent with `sendNow` and never queued in the outbox.  A command carrying
+ * an intake type must be `@online`.
+ */
+extern dec online(target: Model);
+
+/** The end of a stream, in a `@command` output. */
+model Death {}
+
+// Intake types.  Each is a command field that the database transforms at intake, before
+// precommit runs, into a result only intake can produce.  They appear only as top-level fields
+// of `@online` commands, and their results never appear in commands.
+
+/** A password to store: precommit sees its salted hash. */
+scalar NewPassword extends string;
+
+/** A stored password's hash, as only intake produces it. */
+scalar PasswordHash extends string;
+
+/** A captcha widget's token: intake verifies it with the provider. */
+scalar CaptchaToken extends string;
+
+/** A verified captcha token, as only intake produces it. */
+model CaptchaResult {
+  hostname: string;
+}
+
+/** A proof of a credential the account has registered, for commands that re-authenticate. */
+union CommandAuth {
+  password: {
+    kind: "password";
+    password: string;
+  },
+  totp: {
+    kind: "totp";
+    code: string;
+  },
+  emailCode: {
+    kind: "email-code";
+    token: string;
+    code: string;
+  },
+  webauthn: {
+    kind: "webauthn";
+    challenge: string;
+    assertion: string;
+  },
+  yubikeyOtp: {
+    kind: "yubikey-otp";
+    otp: string;
+  },
+}
+
+/** The kind of credential a CommandAuth proved, as only intake produces it. */
+model CommandAuthResult {
+  kind: "password" | "totp" | "email-code" | "webauthn" | "yubikey-otp";
+}
+
+/** An identity proven outside the database (an OAuth2 login, an email link), signed by it. */
+scalar IdentityProof extends string;
+
+/** A verified identity proof, as only intake produces it. */
+model IdentityResult {
+  provider: string;
+  subject: string;
+  email?: string;
+}

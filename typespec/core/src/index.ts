@@ -1,5 +1,6 @@
 export { $lib } from './lib.js';
 export { $onValidate } from './validate.js';
+export { $decorators, getCommandOutput, isOnline } from './decorators.js';
 export * from './ptypes.js';
 export * from './solver.js';
 export * from './denter.js';
