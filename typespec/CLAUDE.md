@@ -19,15 +19,7 @@ emitters).  See README.md for layout, build commands, and the test suite.
   (one `PQuery` per op: name, args, result) on `LoweredProgram.queries` for the emitters to walk.
   The TS emitter generates the full query API from them: wire tuples, checkers/decoders, the
   `QueryDefs`/`Local*`/`Remote*`/`dispatch*` family.
-- **Commands stay a union** (`Engine<Events, Commands, Store>`).  Someday: allow a
-  null/omitted Commands argument, with commands declared as ops in the engine interface body
-  instead — the endgame where the command union is *derived* from the interface:
-  `interface UserEngine extends Engine<LibraryEvents, UserStore> { tryHold(cmd: TryHold): NewVHold | VHoldRejected; ... }`
-  The op return type declares the command→event correlation that today lives only in decider code
-  and forecasters.
-- **`op` is reserved for that commands-as-operations future.**  Do not spend it as a generic
-  `X = f(args)` binder for stores/engines (it works — `op X is store<...>` — but collides with
-  the higher-value meaning).
+- **Commands stay a union** (`Engine<Events, Commands, Store>`).
 - **Constraint validation (`@minLength`, `@pattern`, ...): decided, not implemented.**  The
   emitters currently ignore the constraint decorators entirely; the generated checkers verify
   structure only.  The decided placement, when implemented: JS-only, enforced at relay command

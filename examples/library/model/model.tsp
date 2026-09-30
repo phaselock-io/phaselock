@@ -42,8 +42,20 @@ alias Isbn = string;
 model Setx is Record<true>;
 
 ////////////////
-// Book Shard //
+// Book Slice //
 ////////////////
+
+interface BookSlice extends Slice<"book", BookEvents, BookStore> {}
+
+alias BookStore {
+  "edition.{edition_isbn}": Edition;
+  "editions": Setx;
+  "book.{book_uuid}": Book;
+  "hold.{hold_uuid}": Hold;
+  "checkout.{checkout_uuid}": Checkout;
+  "active_holds": Setx;
+  "active_checkouts": Setx;
+};
 
 model Edition {
   isbn: Isbn;
@@ -78,146 +90,6 @@ model Checkout {
   active?: true;
 }
 
-alias BookStore {
-  "edition.{edition_isbn}": Edition;
-  "editions": Setx;
-  "book.{book_uuid}": Book;
-  "hold.{hold_uuid}": Hold;
-  "checkout.{checkout_uuid}": Checkout;
-  "active_holds": Setx;
-  "active_checkouts": Setx;
-};
-
-// Book commands + events //
-
-// command, event
-model AddBook {
-  type: "add-book";
-  id: @newID(Uuid);
-  isbn: Isbn;
-  restricted: boolean;
-  timestamp: utcDateTime;
-}
-
-// command, event
-model UpdateBookRestricted {
-  type: "update-book-restricted";
-  id: Uuid;
-  restricted: boolean;
-  timestamp: utcDateTime;
-}
-
-// command, event
-model RemoveBook {
-  type: "remove-book";
-  id: Uuid;
-  timestamp: utcDateTime;
-}
-
-// Edition commands + events //
-
-// command, event
-model AddEdition {
-  type: "add-edition";
-  isbn: @newID(Isbn);
-  title: string;
-  timestamp: utcDateTime;
-}
-
-// command, event
-model UpdateEditionTitle {
-  type: "update-edition-title";
-  isbn: Isbn;
-  title: string;
-  timestamp: utcDateTime;
-}
-
-// Hold commands + events //
-
-// command results in HoldOpened OR HoldFailed
-model TryHold {
-  type: "try-hold";
-  id: Uuid;
-  patron: Uuid;
-  // can hold a specific book or just any generic one
-  target: { book: Uuid } | { edition: Isbn };
-  open: boolean;
-  timestamp: utcDateTime;
-}
-
-model HoldOpened {
-  type: @newID("hold-opened");
-  id: Uuid;
-  target: { book: Uuid } | { edition: Isbn };
-  timestamp: utcDateTime;
-}
-
-// sent to patron stream
-model HoldFailed {
-  type: @newID("hold-failed");
-  id: Uuid;
-  reason: string;
-}
-
-// command, results in HoldClosed
-model ExpireHold {
-  type: "expire-hold";
-  id: Uuid;
-}
-
-// command, results in HoldClosed
-model CancelHold {
-  type: "expire-hold";
-  id: Uuid;
-}
-
-// event
-model HoldClosed {
-  type: "hold-closed";
-  id: Uuid;
-  reason: string;
-}
-
-// Checkout commands + events //
-
-// command, results in CheckoutOpened or CheckoutFailed
-model TryCheckout {
-  type: "try-checkout";
-  id: Uuid;
-  patron: Uuid;
-  book: Uuid;
-  timestamp: utcDateTime;
-}
-
-// event
-model CheckoutOpened {
-  type: "checkout-opened";
-  id: @newID(Uuid);
-  book: Uuid;
-  timestamp: utcDateTime;
-}
-
-// event
-model CheckoutFailed {
-  type: "checkout-failed";
-  id: @newID(Uuid);
-  reason: string;
-}
-
-// event
-model EndCheckout {
-  type: "end-checkout";
-  checkout: Uuid;
-  timestamp: utcDateTime;
-}
-
-// event, system-generated
-model OverdueCheckout {
-  type: "overdue-checkout";
-  checkout: Uuid;
-  timestamp: utcDateTime;
-}
-
 union BookEvents {
   AddEdition,
   UpdateEditionTitle,
@@ -232,11 +104,134 @@ union BookEvents {
   OverdueCheckout,
 }
 
-interface BookShard extends Shard<"book", BookEvents, BookStore> {}
+@command(AddBook)
+model AddBook {
+  type: "add-book";
+  id: Uuid;
+  isbn: Isbn;
+  restricted: boolean;
+  timestamp: utcDateTime;
+}
+
+@command(UpdateBookRestricted)
+model UpdateBookRestricted {
+  type: "update-book-restricted";
+  id: Uuid;
+  restricted: boolean;
+  timestamp: utcDateTime;
+}
+
+@command(RemoveBook)
+model RemoveBook {
+  type: "remove-book";
+  id: Uuid;
+  timestamp: utcDateTime;
+}
+
+// Edition commands + events //
+
+@command(AddEdition)
+model AddEdition {
+  type: "add-edition";
+  isbn: Isbn;
+  title: string;
+  timestamp: utcDateTime;
+}
+
+@command(UpdateEditionTitle)
+model UpdateEditionTitle {
+  type: "update-edition-title";
+  isbn: Isbn;
+  title: string;
+  timestamp: utcDateTime;
+}
+
+// Hold commands + events //
+
+@command([HoldOpened, PatronHoldOpened] | HoldFailed)
+model TryHold {
+  type: "try-hold";
+  id: Uuid;
+  patron: Uuid;
+  // can hold a specific book or just any generic one
+  target: { book: Uuid } | { edition: Isbn };
+  open: boolean;
+  timestamp: utcDateTime;
+}
+
+model HoldOpened {
+  type: "hold-opened";
+  id: Uuid;
+  target: { book: Uuid } | { edition: Isbn };
+  timestamp: utcDateTime;
+}
+
+@command(HoldClosed)
+model ExpireHold {
+  type: "expire-hold";
+  id: Uuid;
+}
+
+@command(HoldClosed)
+model CancelHold {
+  type: "cancel-hold";
+  id: Uuid;
+}
+
+model HoldClosed {
+  type: "hold-closed";
+  id: Uuid;
+  reason: string;
+}
+
+// Checkout commands + events //
+
+@command(CheckoutOpened | CheckoutFailed)
+model TryCheckout {
+  type: "try-checkout";
+  id: Uuid;
+  patron: Uuid;
+  book: Uuid;
+  timestamp: utcDateTime;
+}
+
+model CheckoutOpened {
+  type: "checkout-opened";
+  id: Uuid;
+  book: Uuid;
+  timestamp: utcDateTime;
+}
+
+model CheckoutFailed {
+  type: "checkout-failed";
+  id: Uuid;
+  reason: string;
+}
+
+@command(EndCheckout)
+model EndCheckout {
+  type: "end-checkout";
+  checkout: Uuid;
+  timestamp: utcDateTime;
+}
+
+// system-generated
+@command(OverdueCheckout)
+model OverdueCheckout {
+  type: "overdue-checkout";
+  checkout: Uuid;
+  timestamp: utcDateTime;
+}
 
 //////////////////
-// Patron Shard //
+// Patron Slice //
 //////////////////
+
+interface PatronSlice extends Slice<"patron.{patron_uuid}", PatronEvents, PatronStore> {}
+
+alias PatronStore = {
+  "patron": Patron;
+}
 
 model Patron {
   id: Uuid;
@@ -246,11 +241,26 @@ model Patron {
   holds: Setx;
 }
 
-alias PatronStore = {
-  "patron": Patron;
+union PatronEvents {
+  AddPatron,
+  RenamePatron,
+  AssignPatron,
+  PatronHoldOpened,
+  HoldFailed,
 }
 
-// command, event
+model PatronHoldOpened {
+  type: "patron-hold-opened";
+  id: Uuid;
+};
+
+model HoldFailed {
+  type: "hold-failed";
+  id: Uuid;
+  reason: string;
+}
+
+@command(AddPatron)
 model AddPatron {
   type: "add-patron";
   id: Uuid;
@@ -259,7 +269,7 @@ model AddPatron {
   timestamp: utcDateTime;
 }
 
-// command, event
+@command(RenamePatron)
 model RenamePatron {
   type: "rename-patron";
   id: Uuid;
@@ -267,7 +277,7 @@ model RenamePatron {
   timestamp: utcDateTime;
 }
 
-// command, event
+@command(AssignPatron)
 model AssignPatron {
   type: "assign-patron";
   id: Uuid;
@@ -275,28 +285,32 @@ model AssignPatron {
   timestamp: utcDateTime;
 }
 
-union PatronEvents {
-  AddPatron,
-  RenamePatron,
-  AssignPatron,
-  HoldSucceeded,
-  HoldFailed,
+/////////////////
+// Admin Slice //
+/////////////////
+
+interface AdminSlice extends Slice<"admin", AdminEvents, AdminStore> {}
+
+alias AdminStore = {
+  // just a list of unacked messages
+  "admin_messages": [Uuid, string],
 }
-
-interface PatronShard extends Shard<"patron.{patron_uuid}", PatronEvents, PatronStore> {}
-
-/////////////////
-// Admin shard //
-/////////////////
-
-alias AdminStore = {}
 
 union AdminEvents {
   CheckoutFailed;
   MessageAck;
 }
 
-interface AdminShard extends Shard<"admin", AdminEvents, AdminStore> {}
+model CheckoutFailed {
+  id: Uuid,
+  checkout: Uuid,
+  string: reason,
+}
+
+@command(MessageAck)
+model MessageAck {
+  id: Uuid,
+}
 
 ////////////////////////
 // Engine definitions //
@@ -310,7 +324,7 @@ union UserCommands {
   CancelHold,
 }
 
-interface UserEngine extends Engine<[BookShard, PatronShard], UserCommands> {}
+interface UserEngine extends Engine<[BookSlice, PatronSlice], UserCommands> {}
 
 // An admin (the librarian at the front desk) has most of the write capabilities in the system,
 // except they cannot create decider-specific events.
@@ -328,14 +342,88 @@ union AdminCommands {
   EndCheckout,
 }
 
-interface AdminEngine extends Engine<[BookShard, PatronShard, AdminShard], AdminCommands> {}
+interface AdminEngine extends Engine<[BookSlice, PatronSlice, AdminSlice], AdminCommands> {}
+
+/////////////////
+// Login Slice //
+/////////////////
+
+interface LoginSlice extends Slice<"login", LoginEvents, LoginStore> {}
+
+alias LoginStore {
+  "login.{email}": Login,
+}
+
+model Login {
+  patron: Uuid;
+  password: PasswordHash;
+}
+
+@online
+@command([LoginCreated, PatronCreated])
+model CreateLogin {
+  patron: Uuid;
+  username: User;
+  password: NewPassword;
+}
+
+model LoginCreated {
+  patron: Uuid;
+  login: string;
+  display: string;
+  password: PasswordHash;
+}
+
+model PatronCreated {
+  patron: Uuid;
+  display: string;
+}
+
+@online
+@command(PasswordChanged)
+model ChangePassword {
+  patron: Uuid;
+  // CommandAuth could be the existing password, or the TOTP token, or something,
+  // but Go has to match it against what lookup() returns or it will be rejected.
+  check: CommandAuth;
+  new: NewPassword;
+}
+
+model PasswordChanged {
+  patron: Uuid;
+  password: PasswordHash;
+}
+
+@online
+@command([LoginDeleted, PatronDeleted])
+model DeleteLogin {
+  patron: Uuid;
+  check: CommandAuth;
+}
+
+model LoginDeleted {
+  patron: Uuid;
+}
+
+model PatronDeleted {
+  patron: Uuid;
+}
 
 //////////////////
 // The Database //
 //////////////////
 
-// the DB holds all shards and its precommit function handles all commands
-interface DB extends Database<[UserEngine, AdminEngine]> {}
+/* The DB holds all slices and its precommit function handles all commands,
+   and it may declare additional slices and commands that no Engine handles.
+   Additional slices are maintained for internal use (precommit, maySee, and
+   lookup), but are not synced to any client. */
+interface LibraryDB extends Database<
+  [UserEngine, AdminEngine],
+  [LoginSlice],
+  SystemCommands
+> {}
+
+union SystemCommands = OverdueCheckout;
 
 /////////////////
 // Query Layer //
@@ -362,13 +450,11 @@ model AdminEditionInfo {
   books: AdminBookInfo[];
 }
 
-// admin queries can run against the relay, or against a local AdminStore
 interface AdminQueries extends Queries {
   allPatronIds(): Uuid[];
   allPatrons(): AdminPatronInfo[];
   allEditions(): AdminEditionInfo[];
 }
-
 
 model UserBookInfo {
   isbn: string;
@@ -383,7 +469,6 @@ model UserPatronInfo {
   researcher: boolean;
 };
 
-// user queries can run on the relay, or against a local UserStore
 interface UserQueries extends Queries {
   allBooks(): UserBookInfo[];
   myPatron(): UserPatronInfo;

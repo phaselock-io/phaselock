@@ -176,6 +176,53 @@ function* precommitTryCheckout(
   ];
 }
 
+function mustBeAdmin(auth: Authorize) {
+  if ("admin" not in auth.traits) {
+    throw Reject("unauthorized");
+  }
+  auth.set(true);
+}
+
+function editionMustExist(txn) {
+  if (txn.get.edition(e.isbn) === undefined) {
+    throw Reject("no such edition");
+  }
+}
+
+const precommit: Precommit = {
+  addEdition(txn, auth, cmd) {
+    mustBeAdmin(auth);
+    return { stream: 'book', event: cmd };
+  },
+  updateEditionTitle(txn, auth, cmd) {
+    mustBeAdmin(auth);
+    editionMustExit(txn, cmd.edition);
+    return { stream: 'book', event: cmd };
+  },
+  addBook(txn, auth, cmd) {
+    mustBeAdmin(auth);
+    editionMustExit(txn, cmd.edition);
+    return { stream: 'book', event: cmd };
+  },
+  updateBookRestricted(txn, auth, cmd) {
+    mustBeAdmin(auth);
+    bookMustExit(txn, cmd.book);
+    return { stream: 'book', event: cmd };
+  },
+  removeBook(txn, auth, cmd) {
+    mustBeAdmin(auth);
+    bookMustExit(txn, cmd.book);
+    return { stream: 'book', event: cmd };
+  },
+  tryCheckout(txn, auth, cmd) {
+    mustBeAdmin(auth);
+    patronMustExist(txn, cmd.patron);
+    bookMustExit(txn, cmd.book);
+    return precommitTryCheckout(txn, auth.principal, cmd);
+  },
+  // XXX finishme
+}
+
 // precommit is NOT called if:
 //   - the commandId is not unique
 //   - the command is not structurally valid
