@@ -31,6 +31,9 @@
 // Circulating or Restricted.  This enables us to have book with same ISBN as
 // circulated and restricted at the same time (for instance, there is a book
 // signed by the author that we want to keep as Restricted)
+//
+// The demo deliberately simplifies the domain: there is one library branch, so the
+// overdue-checkout rule counts every overdue checkout, and there are no fees.
 
 import "@phaselock/typespec-core";
 
@@ -39,30 +42,32 @@ using PhaseLock;
 alias Uuid = string;
 alias Isbn = string;
 
-model Setx is Record<true>;
-
 ////////////////
 // Book Slice //
 ////////////////
 
+// The public catalogue: editions, the books of each edition, and the state of every hold and
+// checkout, with no patron named anywhere, since every user syncs this slice.  Collections are
+// key ranges that readers scan, such as `edition_book.{isbn}.` for the books of one edition.
+
 interface BookSlice extends Slice<"book", BookEvents, BookStore> {}
 
-alias BookStore {
-  "edition.{edition_isbn}": Edition;
-  "editions": Setx;
-  "book.{book_uuid}": Book;
-  "hold.{hold_uuid}": Hold;
-  "checkout.{checkout_uuid}": Checkout;
-  "active_holds": Setx;
-  "active_checkouts": Setx;
+alias BookStore = {
+  "edition.{isbn}": Edition;
+  "book.{book}": Book;
+  // index: every book of an edition
+  "edition_book.{isbn}.{book}": true;
+  // one key per open hold; closing a hold deletes its key
+  "hold.{hold}": Hold;
+  // index: every open edition-level hold of an edition
+  "edition_hold.{isbn}.{hold}": true;
+  // one key per open checkout; ending a checkout deletes its key
+  "checkout.{checkout}": Checkout;
 };
 
 model Edition {
   isbn: Isbn;
   title: string;
-  books: Setx;
-  // edition-level holds
-  holds: Setx;
 }
 
 model Book {
@@ -78,16 +83,15 @@ model Hold {
   id: Uuid;
   target: { book: Uuid } | { edition: Isbn };
   timestamp: utcDateTime;
+  // absent for an open-ended hold
   expires?: utcDateTime;
-  active?: true;
 }
 
 model Checkout {
   id: Uuid;
   book: Uuid;
   expires: utcDateTime;
-  overdue: boolean; // server determination based on expires
-  active?: true;
+  overdue: boolean;
 }
 
 union BookEvents {
@@ -96,36 +100,11 @@ union BookEvents {
   AddBook,
   UpdateBookRestricted,
   RemoveBook,
-  TryHold,
-  CancelHold,
-  ExpireHold,
-  TryCheckout,
-  EndCheckout,
-  OverdueCheckout,
-}
-
-@command(AddBook)
-model AddBook {
-  type: "add-book";
-  id: Uuid;
-  isbn: Isbn;
-  restricted: boolean;
-  timestamp: utcDateTime;
-}
-
-@command(UpdateBookRestricted)
-model UpdateBookRestricted {
-  type: "update-book-restricted";
-  id: Uuid;
-  restricted: boolean;
-  timestamp: utcDateTime;
-}
-
-@command(RemoveBook)
-model RemoveBook {
-  type: "remove-book";
-  id: Uuid;
-  timestamp: utcDateTime;
+  HoldOpened,
+  HoldClosed,
+  CheckoutOpened,
+  CheckoutEnded,
+  CheckoutOverdue,
 }
 
 // Edition commands + events //
@@ -146,8 +125,37 @@ model UpdateEditionTitle {
   timestamp: utcDateTime;
 }
 
+// Book commands + events //
+
+@command(AddBook)
+model AddBook {
+  type: "add-book";
+  id: Uuid;
+  isbn: Isbn;
+  restricted: boolean;
+  timestamp: utcDateTime;
+}
+
+@command(UpdateBookRestricted)
+model UpdateBookRestricted {
+  type: "update-book-restricted";
+  id: Uuid;
+  restricted: boolean;
+  timestamp: utcDateTime;
+}
+
+// rejected while the book is held or checked out
+@command(RemoveBook)
+model RemoveBook {
+  type: "remove-book";
+  id: Uuid;
+  timestamp: utcDateTime;
+}
+
 // Hold commands + events //
 
+// the catalogue learns of the hold and the patron learns it is theirs, or the patron alone
+// learns why it failed
 @command([HoldOpened, PatronHoldOpened] | HoldFailed)
 model TryHold {
   type: "try-hold";
@@ -164,18 +172,22 @@ model HoldOpened {
   id: Uuid;
   target: { book: Uuid } | { edition: Isbn };
   timestamp: utcDateTime;
+  expires?: utcDateTime;
 }
 
-@command(HoldClosed)
-model ExpireHold {
-  type: "expire-hold";
-  id: Uuid;
-}
-
-@command(HoldClosed)
+@command([HoldClosed, PatronHoldClosed])
 model CancelHold {
   type: "cancel-hold";
   id: Uuid;
+  patron: Uuid;
+}
+
+// sent by the Tick, once it exists
+@command([HoldClosed, PatronHoldClosed])
+model ExpireHold {
+  type: "expire-hold";
+  id: Uuid;
+  patron: Uuid;
 }
 
 model HoldClosed {
@@ -186,7 +198,13 @@ model HoldClosed {
 
 // Checkout commands + events //
 
-@command(CheckoutOpened | CheckoutFailed)
+// a checkout that fulfills the patron's own hold also closes it; a failure is a notice to the
+// librarians, since a checkout queued offline at the desk can fail after they have moved on
+@command(
+  | [CheckoutOpened, PatronCheckoutOpened]
+  | [CheckoutOpened, PatronCheckoutOpened, HoldClosed, PatronHoldClosed]
+  | CheckoutFailed
+)
 model TryCheckout {
   type: "try-checkout";
   id: Uuid;
@@ -199,74 +217,90 @@ model CheckoutOpened {
   type: "checkout-opened";
   id: Uuid;
   book: Uuid;
+  expires: utcDateTime;
   timestamp: utcDateTime;
 }
 
-model CheckoutFailed {
-  type: "checkout-failed";
-  id: Uuid;
-  reason: string;
-}
-
-@command(EndCheckout)
+@command([CheckoutEnded, PatronCheckoutEnded])
 model EndCheckout {
   type: "end-checkout";
   checkout: Uuid;
+  patron: Uuid;
   timestamp: utcDateTime;
 }
 
-// system-generated
-@command(OverdueCheckout)
+model CheckoutEnded {
+  type: "checkout-ended";
+  id: Uuid;
+  timestamp: utcDateTime;
+}
+
+// sent by the Tick, once it exists
+@command([CheckoutOverdue, PatronCheckoutOverdue])
 model OverdueCheckout {
   type: "overdue-checkout";
   checkout: Uuid;
+  patron: Uuid;
   timestamp: utcDateTime;
+}
+
+model CheckoutOverdue {
+  type: "checkout-overdue";
+  id: Uuid;
 }
 
 //////////////////
 // Patron Slice //
 //////////////////
 
-interface PatronSlice extends Slice<"patron.{patron_uuid}", PatronEvents, PatronStore> {}
+// One patron's own record: their profile, and the holds, checkouts, and notices that are theirs.
+// Every hold and checkout change that touches a patron reaches them as an event of their own,
+// since a reducer here cannot read the book slice.
+
+interface PatronSlice extends Slice<"patron.{patron}", PatronEvents, PatronStore> {}
 
 alias PatronStore = {
   "patron": Patron;
-}
+  "patron_hold.{hold}": PatronHold;
+  "patron_checkout.{checkout}": Checkout;
+  "patron_notice.{notice}": Notice;
+};
 
 model Patron {
   id: Uuid;
   name: string;
   researcher: boolean;
-  checkouts: Setx;
-  holds: Setx;
 }
 
-union PatronEvents {
-  AddPatron,
-  RenamePatron,
-  AssignPatron,
-  PatronHoldOpened,
-  HoldFailed,
-}
-
-model PatronHoldOpened {
-  type: "patron-hold-opened";
+model PatronHold {
   id: Uuid;
-};
+  target: { book: Uuid } | { edition: Isbn };
+  expires?: utcDateTime;
+}
 
-model HoldFailed {
-  type: "hold-failed";
+// a notice the patron or the librarians dismiss
+model Notice {
   id: Uuid;
   reason: string;
 }
 
-@command(AddPatron)
-model AddPatron {
-  type: "add-patron";
+union PatronEvents {
+  PatronCreated,
+  RenamePatron,
+  AssignPatron,
+  PatronHoldOpened,
+  PatronHoldClosed,
+  HoldFailed,
+  PatronCheckoutOpened,
+  PatronCheckoutEnded,
+  PatronCheckoutOverdue,
+  DismissNotice,
+}
+
+model PatronCreated {
+  type: "patron-created";
   id: Uuid;
   name: string;
-  researcher: boolean;
-  timestamp: utcDateTime;
 }
 
 @command(RenamePatron)
@@ -277,6 +311,7 @@ model RenamePatron {
   timestamp: utcDateTime;
 }
 
+// grants or revokes researcher status
 @command(AssignPatron)
 model AssignPatron {
   type: "assign-patron";
@@ -285,43 +320,169 @@ model AssignPatron {
   timestamp: utcDateTime;
 }
 
+model PatronHoldOpened {
+  type: "patron-hold-opened";
+  id: Uuid;
+  target: { book: Uuid } | { edition: Isbn };
+  expires?: utcDateTime;
+}
+
+model PatronHoldClosed {
+  type: "patron-hold-closed";
+  id: Uuid;
+  reason: string;
+}
+
+// folded into a notice the patron dismisses
+model HoldFailed {
+  type: "hold-failed";
+  id: Uuid;
+  reason: string;
+}
+
+model PatronCheckoutOpened {
+  type: "patron-checkout-opened";
+  id: Uuid;
+  book: Uuid;
+  expires: utcDateTime;
+}
+
+model PatronCheckoutEnded {
+  type: "patron-checkout-ended";
+  id: Uuid;
+}
+
+model PatronCheckoutOverdue {
+  type: "patron-checkout-overdue";
+  id: Uuid;
+}
+
+// the sender's own notice: an admin dismisses from the librarians' shared inbox, anyone else from
+// their own patron stream
+@command(DismissNotice)
+model DismissNotice {
+  type: "dismiss-notice";
+  id: Uuid;
+}
+
 /////////////////
 // Admin Slice //
 /////////////////
 
+// The librarians' shared inbox: notices about work that failed after it was queued.
+
 interface AdminSlice extends Slice<"admin", AdminEvents, AdminStore> {}
 
 alias AdminStore = {
-  // just a list of unacked messages
-  "admin_messages": [Uuid, string],
-}
+  // one key per undismissed notice
+  "admin_notice.{notice}": Notice;
+};
 
 union AdminEvents {
-  CheckoutFailed;
-  MessageAck;
+  CheckoutFailed,
+  DismissNotice,
 }
 
 model CheckoutFailed {
-  id: Uuid,
-  checkout: Uuid,
-  string: reason,
+  type: "checkout-failed";
+  id: Uuid;
+  patron: Uuid;
+  book: Uuid;
+  reason: string;
 }
 
-@command(MessageAck)
-model MessageAck {
-  id: Uuid,
+/////////////////
+// Login Slice //
+/////////////////
+
+// Credentials, which the database keeps for itself and never syncs: a hash in a browser cache
+// can be cracked offline.  `lookup` reads a login by name to sign someone in.  A login's user
+// is the patron it belongs to, except for the one `admin` login every librarian shares, which
+// the bundle's bootstrap seeds.
+
+interface LoginSlice extends Slice<"login", LoginEvents, LoginStore> {}
+
+alias LoginStore = {
+  // login names are globally unique and never change
+  "login.{login}": Login;
+  // index: the login name of each user
+  "user_login.{user}": string;
+};
+
+model Login {
+  user: Uuid;
+  password: PasswordHash;
+}
+
+union LoginEvents {
+  LoginCreated,
+  PasswordChanged,
+  LoginDeleted,
+}
+
+// sent with a plain fetch() before signing in, since no Engine exists until someone has
+@online
+@command([LoginCreated, PatronCreated])
+model CreateAccount {
+  type: "create-account";
+  patron: Uuid;
+  login: string;
+  name: string;
+  password: NewPassword;
+}
+
+model LoginCreated {
+  type: "login-created";
+  login: string;
+  user: Uuid;
+  password: PasswordHash;
+}
+
+// changes the sender's own password
+@online
+@command(PasswordChanged)
+model ChangePassword {
+  type: "change-password";
+  // CommandAuth could be the existing password, or the TOTP token, or something,
+  // but Go has to match it against what lookup() returns or it will be rejected.
+  check: CommandAuth;
+  new: NewPassword;
+}
+
+model PasswordChanged {
+  type: "password-changed";
+  login: string;
+  password: PasswordHash;
+}
+
+// deletes the sender's own account; rejected while they have open checkouts, their open holds
+// close with the account, and their patron stream ends
+@online
+@command([LoginDeleted, Death, HoldClosed[]])
+model DeleteAccount {
+  type: "delete-account";
+  check: CommandAuth;
+}
+
+model LoginDeleted {
+  type: "login-deleted";
+  login: string;
+  user: Uuid;
 }
 
 ////////////////////////
 // Engine definitions //
 ////////////////////////
 
-// A patron has very limited write capabilities.  Each of these events may be written but only to
+// A patron has very limited write capabilities.  Each of these commands may be sent only for
 // their own patron_uuid.
 union UserCommands {
   RenamePatron,
   TryHold,
   CancelHold,
+  DismissNotice,
+  ChangePassword,
+  DeleteAccount,
 }
 
 interface UserEngine extends Engine<[BookSlice, PatronSlice], UserCommands> {}
@@ -336,78 +497,12 @@ union AdminCommands {
   AddBook,
   UpdateBookRestricted,
   RemoveBook,
-  AddPatron,
   AssignPatron,
   TryCheckout,
   EndCheckout,
 }
 
 interface AdminEngine extends Engine<[BookSlice, PatronSlice, AdminSlice], AdminCommands> {}
-
-/////////////////
-// Login Slice //
-/////////////////
-
-interface LoginSlice extends Slice<"login", LoginEvents, LoginStore> {}
-
-alias LoginStore {
-  "login.{email}": Login,
-}
-
-model Login {
-  patron: Uuid;
-  password: PasswordHash;
-}
-
-@online
-@command([LoginCreated, PatronCreated])
-model CreateLogin {
-  patron: Uuid;
-  username: User;
-  password: NewPassword;
-}
-
-model LoginCreated {
-  patron: Uuid;
-  login: string;
-  display: string;
-  password: PasswordHash;
-}
-
-model PatronCreated {
-  patron: Uuid;
-  display: string;
-}
-
-@online
-@command(PasswordChanged)
-model ChangePassword {
-  patron: Uuid;
-  // CommandAuth could be the existing password, or the TOTP token, or something,
-  // but Go has to match it against what lookup() returns or it will be rejected.
-  check: CommandAuth;
-  new: NewPassword;
-}
-
-model PasswordChanged {
-  patron: Uuid;
-  password: PasswordHash;
-}
-
-@online
-@command([LoginDeleted, PatronDeleted])
-model DeleteLogin {
-  patron: Uuid;
-  check: CommandAuth;
-}
-
-model LoginDeleted {
-  patron: Uuid;
-}
-
-model PatronDeleted {
-  patron: Uuid;
-}
 
 //////////////////
 // The Database //
@@ -420,20 +515,20 @@ model PatronDeleted {
 interface LibraryDB extends Database<
   [UserEngine, AdminEngine],
   [LoginSlice],
-  SystemCommands
+  DatabaseCommands
 > {}
 
-union SystemCommands = OverdueCheckout;
+union DatabaseCommands {
+  // the daily sweep, sent by the Tick once it exists
+  ExpireHold,
+  OverdueCheckout,
+  // sent before signing in, when there is no Engine to send them
+  CreateAccount,
+}
 
 /////////////////
 // Query Layer //
 /////////////////
-
-model AdminPatronInfo {
-  id: Uuid;
-  name: string;
-  researcher: boolean;
-};
 
 model AdminBookInfo {
   id: string;
@@ -452,8 +547,16 @@ model AdminEditionInfo {
 
 interface AdminQueries extends Queries {
   allPatronIds(): Uuid[];
-  allPatrons(): AdminPatronInfo[];
+  allPatrons(): Patron[];
   allEditions(): AdminEditionInfo[];
+}
+
+model UserCheckoutInfo {
+  id: Uuid;
+  book: Uuid;
+  title: string;
+  expires: utcDateTime;
+  overdue: boolean;
 }
 
 model UserBookInfo {
@@ -461,13 +564,16 @@ model UserBookInfo {
   title: string;
   availableNormal: int32;
   availableRestricted: string[];
-  hold: VHold | null;
+  hold: PatronHold | null;
 }
 
+// the patron profile: their current holds, and their current checkouts including overdue ones
 model UserPatronInfo {
   name: string;
   researcher: boolean;
-};
+  holds: PatronHold[];
+  checkouts: UserCheckoutInfo[];
+}
 
 interface UserQueries extends Queries {
   allBooks(): UserBookInfo[];
