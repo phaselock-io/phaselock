@@ -2,16 +2,16 @@
 
 import { describe, expect, test } from 'vitest';
 
-import { DEV, JS, type QueryAnswer } from '../../../ts/assets/skeleton.ts';
+import { DEV } from '../../../ts/assets/skeleton.ts';
 
 import {
   type Blob,
   bootstrap,
   type Forecaster,
-  type Rig,
   rig,
   settle,
   type State,
+  watch,
 } from './harness.ts';
 
 const patrons: Blob = {
@@ -19,24 +19,6 @@ const patrons: Blob = {
   seqs: { 'patron.p1': 2 },
   values: [['patron.p1/state', { count: 2, fields: { tags: ['a'] } }]],
 };
-
-/** the value a store answer carries for a key */
-function stateOf(a: QueryAnswer, key: string): State | undefined {
-  const res = a.store[key];
-  if (!('value' in res)) return undefined;
-  return (res.value as Record<number, unknown> | undefined)?.[JS] as State | undefined;
-}
-
-/** a query on patron.p1's state, collecting every value delivered */
-function watch(r: Rig): (State | undefined)[] {
-  const values: (State | undefined)[] = [];
-  const q = r.engine.newQuery(function* () {
-    const a = (yield { store: { 'patron.p1/state': { type: 'state', want: JS } } }) as QueryAnswer;
-    return stateOf(a, 'patron.p1/state');
-  });
-  q.subscribe((v) => values.push(v));
-  return values;
-}
 
 describe('dev mode', () => {
   test('the suite runs in dev mode', () => {
@@ -46,7 +28,7 @@ describe('dev mode', () => {
   test('a query result is read-only, and the throw names the key and the property', async () => {
     const r = rig();
     await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
-    const values = watch(r);
+    const { values } = watch(r, 'patron.p1');
     await settle();
     const v = values[0]!;
     const fields = v.fields as { tags: string[] };
@@ -67,15 +49,13 @@ describe('dev mode', () => {
   });
 
   test('a forecast that mutates what it read throws, so it forecasts nothing', async () => {
-    const forecaster: Forecaster = function* () {
-      const ask = { store: { 'patron.p1/state': { type: 'state', want: JS } } };
-      const a = (yield ask) as QueryAnswer;
-      stateOf(a, 'patron.p1/state')!.count++;
+    const forecaster: Forecaster = (qx) => {
+      (qx.get('patron.p1/state', 'state') as State).count++;
       return [{ stream: 'patron.p1', event: { id: 'p1', type: 'bump' } }];
     };
     const r = rig({ forecaster });
     await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
-    const values = watch(r);
+    const { values } = watch(r, 'patron.p1');
     await settle();
     r.engine.sendCommands([{}]);
     await settle();

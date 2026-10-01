@@ -958,29 +958,81 @@ export class ExternalStore implements Store {
 
 // reducers /////////////////////////////////////////////////////////////////
 
-/** ReducerTxn is what a slice reducer reads and writes through, inside the Engine's transaction:
-    rich JS values by key and type.  A reducer owns what it gets, and what it sets is the store's
-    from that call on. */
-export interface ReducerTxn {
-  /** the value at key, undefined when absent */
+/** ReadTxn is what a query, a forecast, or precommit reads through: rich JS values by key and type,
+    undefined for an absent key. */
+export interface ReadTxn {
   get(key: string, type: string): unknown;
+}
+
+/** ReducerTxn is what a slice reducer reads and writes through, inside the Engine's transaction.
+    Its keys are local to one stream: the Engine prefixes `{stream}/`, so a reducer cannot name a
+    key outside its own stream.  A reducer owns what it gets, and what it sets is the store's from
+    that call on. */
+export interface ReducerTxn extends ReadTxn {
   set(key: string, type: string, value: unknown): void;
   del(key: string): void;
 }
 
-// a ReducerTxn over a store transaction, adding every key it writes to updates
-function reducerTxn(txn: WTxn, updates: string[]): ReducerTxn {
+// a ReducerTxn over a store transaction for one stream's keys, adding every key it writes to
+// updates
+function reducerTxn(txn: WTxn, stream: string, updates: string[]): ReducerTxn {
+  const prefix = `${stream}/`;
   return {
-    get: (key, type) => txnGet(txn, key, type),
+    get: (key, type) => txnGet(txn, prefix + key, type),
     set(key, type, value) {
-      txn.set(key, type, { [JS]: value });
-      updates.push(key);
+      txn.set(prefix + key, type, { [JS]: value });
+      updates.push(prefix + key);
     },
     del(key) {
-      txn.del(key);
-      updates.push(key);
+      txn.del(prefix + key);
+      updates.push(prefix + key);
     },
   };
+}
+
+// authorization //////////////////////////////////////////////////////////////
+
+/** A precommit handler rejects a command by throwing a Reject, whose reason goes back to the
+    client.  Any other throw is a bug, answered with a generic rejection. */
+export class Reject extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = 'Reject';
+  }
+}
+
+/** who sent a command, as their token proves it; user is null for the anonymous principal */
+export type Principal = { user: string | null; traits: string[] };
+
+/** Auth is what a precommit handler authorizes through.  Each call gets a fresh one, and the
+    caller rejects a handler that returns without an authorization decision, so authorization fails
+    closed.  It carries the principal, so precommit can hand it on wherever a Principal is wanted. */
+export class Auth implements Principal {
+  readonly user: string | null;
+  readonly traits: string[];
+  #authorized: boolean = false;
+
+  constructor(principal: Principal) {
+    this.user = principal.user;
+    this.traits = principal.traits;
+  }
+
+  /** whether the call has been authorized so far */
+  get authorized(): boolean {
+    return this.#authorized;
+  }
+
+  /** authorize the call when the condition holds, and reject it otherwise */
+  authorize(condition: boolean, reason: string = 'unauthorized'): void {
+    if (!condition) throw new Reject(reason);
+    this.#authorized = true;
+  }
+
+  /** authorize the call for anyone, anonymous included: the one unconditional decision, so an
+      open command is visible in code */
+  authorizeAnyone(): void {
+    this.#authorized = true;
+  }
 }
 
 // queries ////////////////////////////////////////////////////////////////////
@@ -988,12 +1040,12 @@ function reducerTxn(txn: WTxn, updates: string[]): ReducerTxn {
 /* Example query for loading all comments in a topic:
 
       let myTopic = ...;
-      const q = engine.newQuery(function*(qx: QX) => {
-        const uuids = yield* qx.get.topicComments(myTopic);
+      const q = engine.newQuery((qx: QX) => {
+        const uuids = qx.get.topicComments(myTopic);
         const comments = {};
         const toplevels = [];
         for (const uuid of uuids) {
-          comments[uuid] = yield* qx.get.comments(uuid);
+          comments[uuid] = qx.get.comments(uuid);
           if (!comment.parent) toplevels.push(uuid);
         }
         return {comments, toplevels};
@@ -1007,107 +1059,41 @@ export interface Query<T> {
   latest: T | undefined;
   /** subscribe returns an unsubscribe function */
   subscribe(callback: (val: T) => void): () => void;
-  /** close will stop the query from running again.
-      Dependent queries which are not also closed will start crashing. */
+  /** close will stop the query from running again */
   close(): void;
 }
 
-/** LocalQuery extends Query with the ability to compose queries by calling awaitResult() inside a
-    QueryFunction body.  This isn't possible with typespec-defined Queries, which can only handle
-    json-serializable args, not references to existing Query objects. */
-export interface LocalQuery<T> extends Query<T> {
-  /** awaitResult has no effect when executed outside of a query function */
-  awaitResult(): QueryGenerator<T>;
-}
+/** A QueryFunction reads through its query context and returns its result.  It runs to completion
+    in one call, so the graph records every key it reads, and runs it again only when one of those
+    keys changes. */
+export type QueryFunction<QX, T> = (qx: QX) => T;
 
-export type QueryQuestion = {
-  // which keys to look up in the store
-  store?: Record<string, StoreDecoder>;
-  // which query ids to await their result
-  query?: Record<string, true>;
-};
-
-/** a store lookup's answer to a query */
-export type StoreResult = { value: StoreValue | undefined } | { err: Error };
-
-/** A LookupGenerator is a graph run or a forecast as the Engine drives it: each step yields the
-    keys it is blocked on, and runLookups answers them together from a read transaction. */
-export type Lookups = { get: Record<string, { type: string; want: Wants }> };
-export type LookupAnswers = { get: Record<string, StoreResult> };
-export type LookupGenerator<T> = Generator<Lookups, T, LookupAnswers>;
-
-/** run g to completion against txn; a store failure throws out of it */
-export function runLookups<T>(txn: RTxn, g: LookupGenerator<T>): T {
-  let step = g.next({ get: {} });
-  while (!step.done) {
-    const get: Record<string, StoreResult> = {};
-    for (const [key, { type, want }] of Object.entries(step.value.get)) {
-      get[key] = { value: txn.get(key, type, want) };
-    }
-    step = g.next({ get });
-  }
-  return step.value;
-}
-
-// in dev mode a query reads through a read-only proxy, so a mutation of a result throws where it
-// happens, naming the key; the JS representation is the one the app touches
-function readOnlyResult(result: StoreResult, key: string): StoreResult {
-  if (!('value' in result) || result.value === undefined || !(JS in result.value)) return result;
-  return { value: { ...result.value, [JS]: readOnly(result.value[JS], key) } };
-}
-
-export type QueryAnswer = {
-  // the value for each store lookup
-  store: Record<string, StoreResult>;
-  // the {result, dirty} for each asked query
-  query: Record<string, { result: unknown; dirty: boolean }>;
-};
-
-export type QueryGenerator<T> = Generator<QueryQuestion, T, QueryAnswer>;
-
-export type QueryFunction<QX, T> = (qx: QX) => QueryGenerator<T>;
-
-// graph-facing api, which hides typing info from the graph
-interface QueryWrapper<QX> {
-  // the id of this query
-  id: string;
-  closed: boolean; // TODO: somehow use this to fail dependent queries after a query is closed
-  // returns `{result, dirty}` indicating if the result and if it changed
-  run(
-    qx: QX,
-    commitKeys: Record<string, true>,
-  ): QueryGenerator<{ result: unknown; dirty: boolean }>;
-  // call subscribers with the latest result
-  notify(): void;
+// A ReadTxn over a store transaction, adding every key it reads to keys when given.  In dev mode
+// what it hands out is a read-only proxy, so a mutation of a result throws where it happens,
+// naming the key; the JS representation is the one the app touches.
+function readTxn(txn: RTxn, keys?: Record<string, true>): ReadTxn {
+  return {
+    get(key, type) {
+      if (keys !== undefined) keys[key] = true;
+      const value = txnGet(txn, key, type);
+      return DEV ? readOnly(value, key) : value;
+    },
+  };
 }
 
 class QueryImpl<QX, T> {
-  id: string;
   latest: T | undefined = undefined;
   closed: boolean = false;
 
   #subs: ((val: T) => void)[] = [];
-
-  // {key: true}
+  #fn: QueryFunction<QX, T>;
+  // the keys the last run read: {key: true}
   #keyDeps: Record<string, true> = {};
-  // {query_id: true}
-  #queryDeps: Record<string, true> = {};
   #runs: number = 0;
   #result: T | undefined = undefined;
-  #fn: (qx: QX) => QueryGenerator<T>;
 
-  constructor(id: string, fn: QueryFunction<QX, T>) {
-    this.id = id;
+  constructor(fn: QueryFunction<QX, T>) {
     this.#fn = fn;
-  }
-
-  // part of public api
-  *awaitResult(): QueryGenerator<T> {
-    // don't try to coordinate our own #result vaule with the graph being executed; just use this as
-    // an idiomatic way to ask the graph run for the result from our .id.
-    const ans = yield { query: { [this.id]: true } };
-    const { result } = ans.query[this.id];
-    return result as T;
   }
 
   // part of public api
@@ -1125,69 +1111,22 @@ class QueryImpl<QX, T> {
     this.closed = true;
   }
 
-  *#shouldSkip(commitKeys: Record<string, true>): QueryGenerator<boolean> {
-    if (this.#runs === 1) {
-      // this is our first time; always run
-      return false;
-    }
+  /** run against txn, unless it has run before and read no key in dirty; answers whether its
+      result changed */
+  run(txn: RTxn, context: (txn: ReadTxn) => QX, dirty: Record<string, true>): boolean {
+    // a query that read nothing which changed keeps its result
+    if (this.#runs > 0 && !Object.keys(this.#keyDeps).some((k) => k in dirty)) return false;
 
-    // check if a key dependency was updated
-    for (const key of Object.keys(this.#keyDeps)) {
-      if (key in commitKeys) return false;
-    }
-
-    // check if any query dependency changed its result
-    for (const qid of Object.keys(this.#queryDeps)) {
-      const ans = yield { query: { [qid]: true } };
-      const { dirty } = ans['query'][qid];
-      if (dirty) return false;
-    }
-
-    return true;
-  }
-
-  // part of graph api
-  *run(
-    qx: QX,
-    commitKeys: Record<string, true>,
-  ): QueryGenerator<{ result: unknown; dirty: boolean }> {
-    // shift current values to old values
-    const oldResult = this.#result;
+    // run it, recording the keys it reads
+    const keys: Record<string, true> = {};
+    const old = this.#result;
+    this.#result = this.#fn(context(readTxn(txn, keys)));
+    this.#keyDeps = keys;
     this.#runs++;
-
-    if (yield* this.#shouldSkip(commitKeys)) {
-      return { result: this.#result, dirty: false };
-    }
-
-    // rebuild deps
-    this.#keyDeps = {};
-    this.#queryDeps = {};
-
-    const g = this.#fn(qx);
-    let ans: QueryAnswer = { query: {}, store: {} };
-    // run query function to completion
-    while (true) {
-      // pass the current answer to the coroutine
-      const { value, done } = g.next(ans);
-      if (done) {
-        this.#result = value;
-        const dirty = this.#runs === 1 || this.#result !== oldResult;
-        return { result: this.#result, dirty };
-      }
-      // capture dependencies before yielding up to the graph for answers
-      // {store: {store_key: true}, query: {query_id: true}}
-      for (const key of Object.keys(value.store ?? {})) {
-        this.#keyDeps[key] = true;
-      }
-      for (const qid of Object.keys(value.query ?? {})) {
-        this.#queryDeps[qid] = true;
-      }
-      // let the graph provide answers
-      ans = yield value;
-    }
+    return this.#runs === 1 || this.#result !== old;
   }
 
-  // part of graph api
+  // call subscribers with the latest result
   notify(): void {
     if (this.closed) return;
     for (const sub of this.#subs) {
@@ -1197,152 +1136,26 @@ class QueryImpl<QX, T> {
   }
 }
 
-/* GraphRun represents one run of the QueryGraph.  Having it as a separate object rather than a
-   single generator function (as it once was written) allows a graph to be extended if new queries
-   arrive */
-class GraphRun<QX> {
-  #qx: QX;
-  // {key: true}
-  #commitKeys: Record<string, true>;
-
-  // the {result, dirty} of queries which have ran
-  // {query_id: {result, dirty}}
-  #ran: Record<string, { result: unknown; dirty: boolean }> = {};
-
-  constructor(qx: QX, commitKeys: Record<string, true>) {
-    this.#qx = qx;
-    this.#commitKeys = commitKeys;
-  }
-
-  // Run the query graph to completion.
-  //
-  // run() may be called once after construction against all existing queries, then may be called
-  // additional times as new queries are added to the QueryGraph.
-  // yields: list of keys, returns callback for users, receives: map of keys to values
-  *run(queries: QueryWrapper<QX>[]): LookupGenerator<() => void> {
-    // freeze current query list, in case our caller ever gives us something they intend to mutate
-    queries = [...queries];
-
-    // every query which is currently running
-    // {query_id: generator}
-    const active: Record<string, QueryGenerator<{ result: unknown; dirty: boolean }>> = {};
-    // a record of {query_id: answer} to feed to coroutines
-    let runnable: Record<string, QueryAnswer> = {};
-    // which queries are unblocked by a given answer
-    // {answer_key: query_id[]}
-    const wantAnswers: Record<string, [StoreDecoder, string[]]> = {};
-    // which queries are unblocked by a given query result
-    // {query_id: query_id[]}
-    const wantResults: Record<string, string[]> = {};
-
-    // start every query in parallel
-    for (const q of queries) {
-      const g = q.run(this.#qx, this.#commitKeys);
-      active[q.id] = g;
-      // provide a phony first answer to start the generator off
-      runnable[q.id] = { store: {}, query: {} };
-    }
-
-    // run the graph to completion
-    while (true) {
-      // run runnables until we run out; each runnable may unlock other runnables
-      while (true) {
-        const answers = Object.entries(runnable);
-        if (answers.length === 0) break;
-        runnable = {};
-        for (const [qid, ans] of answers) {
-          const { value, done } = active[qid].next(ans);
-          if (done) {
-            // query finished
-            delete active[qid];
-            const result = value;
-            this.#ran[qid] = result;
-            // unblock anybody waiting for this result
-            const waiting = wantResults[qid];
-            if (waiting !== undefined) {
-              delete wantResults[qid];
-              for (const id of waiting) {
-                setdefault(runnable, id, { query: {}, store: {} }).query[qid] = result;
-              }
-            }
-            continue;
-          }
-          // query is blocked; handle its store and query questions
-          for (const [key, decoder] of Object.entries(value.store ?? {})) {
-            setdefault(wantAnswers, key, [decoder, []])[1].push(qid);
-          }
-          for (const id of Object.keys(value.query ?? {})) {
-            // has this query ran yet?
-            if (id in this.#ran) {
-              // we already have this result
-              setdefault(runnable, qid, { query: {}, store: {} }).query[id] = this.#ran[id];
-            } else {
-              // wake this query up when the other query finishes
-              setdefault(wantResults, id, []).push(qid);
-            }
-          }
-        }
-      }
-
-      // are we all done?
-      if (Object.keys(active).length === 0) break;
-
-      // send all pending questions to the store
-      const gets: Record<string, StoreDecoder> = {};
-      for (const [key, [decoder]] of Object.entries(wantAnswers)) {
-        gets[key] = decoder;
-      }
-      const answers = (yield { get: gets }).get;
-
-      // process answers
-      const answerEntries = Object.entries(answers);
-      if (answerEntries.length === 0) {
-        throw new Error('empty answer');
-      }
-      for (const [key, value] of answerEntries) {
-        const shared = DEV ? readOnlyResult(value, key) : value;
-        for (const qid of wantAnswers[key][1]) {
-          setdefault(runnable, qid, { query: {}, store: {} }).store[key] = shared;
-        }
-        delete wantAnswers[key];
-      }
-    }
-
-    // return a callback to notify query subscribers
-    return () => {
-      for (const q of queries) {
-        const { dirty } = this.#ran[q.id];
-        if (dirty) q.notify();
-      }
-    };
-  }
-}
-
-/** QueryGraph is responsible for tracking queries generated by the UI and rerunning them when new
-    data is present.  It tracks dependencies of a query function by injecting a query context, which
-    provides the actual key-value lookup capability to the function.  It is informed of changes to
-    the store by the Midend, such as some keys being updated by the UI, keys of an old overlay being
-    discarded, or new forecast data from the UI itself. */
+/** QueryGraph tracks the app's queries and runs them again when keys they read change.  Each query
+    runs over a read transaction that records its keys, through the query context the Engine's
+    context factory builds over it.  The Engine tells it which keys changed: keys written by real
+    events, keys of an overlay being discarded, and keys a new forecast wrote. */
 export class QueryGraph<QX> {
-  #qx: QX;
+  #context: (txn: ReadTxn) => QX;
+  // the keys changed since the last run: {key: true}
   #dirty: Record<string, true> = {};
-  #queries: Record<string, QueryWrapper<QX>> = {};
-  #newQueries: QueryWrapper<QX>[] = [];
-  #id: number = 1;
+  #queries: QueryImpl<QX, unknown>[] = [];
+  // queries added since the last run, which have never run
+  #newQueries: QueryImpl<QX, unknown>[] = [];
 
-  #run: GraphRun<QX>;
-
-  constructor(qx: QX) {
-    this.#qx = qx;
-    // start with an empty graphrun
-    this.#run = new GraphRun(this.#qx, {});
+  constructor(context: (txn: ReadTxn) => QX) {
+    this.#context = context;
   }
 
-  newQuery<T>(fn: QueryFunction<QX, T>): LocalQuery<T> {
-    const id = `${this.#id++}`;
-    const q = new QueryImpl(id, fn);
-    this.#queries[id] = q;
-    this.#newQueries.push(q);
+  newQuery<T>(fn: QueryFunction<QX, T>): Query<T> {
+    const q = new QueryImpl<QX, T>(fn);
+    this.#queries.push(q as QueryImpl<QX, unknown>);
+    this.#newQueries.push(q as QueryImpl<QX, unknown>);
     return q;
   }
 
@@ -1352,50 +1165,33 @@ export class QueryGraph<QX> {
     }
   }
 
-  *run(): LookupGenerator<() => void> {
-    // start a new graph run
-    const commitKeys = this.#dirty;
+  /** run every open query whose keys changed, and return a callback that notifies the subscribers
+      of every query whose result changed */
+  run(txn: RTxn): () => void {
+    const dirty = this.#dirty;
     this.#dirty = {};
-    this.#run = new GraphRun(this.#qx, commitKeys);
 
     // #newQueries are already in #queries, so they're no longer new
     this.#newQueries = [];
 
     // discard closed queries and run all the rest
-    const queries: QueryWrapper<QX>[] = [];
-    for (const [qid, q] of Object.entries(this.#queries)) {
-      if (q.closed) {
-        delete this.#queries[qid];
-      } else {
-        queries.push(q);
-      }
-    }
-    return yield* this.#execute(queries);
+    this.#queries = this.#queries.filter((q) => !q.closed);
+    return this.#execute(txn, this.#queries, dirty);
   }
 
-  *extend(): LookupGenerator<() => void> {
-    // extend an existing graph run with only new queries
+  /** run only the queries added since the last run */
+  extend(txn: RTxn): () => void {
+    // extend an existing run with only new queries
     const queries = this.#newQueries;
     this.#newQueries = [];
-    return yield* this.#execute(queries);
+    return this.#execute(txn, queries, {});
   }
 
-  *#execute(queries: QueryWrapper<QX>[]): LookupGenerator<() => void> {
-    /* TODO: put a graph-wide store cache here.  We can keep a new cache and an old cache.  When
-       the new cache is hit we return it immediately.  When the old cache is hit, we pop from old,
-       place in new, then return.  When we start a new graph run we discard the old old, make the
-       old new into the new old, and create a new, empty new.   We'll need something like the
-       while loop in GraphRun to return partial answers until we are fully blocked.
-
-       Additional ideas might be:
-         - grant individual lookups a cache control flag (true/false/undefined)
-         - allow configuring the graph-wide query default cache disposition (true/false)
-         - maybe a frequent use cache mode, where we track stats of key lookup usage and cache
-           the most frequently used keys
-         - nah, just let the cache be a configurable extra layer.  Too many ways to do it.
-         - probably force yourself to skip this for now.
-    */
-    return yield* this.#run.run(queries);
+  #execute(txn: RTxn, queries: QueryImpl<QX, unknown>[], dirty: Record<string, true>): () => void {
+    const changed = queries.filter((q) => q.run(txn, this.#context, dirty));
+    return () => {
+      for (const q of changed) q.notify();
+    };
   }
 }
 
@@ -1658,9 +1454,13 @@ export function decodeDbEvent<T>(val: any, subdecoder: (val: any) => T): DbEvent
                                   is, moved to {key} when the backfill lands
 */
 /** one slice's reducer, keyed by stream prefix in the Engine's table.  The Engine calls it with a
-    run of one stream's events, in order, inside the transaction that brings them in. */
+    run of one stream's events, in order, inside the transaction that brings them in, through a
+    ReducerTxn over that stream's own keys.  `pending` is true when the events are a forecast
+    folded onto the overlay, and false for real events folded onto the base, so a reducer may mark
+    what it writes as pending; the base, the only state ever stored or synced, is always folded
+    with false. */
 export type SliceReducer = {
-  reducer: (txn: ReducerTxn, events: unknown[]) => void;
+  reducer: (txn: ReducerTxn, events: unknown[], stream: string, pending: boolean) => void;
 };
 
 /** the view, as persisted at /view when a reconciliation commits */
@@ -1742,11 +1542,12 @@ export function parsePark(key: string): { stream: string; seq: number } {
   return { stream: key.slice('/park.ev.'.length, slash), seq: Number(key.slice(slash + 1)) };
 }
 
-/** the app's forecast of the events a command will produce, by stream; a string is a rejection */
-export type Forecaster<QX, C> = (
-  qx: QX,
-  command: C,
-) => QueryGenerator<{ stream: string; event: unknown }[] | string>;
+/** one thing a forecast emits: an event labelled with its stream, or the end of a stream */
+export type ForecastOutput = { stream: string; event: unknown } | { stream: string; death: true };
+
+/** the app's forecast of what the database will do with a command, read through the query context
+    over the overlay; a throw, a Reject included, forecasts nothing */
+export type Forecaster<QX, C> = (qx: QX, command: C) => ForecastOutput[];
 
 /** what the connector delivered, in arrival order */
 type Inbound =
@@ -1833,11 +1634,11 @@ export class Engine<QX, C> {
   #newQueries: boolean = false;
   // every new connection resends the outbox
   #resend: boolean = false;
-  // the query context, handed to every query and every forecast
-  #qx: QX;
+  // builds the query context, handed to every query and every forecast, over a read transaction
+  #context: (txn: ReadTxn) => QX;
 
   constructor(
-    qx: QX,
+    context: (txn: ReadTxn) => QX,
     // if store is null, InMemStore is used
     store: Store | null,
     reg: Registry,
@@ -1847,8 +1648,8 @@ export class Engine<QX, C> {
       reducers: Record<string, SliceReducer>;
       // injected by generated subclass: the refs of the shards the engine declares
       wants: string[];
-      // optional: forecast the events the server will mint for a command, by stream, reading the
-      // state the earlier outbox commands leave; a string is a rejection
+      // optional: forecast what the database will do with a command, reading the state the
+      // earlier outbox commands leave
       forecaster?: Forecaster<QX, C>;
       // optional: ends the Engine, its connector, and every backfill
       signal?: AbortSignal;
@@ -1857,7 +1658,7 @@ export class Engine<QX, C> {
       onError?: (e: unknown) => void;
     },
   ) {
-    this.#qx = qx;
+    this.#context = context;
     this.#store = store ?? new InMemStore(reg);
     this.#reg = reg;
     this.#connect = connect;
@@ -1873,7 +1674,7 @@ export class Engine<QX, C> {
     this.#signal.addEventListener('abort', () => this.#schedule(), { once: true });
 
     this.#overlay = new OverlayStore(this.#store, reg);
-    this.#graph = new QueryGraph(qx);
+    this.#graph = new QueryGraph(context);
 
     // let the advancer begin initializing
     this.#run();
@@ -1895,7 +1696,7 @@ export class Engine<QX, C> {
   }
 
   /** add a new Query to the graph */
-  newQuery<T>(fn: QueryFunction<QX, T>): LocalQuery<T> {
+  newQuery<T>(fn: QueryFunction<QX, T>): Query<T> {
     this.#newQueries = true;
     this.#schedule();
     return this.#graph.newQuery(fn);
@@ -2160,7 +1961,7 @@ export class Engine<QX, C> {
   #onNewQueries(): void {
     const cbs = this.#overlay.read((txn) => {
       this.#newQueries = false;
-      return runLookups(txn, this.#graph.extend());
+      return this.#graph.extend(txn);
     });
     cbs();
   }
@@ -2657,7 +2458,7 @@ export class Engine<QX, C> {
     // reduce the pending events, if any
     const reduce = () => {
       if (data.length === 0) return;
-      slice.reducer(reducerTxn(txn, dirty), data);
+      slice.reducer(reducerTxn(txn, stream, dirty), data, stream, false);
       data = [];
     };
 
@@ -3063,44 +2864,32 @@ export class Engine<QX, C> {
     // forecast each outbox command, each seeing what the ones before it left
     const forecaster = this.#forecaster;
     if (forecaster !== null && this.#outbox.size > 0) {
-      const updates = this.#overlay.write((txn) => {
-        const dirty: string[] = [];
-        const rows = txnScanAll(
-          txn,
-          prefixRange('/command.', 1000, { type: '.command', want: JS }),
-        );
-        for (const [, value] of rows) {
-          const command = (value as Record<number, unknown>)[JS] as Command<Uint8Array>;
+      const rows = this.#store.read((txn) =>
+        txnScanAll(txn, prefixRange('/command.', 1000, { type: '.command', want: JS })),
+      );
+      for (const [, value] of rows) {
+        const command = (value as Record<number, unknown>)[JS] as Command<Uint8Array>;
 
-          // a command this vocabulary cannot read is still sent; it just forecasts nothing
-          const data = this.#commandData(command.data);
-          if (data === undefined) continue;
+        // a command this vocabulary cannot read is still sent; it just forecasts nothing
+        const data = this.#commandData(command.data);
+        if (data === undefined) continue;
 
-          // a reason, or a throw, forecasts nothing: the command is in flight, the server decides
-          const forecast = runLookups(txn, this.#runForecast(forecaster(this.#qx, data)));
-          if (typeof forecast === 'string') continue;
-
-          // reduce the forecast events per stream through the slice reducers
-          const runs = new Map<string, unknown[]>();
-          for (const { stream, event } of forecast) {
-            if (!runs.has(stream)) runs.set(stream, []);
-            runs.get(stream)!.push(event);
-          }
-          for (const [stream, events] of runs) {
-            const slice = this.#reducers[stream.split('.')[0]];
-            if (slice === undefined) continue;
-            slice.reducer(reducerTxn(txn, dirty), events);
-          }
+        /* Each command forecasts in its own overlay transaction, so a throw cancels its events
+           alone.  A throw from the forecast is its way of forecasting nothing; a reducer can also
+           throw on correct code, when real events have moved the base underneath a forecast that
+           no longer applies.  Either way the command is in flight and the server decides. */
+        try {
+          this.#graph.dirty(this.#overlay.write((txn) => this.#forecastIn(txn, forecaster, data)));
+        } catch {
+          continue;
         }
-        return dirty;
-      });
-      this.#graph.dirty(updates);
+      }
     }
 
     // run the graph, new queries included
     const cbs = this.#overlay.read((txn) => {
       this.#newQueries = false;
-      return runLookups(txn, this.#graph.run());
+      return this.#graph.run(txn);
     });
     cbs();
   }
@@ -3116,30 +2905,36 @@ export class Engine<QX, C> {
     }
   }
 
-  // drives a forecast's query generator against the overlay; a throw from the forecast itself is
-  // a reason, and a forecast cannot await another query
-  *#runForecast<T>(g: QueryGenerator<T | string>): LookupGenerator<T | string> {
-    let ans: QueryAnswer = { store: {}, query: {} };
-    for (;;) {
-      // only the forecast's own step may throw; a store failure ends the Engine as usual
-      let step: IteratorResult<QueryQuestion, T | string>;
-      try {
-        step = g.next(ans);
-      } catch (e: unknown) {
-        return `forecast threw: ${String(e)}`;
-      }
-      if (step.done) return step.value;
-      if (Object.keys(step.value.query ?? {}).length > 0) {
-        throw new Error('a forecast awaited a query');
-      }
+  // one command's forecast folded onto the overlay: each run of consecutive events on one stream
+  // goes through its slice's reducer as pending, and a death drops the stream's keys; returns the
+  // keys it changed
+  #forecastIn(txn: WTxn, forecaster: Forecaster<QX, C>, command: C): string[] {
+    const dirty: string[] = [];
+    let stream = '';
+    let run: unknown[] = [];
 
-      // answer its store questions from the overlay
-      const got = (yield { get: step.value.store ?? {} }).get;
-      if (DEV) {
-        for (const key of Object.keys(got)) got[key] = readOnlyResult(got[key], key);
+    // reduce the pending run; a family with no reducer forecasts nothing
+    const flush = () => {
+      if (run.length === 0) return;
+      const slice = this.#reducers[stream.split('.')[0]];
+      if (slice !== undefined) slice.reducer(reducerTxn(txn, stream, dirty), run, stream, true);
+      run = [];
+    };
+
+    for (const out of forecaster(this.#context(readTxn(txn)), command)) {
+      if (out.stream !== stream) {
+        flush();
+        stream = out.stream;
       }
-      ans = { store: got, query: {} };
+      if ('death' in out) {
+        flush();
+        dirty.push(...txn.delPrefix(`${stream}/`));
+      } else {
+        run.push(out.event);
+      }
     }
+    flush();
+    return dirty;
   }
 
   // ends everything the Engine drives; nothing is persisted, since the store is already consistent

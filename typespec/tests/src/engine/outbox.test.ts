@@ -2,13 +2,7 @@
 
 import { describe, expect, test } from 'vitest';
 
-import {
-  type Command,
-  type CommandResult,
-  JS,
-  type LocalQuery,
-  type QueryAnswer,
-} from '../../../ts/assets/skeleton.ts';
+import { type Command, type CommandResult, Reject } from '../../../ts/assets/skeleton.ts';
 
 import {
   type Blob,
@@ -26,6 +20,7 @@ import {
   settle,
   type State,
   state,
+  watch,
 } from './harness.ts';
 
 /** a test command: what the forecast should do with it */
@@ -35,28 +30,18 @@ type Cmd = {
   stream?: string;
   reason?: true;
   throws?: true;
-  awaitsQuery?: true;
   reads?: true;
   ghost?: true;
 };
 
 /** forecasts a `set` on patron.p1 (or the named stream), or misbehaves as the command asks */
-const forecaster: Forecaster = function* (_qx, command) {
+const forecaster: Forecaster = (qx, command) => {
   const cmd = command as Cmd;
-  if (cmd.reason) return 'not this time';
+  if (cmd.reason) throw new Reject('not this time');
   if (cmd.throws) throw new Error('forecast boom');
-  if (cmd.awaitsQuery) {
-    yield { query: { x: true } };
-    return [];
-  }
   if (cmd.ghost) return [{ stream: 'ghost.g1', event: { id: 'g1', type: 'bump' } }];
   if (cmd.reads) {
-    const a = (yield { store: { 'patron.p1/state': { type: 'state', want: JS } } }) as QueryAnswer;
-    const res = a.store['patron.p1/state'];
-    const st =
-      'value' in res
-        ? ((res.value as Record<number, unknown> | undefined)?.[JS] as State | undefined)
-        : undefined;
+    const st = qx.get('patron.p1/state', 'state') as State | undefined;
     const seen = JSON.stringify(st?.fields ?? {});
     return [{ stream: 'patron.p1', event: { id: 'p1', type: 'set', field: 'seen', value: seen } }];
   }
@@ -79,24 +64,6 @@ async function held(server = new FakeServer()): Promise<Rig> {
   const r = rig({ forecaster, server });
   await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
   return r;
-}
-
-/** a query on a stream's state, collecting every value delivered */
-function watch(
-  r: Rig,
-  stream: string,
-): { values: (State | undefined)[]; q: LocalQuery<State | undefined> } {
-  const values: (State | undefined)[] = [];
-  const key = `${stream}/state`;
-  const q = r.engine.newQuery(function* () {
-    const a = (yield { store: { [key]: { type: 'state', want: JS } } }) as QueryAnswer;
-    const res = a.store[key];
-    return 'value' in res
-      ? ((res.value as Record<number, unknown> | undefined)?.[JS] as State | undefined)
-      : undefined;
-  });
-  q.subscribe((v) => values.push(v));
-  return { values, q };
 }
 
 type SendCall = {
@@ -351,7 +318,7 @@ describe('forecasts', () => {
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1, seen: '{"a":1}' } });
   });
 
-  test('a reason adds nothing; a family with no reducer adds nothing', async () => {
+  test('a rejection adds nothing; a family with no reducer adds nothing', async () => {
     const r = await held();
     const w = watch(r, 'patron.p1');
     await settle();
@@ -360,12 +327,6 @@ describe('forecasts', () => {
     expect(outbox(r.data).length).toBe(2);
     expect(w.values.at(-1)).toEqual({ count: 2, fields: {} });
     expect(keys(r.data, 'ghost')).toEqual([]);
-  });
-
-  test('a forecast that awaits a query ends the Engine', async () => {
-    const r = await held();
-    r.engine.sendCommands([{ awaitsQuery: true }]);
-    await expect(settle()).rejects.toThrow(/awaited a query/);
   });
 
   test('a dropped command rebuilds the overlay and runs the graph even while frozen', async () => {

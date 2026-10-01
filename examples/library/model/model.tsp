@@ -294,7 +294,7 @@ union PatronEvents {
   PatronCheckoutOpened,
   PatronCheckoutEnded,
   PatronCheckoutOverdue,
-  DismissNotice,
+  PatronDismissNotice,
 }
 
 model PatronCreated {
@@ -357,12 +357,12 @@ model PatronCheckoutOverdue {
   id: Uuid;
 }
 
-// the sender's own notice: an admin dismisses from the librarians' shared inbox, anyone else from
-// their own patron stream
-@command(DismissNotice)
-model DismissNotice {
-  type: "dismiss-notice";
+// a patron dismisses one of their own notices, or a librarian dismisses it for them
+@command(PatronDismissNotice)
+model PatronDismissNotice {
+  type: "patron-dismiss-notice";
   id: Uuid;
+  patron: Uuid;
 }
 
 /////////////////
@@ -389,6 +389,13 @@ model CheckoutFailed {
   patron: Uuid;
   book: Uuid;
   reason: string;
+}
+
+// a librarian dismisses one of the shared notices
+@command(DismissNotice)
+model DismissNotice {
+  type: "dismiss-notice";
+  id: Uuid;
 }
 
 /////////////////
@@ -480,7 +487,7 @@ union UserCommands {
   RenamePatron,
   TryHold,
   CancelHold,
-  DismissNotice,
+  PatronDismissNotice,
   ChangePassword,
   DeleteAccount,
 }
@@ -500,6 +507,7 @@ union AdminCommands {
   AssignPatron,
   TryCheckout,
   EndCheckout,
+  DismissNotice,
 }
 
 interface AdminEngine extends Engine<[BookSlice, PatronSlice, AdminSlice], AdminCommands> {}

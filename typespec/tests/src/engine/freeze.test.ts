@@ -2,8 +2,6 @@
 
 import { describe, expect, test } from 'vitest';
 
-import { JS, type LocalQuery, type QueryAnswer } from '../../../ts/assets/skeleton.ts';
-
 import {
   type Blob,
   bootstrap,
@@ -17,8 +15,8 @@ import {
   rig,
   seq,
   settle,
-  type State,
   state,
+  watch,
 } from './harness.ts';
 
 type Record_ = { until: number; replacing: boolean; children: string[] };
@@ -45,8 +43,7 @@ const p1Blob: Blob = {
 };
 
 /** forecasts a `set` on patron.p1, reading nothing */
-// eslint-disable-next-line require-yield -- a forecast that reads nothing never yields
-const forecaster: Forecaster = function* (_qx, command) {
+const forecaster: Forecaster = (_qx, command) => {
   const cmd = command as { field: string; value: unknown };
   return [
     { stream: 'patron.p1', event: { id: 'p1', type: 'set', field: cmd.field, value: cmd.value } },
@@ -76,24 +73,6 @@ async function freeze(r: Rig, position = 11): Promise<{ release: () => void }> {
       hold.go();
     },
   };
-}
-
-/** a query on a stream's state, collecting every value delivered */
-function watch(
-  r: Rig,
-  stream: string,
-): { values: (State | undefined)[]; q: LocalQuery<State | undefined> } {
-  const values: (State | undefined)[] = [];
-  const key = `${stream}/state`;
-  const q = r.engine.newQuery(function* () {
-    const a = (yield { store: { [key]: { type: 'state', want: JS } } }) as QueryAnswer;
-    const res = a.store[key];
-    return 'value' in res
-      ? ((res.value as Record<number, unknown> | undefined)?.[JS] as State | undefined)
-      : undefined;
-  });
-  q.subscribe((v) => values.push(v));
-  return { values, q };
 }
 
 describe('freeze and group land', () => {

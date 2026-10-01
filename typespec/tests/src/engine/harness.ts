@@ -14,10 +14,11 @@ import {
   type ConnectorHooks,
   type DbEvent,
   Engine,
+  type Forecaster as EngineForecaster,
   InMemStore,
   JS,
   MSGPACK,
-  type QueryGenerator,
+  type ReadTxn,
   type ReducerTxn,
   type Registry,
   type SliceReducer,
@@ -74,35 +75,36 @@ export const registry: Registry = {
 export type TestEvent =
   | { id: string; type: 'set'; field: string; value: unknown }
   | { id: string; type: 'bump' }
-  | { id: string; type: 'noop' };
+  | { id: string; type: 'noop' }
+  | { id: string; type: 'boom' };
 
 export type State = { count: number; fields: Record<string, unknown> };
 
-/** a family's reducer: every event lands on `{family}.{id}/state` and is logged on
-    `{family}.{id}/log`, so a test can assert what was applied and in what order */
-function familyReducer(family: string): SliceReducer {
+/** a family's reducer: every event lands on the stream's local `state` key and is logged on its
+    `log` key, so a test can assert what was applied and in what order; a `boom` event throws */
+function familyReducer(): SliceReducer {
   return {
     reducer(txn: ReducerTxn, events: unknown[]): void {
       for (const e of events as TestEvent[]) {
-        const stream = `${family}.${e.id}`;
-        const state = (txn.get(`${stream}/state`, 'state') as State | undefined) ?? {
+        if (e.type === 'boom') throw new Error('reducer boom');
+        const state = (txn.get('state', 'state') as State | undefined) ?? {
           count: 0,
           fields: {},
         };
-        const log = (txn.get(`${stream}/log`, 'log') as string[] | undefined) ?? [];
+        const log = (txn.get('log', 'log') as string[] | undefined) ?? [];
         if (e.type === 'set') state.fields[e.field] = e.value;
         if (e.type === 'bump') state.count++;
         log.push(e.type === 'set' ? `set ${e.field}=${String(e.value)}` : e.type);
-        txn.set(`${stream}/state`, 'state', state);
-        txn.set(`${stream}/log`, 'log', log);
+        txn.set('state', 'state', state);
+        txn.set('log', 'log', log);
       }
     },
   };
 }
 
 export const reducers: Record<string, SliceReducer> = {
-  patron: familyReducer('patron'),
-  book: familyReducer('book'),
+  patron: familyReducer(),
+  book: familyReducer(),
 };
 
 // events ////////////////////////////////////////////////////////////////////
@@ -350,15 +352,13 @@ export function engineError(): unknown {
 
 // the engine ////////////////////////////////////////////////////////////////
 
-export type Forecaster = (
-  qx: unknown,
-  command: unknown,
-) => QueryGenerator<{ stream: string; event: unknown }[] | string>;
+/** the harness's query context is the read transaction itself */
+export type Forecaster = EngineForecaster<ReadTxn, unknown>;
 
 export type Rig = {
   server: FakeServer;
   data: Record<string, unknown>;
-  engine: Engine<unknown, unknown>;
+  engine: Engine<ReadTxn, unknown>;
   abort: AbortController;
 };
 
@@ -367,6 +367,7 @@ export function rig(
   opts: {
     data?: Record<string, unknown>;
     forecaster?: Forecaster;
+    reducers?: Record<string, SliceReducer>;
     wants?: string[];
     server?: FakeServer;
   } = {},
@@ -375,13 +376,13 @@ export function rig(
   const server = opts.server ?? new FakeServer();
   const data = opts.data ?? {};
   const abort = new AbortController();
-  const engine = new Engine<unknown, unknown>(
-    {},
+  const engine = new Engine<ReadTxn, unknown>(
+    (txn) => txn,
     new InMemStore(registry, data),
     registry,
     server.factory,
     {
-      reducers,
+      reducers: opts.reducers ?? reducers,
       wants: opts.wants ?? ['*'],
       forecaster: opts.forecaster,
       signal: abort.signal,
@@ -401,6 +402,21 @@ export async function settle(rounds = 25): Promise<void> {
     }
   }
   if (errors.length > 0) throw errors.shift();
+}
+
+/** a query on a stream's state, collecting every value it delivers and counting its runs */
+export function watch(
+  r: Rig,
+  stream: string,
+): { values: (State | undefined)[]; runs: () => number } {
+  const values: (State | undefined)[] = [];
+  let runs = 0;
+  const q = r.engine.newQuery((qx) => {
+    runs++;
+    return qx.get(`${stream}/state`, 'state') as State | undefined;
+  });
+  q.subscribe((v) => values.push(v));
+  return { values, runs: () => runs };
 }
 
 /** the keys under a prefix, sorted */

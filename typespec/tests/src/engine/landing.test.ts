@@ -2,8 +2,6 @@
 
 import { describe, expect, test } from 'vitest';
 
-import { JS, type QueryAnswer } from '../../../ts/assets/skeleton.ts';
-
 import {
   birth,
   type Blob,
@@ -19,8 +17,8 @@ import {
   rig,
   seq,
   settle,
-  type State,
   state,
+  watch,
 } from './harness.ts';
 
 type Record_ = {
@@ -48,22 +46,6 @@ async function held(server = new FakeServer()): Promise<Rig> {
   return r;
 }
 
-/** a query on a stream's state, collecting every value delivered */
-function watch(r: Rig, stream: string): (State | undefined)[] {
-  const values: (State | undefined)[] = [];
-  const key = `${stream}/state`;
-  const q = r.engine.newQuery(function* () {
-    const a = (yield { store: { [key]: { type: 'state', want: JS } } }) as QueryAnswer;
-    const res = a.store[key];
-    if ('value' in res && res.value !== undefined) {
-      return (res.value as Record<number, unknown>)[JS] as State;
-    }
-    return undefined;
-  });
-  q.subscribe((v) => values.push(v as State | undefined));
-  return values;
-}
-
 /** freeze the base: a gap on patron.p2 whose replacing backfill is held; returns the release */
 async function freeze(r: Rig): Promise<{ go: () => void }> {
   const hold = r.server.hold('patron.p2');
@@ -76,7 +58,7 @@ async function freeze(r: Rig): Promise<{ go: () => void }> {
 describe('landing', () => {
   test('an additive backfill lands alone: values in, parked events reduced over them, seqs, ranges and records gone, one frame', async () => {
     const r = await held();
-    const values = watch(r, 'book.b1');
+    const { values } = watch(r, 'book.b1');
     await settle();
     expect(values).toEqual([undefined]);
     const hold = r.server.hold('book.*');
@@ -518,7 +500,7 @@ describe('landing', () => {
     const server = new FakeServer();
     server.blobs.set('patron.*', patrons);
     const r = rig({ server });
-    const values = watch(r, 'patron.p1');
+    const { values } = watch(r, 'patron.p1');
     await settle();
     r.server.open();
     r.server.view('t1', 10, ['patron.*']);
