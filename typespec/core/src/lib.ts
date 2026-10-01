@@ -105,22 +105,22 @@ export const $lib = createTypeSpecLibrary({
         default: `Death may only appear in a @command output`,
       },
     },
-    'intake-placement': {
+    'placement-violation': {
       severity: 'error',
       messages: {
-        default: paramMessage`intake type ${'kind'} may only be a top-level field of a command (found in ${'where'})`,
+        default: paramMessage`${'kind'} may only be a top-level field of a command (found in ${'where'})`,
       },
     },
-    'intake-requires-online': {
+    'online-required': {
       severity: 'error',
       messages: {
         default: paramMessage`command '${'name'}' carries ${'kind'} and so must be @online`,
       },
     },
-    'brand-in-command': {
+    'result-in-command': {
       severity: 'error',
       messages: {
-        default: paramMessage`command '${'name'}' carries ${'brand'}, which only intake may produce`,
+        default: paramMessage`command '${'name'}' carries ${'result'}, which only the database puts in a command, when it prepares the command for precommit`,
       },
     },
     'unreachable-slice': {

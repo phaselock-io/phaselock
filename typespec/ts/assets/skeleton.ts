@@ -984,6 +984,21 @@ function reducerTxn(txn: WTxn, stream: string, updates: Record<string, true>): R
   };
 }
 
+/** apply fn to the value at a key in place and set it, answering what fn returns; an absent key
+    throws, as a reducer does whenever the state is not what its event implies */
+export function updateKey<T, R>(
+  txn: ReducerTxn,
+  key: string,
+  type: string,
+  fn: (value: T) => R,
+): R {
+  const value = txn.get(key, type) as T | undefined;
+  if (value === undefined) throw new Error(`update of absent key ${key}`);
+  const out = fn(value);
+  txn.set(key, type, value);
+  return out;
+}
+
 // mark every key a store operation reports in dirty
 function markDirty(dirty: Record<string, true>, keys: string[]): void {
   for (const key of keys) dirty[key] = true;
@@ -1004,8 +1019,9 @@ export class Reject extends Error {
 export type Principal = { user: string | null; traits: string[] };
 
 /** Auth is what a precommit handler authorizes through.  Each call gets a fresh one, and the
-    caller rejects a handler that returns without an authorization decision, so authorization fails
-    closed.  It carries the principal, so precommit can hand it on wherever a Principal is wanted. */
+    caller rejects a handler that returns without an authorization decision, so authorization
+    fails closed.  It carries the principal, so precommit can hand it on wherever a Principal is
+    wanted. */
 export class Auth implements Principal {
   readonly user: string | null;
   readonly traits: string[];
@@ -1033,6 +1049,80 @@ export class Auth implements Principal {
     this.#authorized = true;
   }
 }
+
+/** Run one precommit handler with a fresh Auth, answering its outputs as a list, or the reason
+    for a rejection.  A Reject is a rejection, and so is a handler that returns without an
+    authorization decision, which in dev mode is an error naming the handler.  Any other throw
+    is a bug, and goes to the host. */
+export function runPrecommit(
+  name: string,
+  principal: Principal,
+  handler: (auth: Auth) => unknown,
+): string | ForecastOutput[] {
+  const auth = new Auth(principal);
+  let out: unknown;
+  try {
+    out = handler(auth);
+  } catch (e: unknown) {
+    if (e instanceof Reject) return e.message;
+    throw e;
+  }
+
+  // authorization fails closed
+  if (!auth.authorized) {
+    if (DEV) {
+      throw new Error(`precommit handler ${name} returned without an authorization decision`);
+    }
+    return 'unauthorized';
+  }
+  return outputList(out);
+}
+
+// the database bundle ////////////////////////////////////////////////////////
+
+/** what an endpoint asks lookup about: a sign-in by identity, or a token's principal at refresh
+    and on every check of its account's generation */
+export type LookupIdent =
+  | { kind: 'password'; identity: string }
+  | { kind: 'refresh'; user: string; traits: string[] }
+  | { kind: 'token'; user: string; traits: string[] };
+
+/** an existing account: its principal, the generation every token of it must carry, and the
+    stored password hash a sign-in verifies against */
+export type LookupResult = {
+  user: string;
+  traits: string[];
+  generation?: number;
+  secret?: string;
+};
+
+/** what the database hands bootstrap: emit appends an event to the seed atom, hashPassword makes
+    a hash as intake would, and env reads a variable the operator named */
+export type BootstrapContext = {
+  emit: (stream: string, event: unknown) => void;
+  hashPassword: (plain: string) => string;
+  env: (name: string) => string;
+};
+
+/** Bundle is what a database runs: the app's handlers behind the generated wrappers, installed
+    as `globalThis.__bundle`.  precommit, maySee, and lookup read global keys; each reducer reads
+    and writes its own stream's keys.  Values are rich JS values, except checkCommand's, which
+    is the command's plain JSON projection after intake. */
+export type Bundle = {
+  /** the command fields intake hashes, by the command's `type` */
+  hashedFields: Record<string, string[]>;
+  /** the problems with a command's structure, or null when it has none */
+  checkCommand: (data: unknown) => string | null;
+  precommit: (
+    txn: ReadTxn,
+    cmd: Command<unknown>,
+    principal: Principal,
+  ) => string | ForecastOutput[];
+  reducers: Record<string, SliceReducer>;
+  maySee: (txn: ReadTxn, principal: Principal) => string[];
+  lookup: (txn: ReadTxn, ident: LookupIdent) => LookupResult | null;
+  bootstrap?: (ctx: BootstrapContext) => void;
+};
 
 // queries ////////////////////////////////////////////////////////////////////
 
@@ -1542,6 +1632,11 @@ export function parsePark(key: string): { stream: string; seq: number } {
 /** one thing a forecast emits: an event labelled with its stream, or the end of a stream */
 export type ForecastOutput = { stream: string; event: unknown } | { stream: string; death: true };
 
+/** a handler's typed output, which nests tuples and arrays of outputs, as the flat list of them */
+export function outputList(out: unknown): ForecastOutput[] {
+  return [out].flat(Infinity) as ForecastOutput[];
+}
+
 /** the app's forecast of what the database will do with a command, read through the query context
     over the overlay; a throw, a Reject included, forecasts nothing */
 export type Forecaster<QX, C> = (qx: QX, command: C) => ForecastOutput[];
@@ -1555,7 +1650,7 @@ type Inbound =
   | { live: number }
   | { end: { code: number; reason: string } };
 
-export class Engine<QX, C> {
+export class Engine<QX, C, N = never> {
   #store: Store;
   #reg: Registry;
   #connect: ConnectorFactory;
@@ -1684,6 +1779,12 @@ export class Engine<QX, C> {
   sendCommands(commands: C[]): void {
     this.#sendCommands.push(...commands);
     this.#schedule();
+  }
+
+  /** The route for @online commands, which never enter the outbox and answer with their outcome.
+      Its runtime is not built yet, so every call rejects. */
+  sendNow(_command: N): Promise<CommandResult> {
+    return Promise.reject(new Error('sendNow is not built yet'));
   }
 
   /** connect now rather than when the backoff timer fires */

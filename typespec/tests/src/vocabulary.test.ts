@@ -8,10 +8,11 @@ import { readFileSync } from 'node:fs';
 
 import {
   type LoweredProgram,
-  PBrand,
   type PCommand,
   PIntake,
+  type PLiteral,
   type POutput,
+  PResult,
   PString,
   PStruct,
   PUnion,
@@ -518,19 +519,19 @@ describe('intake types', () => {
     const intake = pw as PIntake;
     expect(intake.kind).toBe('NewPassword');
     expect(intake.wire).toBeInstanceOf(PString);
-    expect(intake.result).toBeInstanceOf(PBrand);
-    expect(intake.result.brand).toBe('PasswordHash');
+    expect(intake.result).toBeInstanceOf(PResult);
+    expect(intake.result.kind).toBe('PasswordHash');
     expect(intake.result.base).toBeInstanceOf(PString);
   });
 
-  it('lowers PasswordHash to a branded string, the same one NewPassword produces', async () => {
+  it('lowers PasswordHash to a result over string, the same one NewPassword produces', async () => {
     const l = await lower(`
       ${LOGIN}
       @online @command(LoginCreated)
       model CreateAccount { type: "create-account"; login: string; password: NewPassword; }
     `);
     const hash = (root(l.lowered, 'LoginCreated') as PStruct).fields.get('password')!;
-    expect(hash).toBeInstanceOf(PBrand);
+    expect(hash).toBeInstanceOf(PResult);
     const pw = (root(l.lowered, 'CreateAccount') as PStruct).fields.get('password') as PIntake;
     expect(pw.result).toBe(hash);
   });
@@ -547,10 +548,10 @@ describe('intake types', () => {
     expect(check.kind).toBe('CommandAuth');
     expect(check.wire).toBeInstanceOf(PUnion);
     const kinds = (check.wire as PUnion).types.map(
-      (t) => ((t as PStruct).fields.get('kind') as { value: string }).value,
+      (t) => ((t as PStruct).fields.get('kind') as PLiteral).value,
     );
     expect(kinds).toEqual(['password', 'totp', 'email-code', 'webauthn', 'yubikey-otp']);
-    expect(check.result.brand).toBe('CommandAuthResult');
+    expect(check.result.kind).toBe('CommandAuthResult');
     expect((check.result.base as PStruct).fields.has('kind')).toBe(true);
   });
 
@@ -568,7 +569,7 @@ describe('intake types', () => {
     expect(proof).toBeInstanceOf(PIntake);
     expect(proof.kind).toBe(input);
     expect(proof.wire).toBeInstanceOf(PString);
-    expect(proof.result.brand).toBe(result);
+    expect(proof.result.kind).toBe(result);
   });
 
   it("accepts an intake type as an @online command's top-level field, optional or not", async () => {
@@ -615,7 +616,7 @@ describe('intake types', () => {
     ],
   ])('rejects an intake type %s', async (_, code) => {
     const l = await lower(`${LOGIN} ${code}`);
-    expect(codes(l)).toContain('intake-placement');
+    expect(codes(l)).toContain('placement-violation');
   });
 
   it('requires @online for a command that carries an intake type', async () => {
@@ -624,7 +625,7 @@ describe('intake types', () => {
       @command(LoginCreated)
       model CreateAccount { type: "create-account"; password: NewPassword; }
     `);
-    expect(codes(l)).toContain('intake-requires-online');
+    expect(codes(l)).toContain('online-required');
   });
 
   it.each([
@@ -636,7 +637,7 @@ describe('intake types', () => {
       ${LOGIN}
       @command(LoginDeleted) model Forge { type: "forge"; ${f} }
     `);
-    expect(codes(l)).toContain('brand-in-command');
+    expect(codes(l)).toContain('result-in-command');
   });
 });
 

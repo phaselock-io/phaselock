@@ -23,7 +23,7 @@ layout, build commands, and the test suite.
 - **Commands are models carrying `@command(output)`**, where the output is the precommit
   handler's return type (see EMITTER.md section 5); an engine's commands are a named union of
   them, or one.  `@online` and `Death` are vocabulary too, and so are the intake types
-  (`NewPassword`, `CommandAuth`, ...), which lower by identity to `PIntake` and `PBrand`.
+  (`NewPassword`, `CommandAuth`, ...), which lower by identity to `PIntake` and `PResult`.
 - **Constraint validation (`@minLength`, `@pattern`, ...): decided, not implemented.**  The
   emitters currently ignore the constraint decorators entirely; the generated checkers verify
   structure only.  The decided placement, when implemented: JS-only, enforced at relay command
@@ -46,6 +46,11 @@ layout, build commands, and the test suite.
   `skeleton` option overrides with a project-root-relative path; there is no skeleton-less mode
   (generated code requires the skeleton).  The assets are the canonical copies of the runtime
   skeletons — edit them here.
+- **Generated names keep the declaration's name whole, for now.**  `PatronSlice` gives
+  `PatronSliceTxn`, `PatronSliceReducers`, and `patronSliceReducer`; `UserEngine` gives
+  `UserEngineTxn`, `UserEngineForecasters`, and the `UserEngine` class; `LibraryDB` gives
+  `LibraryDBTxn`, `LibraryDBPrecommit`, and `defineLibraryDB`.  Handler tables are keyed by their
+  event or command model names, camelCased.  EMITTER.md section 5 has the reasoning.
 - **Naming convention: `P` prefix (for PhaseLock) on IR model nouns** — PType and subclasses,
   PSlice, PStore, PStoreItem, PCommand, PEngine, PDatabase, plus PTypeRegistry (which creates
   PTypes).  Machinery stays unprefixed

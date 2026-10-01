@@ -65,15 +65,11 @@ export function encodeProto(base: any): any {
   return Object.fromEntries(Object.entries(base).map(([k, v]) => [k, encodeProto(v)]));
 }
 
-export type QueryGenerator<T> = Generator<any, T, any>;
-export type QueryFunction<QX, T> = (qx: QX) => QueryGenerator<T>;
+export type QueryFunction<QX, T> = (qx: QX) => T;
 export interface Query<T> {
   latest: T | undefined;
   subscribe(callback: (val: T) => void): () => void;
   close(): void;
-}
-export interface LocalQuery<T> extends Query<T> {
-  awaitResult(): QueryGenerator<T>;
 }
 
 export class RemoteQueries {
@@ -215,25 +211,23 @@ describe('remote provider', () => {
 describe('local provider', () => {
   it('curries call args into the defs body along with the query context', () => {
     const seen: any[] = [];
-    /* eslint-disable require-yield -- stubs satisfy the generator-typed defs contract without touching store */
     const defs = {
-      *allPatrons(qx: any) {
+      allPatrons(qx: any) {
         seen.push(['allPatrons', qx]);
         return [];
       },
-      *patronsNamed(qx: any, name: string, limit?: number) {
+      patronsNamed(qx: any, name: string, limit?: number) {
         seen.push(['patronsNamed', qx, name, limit]);
         return [];
       },
-      *patronsSince(qx: any, when: Date) {
+      patronsSince(qx: any, when: Date) {
         seen.push(['patronsSince', qx, when]);
         return [];
       },
     };
-    /* eslint-enable require-yield */
     const captured: any[] = [];
     const eng = {
-      newQuery(fn: (qx: any) => Generator<any, any, any>) {
+      newQuery(fn: (qx: any) => any) {
         captured.push(fn);
         return { latest: undefined, subscribe: () => () => {}, close: () => {} };
       },
@@ -243,7 +237,7 @@ describe('local provider', () => {
     local.patronsNamed('bob', 5);
     local.allPatrons();
     expect(captured).toHaveLength(2);
-    for (const fn of captured) fn('QX').next();
+    for (const fn of captured) fn('QX');
     expect(seen).toEqual([
       ['patronsNamed', 'QX', 'bob', 5],
       ['allPatrons', 'QX'],
@@ -305,10 +299,8 @@ describe('dispatcher', () => {
 describe('generated type surface', () => {
   it('declares the defs and provider interfaces', () => {
     expect(text).toContain('export interface AdminQueryDefs<QX> {');
-    expect(text).toContain('allPatrons(qx: QX): QueryGenerator<PatronInfo[]>;');
-    expect(text).toContain(
-      'patronsNamed(qx: QX, name: string, limit?: number): QueryGenerator<PatronInfo[]>;',
-    );
+    expect(text).toContain('allPatrons(qx: QX): PatronInfo[];');
+    expect(text).toContain('patronsNamed(qx: QX, name: string, limit?: number): PatronInfo[];');
     expect(text).toContain('export interface AdminQueries {');
     expect(text).toContain('patronsNamed(name: string, limit?: number): Query<PatronInfo[]>;');
     expect(text).toContain('export type AdminQuery =');
@@ -317,9 +309,7 @@ describe('generated type surface', () => {
       'export class RemoteAdminQueries extends RemoteQueries implements AdminQueries {',
     );
     expect(text).toContain('export class LocalAdminQueries<QX> implements AdminQueries {');
-    expect(text).toContain(
-      'patronsNamed(name: string, limit?: number): LocalQuery<PatronInfo[]> {',
-    );
+    expect(text).toContain('patronsNamed(name: string, limit?: number): Query<PatronInfo[]> {');
     expect(text).toContain(
       'export function dispatchAdminQuery(queries: AdminQueries, query: AdminQuery): Query<any> {',
     );

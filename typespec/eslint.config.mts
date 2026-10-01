@@ -81,7 +81,7 @@ export default [
       ...pluginViTest.configs.recommended.rules,
       // generated fixtures are imported straight from tsp-output with their .ts extension
       'import/extensions': 'off',
-      'vitest/expect-expect': ['error', { assertFunctionNames: ['expect', 'ok', 'fails'] }],
+      'vitest/expect-expect': ['error', { assertFunctionNames: ['expect', 'ok', 'fails', 'compiles'] }],
     },
   },
   configPrettier,

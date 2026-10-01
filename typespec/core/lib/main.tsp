@@ -74,28 +74,35 @@ extern dec command(target: Model, output: unknown);
 
 /**
  * Marks a command that only makes sense online: its UI waits on the ack, not on the round trip
- * through sync, so it is sent with `sendNow` and never queued in the outbox.  A command carrying
- * an intake type must be `@online`.
+ * through sync, so it is sent with `sendNow` and never queued in the outbox.  A command carrying a
+ * field the database prepares for precommit, such as a `NewPassword`, must be `@online`.
  */
 extern dec online(target: Model);
 
 /** The end of a stream, in a `@command` output. */
 model Death {}
 
-// Intake types.  Each is a command field that the database transforms at intake, before
-// precommit runs, into a result only intake can produce.  They appear only as top-level fields
-// of `@online` commands, and their results never appear in commands.
+// Fields the database prepares for precommit.  Each is a top-level field of an `@online`
+// command, which the database replaces before precommit runs: a NewPassword with its
+// PasswordHash, a CaptchaToken with its CaptchaResult, and so on.  No client can send a
+// replacement, so no command carries one.
 
 /** A password to store: precommit sees its salted hash. */
 scalar NewPassword extends string;
 
-/** A stored password's hash, as only intake produces it. */
+/**
+ * A password's salted hash, which the database puts in place of a NewPassword when it prepares a
+ * command for precommit, and which bootstrap's `hashPassword` makes.
+ */
 scalar PasswordHash extends string;
 
-/** A captcha widget's token: intake verifies it with the provider. */
+/** A captcha widget's token, which the database verifies with the provider. */
 scalar CaptchaToken extends string;
 
-/** A verified captcha token, as only intake produces it. */
+/**
+ * A verified captcha token, which the database puts in place of a CaptchaToken when it prepares a
+ * command for precommit.
+ */
 model CaptchaResult {
   hostname: string;
 }
@@ -126,7 +133,10 @@ union CommandAuth {
   },
 }
 
-/** The kind of credential a CommandAuth proved, as only intake produces it. */
+/**
+ * The kind of credential a CommandAuth proved, which the database puts in its place when it
+ * prepares a command for precommit.
+ */
 model CommandAuthResult {
   kind: "password" | "totp" | "email-code" | "webauthn" | "yubikey-otp";
 }
@@ -134,7 +144,10 @@ model CommandAuthResult {
 /** An identity proven outside the database (an OAuth2 login, an email link), signed by it. */
 scalar IdentityProof extends string;
 
-/** A verified identity proof, as only intake produces it. */
+/**
+ * A verified identity proof, which the database puts in place of an IdentityProof when it
+ * prepares a command for precommit.
+ */
 model IdentityResult {
   provider: string;
   subject: string;

@@ -14,7 +14,7 @@
  *   - queries: interfaces extending `PhaseLock.Queries` become PQueries; each operation
  *     becomes a PQuery carrying its name, arguments, and result type
  *   - intake types: the vocabulary's NewPassword, CommandAuth, and the rest lower by identity to
- *     PIntake, and their results to PBrand
+ *     PIntake, and their results to PResult
  *
  * Interfaces are deliberately the carrier for slices, engines, databases, and queries: they are
  * not data types, so they can't leak into the model space the way decorated models could.
@@ -50,7 +50,6 @@ import type {
 import { getCommandOutput, isOnline } from './decorators.js';
 import { reportDiagnostic } from './lib.js';
 import {
-  PBrand,
   PCommand,
   PDatabase,
   PEngine,
@@ -58,6 +57,7 @@ import {
   type POutput,
   PQueries,
   PQuery,
+  PResult,
   PSlice,
   PStore,
   PType,
@@ -169,28 +169,28 @@ export function lowerProgram(program: Program): LoweredProgram {
     return (ns.models.get(name) ?? ns.unions.get(name))!;
   }
 
-  // the intake results, each a brand over its vocabulary shape
-  function resultBrand(name: string): PBrand {
-    if (name === 'PasswordHash') return registry.brand(name, registry.string());
-    return registry.brand(name, lowerModel(vocabType(name) as Model));
+  // the intake results, each named for its vocabulary type over its vocabulary shape
+  function resultType(name: string): PResult {
+    if (name === 'PasswordHash') return registry.result(name, registry.string());
+    return registry.result(name, lowerModel(vocabType(name) as Model));
   }
 
   /** lower a vocabulary type by identity, or undefined for one that lowers like any other */
   function lowerVocab(name: string, type: Type): PType | undefined {
     switch (name) {
       case 'NewPassword':
-        return registry.intake(name, registry.string(), resultBrand('PasswordHash'));
+        return registry.intake(name, registry.string(), resultType('PasswordHash'));
       case 'CaptchaToken':
-        return registry.intake(name, registry.string(), resultBrand('CaptchaResult'));
+        return registry.intake(name, registry.string(), resultType('CaptchaResult'));
       case 'IdentityProof':
-        return registry.intake(name, registry.string(), resultBrand('IdentityResult'));
+        return registry.intake(name, registry.string(), resultType('IdentityResult'));
       case 'CommandAuth':
-        return registry.intake(name, lowerUnion(type as Union), resultBrand('CommandAuthResult'));
+        return registry.intake(name, lowerUnion(type as Union), resultType('CommandAuthResult'));
       case 'PasswordHash':
       case 'CaptchaResult':
       case 'CommandAuthResult':
       case 'IdentityResult':
-        return resultBrand(name);
+        return resultType(name);
       case 'Death':
         reportDiagnostic(program, { code: 'death-placement', target: type });
         return registry.json();

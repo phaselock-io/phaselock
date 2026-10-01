@@ -165,12 +165,12 @@ export class PUnion extends PType {
 }
 
 /**
- * A value only the database's intake produces, such as a PasswordHash: it travels as its base
- * type, and the brand keeps anything else from passing for one.
+ * A value the database's intake puts in a command, such as a PasswordHash.  `kind` names the
+ * vocabulary type, and the value travels as its base type.
  */
-export class PBrand extends PType {
+export class PResult extends PType {
   constructor(
-    readonly brand: string,
+    readonly kind: string,
     readonly base: PType,
   ) {
     super();
@@ -179,7 +179,7 @@ export class PBrand extends PType {
     return this.base.jsonType;
   }
   toString() {
-    return this.brand;
+    return this.kind;
   }
 }
 
@@ -191,7 +191,7 @@ export class PIntake extends PType {
   constructor(
     readonly kind: string,
     readonly wire: PType,
-    readonly result: PBrand,
+    readonly result: PResult,
   ) {
     super();
   }
@@ -272,11 +272,11 @@ export class PTypeRegistry {
     return this.intern(`tup:${itemTypes.map((t) => t.id).join(',')}`, () => new PTuple(itemTypes));
   }
 
-  brand(brand: string, base: PType): PBrand {
-    return this.intern(`brand:${brand}:${base.id}`, () => new PBrand(brand, base));
+  result(kind: string, base: PType): PResult {
+    return this.intern(`result:${kind}:${base.id}`, () => new PResult(kind, base));
   }
 
-  intake(kind: string, wire: PType, result: PBrand): PIntake {
+  intake(kind: string, wire: PType, result: PResult): PIntake {
     return this.intern(
       `intake:${kind}:${wire.id}:${result.id}`,
       () => new PIntake(kind, wire, result),

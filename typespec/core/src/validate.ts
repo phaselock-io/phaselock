@@ -11,11 +11,11 @@ import { reportDiagnostic } from './lib.js';
 import { type LoweredProgram, lowerProgram } from './lower.js';
 import {
   PArray,
-  PBrand,
   type PCommand,
   PIntake,
   PObject,
   type POutput,
+  PResult,
   type PSlice,
   PStruct,
   PTuple,
@@ -123,28 +123,29 @@ function checkDatabaseOutputs(program: Program, lowered: LoweredProgram): void {
   }
 }
 
-/** whether a type holds an intake type, looking through containers but not into structs */
-function holdsIntake(t: PType): boolean {
-  if (t instanceof PIntake) return true;
-  if (t instanceof PArray) return holdsIntake(t.itemType);
-  if (t instanceof PObject) return holdsIntake(t.valueType);
-  if (t instanceof PTuple) return t.itemTypes.some(holdsIntake);
-  if (t instanceof PUnion) return t.types.some(holdsIntake);
-  return false;
+/** the kind of the first intake type a type holds, looking through containers but not into
+    structs, or undefined */
+function intakeKind(t: PType): string | undefined {
+  if (t instanceof PIntake) return t.kind;
+  if (t instanceof PArray) return intakeKind(t.itemType);
+  if (t instanceof PObject) return intakeKind(t.valueType);
+  if (t instanceof PTuple) return t.itemTypes.map(intakeKind).find((k) => k !== undefined);
+  if (t instanceof PUnion) return t.types.map(intakeKind).find((k) => k !== undefined);
+  return undefined;
 }
 
 /** the first intake result a type holds, anywhere inside it, or undefined */
-function findBrand(t: PType, seen = new Set<PType>()): PBrand | undefined {
+function findResult(t: PType, seen = new Set<PType>()): PResult | undefined {
   if (seen.has(t)) return undefined;
   seen.add(t);
-  if (t instanceof PBrand) return t;
+  if (t instanceof PResult) return t;
   if (t instanceof PIntake) return undefined; // an intake's result is intake's own business
-  if (t instanceof PArray) return findBrand(t.itemType, seen);
-  if (t instanceof PObject) return findBrand(t.valueType, seen);
-  if (t instanceof PTuple) return t.itemTypes.map((x) => findBrand(x, seen)).find((b) => b);
-  if (t instanceof PUnion) return t.types.map((x) => findBrand(x, seen)).find((b) => b);
+  if (t instanceof PArray) return findResult(t.itemType, seen);
+  if (t instanceof PObject) return findResult(t.valueType, seen);
+  if (t instanceof PTuple) return t.itemTypes.map((x) => findResult(x, seen)).find((b) => b);
+  if (t instanceof PUnion) return t.types.map((x) => findResult(x, seen)).find((b) => b);
   if (t instanceof PStruct)
-    return [...t.fields.values()].map((x) => findBrand(x, seen)).find((b) => b);
+    return [...t.fields.values()].map((x) => findResult(x, seen)).find((b) => b);
   return undefined;
 }
 
@@ -158,8 +159,7 @@ function checkIntake(program: Program, lowered: LoweredProgram): void {
   for (const cmd of lowered.commands) commandOf.set(cmd.type, cmd);
   const events = new Set(lowered.slices.flatMap((s) => s.eventTypes));
   const placement = (kind: string, where: string, target: Type | typeof NoTarget) =>
-    reportDiagnostic(program, { code: 'intake-placement', format: { kind, where }, target });
-  const kindOf = (t: PType): string => (t instanceof PIntake ? t.kind : 'an intake type');
+    reportDiagnostic(program, { code: 'placement-violation', format: { kind, where }, target });
 
   // every struct: an intake type is fine only as a command's own top-level field
   for (const t of lowered.registry.all) {
@@ -168,11 +168,12 @@ function checkIntake(program: Program, lowered: LoweredProgram): void {
     const target = lowered.targets.get(t) ?? NoTarget;
     const where = t.name ?? String(t);
     for (const [, ft] of t.fields) {
+      const kind = intakeKind(ft);
       if (ft instanceof PIntake) {
         if (cmd === undefined) placement(ft.kind, where, target);
         else if (events.has(t)) placement(ft.kind, `event ${where}`, target);
-      } else if (holdsIntake(ft)) {
-        placement(kindOf(ft), where, target);
+      } else if (kind !== undefined) {
+        placement(kind, where, target);
       }
     }
   }
@@ -180,9 +181,10 @@ function checkIntake(program: Program, lowered: LoweredProgram): void {
   // store values and queries hold no intake type at all
   for (const slice of lowered.slices) {
     for (const item of slice.store.items) {
-      if (!holdsIntake(item.type)) continue;
+      const kind = intakeKind(item.type);
+      if (kind === undefined) continue;
       placement(
-        kindOf(item.type),
+        kind,
         `slice ${slice.name} key ${item.tpl}`,
         lowered.sources.get(slice) ?? NoTarget,
       );
@@ -191,8 +193,9 @@ function checkIntake(program: Program, lowered: LoweredProgram): void {
   for (const kq of lowered.queries) {
     for (const q of kq.queries) {
       const types = [q.result, ...q.args.map(([, t]) => t)];
-      if (!types.some(holdsIntake)) continue;
-      placement('an intake type', `query ${kq.name}.${q.name}`, NoTarget);
+      const kind = types.map(intakeKind).find((k) => k !== undefined);
+      if (kind === undefined) continue;
+      placement(kind, `query ${kq.name}.${q.name}`, NoTarget);
     }
   }
 
@@ -203,16 +206,16 @@ function checkIntake(program: Program, lowered: LoweredProgram): void {
     const intake = struct && [...struct.fields.values()].find((ft) => ft instanceof PIntake);
     if (intake !== undefined && !cmd.online) {
       reportDiagnostic(program, {
-        code: 'intake-requires-online',
+        code: 'online-required',
         format: { name: cmd.name, kind: (intake as PIntake).kind },
         target,
       });
     }
-    const brand = findBrand(cmd.type);
-    if (brand !== undefined) {
+    const result = findResult(cmd.type);
+    if (result !== undefined) {
       reportDiagnostic(program, {
-        code: 'brand-in-command',
-        format: { name: cmd.name, brand: brand.brand },
+        code: 'result-in-command',
+        format: { name: cmd.name, result: result.kind },
         target,
       });
     }
