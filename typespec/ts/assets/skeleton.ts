@@ -973,21 +973,26 @@ export interface ReducerTxn extends ReadTxn {
   del(key: string): void;
 }
 
-// a ReducerTxn over a store transaction for one stream's keys, adding every key it writes to
+// a ReducerTxn over a store transaction for one stream's keys, marking every key it writes in
 // updates
-function reducerTxn(txn: WTxn, stream: string, updates: string[]): ReducerTxn {
+function reducerTxn(txn: WTxn, stream: string, updates: Record<string, true>): ReducerTxn {
   const prefix = `${stream}/`;
   return {
     get: (key, type) => txnGet(txn, prefix + key, type),
     set(key, type, value) {
       txn.set(prefix + key, type, { [JS]: value });
-      updates.push(prefix + key);
+      updates[prefix + key] = true;
     },
     del(key) {
       txn.del(prefix + key);
-      updates.push(prefix + key);
+      updates[prefix + key] = true;
     },
   };
+}
+
+// mark every key a store operation reports in dirty
+function markDirty(dirty: Record<string, true>, keys: string[]): void {
+  for (const key of keys) dirty[key] = true;
 }
 
 // authorization //////////////////////////////////////////////////////////////
@@ -1159,10 +1164,8 @@ export class QueryGraph<QX> {
     return q;
   }
 
-  dirty(keys: string[]): void {
-    for (const key of keys) {
-      this.#dirty[key] = true;
-    }
+  dirty(keys: Record<string, true>): void {
+    Object.assign(this.#dirty, keys);
   }
 
   /** run every open query whose keys changed, and return a callback that notifies the subscribers
@@ -1783,7 +1786,7 @@ export class Engine<QX, C> {
     // the base as this build would have made it.
     const wanted = (x: string) => this.#wants.some((w) => refCovers(w, x));
     const wasFrozen = this.#replacing > 0;
-    const dirty: string[] = [];
+    const dirty: Record<string, true> = {};
     this.#store.write((txn) => {
       // every backfill outside the wants
       for (const ref of [...this.#backfills.keys()]) {
@@ -1939,7 +1942,7 @@ export class Engine<QX, C> {
       return out;
     });
     if (fresh.length > 0) this.#outboxChanged = true;
-    this.#refresh([]);
+    this.#refresh({});
     if (wire.length === 0) return;
 
     // the results come back through the outcomes, tagged with this connection
@@ -2008,7 +2011,7 @@ export class Engine<QX, C> {
      promise resolves after the commit, which is the backpressure */
   #onBackfillWork(): void {
     const pushes: BackfillWork[] = [];
-    const dirty: string[] = [];
+    const dirty: Record<string, true> = {};
 
     // a push for a backfill that was dropped while it was queued fails on its own
     while (this.#backfillWork.length > 0) {
@@ -2172,7 +2175,7 @@ export class Engine<QX, C> {
      replacing backfill is in flight the base is frozen: nothing lands unless every replacing entry
      is in a landing subtree and the frozen events chain, and then the frozen events land with
      them, so this is the pass that unfreezes. */
-  #tryLandIn(txn: WTxn, dirty: string[]): void {
+  #tryLandIn(txn: WTxn, dirty: Record<string, true>): void {
     // the base is frozen while any replacing backfill is in flight
     const frozen = this.#replacing > 0;
 
@@ -2321,7 +2324,7 @@ export class Engine<QX, C> {
   }
 
   // a top-level ref's subtree lands as one
-  #landRefIn(txn: WTxn, ref: string, dirty: string[]): void {
+  #landRefIn(txn: WTxn, ref: string, dirty: Record<string, true>): void {
     const header = this.#mergedHeaderIn(txn, ref);
     const subtree = this.#subtree(ref);
 
@@ -2336,7 +2339,7 @@ export class Engine<QX, C> {
         for (const r of subtree) txn.delPrefix(`/park.kv.${r}/${stream}/`);
       } else {
         // otherwise the stream loses its state to the blob
-        dirty.push(...txn.delPrefix(`${stream}/`));
+        markDirty(dirty, txn.delPrefix(`${stream}/`));
       }
     }
 
@@ -2348,12 +2351,12 @@ export class Engine<QX, C> {
 
   // a ref's parked values move into place, then each child's over them for the streams in the
   // child's blob, the deepest winning; a kept stream is never touched
-  #moveValuesIn(txn: WTxn, ref: string, dirty: string[], kept: Set<string>): void {
-    dirty.push(...txn.move(`/park.kv.${ref}/`, ''));
+  #moveValuesIn(txn: WTxn, ref: string, dirty: Record<string, true>, kept: Set<string>): void {
+    markDirty(dirty, txn.move(`/park.kv.${ref}/`, ''));
     for (const child of this.#childrenOf(ref)) {
       // clear the parent's values for the child's streams, so a key the child's blob lacks goes too
       for (const stream of Object.keys(this.#headerOf(txn, child))) {
-        if (!kept.has(stream)) dirty.push(...txn.delPrefix(`${stream}/`));
+        if (!kept.has(stream)) markDirty(dirty, txn.delPrefix(`${stream}/`));
       }
       this.#moveValuesIn(txn, child, dirty, kept);
     }
@@ -2397,7 +2400,7 @@ export class Engine<QX, C> {
     txn: WTxn,
     ref: string | null,
     header: Record<string, number>,
-    dirty: string[],
+    dirty: Record<string, true>,
   ): void {
     // {stream: seq}, the header seqs, then the last seq walked
     const seqs = new Map(Object.entries(header));
@@ -2449,7 +2452,12 @@ export class Engine<QX, C> {
      Engine's: a death drops the stream's keys, the stream stays known so a rebirth chains, and
      neither reaches a reducer.  This is where events enter the base, so an event carrying an
      outbox command's id is that command's round trip, whichever path parked or delivered it. */
-  #reduceStreamIn(txn: WTxn, stream: string, events: DbEvent<unknown>[], dirty: string[]): void {
+  #reduceStreamIn(
+    txn: WTxn,
+    stream: string,
+    events: DbEvent<unknown>[],
+    dirty: Record<string, true>,
+  ): void {
     // the server sends nothing outside the wants, and the wants are the families with reducers
     const slice = this.#reducers[stream.split('.')[0]];
     if (slice === undefined) throw new Error(`no reducer for ${stream}`);
@@ -2470,7 +2478,7 @@ export class Engine<QX, C> {
       if (sys === 'death') {
         // the stream died: reduce what came before, then drop its state
         reduce();
-        dirty.push(...txn.delPrefix(`${stream}/`));
+        markDirty(dirty, txn.delPrefix(`${stream}/`));
       } else if (sys === null) {
         data.push(ev.data);
       }
@@ -2557,8 +2565,8 @@ export class Engine<QX, C> {
   }
 
   // a stream leaves the Engine: its state, its seq, and its parked events
-  #dropStreamIn(txn: WTxn, stream: string, dirty: string[]): void {
-    dirty.push(...txn.delPrefix(`${stream}/`));
+  #dropStreamIn(txn: WTxn, stream: string, dirty: Record<string, true>): void {
+    markDirty(dirty, txn.delPrefix(`${stream}/`));
     txn.del(`/seq.${stream}`);
     txn.delPrefix(`/park.ev.${stream}/`);
     this.#streams.delete(stream);
@@ -2573,7 +2581,7 @@ export class Engine<QX, C> {
       return;
     }
 
-    const dirty: string[] = [];
+    const dirty: Record<string, true> = {};
     let wentLive = false;
     let revoked = false;
     this.#store.write((txn) => {
@@ -2612,7 +2620,7 @@ export class Engine<QX, C> {
   }
 
   // one atom's events; each event reduces or parks by a streams-table lookup
-  #onEventsIn(txn: WTxn, events: WireEvent[], dirty: string[]): void {
+  #onEventsIn(txn: WTxn, events: WireEvent[], dirty: Record<string, true>): void {
     // {stream: seq} for every held stream that advanced, and {stream: events} to reduce
     const seqs = new Map<string, number>();
     const runs = new Map<string, DbEvent<unknown>[]>();
@@ -2683,11 +2691,12 @@ export class Engine<QX, C> {
 
   // after a commit, the graph learns what changed and runs when live; base changes reach queries
   // only when not frozen, outbox changes always, since forecasts are not base state
-  #refresh(dirty: string[], always = false): void {
+  #refresh(dirty: Record<string, true>, always = false): void {
     this.#graph.dirty(dirty);
     const outbox = this.#outboxChanged;
     this.#outboxChanged = false;
-    if (this.#live && (always || outbox || (dirty.length > 0 && this.#replacing === 0))) {
+    const changed = Object.keys(dirty).length > 0;
+    if (this.#live && (always || outbox || (changed && this.#replacing === 0))) {
       this.#rebuildOverlay();
     }
   }
@@ -2779,15 +2788,16 @@ export class Engine<QX, C> {
     this.#store.write((txn) => {
       this.#releaseIn(txn, drop);
     });
-    this.#refresh([]);
+    this.#refresh({});
   }
 
   /* A view frame, reconciled against state.  Drops come first, then every ref of the new set that
      nothing accounts for starts a backfill, and the view is written with them.  Returns whether
      the drops removed state from the base. */
-  #onViewIn(txn: WTxn, view: ViewRecord, dirty: string[]): boolean {
+  #onViewIn(txn: WTxn, view: ViewRecord, dirty: Record<string, true>): boolean {
     const wasFrozen = this.#replacing > 0;
-    const before = dirty.length;
+    // the keys this frame removes, apart from any that earlier items in the batch marked
+    const removed: Record<string, true> = {};
     const covered = (refs: string[], x: string) => refs.some((r) => refCovers(r, x));
     const old = this.#view?.refs ?? [];
     const atStart = [...this.#backfills.keys()];
@@ -2799,7 +2809,7 @@ export class Engine<QX, C> {
 
     // drop every stream the new set does not cover
     for (const stream of [...this.#streams.keys()]) {
-      if (!covered(view.refs, stream)) this.#dropStreamIn(txn, stream, dirty);
+      if (!covered(view.refs, stream)) this.#dropStreamIn(txn, stream, removed);
     }
 
     // grant, broadest first so a covered ref finds its cover.  The first view's grants replace
@@ -2826,13 +2836,14 @@ export class Engine<QX, C> {
 
     // did a drop end the last replacing backfill?  Then this is the unfreeze, and whatever
     // finished downloading during the freeze can land now
-    if (wasFrozen && this.#replacing === 0) this.#unfreezeIn(txn, dirty);
-    return dirty.length > before;
+    if (wasFrozen && this.#replacing === 0) this.#unfreezeIn(txn, removed);
+    Object.assign(dirty, removed);
+    return Object.keys(removed).length > 0;
   }
 
   // the last replacing backfill is gone: the frozen events land, the reduced position catches up
   // to the checkpoint, and whatever finished downloading during the freeze lands
-  #unfreezeIn(txn: WTxn, dirty: string[]): void {
+  #unfreezeIn(txn: WTxn, dirty: Record<string, true>): void {
     this.#reduceParkedIn(txn, null, {}, dirty);
     this.#reducedTo(txn, this.#checkpoint?.position ?? -1);
     this.#tryLandIn(txn, dirty);
@@ -2858,7 +2869,9 @@ export class Engine<QX, C> {
   // a fresh overlay over the base, every outbox command forecast onto it in order, and the graph
   // run on the result
   #rebuildOverlay(): void {
-    this.#graph.dirty(this.#overlay.keys());
+    const discarded: Record<string, true> = {};
+    markDirty(discarded, this.#overlay.keys());
+    this.#graph.dirty(discarded);
     this.#overlay = new OverlayStore(this.#store, this.#reg);
 
     // forecast each outbox command, each seeing what the ones before it left
@@ -2908,8 +2921,8 @@ export class Engine<QX, C> {
   // one command's forecast folded onto the overlay: each run of consecutive events on one stream
   // goes through its slice's reducer as pending, and a death drops the stream's keys; returns the
   // keys it changed
-  #forecastIn(txn: WTxn, forecaster: Forecaster<QX, C>, command: C): string[] {
-    const dirty: string[] = [];
+  #forecastIn(txn: WTxn, forecaster: Forecaster<QX, C>, command: C): Record<string, true> {
+    const dirty: Record<string, true> = {};
     let stream = '';
     let run: unknown[] = [];
 
@@ -2928,7 +2941,7 @@ export class Engine<QX, C> {
       }
       if ('death' in out) {
         flush();
-        dirty.push(...txn.delPrefix(`${stream}/`));
+        markDirty(dirty, txn.delPrefix(`${stream}/`));
       } else {
         run.push(out.event);
       }
