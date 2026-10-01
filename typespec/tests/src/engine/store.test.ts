@@ -1,4 +1,4 @@
-// TESTS.md: Store primitives (every implementation), against InMemStore, OverlayStore, and
+// TESTS.md: Store primitives (every implementation), against InMemStore, the Overlay, and
 // ExternalStore
 
 import { describe, expect, test } from 'vitest';
@@ -9,7 +9,7 @@ import {
   type ExternalStoreTxn,
   InMemStore,
   JS,
-  OverlayStore,
+  Overlay,
   prefixRange,
   resumeRange,
   type Store,
@@ -192,29 +192,41 @@ describe('delPrefix and move', () => {
 describe('overlay', () => {
   test('scan answers with pending writes merged in and pending deletes removed', () => {
     const base = seeded({}, 'k1', 'k2', 'k3');
-    const overlay = new OverlayStore(base, registry);
-    const inside = overlay.write((txn) => {
-      txn.set('k4', T, js('k4'));
-      txn.del('k2');
-      return txnScanAll(txn, prefixRange('k', 10, { type: T, want: JS })).map(([k, v]) => [
-        k,
-        asJs(v),
-      ]);
-    });
+    const overlay = new Overlay(registry);
+    const inside = base.read((b) =>
+      overlay.apply(b, (txn) => {
+        txn.set('k4', T, js('k4'));
+        txn.del('k2');
+        return txnScanAll(txn, prefixRange('k', 10, { type: T, want: JS })).map(([k, v]) => [
+          k,
+          asJs(v),
+        ]);
+      }),
+    );
     expect(inside).toEqual([
       ['k1', 'k1'],
       ['k3', 'k3'],
       ['k4', 'k4'],
     ]);
-    const after = overlay.read((txn) => {
-      return txnScanAll(txn, prefixRange('k', 10, false)).map(([k]) => k);
-    });
+    const after = base.read((b) =>
+      txnScanAll(overlay.view(b), prefixRange('k', 10, false)).map(([k]) => k),
+    );
     expect(after).toEqual(['k1', 'k3', 'k4']);
     expect(scanKeys(base, prefixRange('k', 10, false))).toEqual(['k1', 'k2', 'k3']);
-    const gone = overlay.read((txn) => {
-      return txnGet(txn, 'k2', T);
-    });
+    const gone = base.read((b) => txnGet(overlay.view(b), 'k2', T));
     expect(gone).toBeUndefined();
+  });
+});
+
+describe('the overlay view', () => {
+  test('is read-only', () => {
+    const base = seeded({}, 'k1');
+    const overlay = new Overlay(registry);
+    base.read((b) => {
+      const view = overlay.view(b);
+      expect('set' in view).toBe(false);
+      expect('delPrefix' in view).toBe(false);
+    });
   });
 });
 
@@ -261,14 +273,17 @@ describe('ownership', () => {
 
   test('the overlay copies its layer both ways, in gets and in scans', () => {
     const base = seeded({}, 'k1');
-    const overlay = new OverlayStore(base, registry);
+    const overlay = new Overlay(registry);
     const obj = { n: 1 };
-    overlay.write((txn) => {
-      txn.set('k2', T, js(obj));
-    });
+    base.read((b) =>
+      overlay.apply(b, (txn) => {
+        txn.set('k2', T, js(obj));
+      }),
+    );
     obj.n = 2;
     const read = () =>
-      overlay.read((txn) => {
+      base.read((b) => {
+        const txn = overlay.view(b);
         const got = txnGet(txn, 'k2', T) as { n: number };
         const all = txnScanAll(txn, prefixRange('k', 10, { type: T, want: JS }));
         return { got, scanned: asJs(all[1][1]) as { n: number }, base: asJs(all[0][1]) };
@@ -305,12 +320,14 @@ describe('transactions', () => {
     ).toThrow('boom');
     expect(data).toEqual({ k1: 'k1' });
 
-    const overlay = new OverlayStore(store, registry);
+    const overlay = new Overlay(registry);
     expect(() =>
-      overlay.write((txn) => {
-        txn.set('k2', T, js('k2'));
-        throw new Error('boom');
-      }),
+      store.read((b) =>
+        overlay.apply(b, (txn) => {
+          txn.set('k2', T, js('k2'));
+          throw new Error('boom');
+        }),
+      ),
     ).toThrow('boom');
     expect(overlay.keys()).toEqual([]);
   });

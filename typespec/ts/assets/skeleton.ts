@@ -761,13 +761,14 @@ class InMemTxn implements WTxn {
   }
 }
 
-export class OverlayStore implements Store {
-  #base: Store;
+/** Overlay is the Engine's in-memory layer of forecasts over the base.  It is not a Store: each
+    call takes a base read transaction the caller already holds, so one rebuild of the overlay, its
+    forecasts and the graph run after them, reads one snapshot of the base. */
+export class Overlay {
   #reg: Registry;
   #data: Layer = {};
 
-  constructor(base: Store, reg: Registry) {
-    this.#base = base;
+  constructor(reg: Registry) {
     this.#reg = reg;
   }
 
@@ -775,30 +776,23 @@ export class OverlayStore implements Store {
     return Object.keys(this.#data);
   }
 
-  #withTxn<T>(writable: boolean, fn: (txn: WTxn) => T): T {
-    // regardless of read/write status on the overlay txn, we only ever open a read txn on #base
-    return this.#base.read((baseTxn) => {
-      const updates: Layer = {};
-      const txn = new OverlayTxn(this.#reg, baseTxn, this.#data, updates);
+  /** run fn over a scratch layer on top of the overlay and base, keeping its writes when fn
+      returns; a throw drops them */
+  apply<T>(base: RTxn, fn: (txn: WTxn) => T): T {
+    const updates: Layer = {};
+    const result = fn(new OverlayTxn(this.#reg, base, this.#data, updates));
 
-      // a throw leaves the updates uncommitted, which is the rollback
-      const result = fn(writable ? txn : readHalf(txn));
-
-      // commit the updates into the overlay's own layer
-      for (const [key, val] of Object.entries(updates)) {
-        // note: we must keep undefined values rather than propagate deletions to base
-        this.#data[key] = val;
-      }
-      return result;
-    });
+    // keep the scratch layer's writes in the overlay's own layer
+    for (const [key, val] of Object.entries(updates)) {
+      // note: we must keep undefined values rather than propagate deletions to base
+      this.#data[key] = val;
+    }
+    return result;
   }
 
-  write<T>(fn: (txn: WTxn) => T): T {
-    return this.#withTxn(true, fn);
-  }
-
-  read<T>(fn: (txn: RTxn) => T): T {
-    return this.#withTxn(false, fn);
+  /** the overlay over base, read-only */
+  view(base: RTxn): RTxn {
+    return readHalf(new OverlayTxn(this.#reg, base, this.#data, {}));
   }
 }
 
@@ -1572,7 +1566,7 @@ export class Engine<QX, C> {
   #wants: string[];
   #signal: AbortSignal;
 
-  #overlay: OverlayStore;
+  #overlay: Overlay;
   #graph: QueryGraph<QX>;
   #onError: (e: unknown) => void;
   #scheduled: boolean = false;
@@ -1676,7 +1670,7 @@ export class Engine<QX, C> {
       });
     this.#signal.addEventListener('abort', () => this.#schedule(), { once: true });
 
-    this.#overlay = new OverlayStore(this.#store, reg);
+    this.#overlay = new Overlay(reg);
     this.#graph = new QueryGraph(context);
 
     // let the advancer begin initializing
@@ -1962,9 +1956,9 @@ export class Engine<QX, C> {
   }
 
   #onNewQueries(): void {
-    const cbs = this.#overlay.read((txn) => {
+    const cbs = this.#store.read((base) => {
       this.#newQueries = false;
-      return this.#graph.extend(txn);
+      return this.#graph.extend(this.#overlay.view(base));
     });
     cbs();
   }
@@ -2872,37 +2866,42 @@ export class Engine<QX, C> {
     const discarded: Record<string, true> = {};
     markDirty(discarded, this.#overlay.keys());
     this.#graph.dirty(discarded);
-    this.#overlay = new OverlayStore(this.#store, this.#reg);
+    this.#overlay = new Overlay(this.#reg);
 
-    // forecast each outbox command, each seeing what the ones before it left
-    const forecaster = this.#forecaster;
-    if (forecaster !== null && this.#outbox.size > 0) {
-      const rows = this.#store.read((txn) =>
-        txnScanAll(txn, prefixRange('/command.', 1000, { type: '.command', want: JS })),
-      );
-      for (const [, value] of rows) {
-        const command = (value as Record<number, unknown>)[JS] as Command<Uint8Array>;
+    // one base read for the whole rebuild, so every forecast and every query sees one snapshot
+    const cbs = this.#store.read((base) => {
+      // forecast each outbox command, each seeing what the ones before it left
+      const forecaster = this.#forecaster;
+      if (forecaster !== null && this.#outbox.size > 0) {
+        const rows = txnScanAll(
+          base,
+          prefixRange('/command.', 1000, { type: '.command', want: JS }),
+        );
+        for (const [, value] of rows) {
+          const command = (value as Record<number, unknown>)[JS] as Command<Uint8Array>;
 
-        // a command this vocabulary cannot read is still sent; it just forecasts nothing
-        const data = this.#commandData(command.data);
-        if (data === undefined) continue;
+          // a command this vocabulary cannot read is still sent; it just forecasts nothing
+          const data = this.#commandData(command.data);
+          if (data === undefined) continue;
 
-        /* Each command forecasts in its own overlay transaction, so a throw cancels its events
-           alone.  A throw from the forecast is its way of forecasting nothing; a reducer can also
-           throw on correct code, when real events have moved the base underneath a forecast that
-           no longer applies.  Either way the command is in flight and the server decides. */
-        try {
-          this.#graph.dirty(this.#overlay.write((txn) => this.#forecastIn(txn, forecaster, data)));
-        } catch {
-          continue;
+          /* Each command forecasts in its own scratch layer, so a throw cancels its events alone.
+             A throw from the forecast is its way of forecasting nothing; a reducer can also throw
+             on correct code, when real events have moved the base underneath a forecast that no
+             longer applies.  Either way the command is in flight and the server decides. */
+          try {
+            const dirty = this.#overlay.apply(base, (txn) =>
+              this.#forecastIn(txn, forecaster, data),
+            );
+            this.#graph.dirty(dirty);
+          } catch {
+            continue;
+          }
         }
       }
-    }
 
-    // run the graph, new queries included
-    const cbs = this.#overlay.read((txn) => {
+      // run the graph, new queries included
       this.#newQueries = false;
-      return this.#graph.run(txn);
+      return this.#graph.run(this.#overlay.view(base));
     });
     cbs();
   }
