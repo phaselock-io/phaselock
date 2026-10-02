@@ -1,9 +1,21 @@
 // A msgpack cursor: measure a value without decoding it, read one value at a time by its type,
 // skip or slice anything else, and a writer that builds msgpack from headers, scalars, and
-// pre-encoded values.  Dates are the timestamp extension.
+// pre-encoded values.  Dates are the timestamp extension.  UTF-8, 64-bit integers, timestamps,
+// and the map key cache are msgpack-javascript's, vendored under ./vendor.
+
+import { CachedKeyDecoder } from './vendor/msgpack-javascript/CachedKeyDecoder.js';
+import { getInt64, getUint64, setInt64, setUint64 } from './vendor/msgpack-javascript/int.js';
+import { encodeDateToTimeSpec, EXT_TIMESTAMP } from './vendor/msgpack-javascript/timestamp.js';
+import { utf8Count, utf8Decode, utf8Encode } from './vendor/msgpack-javascript/utf8.js';
 
 export const utf8 = new TextDecoder();
-const utf8enc = new TextEncoder();
+
+// one cache of decoded map keys for every reader
+const keyDecoder = new CachedKeyDecoder();
+
+// the largest seconds of the 32- and 64-bit timestamp forms
+const TIMESTAMP32_MAX_SEC = 0x100000000 - 1;
+const TIMESTAMP64_MAX_SEC = 0x400000000 - 1;
 
 /** the kinds of msgpack value a cursor can be on */
 export type Kind = 'nil' | 'bool' | 'int' | 'float' | 'str' | 'bin' | 'array' | 'map' | 'ext';
@@ -141,13 +153,30 @@ export function measure(buf: Uint8Array, pos: number, end: number): number {
 /** Reader walks one complete msgpack value at a time from a buffer. */
 export class Reader {
   #buf: Uint8Array;
+  // made on first use, since most values need no multi-byte read
+  #dataView: DataView | null = null;
   #pos: number;
   #end: number;
+  #lastKey = 0;
+  #lastKeyLen = 0;
 
   constructor(buf: Uint8Array, pos = 0, end = buf.length) {
     this.#buf = buf;
     this.#pos = pos;
     this.#end = end;
+  }
+
+  /** read another buffer, as a new reader over it would */
+  reset(buf: Uint8Array, pos = 0, end = buf.length): void {
+    this.#buf = buf;
+    this.#dataView = null;
+    this.#pos = pos;
+    this.#end = end;
+  }
+
+  get #data(): DataView {
+    const b = this.#buf;
+    return (this.#dataView ??= new DataView(b.buffer, b.byteOffset, b.byteLength));
   }
 
   get done(): boolean {
@@ -221,71 +250,162 @@ export class Reader {
     if (this.#pos + n > this.#end) throw new Error('truncated msgpack value');
   }
 
-  #view(n: number): DataView {
-    this.#need(n);
-    const v = new DataView(this.#buf.buffer, this.#buf.byteOffset + this.#pos, n);
-    this.#pos += n;
-    return v;
+  // a big-endian length or count of n bytes after the header byte, consuming both
+  #length(n: 1 | 2 | 4): number {
+    this.#need(1 + n);
+    const at = this.#pos + 1;
+    this.#pos += 1 + n;
+    if (n === 1) return this.#buf[at];
+    if (n === 2) return this.#data.getUint16(at);
+    return this.#data.getUint32(at);
   }
 
   arrayHeader(): number {
     this.#need(1);
-    const b = this.#buf[this.#pos++];
-    if (b >= 0x90 && b <= 0x9f) return b & 0x0f;
-    if (b === 0xdc) return this.#view(2).getUint16(0);
-    if (b === 0xdd) return this.#view(4).getUint32(0);
+    const b = this.#buf[this.#pos];
+    if (b >= 0x90 && b <= 0x9f) {
+      this.#pos++;
+      return b & 0x0f;
+    }
+    if (b === 0xdc) return this.#length(2);
+    if (b === 0xdd) return this.#length(4);
     throw new Error(`expected msgpack array, got 0x${b.toString(16)}`);
   }
 
   mapHeader(): number {
     this.#need(1);
-    const b = this.#buf[this.#pos++];
-    if (b >= 0x80 && b <= 0x8f) return b & 0x0f;
-    if (b === 0xde) return this.#view(2).getUint16(0);
-    if (b === 0xdf) return this.#view(4).getUint32(0);
+    const b = this.#buf[this.#pos];
+    if (b >= 0x80 && b <= 0x8f) {
+      this.#pos++;
+      return b & 0x0f;
+    }
+    if (b === 0xde) return this.#length(2);
+    if (b === 0xdf) return this.#length(4);
     throw new Error(`expected msgpack map, got 0x${b.toString(16)}`);
   }
 
-  str(): string {
+  // the byte length of the string at the cursor, consuming its header
+  #strHeader(): number {
     this.#need(1);
-    const b = this.#buf[this.#pos++];
-    let n: number;
-    if (b >= 0xa0 && b <= 0xbf) n = b & 0x1f;
-    else if (b === 0xd9) n = this.#view(1).getUint8(0);
-    else if (b === 0xda) n = this.#view(2).getUint16(0);
-    else if (b === 0xdb) n = this.#view(4).getUint32(0);
-    else throw new Error(`expected msgpack string, got 0x${b.toString(16)}`);
+    const b = this.#buf[this.#pos];
+    if (b >= 0xa0 && b <= 0xbf) {
+      this.#pos++;
+      return b & 0x1f;
+    }
+    if (b === 0xd9) return this.#length(1);
+    if (b === 0xda) return this.#length(2);
+    if (b === 0xdb) return this.#length(4);
+    throw new Error(`expected msgpack string, got 0x${b.toString(16)}`);
+  }
+
+  str(): string {
+    const n = this.#strHeader();
     this.#need(n);
-    const s = utf8.decode(this.#buf.subarray(this.#pos, this.#pos + n));
+    const s = utf8Decode(this.#buf, this.#pos, n);
+    this.#pos += n;
+    return s;
+  }
+
+  /** The index of the key at the cursor among keys, each UTF-8, compared as bytes with no
+      string made; -1 for none, and the key is then lastKey().  The search starts at hint, the
+      index a caller expects, and wraps. */
+  keyIndex(keys: readonly Uint8Array[], hint: number): number {
+    const n = this.#strHeader();
+    this.#need(n);
+    const at = this.#pos;
+    this.#pos += n;
+    this.#lastKey = at;
+    this.#lastKeyLen = n;
+    const buf = this.#buf;
+    const count = keys.length;
+    for (let j = 0; j < count; j++) {
+      const i = hint + j < count ? hint + j : hint + j - count;
+      const k = keys[i];
+      if (k.length !== n) continue;
+      let b = 0;
+      while (b < n && k[b] === buf[at + b]) b++;
+      if (b === n) return i;
+    }
+    return -1;
+  }
+
+  /** the key keyIndex last read */
+  lastKey(): string {
+    return utf8Decode(this.#buf, this.#lastKey, this.#lastKeyLen);
+  }
+
+  /** a string in map key position, short ones through the shared key cache */
+  key(): string {
+    const n = this.#strHeader();
+    this.#need(n);
+    const s = keyDecoder.canBeCached(n)
+      ? keyDecoder.decode(this.#buf, this.#pos, n)
+      : utf8Decode(this.#buf, this.#pos, n);
     this.#pos += n;
     return s;
   }
 
   int(): number {
     this.#need(1);
-    const b = this.#buf[this.#pos++];
-    if (b <= 0x7f) return b;
-    if (b >= 0xe0) return b - 256;
+    const b = this.#buf[this.#pos];
+    if (b <= 0x7f) {
+      this.#pos++;
+      return b;
+    }
+    if (b >= 0xe0) {
+      this.#pos++;
+      return b - 256;
+    }
+    const at = this.#pos + 1;
+    const d = this.#data;
+    let width: number;
+    let v: number;
     switch (b) {
       case 0xcc:
-        return this.#view(1).getUint8(0);
+        width = 1;
+        this.#need(1 + width);
+        v = d.getUint8(at);
+        break;
       case 0xcd:
-        return this.#view(2).getUint16(0);
+        width = 2;
+        this.#need(1 + width);
+        v = d.getUint16(at);
+        break;
       case 0xce:
-        return this.#view(4).getUint32(0);
+        width = 4;
+        this.#need(1 + width);
+        v = d.getUint32(at);
+        break;
       case 0xcf:
-        return Number(this.#view(8).getBigUint64(0));
+        width = 8;
+        this.#need(1 + width);
+        v = getUint64(d, at);
+        break;
       case 0xd0:
-        return this.#view(1).getInt8(0);
+        width = 1;
+        this.#need(1 + width);
+        v = d.getInt8(at);
+        break;
       case 0xd1:
-        return this.#view(2).getInt16(0);
+        width = 2;
+        this.#need(1 + width);
+        v = d.getInt16(at);
+        break;
       case 0xd2:
-        return this.#view(4).getInt32(0);
+        width = 4;
+        this.#need(1 + width);
+        v = d.getInt32(at);
+        break;
       case 0xd3:
-        return Number(this.#view(8).getBigInt64(0));
+        width = 8;
+        this.#need(1 + width);
+        v = getInt64(d, at);
+        break;
       default:
         throw new Error(`expected msgpack integer, got 0x${b.toString(16)}`);
     }
+    this.#pos += 1 + width;
+    return v;
   }
 
   bool(): boolean {
@@ -305,38 +425,64 @@ export class Reader {
 
   float(): number {
     this.#need(1);
-    const b = this.#buf[this.#pos++];
-    if (b === 0xca) return this.#view(4).getFloat32(0);
-    if (b === 0xcb) return this.#view(8).getFloat64(0);
+    const b = this.#buf[this.#pos];
+    if (b === 0xca) {
+      this.#need(5);
+      this.#pos += 5;
+      return this.#data.getFloat32(this.#pos - 4);
+    }
+    if (b === 0xcb) {
+      this.#need(9);
+      this.#pos += 9;
+      return this.#data.getFloat64(this.#pos - 8);
+    }
     throw new Error(`expected msgpack number, got 0x${b.toString(16)}`);
   }
 
-  /** a timestamp extension in any of its three sizes, as a Date at millisecond precision */
+  /** a timestamp extension in any of its three sizes, as a Date at millisecond precision, its
+      forms as the vendored decodeTimestampToTimeSpec reads them, read in place */
   timestamp(): Date {
     this.#need(1);
     const b = this.#buf[this.#pos];
-    const ext = b === 0xd6 || b === 0xd7 || b === 0xc7;
-    if (!ext) throw new Error(`expected msgpack timestamp, got 0x${b.toString(16)}`);
-    this.#need(b === 0xc7 ? 3 : 2);
-    const type = this.#buf[this.#pos + 1];
-    if (b === 0xd6 && type === 0xff) {
-      this.#pos += 2;
-      return new Date(this.#view(4).getUint32(0) * 1000);
+    let header: number;
+    let size: number;
+    if (b === 0xd6) {
+      header = 1;
+      size = 4;
+    } else if (b === 0xd7) {
+      header = 1;
+      size = 8;
+    } else if (b === 0xc7) {
+      this.#need(2);
+      header = 2;
+      size = this.#buf[this.#pos + 1];
+    } else {
+      throw new Error(`expected msgpack timestamp, got 0x${b.toString(16)}`);
     }
-    if (b === 0xd7 && type === 0xff) {
-      this.#pos += 2;
-      const v = this.#view(8);
-      const hi = v.getUint32(0);
-      const sec = (hi & 0x3) * 0x100000000 + v.getUint32(4);
-      return new Date(sec * 1000 + Math.floor((hi >>> 2) / 1e6));
+    this.#need(header + 1 + size);
+    const d = this.#data;
+    const type = d.getInt8(this.#pos + header);
+    if (type !== EXT_TIMESTAMP)
+      throw new Error(`expected msgpack timestamp, got extension ${type}`);
+    const at = this.#pos + header + 1;
+    let sec: number;
+    let nsec: number;
+    if (size === 4) {
+      sec = d.getUint32(at);
+      nsec = 0;
+    } else if (size === 8) {
+      const hi = d.getUint32(at);
+      sec = (hi & 0x3) * 0x100000000 + d.getUint32(at + 4);
+      nsec = hi >>> 2;
+    } else if (size === 12) {
+      nsec = d.getUint32(at);
+      sec = getInt64(d, at + 4);
+    } else {
+      throw new Error(`malformed msgpack timestamp of ${size} bytes`);
     }
-    if (b === 0xc7 && type === 12 && this.#buf[this.#pos + 2] === 0xff) {
-      this.#pos += 3;
-      const v = this.#view(12);
-      const nsec = v.getUint32(0);
-      return new Date(Number(v.getBigInt64(4)) * 1000 + Math.floor(nsec / 1e6));
-    }
-    throw new Error('expected msgpack timestamp, got another extension');
+    if (nsec > 999_999_999) throw new Error('malformed msgpack timestamp');
+    this.#pos = at + size;
+    return new Date(sec * 1e3 + Math.floor(nsec / 1e6));
   }
 
   /** skip one value of any type */
@@ -366,9 +512,10 @@ export class Reader {
 }
 
 /** Writer builds msgpack from headers, scalars, and pre-encoded values, in a buffer that grows
-    as needed. */
+    as needed.  Every value takes its smallest form. */
 export class Writer {
   #buf = new Uint8Array(1024);
+  #data = new DataView(this.#buf.buffer);
   #pos = 0;
 
   #ensure(n: number): void {
@@ -378,24 +525,22 @@ export class Writer {
     const grown = new Uint8Array(size);
     grown.set(this.#buf.subarray(0, this.#pos));
     this.#buf = grown;
+    this.#data = new DataView(grown.buffer);
   }
 
   // a container header: the fixed form, then the 16- and 32-bit forms
   #header(n: number, fix: number, wide: number): void {
     this.#ensure(5);
-    const b = this.#buf;
     if (n < 16) {
-      b[this.#pos++] = fix | n;
+      this.#buf[this.#pos++] = fix | n;
     } else if (n < 0x10000) {
-      b[this.#pos++] = wide;
-      b[this.#pos++] = n >>> 8;
-      b[this.#pos++] = n & 0xff;
+      this.#buf[this.#pos++] = wide;
+      this.#data.setUint16(this.#pos, n);
+      this.#pos += 2;
     } else {
-      b[this.#pos++] = wide + 1;
-      b[this.#pos++] = n >>> 24;
-      b[this.#pos++] = (n >>> 16) & 0xff;
-      b[this.#pos++] = (n >>> 8) & 0xff;
-      b[this.#pos++] = n & 0xff;
+      this.#buf[this.#pos++] = wide + 1;
+      this.#data.setUint32(this.#pos, n);
+      this.#pos += 4;
     }
   }
 
@@ -408,69 +553,66 @@ export class Writer {
   }
 
   str(s: string): void {
-    const b = utf8enc.encode(s);
-    const n = b.length;
-    this.#ensure(n + 5);
-    const out = this.#buf;
+    const n = utf8Count(s);
+    this.#ensure(5 + n);
     if (n < 32) {
-      out[this.#pos++] = 0xa0 | n;
+      this.#buf[this.#pos++] = 0xa0 | n;
     } else if (n < 0x100) {
-      out[this.#pos++] = 0xd9;
-      out[this.#pos++] = n;
+      this.#buf[this.#pos++] = 0xd9;
+      this.#buf[this.#pos++] = n;
     } else if (n < 0x10000) {
-      out[this.#pos++] = 0xda;
-      out[this.#pos++] = n >>> 8;
-      out[this.#pos++] = n & 0xff;
+      this.#buf[this.#pos++] = 0xda;
+      this.#data.setUint16(this.#pos, n);
+      this.#pos += 2;
     } else {
-      out[this.#pos++] = 0xdb;
-      out[this.#pos++] = n >>> 24;
-      out[this.#pos++] = (n >>> 16) & 0xff;
-      out[this.#pos++] = (n >>> 8) & 0xff;
-      out[this.#pos++] = n & 0xff;
+      this.#buf[this.#pos++] = 0xdb;
+      this.#data.setUint32(this.#pos, n);
+      this.#pos += 4;
     }
-    out.set(b, this.#pos);
+    utf8Encode(s, this.#buf, this.#pos);
     this.#pos += n;
   }
 
   /** a safe integer in its smallest form */
   int(v: number): void {
     this.#ensure(9);
-    const b = this.#buf;
+    const d = this.#data;
     if (v >= 0) {
       if (v < 0x80) {
-        b[this.#pos++] = v;
+        this.#buf[this.#pos++] = v;
       } else if (v < 0x100) {
-        b[this.#pos++] = 0xcc;
-        b[this.#pos++] = v;
+        this.#buf[this.#pos++] = 0xcc;
+        this.#buf[this.#pos++] = v;
       } else if (v < 0x10000) {
-        b[this.#pos++] = 0xcd;
-        b[this.#pos++] = v >>> 8;
-        b[this.#pos++] = v & 0xff;
+        this.#buf[this.#pos++] = 0xcd;
+        d.setUint16(this.#pos, v);
+        this.#pos += 2;
       } else if (v < 0x100000000) {
-        b[this.#pos++] = 0xce;
-        new DataView(b.buffer, b.byteOffset + this.#pos, 4).setUint32(0, v);
+        this.#buf[this.#pos++] = 0xce;
+        d.setUint32(this.#pos, v);
         this.#pos += 4;
       } else {
-        b[this.#pos++] = 0xcf;
-        new DataView(b.buffer, b.byteOffset + this.#pos, 8).setBigUint64(0, BigInt(v));
+        this.#buf[this.#pos++] = 0xcf;
+        setUint64(d, this.#pos, v);
         this.#pos += 8;
       }
-    } else if (v >= -32) {
-      b[this.#pos++] = v & 0xff;
+    } else if (v >= -0x20) {
+      this.#buf[this.#pos++] = v & 0xff;
     } else if (v >= -0x80) {
-      b[this.#pos++] = 0xd0;
-      b[this.#pos++] = v & 0xff;
+      this.#buf[this.#pos++] = 0xd0;
+      d.setInt8(this.#pos, v);
+      this.#pos += 1;
     } else if (v >= -0x8000) {
-      b[this.#pos++] = 0xd1;
-      new DataView(b.buffer, b.byteOffset + this.#pos, 2).setInt16(0, v);
+      this.#buf[this.#pos++] = 0xd1;
+      d.setInt16(this.#pos, v);
       this.#pos += 2;
     } else if (v >= -0x80000000) {
-      b[this.#pos++] = 0xd2;
-      new DataView(b.buffer, b.byteOffset + this.#pos, 4).setInt32(0, v);
+      this.#buf[this.#pos++] = 0xd2;
+      d.setInt32(this.#pos, v);
       this.#pos += 4;
     } else {
-      b[this.#pos++] = 0xd3;
-      new DataView(b.buffer, b.byteOffset + this.#pos, 8).setBigInt64(0, BigInt(v));
+      this.#buf[this.#pos++] = 0xd3;
+      setInt64(d, this.#pos, v);
       this.#pos += 8;
     }
   }
@@ -488,38 +630,36 @@ export class Writer {
   float64(v: number): void {
     this.#ensure(9);
     this.#buf[this.#pos++] = 0xcb;
-    new DataView(this.#buf.buffer, this.#buf.byteOffset + this.#pos, 8).setFloat64(0, v);
+    this.#data.setFloat64(this.#pos, v);
     this.#pos += 8;
   }
 
-  /** a Date as the smallest timestamp extension that holds it */
+  /** a Date as the smallest timestamp extension that holds it, the forms as the vendored
+      encodeTimeSpecToTimestamp chooses them, written in place */
   timestamp(d: Date): void {
-    const ms = d.getTime();
-    const sec = Math.floor(ms / 1000);
-    const nsec = (ms - sec * 1000) * 1e6;
+    const { sec, nsec } = encodeDateToTimeSpec(d);
     this.#ensure(15);
     const b = this.#buf;
-    if (sec >= 0 && sec <= 0x3ffffffff) {
-      if (nsec === 0 && sec <= 0xffffffff) {
+    const v = this.#data;
+    if (sec >= 0 && sec <= TIMESTAMP64_MAX_SEC) {
+      if (nsec === 0 && sec <= TIMESTAMP32_MAX_SEC) {
         b[this.#pos++] = 0xd6;
-        b[this.#pos++] = 0xff;
-        new DataView(b.buffer, b.byteOffset + this.#pos, 4).setUint32(0, sec);
+        v.setInt8(this.#pos++, EXT_TIMESTAMP);
+        v.setUint32(this.#pos, sec);
         this.#pos += 4;
       } else {
         b[this.#pos++] = 0xd7;
-        b[this.#pos++] = 0xff;
-        const v = new DataView(b.buffer, b.byteOffset + this.#pos, 8);
-        v.setUint32(0, ((nsec << 2) | ((sec / 0x100000000) & 0x3)) >>> 0);
-        v.setUint32(4, sec >>> 0);
+        v.setInt8(this.#pos++, EXT_TIMESTAMP);
+        v.setUint32(this.#pos, (nsec << 2) | (sec / 0x100000000));
+        v.setUint32(this.#pos + 4, sec >>> 0);
         this.#pos += 8;
       }
     } else {
       b[this.#pos++] = 0xc7;
       b[this.#pos++] = 12;
-      b[this.#pos++] = 0xff;
-      const v = new DataView(b.buffer, b.byteOffset + this.#pos, 12);
-      v.setUint32(0, nsec);
-      v.setBigInt64(4, BigInt(sec));
+      v.setInt8(this.#pos++, EXT_TIMESTAMP);
+      v.setUint32(this.#pos, nsec);
+      setInt64(v, this.#pos + 4, sec);
       this.#pos += 12;
     }
   }
@@ -534,5 +674,10 @@ export class Writer {
   /** the bytes written so far, as their own copy */
   bytes(): Uint8Array<ArrayBuffer> {
     return this.#buf.slice(0, this.#pos);
+  }
+
+  /** empty the writer to write another value into the same buffer */
+  reset(): void {
+    this.#pos = 0;
   }
 }

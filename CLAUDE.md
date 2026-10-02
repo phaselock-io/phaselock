@@ -90,6 +90,11 @@ example to regenerate.
   keyof-based `useQuery.ts`) are library-quality; `usePhaseLock.ts` is
   app-specific by design — clarity over generality.
 - Wrap new documentation files at 80 columns.
+- Vendored third-party code lives under a `vendor/` directory, each file
+  headed with its origin, version, commit, any modification, SPDX id,
+  and full license text (see `client/ts/src/vendor/`), and gets an entry
+  in the root `NOTICE`, mirrored in the `NOTICE` of any package that
+  ships it.
 - If a result contradicts your model of the system, stop and ask rather
   than iterating on guesses; this codebase has few but sharp invariants,
   and the user usually spots the mismatch immediately.

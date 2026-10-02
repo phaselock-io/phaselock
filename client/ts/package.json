@@ -31,6 +31,8 @@
     "@types/node": "^22.0.0"
   },
   "files": [
-    "dist/**"
+    "dist/**",
+    "LICENSE",
+    "NOTICE"
   ]
 }

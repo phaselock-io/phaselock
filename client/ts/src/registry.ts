@@ -16,6 +16,8 @@ import {
 } from './contract.js';
 import { Reader, Writer } from './msgpack.js';
 
+const utf8 = new TextEncoder();
+
 /** a value that does not match its type; the message names the path and the problem */
 export class ConvertError extends Error {
   constructor(message: string) {
@@ -30,9 +32,10 @@ type Policy = 'reject' | 'drop';
 
 type Struct = Extract<SchemaNode, { 0: 'struct' }>;
 
-/** a conversion in progress: the path to the value being converted, for its error */
+/** a conversion in progress: the path to the value being converted, for its error, as object
+    keys and array indices */
 class Walk {
-  path: string[] = [];
+  path: (string | number)[] = [];
 
   constructor(
     readonly reg: Registry_,
@@ -40,7 +43,8 @@ class Walk {
   ) {}
 
   fail(message: string): never {
-    throw new ConvertError(`$${this.path.join('')}: ${message}`);
+    const path = this.path.map((p) => (typeof p === 'number' ? `[${p}]` : `.${p}`)).join('');
+    throw new ConvertError(`$${path}: ${message}`);
   }
 
   // reading //////////////////////////////////////////////////////////////////
@@ -75,8 +79,8 @@ class Walk {
         const out: Record<string, unknown> = {};
         for (let k = 0; k < count; k++) {
           if (r.kind() !== 'str') this.fail('expected a string key');
-          const key = r.str();
-          this.path.push(`.${key}`);
+          const key = r.key();
+          this.path.push(key);
           out[key] = this.read(r, n[2]);
           this.path.pop();
         }
@@ -87,7 +91,7 @@ class Walk {
         const count = r.arrayHeader();
         const out = new Array<unknown>(count);
         for (let k = 0; k < count; k++) {
-          this.path.push(`[${k}]`);
+          this.path.push(k);
           out[k] = this.read(r, n[2]);
           this.path.pop();
         }
@@ -99,7 +103,7 @@ class Walk {
         if (count !== n[2].length) this.fail(`expected ${n[2].length} items, not ${count}`);
         const out = new Array<unknown>(count);
         for (let k = 0; k < count; k++) {
-          this.path.push(`[${k}]`);
+          this.path.push(k);
           out[k] = this.read(r, n[2][k]);
           this.path.pop();
         }
@@ -137,35 +141,38 @@ class Walk {
   readStruct(r: Reader, n: Struct): unknown {
     if (r.kind() !== 'map') this.fail('expected an object');
     const fields = n[2];
-    const index = this.reg.fieldIndex(n);
+    const keys = this.reg.encodedKeys(n);
     const count = r.mapHeader();
     const out: Record<string, unknown> = {};
-    const seen = new Array<boolean>(fields.length).fill(false);
+    const seen = new Uint8Array(fields.length);
 
-    // each entry: a declared field, read once, or a foreign one, under the policy
+    // each entry: a declared field, read once, or a foreign one, under the policy; fields are
+    // usually in declaration order, so each search starts after the last match
+    let hint = 0;
     for (let k = 0; k < count; k++) {
       if (r.kind() !== 'str') this.fail('expected a string key');
-      const key = r.str();
-      const f = index.get(key);
-      if (f === undefined) {
+      const f = r.keyIndex(keys, hint);
+      if (f < 0) {
         if (this.policy === 'reject') {
-          this.path.push(`.${key}`);
+          this.path.push(r.lastKey());
           this.fail('unknown field');
         }
         r.skip();
         continue;
       }
-      this.path.push(`.${key}`);
+      const key = fields[f][0];
+      this.path.push(key);
       if (seen[f]) this.fail('repeated field');
-      seen[f] = true;
+      seen[f] = 1;
       out[key] = this.read(r, fields[f][1]);
       this.path.pop();
+      hint = f + 1 < fields.length ? f + 1 : 0;
     }
 
     // every required field was present
     for (let f = 0; f < fields.length; f++) {
       if (seen[f] || fields[f][2]) continue;
-      this.path.push(`.${fields[f][0]}`);
+      this.path.push(fields[f][0]);
       this.fail('missing required field');
     }
     return out;
@@ -281,12 +288,13 @@ class Walk {
   findField(r: Reader, pos: number, key: string): number {
     const saved = r.pos;
     r.pos = pos;
+    const want = [this.reg.encodedKey(key)];
     let at = -1;
     if (r.kind() === 'map') {
       const count = r.mapHeader();
       for (let k = 0; k < count; k++) {
         if (r.kind() !== 'str') this.fail('expected a string key');
-        if (r.str() === key) {
+        if (r.keyIndex(want, 0) === 0) {
           at = r.pos;
           break;
         }
@@ -331,7 +339,7 @@ class Walk {
         w.mapHeader(entries.length);
         for (const [key, x] of entries) {
           w.str(key);
-          this.path.push(`.${key}`);
+          this.path.push(key);
           this.write(w, n[2], x);
           this.path.pop();
         }
@@ -341,7 +349,7 @@ class Walk {
         if (!Array.isArray(v)) this.fail('expected an array');
         w.arrayHeader(v.length);
         for (let k = 0; k < v.length; k++) {
-          this.path.push(`[${k}]`);
+          this.path.push(k);
           this.write(w, n[2], v[k]);
           this.path.pop();
         }
@@ -352,7 +360,7 @@ class Walk {
         if (v.length !== n[2].length) this.fail(`expected ${n[2].length} items, not ${v.length}`);
         w.arrayHeader(v.length);
         for (let k = 0; k < v.length; k++) {
-          this.path.push(`[${k}]`);
+          this.path.push(k);
           this.write(w, n[2][k], v[k]);
           this.path.pop();
         }
@@ -381,7 +389,7 @@ class Walk {
       const index = this.reg.fieldIndex(n);
       for (const key of Object.keys(o)) {
         if (!index.has(key) && o[key] !== undefined) {
-          this.path.push(`.${key}`);
+          this.path.push(key);
           this.fail('unknown field');
         }
       }
@@ -393,7 +401,7 @@ class Walk {
       if (o[key] !== undefined) {
         present++;
       } else if (!optional) {
-        this.path.push(`.${key}`);
+        this.path.push(key);
         this.fail('missing required field');
       }
     }
@@ -403,7 +411,7 @@ class Walk {
       const x = o[key];
       if (x === undefined) continue;
       w.str(key);
-      this.path.push(`.${key}`);
+      this.path.push(key);
       this.write(w, type, x);
       this.path.pop();
     }
@@ -485,7 +493,7 @@ function familyOf(stream: string): string {
 function isSystemEvent(r: Reader): boolean {
   const saved = r.pos;
   let sys = false;
-  if (r.kind() === 'map' && r.mapHeader() > 0 && r.kind() === 'str') sys = r.str() === '$sys';
+  if (r.kind() === 'map' && r.mapHeader() > 0 && r.kind() === 'str') sys = r.key() === '$sys';
   r.pos = saved;
   return sys;
 }
@@ -499,6 +507,12 @@ class Registry_ implements Registry {
   // each struct's field names to their positions, built on first use
   readonly #fieldIndexes = new Map<Struct, Map<string, number>>();
   readonly #writeOrders = new Map<number, number[]>();
+  readonly #encodedKeys = new Map<Struct, Uint8Array[]>();
+  readonly #encodedKey = new Map<string, Uint8Array>();
+  // one cursor every conversion from bytes reads with
+  readonly #reader = new Reader(new Uint8Array(0));
+  // one buffer every conversion to bytes writes into, emptied first and copied out after
+  readonly #writer = new Writer();
 
   constructor(readonly schema: Schema) {
     this.commands = schema.commands ?? '';
@@ -527,6 +541,26 @@ class Registry_ implements Registry {
       case 'field':
         return this.#learnDiscriminators(s[2], key ?? s[1]);
     }
+  }
+
+  /** a struct's field names, UTF-8, in declaration order */
+  encodedKeys(n: Struct): Uint8Array[] {
+    let keys = this.#encodedKeys.get(n);
+    if (keys === undefined) {
+      keys = n[2].map(([key]) => utf8.encode(key));
+      this.#encodedKeys.set(n, keys);
+    }
+    return keys;
+  }
+
+  /** one key, UTF-8 */
+  encodedKey(key: string): Uint8Array {
+    let k = this.#encodedKey.get(key);
+    if (k === undefined) {
+      k = utf8.encode(key);
+      this.#encodedKey.set(key, k);
+    }
+    return k;
   }
 
   fieldIndex(n: Struct): Map<string, number> {
@@ -573,7 +607,8 @@ class Registry_ implements Registry {
 
   #toJs(type: string, bytes: Uint8Array): unknown {
     if (type === '.json' || type === '.command') return decode(bytes);
-    const r = new Reader(bytes);
+    const r = this.#reader;
+    r.reset(bytes);
     const walk = new Walk(this, 'drop');
     try {
       const v = type === '.event' ? this.#readEvent(r, walk) : this.#readTyped(r, type);
@@ -624,7 +659,8 @@ class Registry_ implements Registry {
 
   #toBytes(type: string, v: unknown): Uint8Array {
     if (type === '.json' || type === '.command') return encode(v, { ignoreUndefined: true });
-    const w = new Writer();
+    const w = this.#writer;
+    w.reset();
     if (type === '.event') {
       this.#writeEvent(w, v as DbEvent<unknown>);
     } else {
