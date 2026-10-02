@@ -156,3 +156,102 @@ describe('Writer', () => {
     expect(decode(bytes.subarray(first))).toEqual(['cmd-2', [1, 2, 3]]);
   });
 });
+
+describe('typed reads', () => {
+  test('kind names the type of the value at the cursor', () => {
+    const cases: [unknown, string][] = [
+      [null, 'nil'],
+      [true, 'bool'],
+      [1, 'int'],
+      [-1, 'int'],
+      [2 ** 40, 'int'],
+      [1.5, 'float'],
+      ['s', 'str'],
+      [new Uint8Array(2), 'bin'],
+      [[1], 'array'],
+      [{ a: 1 }, 'map'],
+      [new Date(0), 'ext'],
+    ];
+    for (const [v, kind] of cases) expect(new Reader(encode(v)).kind()).toBe(kind);
+  });
+
+  test('bool, nil, and float read their values and reject anything else', () => {
+    expect(new Reader(encode(true)).bool()).toBe(true);
+    expect(new Reader(encode(false)).bool()).toBe(false);
+    expect(() => new Reader(encode(1)).bool()).toThrow(/bool/);
+    const r = new Reader(encode(null));
+    r.nil();
+    expect(r.done).toBe(true);
+    expect(() => new Reader(encode(0)).nil()).toThrow(/nil/);
+    expect(new Reader(encode(1.5)).float()).toBe(1.5);
+    expect(new Reader(Uint8Array.of(0xca, 0x3f, 0xc0, 0x00, 0x00)).float()).toBe(1.5);
+    expect(() => new Reader(encode('x')).float()).toThrow(/number/);
+  });
+
+  test('timestamp reads the three sizes of the extension', () => {
+    const whole = new Date('2026-01-02T03:04:05Z'); // 32-bit
+    const millis = new Date('2026-01-02T03:04:05.678Z'); // 64-bit
+    const old = new Date('1960-06-07T08:09:10.123Z'); // 96-bit, negative seconds
+    for (const d of [whole, millis, old]) {
+      const bytes = encode(d);
+      expect(new Reader(bytes).timestamp()).toEqual(d);
+    }
+    expect(encode(whole).length).toBe(6);
+    expect(encode(millis).length).toBe(10);
+    expect(encode(old).length).toBe(15);
+    expect(() => new Reader(encode(5)).timestamp()).toThrow(/timestamp/);
+    expect(() => new Reader(Uint8Array.of(0xd6, 1, 0, 0, 0, 0)).timestamp()).toThrow(/timestamp/);
+  });
+});
+
+describe('typed writes', () => {
+  test.each([0, 1, 15, 16, 65535, 65536])('map header of %d matches the encoder', (n) => {
+    const w = new Writer();
+    w.mapHeader(n);
+    const expected = encode(
+      Object.fromEntries(Array.from({ length: n }, (_, i) => [String(i), 0])),
+    );
+    const header = n < 16 ? 1 : n < 65536 ? 3 : 5;
+    expect(w.bytes()).toEqual(expected.subarray(0, header));
+  });
+
+  test.each([...ints, ...negs])('int %d matches the encoder', (n) => {
+    const w = new Writer();
+    w.int(n);
+    expect(w.bytes()).toEqual(encode(n));
+  });
+
+  test('bool, nil, float64, and timestamps match the encoder', () => {
+    const w = new Writer();
+    w.bool(true);
+    w.bool(false);
+    w.nil();
+    w.float64(1.5);
+    const whole = new Date('2026-01-02T03:04:05Z');
+    const millis = new Date('2026-01-02T03:04:05.678Z');
+    const old = new Date('1960-06-07T08:09:10.123Z');
+    w.timestamp(whole);
+    w.timestamp(millis);
+    w.timestamp(old);
+    expect(w.bytes()).toEqual(
+      new Uint8Array([
+        ...encode(true),
+        ...encode(false),
+        ...encode(null),
+        ...encode(1.5),
+        ...encode(whole),
+        ...encode(millis),
+        ...encode(old),
+      ]),
+    );
+  });
+
+  test('grows past its first buffer', () => {
+    const w = new Writer();
+    for (let i = 0; i < 10000; i++) w.str('0123456789');
+    const bytes = w.bytes();
+    expect(bytes.length).toBe(11 * 10000);
+    const r = new Reader(bytes);
+    for (let i = 0; i < 10000; i++) expect(r.str()).toBe('0123456789');
+  });
+});

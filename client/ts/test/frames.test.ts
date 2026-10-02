@@ -2,10 +2,12 @@ import { describe, expect, test } from 'vitest';
 import { decode, encode } from '@msgpack/msgpack';
 import { parseFrame } from '../src/frames.js';
 
+const at = new Date('2026-01-02T03:04:05.678Z');
+
 describe('parseFrame', () => {
   test('events: envelope decoded, data sliced out undecoded', () => {
     const f = parseFrame(
-      encode(['events', [[[7, 'patron.p1', 3, 'id-1', 1700000000000], { type: 'x', n: [1, 2] }]]]),
+      encode(['events', [[[7, 'patron.p1', 3, 'id-1', at], { type: 'x', n: [1, 2] }]]]),
     );
     if (f.tag !== 'events') throw new Error(f.tag);
     expect(f.events).toHaveLength(1);
@@ -15,14 +17,11 @@ describe('parseFrame', () => {
       'patron.p1',
       3,
       'id-1',
-      1700000000000,
+      at,
     ]);
     expect(decode(e.data)).toEqual({ type: 'x', n: [1, 2] });
     // raw is the whole pair, and data is a view into it
-    expect(decode(e.raw)).toEqual([
-      [7, 'patron.p1', 3, 'id-1', 1700000000000],
-      { type: 'x', n: [1, 2] },
-    ]);
+    expect(decode(e.raw)).toEqual([[7, 'patron.p1', 3, 'id-1', at], { type: 'x', n: [1, 2] }]);
     expect(e.data.buffer).toBe(e.raw.buffer);
   });
 
@@ -31,9 +30,9 @@ describe('parseFrame', () => {
       encode([
         'events',
         [
-          [[1, 'a', 1, 'i', 0], 'one'],
-          [[2, 'b', 1, 'i', 0], 'two'],
-          [[3, 'a', 2, 'i', 0], 'three'],
+          [[1, 'a', 1, 'i', at], 'one'],
+          [[2, 'b', 1, 'i', at], 'two'],
+          [[3, 'a', 2, 'i', at], 'three'],
         ],
       ]),
     );
@@ -47,7 +46,7 @@ describe('parseFrame', () => {
 
   test('later protocol additions are skipped: envelope, event pair, and frame elements', () => {
     const f = parseFrame(
-      encode(['events', [[[7, 's', 3, 'id', 1, 'newer', { x: 1 }], 5, 'newer']], 'newer']),
+      encode(['events', [[[7, 's', 3, 'id', at, 'newer', { x: 1 }], 5, 'newer']], 'newer']),
     );
     if (f.tag !== 'events') throw new Error(f.tag);
     expect(decode(f.events[0].data)).toBe(5);
@@ -80,7 +79,9 @@ describe('parseFrame', () => {
     expect(() => parseFrame(encode(['events', [[[1, 's', 1, 'i'], 'x']]]))).toThrow(
       /short envelope/,
     );
-    expect(() => parseFrame(encode(['events', [[[1, 's', 1, 'i', 0]]]]))).toThrow(/without data/);
+    expect(() => parseFrame(encode(['events', [[[1, 's', 1, 'i', at]]]]))).toThrow(/without data/);
+    // the server time is a timestamp, never an integer
+    expect(() => parseFrame(encode(['events', [[[1, 's', 1, 'i', 0], 'x']]]))).toThrow(/timestamp/);
     expect(() => parseFrame(encode('not an array'))).toThrow(/expected msgpack array/);
   });
 });

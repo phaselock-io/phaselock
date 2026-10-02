@@ -33,25 +33,36 @@ const dec = new TextDecoder();
 export const bytes = (v: unknown): Uint8Array => enc.encode(JSON.stringify(v));
 export const parse = (b: Uint8Array): unknown => JSON.parse(dec.decode(b));
 
+// the envelope, with the server time as milliseconds
 type Env = [number, string, number, string, number];
 
 function eventFromWire(pair: unknown): DbEvent<unknown> {
   const [env, data] = pair as [Env, unknown];
-  return { position: env[0], stream: env[1], seq: env[2], id: env[3], servertime: env[4], data };
+  const servertime = new Date(env[4]);
+  return { position: env[0], stream: env[1], seq: env[2], id: env[3], servertime, data };
 }
 
 function wireFromEvent(ev: DbEvent<unknown>): [Env, unknown] {
-  return [[ev.position, ev.stream, ev.seq, ev.id, ev.servertime], ev.data];
+  return [[ev.position, ev.stream, ev.seq, ev.id, ev.servertime.getTime()], ev.data];
 }
 
 // registry //////////////////////////////////////////////////////////////////
+
+/** the registry rejects an event of this type, standing in for one that fails its schema */
+export const INVALID = 'invalid';
 
 export const registry: Registry = {
   convert(type: string, value: StoreValue, want: number): StoreValue {
     const out = { ...value } as Record<number, unknown>;
     if (want & JS && !(JS in out) && MSGPACK in out) {
       const raw = parse(out[MSGPACK] as Uint8Array);
-      out[JS] = type === '.event' ? eventFromWire(raw) : raw;
+      if (type === '.event') {
+        const ev = eventFromWire(raw);
+        if ((ev.data as { type?: string }).type === INVALID) throw new Error('$.type: invalid');
+        out[JS] = ev;
+      } else {
+        out[JS] = raw;
+      }
     }
     if (want & MSGPACK && !(MSGPACK in out) && JS in out) {
       const js = out[JS];
@@ -76,7 +87,8 @@ export type TestEvent =
   | { id: string; type: 'set'; field: string; value: unknown }
   | { id: string; type: 'bump' }
   | { id: string; type: 'noop' }
-  | { id: string; type: 'boom' };
+  | { id: string; type: 'boom' }
+  | { id: string; type: typeof INVALID };
 
 export type State = { count: number; fields: Record<string, unknown> };
 
@@ -127,7 +139,7 @@ export function ev(
     position,
     stream,
     seq,
-    servertime: 0,
+    servertime: new Date(0),
   };
   return { ...e, data: bytes(full), raw: bytes(wireFromEvent(e)) };
 }
@@ -139,7 +151,7 @@ export function birth(stream: string, seq: number, position: number): WireEvent 
     position,
     stream,
     seq,
-    servertime: 0,
+    servertime: new Date(0),
   };
   return { ...e, data: bytes(e.data), raw: bytes(wireFromEvent(e)) };
 }
@@ -151,7 +163,7 @@ export function death(stream: string, seq: number, position: number): WireEvent 
     position,
     stream,
     seq,
-    servertime: 0,
+    servertime: new Date(0),
   };
   return { ...e, data: bytes(e.data), raw: bytes(wireFromEvent(e)) };
 }

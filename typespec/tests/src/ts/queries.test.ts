@@ -1,26 +1,15 @@
 /**
- * Behavioral test of the emitted query layer.
- *
- * Unlike check.test.ts / decode.test.ts, this compiles its TypeSpec in-memory and runs
- * generateTs() directly, prepending a minimal stub of the runtime skeleton (just the pieces the
- * query layer references).  The generated module is written under tsp-output/ and imported, so
- * the assertions below exercise the real generated wire ids, checkers, decoders, and the local
- * and remote provider constructions.
+ * Behavioral test of the emitted query layer: the wire ids, the remote provider that encodes
+ * each call and decodes each result through the host's Registry, the local provider, and the
+ * dispatcher a serving side routes a decoded call through.  The Registry here records what the
+ * generated code hands it, since the conversions themselves are the host's.
  */
 
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-
-import { lowerProgram } from '@phaselock/typespec-core';
-import { generateTs } from '@phaselock/typespec-ts';
-import { resolvePath } from '@typespec/compiler';
-import { createTester } from '@typespec/compiler/testing';
 import { beforeAll, describe, expect, it } from 'vitest';
 
-const base = fileURLToPath(new URL('../..', import.meta.url));
-const Tester = createTester(resolvePath(base), { libraries: ['@phaselock/typespec-core'] })
-  .import('@phaselock/typespec-core')
-  .using('PhaseLock');
+import { JS, MSGPACK } from '../../../ts/assets/skeleton.ts';
+
+import { emit, outDir } from './emit-harness.ts';
 
 const SOURCE = `
   model PatronInfo { id: string; name: string; since: utcDateTime; }
@@ -34,82 +23,52 @@ const SOURCE = `
   }
 `;
 
-/* Stand-in for the runtime skeleton: jsonTypeof and encodeProto behave like the real ones;
-   RemoteQueries records what generated methods pass to the transport. */
-const STUB_SKELETON = `
-export function jsonTypeof(val: any): string {
-  const t = typeof(val);
-  if (t === "object") {
-    if (val === null) return "null";
-    if (Array.isArray(val)) return "array";
-  }
-  return t;
-}
-
-export function encodeProto(base: any): any {
-  switch (typeof base) {
-    case "boolean":
-    case "bigint":
-    case "number":
-    case "string":
-    case "undefined":
-      return base;
-    case "object":
-      if (base === null) return base;
-      break;
-    default:
-      throw new Error("type not handled by encodeProto: " + typeof base);
-  }
-  if (base.toJSON) return base.toJSON();
-  if (Array.isArray(base)) return base.map(encodeProto);
-  return Object.fromEntries(Object.entries(base).map(([k, v]) => [k, encodeProto(v)]));
-}
-
-export type QueryFunction<QX, T> = (qx: QX) => T;
-export interface Query<T> {
-  latest: T | undefined;
-  subscribe(callback: (val: T) => void): () => void;
-  close(): void;
-}
-
-export class RemoteQueries {
-  io: any;
-  constructor(io: any) { this.io = io; }
-  newQuery<T>(raw: any[], decoder: (result: any) => T): Query<T> {
-    return this.io.createQuery(raw, decoder);
-  }
-}
-`;
-
-const ISO = '2024-01-02T03:04:05Z';
+const ISO = '2024-01-02T03:04:05.000Z';
 
 let text: string;
 let M: any;
 
 beforeAll(async () => {
-  const [result, diagnostics] = await Tester.compileAndDiagnose(SOURCE);
-  if (diagnostics.length > 0) {
-    throw new Error(`compile diagnostics: ${diagnostics.map((d) => d.message).join('\n')}`);
-  }
-  text = generateTs(lowerProgram(result.program), STUB_SKELETON);
+  const out = await emit(SOURCE, outDir('queries-test'));
+  text = out.text;
+  M = await import(out.file);
+}, 60_000);
 
-  const dir = resolvePath(base, 'tsp-output/.queries-test');
-  mkdirSync(dir, { recursive: true });
-  const file = resolvePath(dir, 'queries.gen.ts');
-  writeFileSync(file, text);
-  M = await import(file);
-});
+const enc = new TextEncoder();
+const dec = new TextDecoder();
 
-/** assert the checker accepts `value` (no problems) */
-function ok(fn: (val: any) => string[], value: any): void {
-  expect(fn(value)).toEqual([]);
+/** a Registry whose bytes are JSON, recording the type each conversion was asked under */
+function fakeRegistry() {
+  const asked: [string, 'toBytes' | 'toJs'][] = [];
+  return {
+    asked,
+    commands: '',
+    eventTypes: {},
+    storeTypes: {},
+    convert(type: string, value: any, want: number) {
+      const out = { ...value };
+      if (want & MSGPACK && !(MSGPACK in out)) {
+        asked.push([type, 'toBytes']);
+        out[MSGPACK] = enc.encode(JSON.stringify(out[JS]));
+      }
+      if (want & JS && !(JS in out)) {
+        asked.push([type, 'toJs']);
+        out[JS] = JSON.parse(dec.decode(out[MSGPACK]));
+      }
+      return out;
+    },
+  };
 }
 
-/** assert the checker rejects `value`, optionally with a problem containing `needle` */
-function fails(fn: (val: any) => string[], value: any, needle?: string): void {
-  const problems = fn(value);
-  expect(problems).not.toEqual([]);
-  if (needle !== undefined) expect(problems.join('\n')).toContain(needle);
+function fakeIo() {
+  const calls: { query: unknown; onResult: (bytes: Uint8Array) => void }[] = [];
+  return {
+    calls,
+    createQuery(query: Uint8Array, onResult: (bytes: Uint8Array) => void) {
+      calls.push({ query: JSON.parse(dec.decode(query)), onResult });
+      return () => {};
+    },
+  };
 }
 
 describe('wire ids', () => {
@@ -123,88 +82,40 @@ describe('wire ids', () => {
   });
 });
 
-describe('wire message checker', () => {
-  it('accepts well-formed query messages', () => {
-    ok(M.checkAdminQuery, ['AdminQueries.allPatrons']);
-    ok(M.checkAdminQuery, ['AdminQueries.patronsNamed', 'bob', 3]);
-    ok(M.checkAdminQuery, ['AdminQueries.patronsNamed', 'bob', null]);
-    ok(M.checkAdminQuery, ['AdminQueries.patronsSince', ISO]);
-    ok(M.checkUserQuery, ['UserQueries.myPatron', 'u1']);
-  });
-
-  it('rejects unknown ids, wrong arity, and wrong arg types', () => {
-    fails(M.checkAdminQuery, ['AdminQueries.nope']);
-    fails(M.checkAdminQuery, ['AdminQueries.patronsNamed', 'bob']);
-    fails(M.checkAdminQuery, ['AdminQueries.patronsNamed', 5, 3]);
-    fails(M.checkAdminQuery, ['AdminQueries.patronsSince', 'not a date'], 'invalid timestamp');
-    fails(M.checkAdminQuery, 'AdminQueries.allPatrons');
-    fails(M.checkUserQuery, ['UserQueries.myPatron']);
-  });
-});
-
-describe('wire message decoder', () => {
-  it('produces the typed tuple, reviving dates', () => {
-    const decoded = M.decodeAdminQuery(['AdminQueries.patronsSince', ISO]);
-    expect(decoded[0]).toBe('AdminQueries.patronsSince');
-    expect(decoded[1]).toBeInstanceOf(Date);
-    expect(decoded[1].toISOString()).toBe('2024-01-02T03:04:05.000Z');
-  });
-
-  it('passes nullable args through', () => {
-    expect(M.decodeAdminQuery(['AdminQueries.patronsNamed', 'bob', null])).toEqual([
-      'AdminQueries.patronsNamed',
-      'bob',
-      null,
-    ]);
-  });
-});
-
-function fakeIo() {
-  const calls: { raw: any[]; decoder: (v: any) => any }[] = [];
-  return {
-    calls,
-    createQuery(raw: any[], decoder: (v: any) => any) {
-      const call = { raw, decoder };
-      calls.push(call);
-      return call;
-    },
-  };
-}
-
 describe('remote provider', () => {
-  it('encodes each call as [id, ...args]', () => {
+  it("encodes each call as [id, ...args] through the registry, under the interface's wire type", () => {
+    const reg = fakeRegistry();
     const io = fakeIo();
-    const remote = new M.RemoteAdminQueries(io);
+    const remote = new M.RemoteAdminQueries(reg, io);
     remote.allPatrons();
     remote.patronsNamed('bob', 3);
     remote.patronsNamed('bob');
     remote.patronsSince(new Date(ISO));
 
-    expect(io.calls.map((c) => c.raw)).toEqual([
+    expect(io.calls.map((c) => c.query)).toEqual([
       ['AdminQueries.allPatrons'],
       ['AdminQueries.patronsNamed', 'bob', 3],
       ['AdminQueries.patronsNamed', 'bob', null],
-      ['AdminQueries.patronsSince', '2024-01-02T03:04:05.000Z'],
+      ['AdminQueries.patronsSince', ISO],
+    ]);
+    expect(reg.asked).toEqual([
+      ['AdminQuery', 'toBytes'],
+      ['AdminQuery', 'toBytes'],
+      ['AdminQuery', 'toBytes'],
+      ['AdminQuery', 'toBytes'],
     ]);
   });
 
-  it('every encoded call passes its own checker', () => {
+  it("decodes results through the registry, under the query's id plus #result", () => {
+    const reg = fakeRegistry();
     const io = fakeIo();
-    const remote = new M.RemoteAdminQueries(io);
-    remote.allPatrons();
-    remote.patronsNamed('bob');
-    remote.patronsSince(new Date(ISO));
-    for (const call of io.calls) {
-      ok(M.checkAdminQuery, JSON.parse(JSON.stringify(call.raw)));
-    }
-  });
-
-  it("decodes results with the query's result decoder", () => {
-    const io = fakeIo();
-    const remote = new M.RemoteAdminQueries(io);
-    remote.allPatrons();
-    const decoded = io.calls[0].decoder([{ id: 'p1', name: 'n', since: ISO }]);
-    expect(decoded[0].since).toBeInstanceOf(Date);
+    const remote = new M.RemoteAdminQueries(reg, io);
+    const q = remote.allPatrons();
+    const seen: unknown[] = [];
+    q.subscribe((v: unknown) => seen.push(v));
+    io.calls[0].onResult(enc.encode(JSON.stringify([{ id: 'p1', name: 'n', since: ISO }])));
+    expect(seen).toEqual([[{ id: 'p1', name: 'n', since: ISO }]]);
+    expect(reg.asked.at(-1)).toEqual(['AdminQueries.allPatrons#result', 'toJs']);
   });
 });
 
@@ -265,13 +176,10 @@ describe('dispatcher', () => {
     };
   }
 
-  it('routes a decoded message to the matching provider method', () => {
+  it('routes a decoded call to the matching provider method', () => {
     const queries = fakeQueries();
-    const q1 = M.dispatchAdminQuery(queries, M.decodeAdminQuery(['AdminQueries.allPatrons']));
-    const q2 = M.dispatchAdminQuery(
-      queries,
-      M.decodeAdminQuery(['AdminQueries.patronsNamed', 'bob', 3]),
-    );
+    const q1 = M.dispatchAdminQuery(queries, ['AdminQueries.allPatrons']);
+    const q2 = M.dispatchAdminQuery(queries, ['AdminQueries.patronsNamed', 'bob', 3]);
     expect(q1).toBe('q-all');
     expect(q2).toBe('q-named');
     expect(queries.calls).toEqual([['allPatrons'], ['patronsNamed', 'bob', 3]]);
@@ -279,14 +187,8 @@ describe('dispatcher', () => {
 
   it('passes nullable wire args as absent', () => {
     const queries = fakeQueries();
-    M.dispatchAdminQuery(queries, M.decodeAdminQuery(['AdminQueries.patronsNamed', 'bob', null]));
+    M.dispatchAdminQuery(queries, ['AdminQueries.patronsNamed', 'bob', null]);
     expect(queries.calls).toEqual([['patronsNamed', 'bob', undefined]]);
-  });
-
-  it('revived args arrive as their decoded types', () => {
-    const queries = fakeQueries();
-    M.dispatchAdminQuery(queries, M.decodeAdminQuery(['AdminQueries.patronsSince', ISO]));
-    expect(queries.calls[0][1]).toBeInstanceOf(Date);
   });
 
   it('throws on an unknown id', () => {

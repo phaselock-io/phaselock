@@ -113,7 +113,7 @@ describe('the live stream', () => {
     NewHTTPConnector(stub.url, () => 'jwt')(-1, null, ['*', 'book'], ctl.signal, hooks(log));
     await s.opened;
     s.push(['live', 0]);
-    s.push(['events', [[[1, 'book', 1, 'c1', 5], { $sys: 'birth' }]]]);
+    s.push(['events', [[[1, 'book', 1, 'c1', new Date(5)], { $sys: 'birth' }]]]);
     s.push(['view', 't2', 2, ['book', 'patron.p1']]);
     s.push(['vouch', 3]);
     s.push(['end', 7, 'done']);
@@ -379,7 +379,7 @@ describe('backfill', () => {
         'PhaseLock-Scanned': String(scanned),
       });
       const body = page.map(([p, s, seq]) =>
-        encode(['events', [[[p, s, seq, `c${p}`, 0], { p }]]]),
+        encode(['events', [[[p, s, seq, `c${p}`, new Date(0)], { p }]]]),
       );
       res.end(Buffer.concat(body.map((b) => Buffer.from(b))));
     });

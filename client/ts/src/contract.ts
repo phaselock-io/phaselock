@@ -8,14 +8,15 @@ export type Command<T> = {
 };
 
 /** DbEvent is event data T with the envelope the DB stamped on it when it was committed:
-    [position, stream, seq, id, servertime] on the wire.  The id is the command's. */
+    [position, stream, seq, id, servertime] on the wire, the server time a msgpack timestamp.  The
+    id is the command's. */
 export type DbEvent<T> = {
   id: string;
   data: T;
   position: number;
   stream: string;
   seq: number;
-  servertime: number;
+  servertime: Date;
 };
 
 /** WireEvent is an event as a connector delivers it: the envelope decoded for routing, data as
@@ -99,3 +100,84 @@ export type ConnectorFactory = (
   signal: AbortSignal,
   hooks: ConnectorHooks,
 ) => Connector;
+
+// the store's value bundles and the Registry, with the registry data a host builds one from
+
+/** The representations a value can be in: JS is the rich JS value, HOST the host language's,
+    MSGPACK the bytes.  They are bits, so a Wants is a mask of them: what an ask wants back, and
+    a store produces every wanted one it does not already hold, in one read.  0 means "as held",
+    which only move uses. */
+export const JS = 1;
+export const HOST = 2;
+export const MSGPACK = 4;
+export type Wants = number;
+
+/** A StoreValue is a value keyed by representation, in one, or in several when several were
+    wanted.  What arrives may not be what a caller asked for; a store converts to what it keeps
+    on the way in and to what was wanted on the way out. */
+export type StoreValue = { [JS]: unknown } | { [HOST]: unknown } | { [MSGPACK]: Uint8Array };
+
+/** Registry converts between representations of typed values and names the types the store
+    holds.  Types are model names from the TypeSpec, plus three reserved names: `.json` for the
+    Engine's own shapes; `.command` for the outbox envelope, `{id, data}` with `data` already the
+    command's wire bytes, so it needs no vocabulary to read; and `.event` for a parked event, the
+    wire pair `[env, data]` in `msgpack` and a DbEvent in `js`, its `data` converted through the
+    union of the stream's slice. */
+export interface Registry {
+  /** the value of type `type` carrying every representation in `want`: present ones are kept,
+      the rest produced in one pass */
+  convert(type: string, value: StoreValue, want: Wants): StoreValue;
+  /** the commands union this engine may submit */
+  commands: string;
+  /** stream prefix (before the first dot) to the slice's events union */
+  eventTypes: Record<string, string>;
+  /** slicePrefix/subkeyPrefix (each before its first dot) to the store value's type */
+  storeTypes: Record<string, string>;
+}
+
+/** One type of the model, as the generated registry describes it; children are indices into
+    the same node table.  A struct lists its fields in declaration order; a union carries the
+    solver's decision tree; an intake node names a field the database prepares for precommit,
+    over the wire type a client sends.  The identities of a struct, record, array, tuple, or union
+    are its name, or null when the type has none. */
+export type SchemaNode =
+  | ['null']
+  | ['int']
+  | ['str']
+  | ['bool']
+  | ['date']
+  | ['json']
+  | ['lit', string | number | boolean]
+  | ['struct', string | null, [key: string, type: number, optional: boolean][]]
+  | ['record', string | null, number]
+  | ['array', string | null, number]
+  | ['tuple', string | null, number[]]
+  | ['union', string | null, SchemaSolution]
+  | ['intake', string, number];
+
+/** How a walk tells a union's members apart.  `match` names the member.  `jsontype` branches on
+    the value's json type, `literal` on its value, `length` on an array's length with a default
+    for any other, `index` descends into an array element, `field` tests a field of the object
+    without descending, and `hasfield` picks the first of its keys present. */
+export type SchemaSolution =
+  | ['match', number]
+  | ['jsontype', [string, SchemaSolution][]]
+  | ['literal', [string | number | boolean, SchemaSolution][]]
+  | ['length', [number, SchemaSolution][], SchemaSolution | null]
+  | ['index', number, SchemaSolution]
+  | ['field', string, SchemaSolution]
+  | ['hasfield', [string, SchemaSolution][]];
+
+/** The type registry as data, generated per engine and per database: the model's types as a
+    node table, the type identities the Registry answers for and their nodes, and what the
+    Registry's `commands`, `eventTypes`, and `storeTypes` are.  Every engine and database of one
+    model shares one node table.  A host walks it to convert values; the reserved identities are
+    the host's own. */
+export type Schema = {
+  nodes: SchemaNode[];
+  ids: Record<string, number>;
+  /** the commands union, or null for a database with no commands */
+  commands: string | null;
+  eventTypes: Record<string, string>;
+  storeTypes: Record<string, string>;
+};

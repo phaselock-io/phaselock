@@ -43,7 +43,7 @@ export function parseFrame(bytes: Uint8Array): Frame {
         const stream = p.str();
         const seq = p.int();
         const id = p.str();
-        const servertime = p.int();
+        const servertime = p.timestamp();
         for (let k = 5; k < env; k++) p.skip();
         const data = p.view();
         events.push({ id, data, raw, position, stream, seq, servertime });

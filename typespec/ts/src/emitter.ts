@@ -1,12 +1,14 @@
 /**
- * TypeScript code generator: emits type aliases, decoders, and JSON structural checkers for the
- * model's types; each slice's reducer context and handler table; each engine's read context,
- * forecaster table, and Engine class; each database's read context, precommit table, and bundle
- * definition; and the typed query layers, all from the lowered IR.
+ * TypeScript code generator: emits type aliases for the model's types; the type registry as
+ * data, one node table with a schema per engine and per database; each slice's reducer context
+ * and handler table; each engine's read context, forecaster table, and Engine class; each
+ * database's read context, precommit table, and bundle definition; and the typed query layers,
+ * all from the lowered IR.
  *
  * Names derive from the declarations the user wrote: `PatronSlice` gives `PatronSliceTxn` and
- * `PatronSliceReducers`, `UserEngine` gives `UserEngineTxn` and the `UserEngine` class, and a
- * handler table's keys are its event or command model names, camelCased.
+ * `PatronSliceReducers`, `UserEngine` gives `UserEngineTxn`, `userEngineSchema`, and the
+ * `UserEngine` class, and a handler table's keys are its event or command model names,
+ * camelCased.
  */
 
 import {
@@ -48,14 +50,6 @@ import {
 } from '@phaselock/typespec-core';
 
 type Annos = Map<PType, string>;
-/** a decoder maps a value expression to a decoding expression; null is the identity decoder */
-type Decoder = ((val: string) => string) | null;
-type Decoders = Map<PType, Decoder>;
-/** a checker maps (valueExpr, pathExpr) to TS statements appending to `problems`; noop → "" */
-type Checker = (val: string, path: string) => string;
-type Checkers = Map<PType, Checker>;
-
-const NOOP: Checker = () => '';
 
 function lowerFirst(name: string): string {
   return name[0].toLowerCase() + name.slice(1);
@@ -241,542 +235,193 @@ function walkSolution(d: Denter, solution: Solution, onMatch: (t: PType) => stri
   visit(solution, 'x');
 }
 
-function decodeSolution(d: Denter, decoders: Decoders, solution: Solution): void {
-  walkSolution(d, solution, (t) => {
-    const decoder = decoders.get(t) ?? null;
-    return 'return ' + (decoder === null ? 'val' : decoder('val')) + ';\n';
-  });
-}
+// the type registry ////////////////////////////////////////////////////////
 
-function generateDecoders(
-  d: Denter,
-  registry: PTypeRegistry,
-  annos: Annos,
-  decoders: Decoders,
-  t: PType,
-  anon: { n: number },
-): void {
-  const visit = (t: PType): void => {
-    if (decoders.has(t)) return;
+/* The registry is data: a table of nodes, each type once, referring to each other by index,
+   with the union solver's decision tree inside each union node; and for each engine and
+   database a Schema naming that table, the identities a Registry answers for, and its commands,
+   eventTypes, and storeTypes.  Hosts walk it to convert values. */
 
-    if (
-      t instanceof PString ||
-      t instanceof PInt ||
-      t instanceof PBool ||
-      t instanceof PNull ||
-      t instanceof PLiteral ||
-      t instanceof PJson
-    ) {
-      decoders.set(t, null);
-      // builtin types and their aliases need no decode{name}() function
-      return;
+/** the type identities a Schema answers for, each to its type */
+type Identities = Map<string, PType>;
+
+/** the node table being built: each type's index, in visiting order */
+class NodeTable {
+  readonly index = new Map<PType, number>();
+  readonly order: PType[] = [];
+
+  constructor(private readonly registry: PTypeRegistry) {}
+
+  /** the index of a type's node, visiting its children first; a result is its base's node */
+  visit(t: PType): number {
+    if (t instanceof PResult) return this.visit(t.base);
+    const seen = this.index.get(t);
+    if (seen !== undefined) return seen;
+    const i = this.order.length;
+    this.index.set(t, i);
+    this.order.push(t);
+    if (t instanceof PStruct) for (const ft of t.fields.values()) this.visit(ft);
+    else if (t instanceof PObject) this.visit(t.valueType);
+    else if (t instanceof PArray) this.visit(t.itemType);
+    else if (t instanceof PTuple) for (const it of t.itemTypes) this.visit(it);
+    else if (t instanceof PUnion) for (const ut of t.types) this.visit(ut);
+    else if (t instanceof PIntake) this.visit(t.wire);
+    return i;
+  }
+
+  /** a solution as data */
+  solution(sln: Solution): string {
+    if (sln instanceof Match) return `["match", ${this.visit(sln.typ)}]`;
+    if (sln instanceof CheckJsonType) {
+      const opts = [...sln.options].map(
+        ([jt, sub]) => `[${JSON.stringify(jt)}, ${this.solution(sub)}]`,
+      );
+      return `["jsontype", [${opts.join(', ')}]]`;
     }
-
-    if (t instanceof PDate) {
-      decoders.set(t, (val) => `new Date(${val} as string)`);
-      // no decode{name}() needed
-      return;
+    if (sln instanceof CheckLiteral) {
+      const opts = [...sln.options].map(
+        ([lit, sub]) => `[${JSON.stringify(lit)}, ${this.solution(sub)}]`,
+      );
+      return `["literal", [${opts.join(', ')}]]`;
     }
-
-    // a result decodes as its base; an intake type as its result, which is what the database
-    // decodes, since intake runs first
-    if (t instanceof PResult || t instanceof PIntake) {
-      const inner = t instanceof PResult ? t.base : t.result;
-      visit(inner);
-      decoders.set(t, decoders.get(inner)!);
-      return;
+    if (sln instanceof CheckLength) {
+      const opts = [...sln.options].map(([n, sub]) => `[${n}, ${this.solution(sub)}]`);
+      const dflt = sln.default === null ? 'null' : this.solution(sln.default);
+      return `["length", [${opts.join(', ')}], ${dflt}]`;
     }
+    if (sln instanceof GetIndex) return `["index", ${sln.i}, ${this.solution(sln.solution)}]`;
+    if (sln instanceof GetField) {
+      return `["field", ${JSON.stringify(sln.key)}, ${this.solution(sln.solution)}]`;
+    }
+    if (sln instanceof HasField) {
+      const opts = sln.solutions.map(([k, sub]) => `[${JSON.stringify(k)}, ${this.solution(sub)}]`);
+      return `["hasfield", [${opts.join(', ')}]]`;
+    }
+    throw new Error(`unrecognized solution type: ${(sln as Solution).constructor.name}`);
+  }
 
-    let decoder: Decoder;
+  /** one node as data; children were visited when the type was */
+  node(t: PType): string {
+    const name = JSON.stringify(t.name);
+    const at = (c: PType) => this.index.get(c instanceof PResult ? c.base : c)!;
+    if (t instanceof PNull) return '["null"]';
+    if (t instanceof PInt) return '["int"]';
+    if (t instanceof PString) return '["str"]';
+    if (t instanceof PBool) return '["bool"]';
+    if (t instanceof PDate) return '["date"]';
+    if (t instanceof PJson) return '["json"]';
+    if (t instanceof PLiteral) return `["lit", ${JSON.stringify(t.value)}]`;
+    if (t instanceof PStruct) {
+      const fields = [...t.fields].map(
+        ([k, ft]) => `[${JSON.stringify(k)}, ${at(ft)}, ${t.maybes.has(k)}]`,
+      );
+      return `["struct", ${name}, [${fields.join(', ')}]]`;
+    }
+    if (t instanceof PObject) return `["record", ${name}, ${at(t.valueType)}]`;
+    if (t instanceof PArray) return `["array", ${name}, ${at(t.itemType)}]`;
+    if (t instanceof PTuple) return `["tuple", ${name}, [${t.itemTypes.map(at).join(', ')}]]`;
     if (t instanceof PUnion) {
-      for (const ut of t.types) visit(ut);
-      if (t.types.every((ut) => decoders.get(ut) === null)) {
-        decoder = null;
-      } else {
-        // non-identity union; this requires a union solution
-        const solution = solveUnion(registry, t.types);
-        let name = t.name;
-        if (!name) {
-          name = `Anon${anon.n}`;
-          anon.n += 1;
-        }
-        d.print(
-          `\n${t.name ? 'export ' : ''}function decode${name}(val: any): ${annos.get(t)} {\n`,
-        );
-        d.indent('  ');
-        decodeSolution(d, decoders, solution);
-        d.dedent();
-        d.print(`}\n`);
-        decoder = (val) => `decode${name}(${val})`;
-      }
-    } else if (t instanceof PArray) {
-      visit(t.itemType);
-      // calculate the decoding expression
-      const itemDecoder = decoders.get(t.itemType)!;
-      if (itemDecoder === null) {
-        decoder = null;
-      } else {
-        const decodeItemX = itemDecoder('x');
-        decoder = (val) => `${val}.map((x: any) => ${decodeItemX})`;
-      }
-    } else if (t instanceof PTuple) {
-      for (const it of t.itemTypes) visit(it);
-      if (t.itemTypes.every((it) => decoders.get(it) === null)) {
-        decoder = null;
-      } else {
-        decoder = (val) =>
-          '[' +
-          t.itemTypes
-            .map((it, i) => {
-              const itd = decoders.get(it);
-              return itd === null ? `${val}[${i}]` : itd!(`${val}[${i}]`);
-            })
-            .join(', ') +
-          ']';
-      }
-    } else if (t instanceof PStruct) {
-      for (const ft of t.fields.values()) visit(ft);
-      if ([...t.fields.values()].every((ft) => decoders.get(ft) === null)) {
-        // all decoders are identity; identity decoder works for the whole struct
-        decoder = null;
-      } else if ([...t.maybes.values()].every((ft) => decoders.get(ft) === null)) {
-        // all maybe decoders are identity; can be inlined with spread operator
-        decoder = (val) =>
-          '{ ' +
-          [
-            `...${val}`,
-            ...[...t.always]
-              .filter(([, ft]) => decoders.get(ft) !== null)
-              .map(([fn, ft]) => fn + ': ' + decoders.get(ft)!(`${val}.${fn}`)),
-          ].join(', ') +
-          ' }';
-      } else {
-        // non-identity maybes are present; inlining not possible
-        const n = anon.n;
-        anon.n += 1;
-        d.print(`\nfunction decodeAnon${n}(val: any): ${annos.get(t)} {\n`);
-        d.indent('  ');
-        d.print('const out = { ...val };\n');
-        for (const [fn, ft] of t.fields) {
-          const fd = decoders.get(ft)!;
-          if (fd === null) continue;
-          const decodedField = fd(`val.${fn}`);
-          if (t.maybes.has(fn)) {
-            d.print(`if(val.${fn}) out.${fn} = ${decodedField};\n`);
-          } else {
-            d.print(`out.${fn} = ${decodedField};\n`);
-          }
-        }
-        d.print(`return out as ${annos.get(t)};\n`);
-        d.dedent();
-        d.print(`}\n`);
-        decoder = (val) => `decodeAnon${n}(${val})`;
-      }
-    } else if (t instanceof PObject) {
-      visit(t.valueType);
-      const vd = decoders.get(t.valueType)!;
-      if (vd === null) {
-        decoder = null;
-      } else {
-        // non-identity values; inlining not possible
-        const n = anon.n;
-        anon.n += 1;
-        d.print(`\nfunction decodeAnon${n}(val: any): ${annos.get(t)} {\n`);
-        d.indent('  ');
-        d.print(
-          `return Object.fromEntries(Object.entries(val).map(([k, v]) => [k, ${vd('v')}])) as ${annos.get(t)};\n`,
-        );
-        d.dedent();
-        d.print(`}\n`);
-        decoder = (val) => `decodeAnon${n}(${val})`;
-      }
-    } else {
-      throw new Error(`unhandled type in generateDecoders: ${t}`);
+      return `["union", ${name}, ${this.solution(solveUnion(this.registry, t.types))}]`;
     }
-
-    // either define a named decoder or inline it
-    if (t.name) {
-      // we always export a named decoder (named unions with a solution already exported theirs)...
-      if (!(t instanceof PUnion && decoder !== null)) {
-        const decodeVal = decoder === null ? 'val' : decoder('val');
-        d.print(`\nexport function decode${t.name}(val: any): ${annos.get(t)} {\n`);
-        d.print(`  return ${decodeVal} as ${annos.get(t)};\n`);
-        d.print('}\n');
-      }
-      // ... but if the decoder is the identity_decoder, we don't use it ourselves
-      if (decoder === null) {
-        decoders.set(t, null);
-      } else {
-        const nm = t.name;
-        decoders.set(t, (val) => `decode${nm}(${val})`);
-      }
-    } else {
-      decoders.set(t, decoder);
-    }
-  };
-
-  visit(t);
-}
-
-// checkers
-
-/** an expression testing that `subj` is of the given json type */
-function jsonTypeCond(jtyp: string, subj: string): string {
-  switch (jtyp) {
-    case 'null':
-      return `${subj} === null`;
-    case 'string':
-      return `typeof ${subj} === "string"`;
-    case 'boolean':
-      return `typeof ${subj} === "boolean"`;
-    case 'int':
-      return `Number.isInteger(${subj})`;
-    case 'object':
-      return `jsonTypeof(${subj}) === "object"`;
-    case 'array':
-      return `Array.isArray(${subj})`;
-    default:
-      throw new Error(`json type not checkable in a union: ${jtyp}`);
+    if (t instanceof PIntake) return `["intake", ${JSON.stringify(t.kind)}, ${at(t.wire)}]`;
+    throw new Error(`unhandled type in the registry: ${t.constructor.name}`);
   }
 }
 
-const TIMESTAMP_RE = String.raw`/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/`;
-
-function checkSolution(d: Denter, checkers: Checkers, solution: Solution): void {
-  d.print('const problems: string[] = [];\n');
-  d.print('const x0 = val;\n');
-  d.print('const xpath0 = path;\n');
-
-  // `obj` names the value/path currently being navigated; `subj` names the value/path the
-  // enclosing check tests.  GetField mints a fresh, uniquely-numbered subject variable from `obj`
-  // but leaves `obj` unchanged, so sibling discriminators like [type, v] both read from the same
-  // object rather than from a previously extracted field.  Only GetIndex descends `obj` (into an
-  // array element).
-  let counter = 1;
-  const visit = (
-    solution: Solution,
-    obj: readonly [string, string],
-    subj: readonly [string, string],
-  ): void => {
-    const [objVar, objPath] = obj;
-    const [subjVar, subjPath] = subj;
-    if (solution instanceof Match) {
-      d.print(checkers.get(solution.typ)!('val', 'path'));
-      d.print('return problems;\n');
-    } else if (solution instanceof CheckJsonType) {
-      for (const [jtyp, subsln] of solution.options) {
-        d.print(`if (${jsonTypeCond(jtyp, subjVar)}) {\n`);
-        d.indent('  ');
-        visit(subsln, obj, obj);
-        d.dedent();
-        d.print('}\n');
-      }
-      d.print(
-        `problems.push(${subjPath} + ": type " + jsonTypeof(${subjVar}) + " not allowed here");\n`,
-      );
-      d.print('return problems;\n');
-    } else if (solution instanceof CheckLiteral) {
-      for (const [lit, subsln] of solution.options) {
-        const jslit = typeof lit === 'string' ? `"${lit}"` : String(lit);
-        d.print(`if (${subjVar} === ${jslit}) {\n`);
-        d.indent('  ');
-        visit(subsln, obj, obj);
-        d.dedent();
-        d.print('}\n');
-      }
-      d.print(`problems.push(${subjPath} + ": unexpected value");\n`);
-      d.print('return problems;\n');
-    } else if (solution instanceof CheckLength) {
-      for (const [length, subsln] of solution.options) {
-        d.print(`if (${subjVar}.length === ${length}) {\n`);
-        d.indent('  ');
-        visit(subsln, obj, obj);
-        d.dedent();
-        d.print('}\n');
-      }
-      if (solution.default !== null) {
-        visit(solution.default, obj, obj);
-      } else {
-        d.print(`problems.push(${subjPath} + ": unexpected length");\n`);
-        d.print('return problems;\n');
-      }
-    } else if (solution instanceof GetIndex) {
-      const i = counter++;
-      d.print(`const x${i} = ${objVar}[${solution.i}];\n`);
-      d.print(`const xpath${i} = ${objPath} + "[${solution.i}]";\n`);
-      const next = [`x${i}`, `xpath${i}`] as const;
-      visit(solution.solution, next, next);
-    } else if (solution instanceof GetField) {
-      const i = counter++;
-      d.print(`if (!("${solution.key}" in ${objVar})) {\n`);
-      d.print(`  problems.push(${objPath} + ': missing discriminator "${solution.key}"');\n`);
-      d.print(`  return problems;\n`);
-      d.print(`}\n`);
-      d.print(`const x${i} = ${objVar}["${solution.key}"];\n`);
-      d.print(`const xpath${i} = ${objPath} + ".${solution.key}";\n`);
-      visit(solution.solution, obj, [`x${i}`, `xpath${i}`]);
-    } else if (solution instanceof HasField) {
-      for (const [field, subsln] of solution.solutions) {
-        d.print(`if ("${field}" in ${objVar}) {\n`);
-        d.indent('  ');
-        visit(subsln, obj, obj);
-        d.dedent();
-        d.print('}\n');
-      }
-      d.print(`problems.push(${subjPath} + ": no matching keys found");\n`);
-      d.print('return problems;\n');
-    } else {
-      throw new Error(`unrecognized solution type: ${(solution as Solution).constructor.name}`);
-    }
-  };
-  visit(solution, ['x0', 'xpath0'], ['x0', 'xpath0']);
+/** the type identity of a type: its name, or a result's vocabulary name */
+function identityOf(t: PType): string {
+  if (t instanceof PResult) return t.kind;
+  if (t.name === null) throw new Error(`a type with no identity: ${t}`);
+  return t.name;
 }
 
-function generateCheckers(
+/** the identities of an engine's or a database's slices and commands: the events union of
+    each family, the type of each key template, and the commands union */
+function audienceIdentities(
+  ids: Identities,
+  slices: readonly PSlice[],
+  commandType: PType | undefined,
+): {
+  commands: string | null;
+  eventTypes: Record<string, string>;
+  storeTypes: Record<string, string>;
+} {
+  const eventTypes: Record<string, string> = {};
+  const storeTypes: Record<string, string> = {};
+  for (const slice of slices) {
+    eventTypes[slice.family] = identityOf(slice.events);
+    ids.set(eventTypes[slice.family], slice.events);
+    for (const item of slice.store.items) {
+      const id = storeTypeName(slice, item);
+      storeTypes[`${slice.family}/${item.name}`] = id;
+      ids.set(id, item.type);
+    }
+  }
+  let commands: string | null = null;
+  if (commandType !== undefined) {
+    commands = identityOf(commandType);
+    ids.set(commands, commandType);
+  }
+  return { commands, eventTypes, storeTypes };
+}
+
+/** the node table, the identity map, and a Schema per engine and per database */
+function generateSchema(
   d: Denter,
   registry: PTypeRegistry,
-  checkers: Checkers,
-  t: PType,
-  anon: { n: number },
-  loop: { n: number },
+  roots: readonly PType[],
+  engines: readonly PEngine[],
+  databases: readonly PDatabase[],
+  commandUnions: Map<PDatabase, PType>,
+  queries: readonly PQueries[],
 ): void {
-  const visit = (t: PType): void => {
-    if (checkers.has(t)) return;
+  const ids: Identities = new Map();
+  for (const t of roots) ids.set(identityOf(t), t);
 
-    if (t instanceof PJson) {
-      checkers.set(t, NOOP);
-      return;
-    }
-    // a result checks as its base; an intake type as its result, since the database checks a
-    // command after intake
-    if (t instanceof PResult || t instanceof PIntake) {
-      const inner = t instanceof PResult ? t.base : t.result;
-      visit(inner);
-      checkers.set(t, checkers.get(inner)!);
-      return;
-    }
-    if (t instanceof PString) {
-      checkers.set(
-        t,
-        (val, path) =>
-          `if (typeof ${val} !== "string") {\n` +
-          `  problems.push(${path} + ": is of type " + jsonTypeof(${val}) + ", not string");\n` +
-          `}\n`,
-      );
-      return;
-    }
-    if (t instanceof PInt) {
-      checkers.set(
-        t,
-        (val, path) =>
-          `if (!Number.isInteger(${val})) {\n` +
-          `  problems.push(${path} + ": is of type " + jsonTypeof(${val}) + ", not int");\n` +
-          `}\n`,
-      );
-      return;
-    }
-    if (t instanceof PBool) {
-      checkers.set(
-        t,
-        (val, path) =>
-          `if (typeof ${val} !== "boolean") {\n` +
-          `  problems.push(${path} + ": is of type " + jsonTypeof(${val}) + ", not bool");\n` +
-          `}\n`,
-      );
-      return;
-    }
-    if (t instanceof PNull || (t instanceof PLiteral && t.value === null)) {
-      checkers.set(
-        t,
-        (val, path) =>
-          `if (${val} !== null) {\n` +
-          `  problems.push(${path} + ": is of type " + jsonTypeof(${val}) + ", not null");\n` +
-          `}\n`,
-      );
-      return;
-    }
-    if (t instanceof PDate) {
-      checkers.set(
-        t,
-        (val, path) =>
-          `if (typeof ${val} !== "string" || !${TIMESTAMP_RE}.test(${val}) || isNaN(Date.parse(${val}))) {\n` +
-          `  problems.push(${path} + ": invalid timestamp");\n` +
-          `}\n`,
-      );
-      return;
-    }
-    if (t instanceof PLiteral) {
-      if (typeof t.value === 'string') {
-        checkers.set(
-          t,
-          (val, path) =>
-            `if (${val} !== "${t.value}") {\n` +
-            `  problems.push(${path} + ': is not "${t.value}"');\n` +
-            `}\n`,
-        );
-      } else {
-        const jslit = String(t.value);
-        checkers.set(
-          t,
-          (val, path) =>
-            `if (${val} !== ${jslit}) {\n` +
-            `  problems.push(${path} + ": is not ${jslit}");\n` +
-            `}\n`,
-        );
-      }
-      return;
-    }
+  // each audience's own identities
+  const audiences: [string, ReturnType<typeof audienceIdentities>][] = [];
+  for (const e of engines) {
+    audiences.push([e.name, audienceIdentities(ids, e.slices, e.commandType)]);
+  }
+  for (const db of databases) {
+    audiences.push([db.name, audienceIdentities(ids, db.slices, commandUnions.get(db))]);
+  }
 
-    let checker: Checker;
-    if (t instanceof PUnion) {
-      for (const ut of t.types) visit(ut);
-      const solution = solveUnion(registry, t.types);
-      const name = t.name ? `check${t.name}` : `checkAnon${anon.n++}`;
-      d.print(
-        `\n${t.name ? 'export ' : ''}function ${name}(val: any, path: string = "<root>"): string[] {\n`,
-      );
-      d.indent('  ');
-      checkSolution(d, checkers, solution);
-      d.dedent();
-      d.print('}\n');
-      checker = (val, path) => `problems.push(...${name}(${val}, ${path}));\n`;
-    } else if (t instanceof PArray) {
-      visit(t.itemType);
-      checker = (val, path) => {
-        const dd = new Denter();
-        dd.print(`if (!Array.isArray(${val})) {\n`);
-        dd.print(
-          `  problems.push(${path} + ": is a " + jsonTypeof(${val}) + ", not json array");\n`,
-        );
-        if (checkers.get(t.itemType) === NOOP) {
-          dd.print('}\n');
-          return dd.getvalue();
-        }
-        dd.print('} else {\n');
-        dd.indent('  ');
-        const n = loop.n++;
-        const iv = `i${n}`;
-        const ev = `e${n}`;
-        dd.print(`for (const [${iv}, ${ev}] of ${val}.entries()) {\n`);
-        dd.indent('  ');
-        // build the element's path off the original path expression, so nothing is clobbered
-        // when this checker is inlined inside another
-        dd.print(checkers.get(t.itemType)!(ev, `${path} + "[" + ${iv} + "]"`));
-        dd.dedent();
-        dd.print('}\n');
-        dd.dedent();
-        dd.print('}\n');
-        return dd.getvalue();
-      };
-    } else if (t instanceof PTuple) {
-      for (const it of t.itemTypes) visit(it);
-      checker = (val, path) => {
-        const dd = new Denter();
-        const n = t.itemTypes.length;
-        dd.print(`if (!Array.isArray(${val})) {\n`);
-        dd.print(
-          `  problems.push(${path} + ": is a " + jsonTypeof(${val}) + ", not json array");\n`,
-        );
-        dd.print(`} else if (${val}.length !== ${n}) {\n`);
-        dd.print(`  problems.push(${path} + ": expected ${n} items, not " + ${val}.length);\n`);
-        // index each element off the original value/path expressions, so nothing is clobbered
-        // even when this checker is inlined inside another (e.g. a struct field)
-        const parts = t.itemTypes
-          .map((it, i) => checkers.get(it)!(`${val}[${i}]`, `${path} + "[${i}]"`))
-          .filter((p) => p);
-        if (parts.length) {
-          dd.print('} else {\n');
-          dd.indent('  ');
-          for (const p of parts) dd.print(p);
-          dd.dedent();
-        }
-        dd.print('}\n');
-        return dd.getvalue();
-      };
-    } else if (t instanceof PStruct) {
-      for (const ft of t.fields.values()) visit(ft);
-      let keys: string, func: string;
-      if (t.name) {
-        keys = `${lowerFirst(t.name)}AllowedKeys`;
-        func = `check${t.name}`;
-      } else {
-        const n = anon.n++;
-        keys = `anon${n}AllowedKeys`;
-        func = `checkAnon${n}`;
-      }
-      const keyset = '{ ' + [...t.fields.keys()].map((fn) => `"${fn}": true`).join(', ') + ' }';
-      d.print(`\nconst ${keys} = ${keyset};\n`);
-      d.print(
-        `\n${t.name ? 'export ' : ''}function ${func}(val: any, path: string = "<root>"): string[] {\n`,
-      );
-      d.indent('  ');
-      d.print(`if (jsonTypeof(val) !== "object") {\n`);
-      d.print(`  return [path + ": is a " + jsonTypeof(val) + ", not json object"];\n`);
-      d.print('}\n');
-      d.print('const problems: string[] = [];\n');
-      for (const [fn, ft] of t.fields) {
-        d.print(`if ("${fn}" in val) {\n`);
-        d.indent('  ');
-        d.print(`const x = val["${fn}"];\n`);
-        d.print(`const xpath = path + ".${fn}";\n`);
-        d.print(checkers.get(ft)!('x', 'xpath'));
-        d.dedent();
-        if (!t.maybes.has(fn)) {
-          d.print('} else {\n');
-          d.print(`  problems.push(path + ": missing required key ${fn}");\n`);
-        }
-        d.print('}\n');
-      }
-      d.print(`if (Object.keys(val).some((k) => !Object.hasOwn(${keys}, k))) {\n`);
-      d.print(`  problems.push(path + ": contains extra keys");\n`);
-      d.print('}\n');
-      d.print('return problems;\n');
-      d.dedent();
-      d.print('}\n');
-      checker = (val, path) => `problems.push(...${func}(${val}, ${path}));\n`;
-    } else if (t instanceof PObject) {
-      visit(t.valueType);
-      checker = (val, path) => {
-        const dd = new Denter();
-        dd.print(`if (jsonTypeof(${val}) !== "object") {\n`);
-        dd.print(
-          `  problems.push(${path} + ": is a " + jsonTypeof(${val}) + ", not json object");\n`,
-        );
-        if (checkers.get(t.valueType) === NOOP) {
-          dd.print('}\n');
-          return dd.getvalue();
-        }
-        dd.print('} else {\n');
-        dd.indent('  ');
-        const kv = `k${loop.n++}`;
-        dd.print(`for (const ${kv} of Object.keys(${val})) {\n`);
-        dd.indent('  ');
-        // index the value and build its path off the original expressions, so nothing is
-        // clobbered when this checker is inlined inside another
-        dd.print(checkers.get(t.valueType)!(`(${val})[${kv}]`, `${path} + "." + ${kv}`));
-        dd.dedent();
-        dd.print('}\n');
-        dd.dedent();
-        dd.print('}\n');
-        return dd.getvalue();
-      };
-    } else {
-      throw new Error(`unhandled type in generateCheckers: ${t}`);
-    }
+  // every query's wire type, and each result under the query's id plus #result
+  for (const kq of queries) {
+    if (!kq.queries.length) continue;
+    const wire = queryWireType(registry, kq);
+    ids.set(identityOf(wire), wire);
+    for (const q of kq.queries) ids.set(`${queryId(kq, q)}#result`, q.result);
+  }
 
-    // named types without a function already defined get a wrapper now
-    if (t.name && !(t instanceof PUnion) && !(t instanceof PStruct)) {
-      d.print(`\nexport function check${t.name}(val: any, path: string = "<root>"): string[] {\n`);
-      d.indent('  ');
-      d.print('const problems: string[] = [];\n');
-      d.print(checker('val', 'path'));
-      d.print('return problems;\n');
-      d.dedent();
-      d.print('}\n');
-    }
-    checkers.set(t, checker);
-  };
-  visit(t);
+  // the table, in identity order
+  const table = new NodeTable(registry);
+  for (const t of ids.values()) table.visit(t);
+
+  d.print('\n// the type registry: one node table, and the schema of each engine and database\n');
+  d.print('const schemaNodes: SchemaNode[] = [\n');
+  d.indent('  ');
+  for (const t of table.order) d.print(`${table.node(t)},\n`);
+  d.dedent();
+  d.print('];\n');
+  d.print('const schemaIds: Record<string, number> = {\n');
+  d.indent('  ');
+  for (const [id, t] of ids) d.print(`${JSON.stringify(id)}: ${table.visit(t)},\n`);
+  d.dedent();
+  d.print('};\n');
+  for (const [name, a] of audiences) {
+    d.print(`\n/** the registry data of ${name} */\n`);
+    d.print(`export const ${lowerFirst(name)}Schema: Schema = {\n`);
+    d.indent('  ');
+    d.print('nodes: schemaNodes,\n');
+    d.print('ids: schemaIds,\n');
+    d.print(`commands: ${JSON.stringify(a.commands)},\n`);
+    d.print(`eventTypes: ${JSON.stringify(a.eventTypes)},\n`);
+    d.print(`storeTypes: ${JSON.stringify(a.storeTypes)},\n`);
+    d.dedent();
+    d.print('};\n');
+  }
 }
 
 /**
@@ -808,15 +453,6 @@ function intakeFields(cmd: PCommand): [string, PIntake][] {
 /** the type precommit sees a command as: its intake view when intake transforms it */
 function precommitView(annos: Annos, cmd: PCommand): string {
   return intakeFields(cmd).length > 0 ? `${cmd.name}ForPrecommit` : annos.get(cmd.type)!;
-}
-
-/** the value of a command's literal `type` field, which is how intake recognizes it */
-function commandTag(cmd: PCommand): string {
-  const t = cmd.type instanceof PStruct ? cmd.type.fields.get('type') : undefined;
-  if (!(t instanceof PLiteral) || typeof t.value !== 'string') {
-    throw new Error(`command ${cmd.name} has intake fields, so it needs a literal string 'type'`);
-  }
-  return t.value;
 }
 
 /** the stream label of an event folded by these slices: a singleton's literal name, else any */
@@ -1305,26 +941,14 @@ export type ${slotsType} = {
 };
 `);
 
-  // the fields intake hashes, by command type
-  const hashed: Record<string, string[]> = {};
-  for (const c of db.commands) {
-    const fields = intakeFields(c).filter(([, ft]) => ft.kind === 'NewPassword');
-    if (fields.length > 0) hashed[commandTag(c)] = fields.map(([k]) => k);
-  }
-
   // the bundle, over the generated wrappers
-  const check = commandUnion === undefined ? `['no commands']` : `check${commandUnion.name!}(data)`;
   d.print(`
 /** Install ${db.name}'s bundle as globalThis.__bundle, the app's slots behind the generated
     wrappers, and answer it. */
 export function define${db.name}(slots: ${slotsType}): Bundle {
   const bootstrap = slots.bootstrap;
   const bundle: Bundle = {
-    hashedFields: ${JSON.stringify(hashed)},
-    checkCommand: (data) => {
-      const problems = ${check};
-      return problems.length === 0 ? null : problems.join("\\n");
-    },
+    schema: ${lowerFirst(db.name)}Schema,
     precommit: (txn, cmd, principal) =>
       ${precommit}(slots.precommit, principal, ${lowerFirst(db.name)}Txn(txn), cmd.data),
     reducers: ${reducersValue(db.slices, 'slots.reducers')},
@@ -1377,7 +1001,7 @@ function queryWireType(registry: PTypeRegistry, kq: PQueries): PType {
  * execution venue by choosing a provider instance), and the dispatcher a serving side uses to
  * route a decoded wire message into a provider.
  */
-function generateQueries(d: Denter, annos: Annos, decoders: Decoders, kq: PQueries): void {
+function generateQueries(d: Denter, annos: Annos, kq: PQueries): void {
   const name = kq.name!;
   const stem = queryStem(name);
   const idsName = `${stem}QueryIds`;
@@ -1441,19 +1065,19 @@ function generateQueries(d: Denter, annos: Annos, decoders: Decoders, kq: PQueri
   d.dedent();
   d.print('}\n');
 
-  // remote provider: encode the call, subscribe over the transport, decode results
+  // remote provider: the call goes through the Registry under the wire type, and each result
+  // under the query's id
   d.print(`\nexport class Remote${name} extends RemoteQueries implements ${name} {\n`);
   d.indent('  ');
   for (const q of kq.queries) {
-    const raw = [
+    const call = [
       `${idsName}.${q.name}`,
-      ...q.args.map(([an, , opt]) => `encodeProto(${an}${opt ? ' ?? null' : ''})`),
+      ...q.args.map(([an, , opt]) => `${an}${opt ? ' ?? null' : ''}`),
     ];
-    const dec = decoders.get(q.result);
-    const decodeFn =
-      dec == null ? `(val: any): ${result(q)} => val` : `(val: any): ${result(q)} => ${dec('val')}`;
     d.print(`${q.name}(${params(q)}): Query<${result(q)}> {\n`);
-    d.print(`  return this.newQuery([${raw.join(', ')}], ${decodeFn});\n`);
+    d.print(
+      `  return this.newQuery(${JSON.stringify(`${stem}Query`)}, [${call.join(', ')}], ${idsName}.${q.name});\n`,
+    );
     d.print('}\n');
   }
   d.dedent();
@@ -1503,8 +1127,8 @@ export function generateTs(lowered: LoweredProgram, skeleton: string): string {
     typesToVisit.push(union);
   }
 
-  // Queries need their wire message type (which carries the arg types inside it) plus decoders
-  // for their result types.
+  // Queries need their wire message type (which carries the arg types inside it) and their
+  // result types.
   for (const kq of queries) {
     if (!kq.queries.length) continue;
     typesToVisit.push(queryWireType(registry, kq));
@@ -1515,15 +1139,8 @@ export function generateTs(lowered: LoweredProgram, skeleton: string): string {
   const annos: Annos = new Map();
   for (const t of typesToVisit) generateAnnotations(d, annos, t);
 
-  // Generate decoders and pick decoding expressions.
-  const decoders: Decoders = new Map();
-  const anon = { n: 0 };
-  for (const t of typesToVisit) generateDecoders(d, registry, annos, decoders, t, anon);
-
-  // Generate structural checkers and pick checking statements.
-  const checkers: Checkers = new Map();
-  const loop = { n: 0 };
-  for (const t of typesToVisit) generateCheckers(d, registry, checkers, t, anon, loop);
+  // The type registry, which every host converts by.
+  generateSchema(d, registry, roots, engines, databases, commandUnions, queries);
 
   // Generate each command's output type and intake view
   for (const c of commands) generateCommandTypes(d, annos, c);
@@ -1534,7 +1151,7 @@ export function generateTs(lowered: LoweredProgram, skeleton: string): string {
   for (const db of databases) generateDatabase(d, annos, registry, db, commandUnions.get(db));
 
   // Generate query layers
-  for (const kq of queries) generateQueries(d, annos, decoders, kq);
+  for (const kq of queries) generateQueries(d, annos, kq);
 
   // the generated file ends with a trailing newline
   return d.getvalue() + '\n';

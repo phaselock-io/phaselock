@@ -8,3 +8,4 @@ export { crc32c, Fnv64 } from './checksum.js';
 export { ByteReader } from './bytes.js';
 export { parseFrame, frames } from './frames.js';
 export type { Frame } from './frames.js';
+export { buildRegistry, ConvertError } from './registry.js';

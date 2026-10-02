@@ -9,8 +9,8 @@ declare const process: { env: Record<string, string | undefined> };
     bundle. */
 export const DEV = process.env.NODE_ENV !== 'production';
 
-/** jsonTypeof returns the json type of a value that came out of parsing json
-    (so 'undefined' is not handled, since it isn't allowed in json) */
+/** jsonTypeof names a value's json type, which the generated dispatch over a union's members
+    branches on when they differ by it */
 export function jsonTypeof(val: any): string {
   const t = typeof val;
   if (t === 'object') {
@@ -57,52 +57,6 @@ if (!(globalThis as any).generateUuid) {
       out.substring(20, 32),
     ].join('-');
   };
-}
-
-/** protoJSONReplacer is a JSON.stringify() replacer; it is more efficient than encodeProto because
-    JSON.stringify() doesn't have to recreate the whole tree of an object like encodeProto does.
-    But encodeProto is more like an inverse operation of the decode* family of functions. */
-export function protoJSONReplacer(_k: string, v: any): any {
-  if (v instanceof Map) return [...v.entries()];
-  if (v instanceof Set) return [...v.keys()];
-  // all other types naturally stringify correctly, e.g. Date
-  return v;
-}
-
-/** protoStringify is like JSON.stringify(), but it handles Map and Set */
-export function protoStringify(obj: any): any {
-  return JSON.stringify(obj, protoJSONReplacer);
-}
-
-export function encodeProto(base: any): any {
-  switch (typeof base) {
-    case 'boolean':
-    case 'bigint':
-    case 'number':
-    case 'string':
-    case 'undefined':
-      // these types are already immutable
-      return base;
-
-    case 'object':
-      // null handled here
-      if (base === null) return base;
-      // general objects handled below
-      break;
-
-    case 'symbol':
-    case 'function':
-    default:
-      throw new Error(`base of type "${typeof base}" not handled by encodeProto`);
-  }
-
-  // check if object has toJSON()
-  if (base.toJSON) return base.toJSON();
-
-  if (Array.isArray(base)) return base.map(encodeProto);
-  if (base instanceof Map) return [...base.entries()].map(encodeProto);
-  if (base instanceof Set) return [...base.keys()]; // object keys not supported
-  return Object.fromEntries(Object.entries(base).map(([k, v]) => [k, encodeProto(v)]));
 }
 
 // a value is a tree, so nothing legitimate nests this deep
@@ -476,6 +430,53 @@ export interface Registry {
   storeTypes: Record<string, string>;
 }
 
+/** One type of the model, as the generated registry describes it; children are indices into
+    the same node table.  A struct lists its fields in declaration order; a union carries the
+    solver's decision tree; an intake node names a field the database prepares for precommit,
+    over the wire type a client sends.  The identities of a struct, record, array, tuple, or union
+    are its name, or null when the type has none. */
+export type SchemaNode =
+  | ['null']
+  | ['int']
+  | ['str']
+  | ['bool']
+  | ['date']
+  | ['json']
+  | ['lit', string | number | boolean]
+  | ['struct', string | null, [key: string, type: number, optional: boolean][]]
+  | ['record', string | null, number]
+  | ['array', string | null, number]
+  | ['tuple', string | null, number[]]
+  | ['union', string | null, SchemaSolution]
+  | ['intake', string, number];
+
+/** How a walk tells a union's members apart.  `match` names the member.  `jsontype` branches on
+    the value's json type, `literal` on its value, `length` on an array's length with a default
+    for any other, `index` descends into an array element, `field` tests a field of the object
+    without descending, and `hasfield` picks the first of its keys present. */
+export type SchemaSolution =
+  | ['match', number]
+  | ['jsontype', [string, SchemaSolution][]]
+  | ['literal', [string | number | boolean, SchemaSolution][]]
+  | ['length', [number, SchemaSolution][], SchemaSolution | null]
+  | ['index', number, SchemaSolution]
+  | ['field', string, SchemaSolution]
+  | ['hasfield', [string, SchemaSolution][]];
+
+/** The type registry as data, generated per engine and per database: the model's types as a
+    node table, the type identities the Registry answers for and their nodes, and what the
+    Registry's `commands`, `eventTypes`, and `storeTypes` are.  Every engine and database of one
+    model shares one node table.  A host walks it to convert values; the reserved identities are
+    the host's own. */
+export type Schema = {
+  nodes: SchemaNode[];
+  ids: Record<string, number>;
+  /** the commands union, or null for a database with no commands */
+  commands: string | null;
+  eventTypes: Record<string, string>;
+  storeTypes: Record<string, string>;
+};
+
 /** the type of a store key's value, from the Registry's storeTypes; undefined for a key no slice
     declares */
 export function storeTypeOf(reg: Registry, key: string): string | undefined {
@@ -494,7 +495,7 @@ export function storeTypeOf(reg: Registry, key: string): string | undefined {
     closed, one batch at a time.  It is a walk, not a snapshot: a batch is a fresh seek from the
     resume key, so a key written above the cursor inside the range is visited and one written
     below is not.  A scan may therefore write anywhere except above its own cursor inside its
-    range. */
+    range.  Its values are all of one type, so a range lies within one key template. */
 export type StoreRange = {
   gte?: string;
   gt?: string;
@@ -1105,14 +1106,11 @@ export type BootstrapContext = {
 };
 
 /** Bundle is what a database runs: the app's handlers behind the generated wrappers, installed
-    as `globalThis.__bundle`.  precommit, maySee, and lookup read global keys; each reducer reads
-    and writes its own stream's keys.  Values are rich JS values, except checkCommand's, which
-    is the command's plain JSON projection after intake. */
+    as `globalThis.__bundle`, and the registry the database converts and checks every value by.
+    precommit, maySee, and lookup read global keys; each reducer reads and writes its own stream's
+    keys.  Values are rich JS values. */
 export type Bundle = {
-  /** the command fields intake hashes, by the command's `type` */
-  hashedFields: Record<string, string[]>;
-  /** the problems with a command's structure, or null when it has none */
-  checkCommand: (data: unknown) => string | null;
+  schema: Schema;
   precommit: (
     txn: ReadTxn,
     cmd: Command<unknown>,
@@ -1320,23 +1318,35 @@ class RemoteQuery<T> {
 }
 
 /** QueriesIO is implemented by the user and passed into the RemoteQueries subclass.  Only the user
-    knows the transport over which query data should flow. */
+    knows the transport over which query data should flow; what flows is msgpack: the encoded
+    call one way, each encoded result the other. */
 export interface QueriesIO {
-  /** createQuery takes, query id, args, and an onResults hook, returning a closer function */
-  createQuery(raw: any[], onResult: (result: any) => void): () => void;
+  /** createQuery takes the encoded call and an onResult hook for each encoded result, and
+      returns a closer function */
+  createQuery(query: Uint8Array, onResult: (result: Uint8Array) => void): () => void;
 }
 
-/** RemoteQueries is the base class behind the generated, strongly-typed remote query interfaces. */
+/** RemoteQueries is the base class behind the generated, strongly-typed remote query interfaces.
+    A call is `[id, ...args]`, converted through the Registry under the interface's wire type,
+    and a result is converted under the query's id plus `#result`. */
 export class RemoteQueries {
+  #reg: Registry;
   #io: QueriesIO;
 
-  constructor(io: QueriesIO) {
+  constructor(reg: Registry, io: QueriesIO) {
+    this.#reg = reg;
     this.#io = io;
   }
 
-  newQuery<T>(raw: any[], decoder: (result: any) => T): Query<T> {
+  newQuery<T>(wireType: string, call: unknown[], id: string): Query<T> {
+    const bytes = this.#reg.convert(wireType, { [JS]: call }, MSGPACK) as Record<number, unknown>;
+    const query = bytes[MSGPACK] as Uint8Array;
+    const resultType = `${id}#result`;
     return new RemoteQuery<T>((onResult: (result: T) => void) => {
-      return this.#io.createQuery(raw, (result: any) => onResult(decoder(result)));
+      return this.#io.createQuery(query, (result: Uint8Array) => {
+        const v = this.#reg.convert(resultType, { [MSGPACK]: result }, JS);
+        onResult((v as Record<number, unknown>)[JS] as T);
+      });
     });
   }
 }
@@ -1435,24 +1445,21 @@ export type Command<T> = {
 };
 
 /** DbEvent is event data T with the envelope the DB stamped on it when it was committed:
-    [position, stream, seq, id, servertime] on the wire.  The id is the command's. */
+    [position, stream, seq, id, servertime] on the wire, the server time a msgpack timestamp.  The
+    id is the command's. */
 export type DbEvent<T> = {
   id: string;
   data: T;
   position: number;
   stream: string;
   seq: number;
-  servertime: number;
+  servertime: Date;
 };
 
 /** WireEvent is an event as a connector delivers it: the envelope decoded for routing, data as
     the bytes the server sent, and the whole wire pair `[env, data]` so if needs to be parked, the
     full msgpack format is readily available. */
 export type WireEvent = DbEvent<Uint8Array> & { raw: Uint8Array };
-
-export function decodeDbEvent<T>(val: any, subdecoder: (val: any) => T): DbEvent<T> {
-  return { ...val, data: subdecoder(val.data) } as DbEvent<T>;
-}
 
 /** Engine builds a sync engine out of a Store implementation and a reducer to process incoming
    events.
@@ -2796,9 +2803,16 @@ export class Engine<QX, C, N = never> {
     }
   }
 
-  // a live event as the reducers see it
+  // a live event as the reducers see it; one that fails its schema is an error naming it, since
+  // the client and the database can run different versions of the model
   #decode(ev: WireEvent): DbEvent<unknown> {
-    const v = this.#reg.convert('.event', { [MSGPACK]: ev.raw }, JS);
+    let v: StoreValue;
+    try {
+      v = this.#reg.convert('.event', { [MSGPACK]: ev.raw }, JS);
+    } catch (e: unknown) {
+      const why = e instanceof Error ? e.message : String(e);
+      throw new Error(`event ${ev.stream}@${ev.position}: ${why}`);
+    }
     return (v as Record<number, unknown>)[JS] as DbEvent<unknown>;
   }
 

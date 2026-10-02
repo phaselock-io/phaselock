@@ -27,6 +27,12 @@ examples/
   todo-thin/      Same app, engine in the server, clients get query results.
   library/        Full architecture: Python relay, Go decider, forecasts,
                   per-audience stores. Root also has populate.py seed data.
+client/ts/        @phaselock/client: the JS host's connector over HTTP,
+                  its msgpack cursor, and the Registry that walks the
+                  generated type registry.
+db/               The v0 database: a C core (QuickJS, SQLite, the
+                  conversion kernel) under a Go HTTP layer.  See
+                  db/README.md.
 agents/           The "phaselock" agent plugin; canonical skill at
                   agents/skills/phaselock/.
 .claude-plugin/   marketplace.json cataloging the plugin.
@@ -35,6 +41,10 @@ agents/           The "phaselock" agent plugin; canonical skill at
 The runtime skeletons (`typespec/{ts,py,go}/assets/skeleton.{ts,py,go}`)
 are the canonical engine runtime — generated files embed a copy. Edit
 skeletons in `typespec/`, never in generated output.
+
+The TypeScript skeleton is the reference protocol.  `client/ts` and
+`db/` follow it, never the reverse: a change to the Engine's contract,
+the `Bundle`, or the store interface starts in the skeleton.
 
 ## Build and check
 

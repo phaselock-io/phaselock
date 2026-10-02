@@ -774,18 +774,13 @@ describe('intake types', () => {
     compiles('intake');
   });
 
-  it("generates the bundle's hashedFields from the NewPassword fields", () => {
-    expect(bundle().hashedFields).toEqual({ 'sign-up': ['password'] });
-  });
-
-  it('checks commands as precommit sees them, after intake', () => {
-    const b = bundle();
-    expect(b.checkCommand({ type: 'sweep', id: 'i1' })).toBeNull();
-    expect(b.checkCommand({ type: 'sweep' })).toContain('missing required key id');
-    expect(b.checkCommand({ type: 'leave', check: { kind: 'password' } })).toBeNull();
-    expect(
-      b.checkCommand({ type: 'leave', check: { kind: 'password', password: 'x' } }),
-    ).not.toBeNull();
+  it('needs no checker: the registry describes a prepared field by its wire type', () => {
+    const s = M.appDBSchema;
+    const leaf = (s: any, kind: string) =>
+      s.nodes.findIndex((n: any[]) => n.length === 1 && n[0] === kind);
+    const signUp = s.nodes[s.ids.SignUp];
+    const password = signUp[2].find(([k]: [string]) => k === 'password');
+    expect(s.nodes[password[1]]).toEqual(['intake', 'NewPassword', leaf(s, 'str')]);
   });
 });
 
@@ -798,8 +793,23 @@ describe('sending commands', () => {
 });
 
 describe('schema and bundle', () => {
-  it.todo("generates storeTypes from every slice's key templates");
-  it.todo("generates eventTypes from each slice's family to its events union");
+  it("generates storeTypes from every slice's key templates", () => {
+    expect(M.writerEngineSchema.storeTypes).toEqual({
+      'catalog/item': 'Item',
+      'catalog/count': 'catalog/count',
+      'inbox/profile': 'Profile',
+      'inbox/note': 'inbox/note',
+    });
+    expect(M.appDBSchema.storeTypes['secret/secret']).toBe('PasswordHash');
+  });
+
+  it("generates eventTypes from each slice's family to its events union", () => {
+    expect(M.appDBSchema.eventTypes).toEqual({
+      catalog: 'CatalogEvents',
+      inbox: 'InboxEvents',
+      secret: 'SecretSet',
+    });
+  });
 
   it('generates the engine subclass taking its reducers and forecaster, deriving its wants', async () => {
     compiles('engines');
@@ -859,5 +869,6 @@ describe('schema and bundle', () => {
     b.bootstrap({ emit: (stream: string, event: unknown) => emitted.push([stream, event]) });
     expect(emitted).toEqual([['catalog', itemAdded]]);
     expect((globalThis as any).__bundle).toBe(b);
+    expect(b.schema).toBe(M.appDBSchema);
   });
 });
