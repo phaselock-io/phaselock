@@ -29,9 +29,10 @@ const Item = add([
     ['added', DATE, false],
     ['meta', META, true],
   ],
+  -1,
 ]);
-const ByBook = add(['struct', 'ByBook', [['book', STR, false]]]);
-const ByEdition = add(['struct', 'ByEdition', [['edition', STR, false]]]);
+const ByBook = add(['struct', 'ByBook', [['book', STR, false]], -1]);
+const ByEdition = add(['struct', 'ByEdition', [['edition', STR, false]], -1]);
 const Target = add([
   'union',
   'Target',
@@ -55,11 +56,12 @@ const ItemAdded = add([
   'struct',
   'ItemAdded',
   [
-    ['type', ITEM_ADDED, false],
     ['id', STR, false],
     ['title', STR, false],
     ['added', DATE, false],
+    ['type', ITEM_ADDED, false],
   ],
+  3,
 ]);
 const ItemRemoved = add([
   'struct',
@@ -69,6 +71,7 @@ const ItemRemoved = add([
     ['id', STR, false],
     ['target', Target, false],
   ],
+  0,
 ]);
 const Noted = add([
   'struct',
@@ -78,6 +81,7 @@ const Noted = add([
     ['note', STR, false],
     ['text', STR, false],
   ],
+  0,
 ]);
 const CatalogEvents = add([
   'union',
@@ -188,9 +192,10 @@ const Slot = add([
     ['note', MaybeStr, false],
     ['blob', ANY, false],
   ],
+  -1,
 ]);
 const Slots = add(['array', null, Slot]);
-const Profile = add(['struct', 'Profile', [['name', STR, false]]]);
+const Profile = add(['struct', 'Profile', [['name', STR, false]], -1]);
 const NewPassword = add(['intake', 'NewPassword', STR]);
 const PW_KIND = add(['lit', 'password']);
 const TOTP_KIND = add(['lit', 'totp']);
@@ -201,6 +206,7 @@ const AuthPassword = add([
     ['kind', PW_KIND, false],
     ['password', STR, false],
   ],
+  0,
 ]);
 const AuthTotp = add([
   'struct',
@@ -209,6 +215,7 @@ const AuthTotp = add([
     ['kind', TOTP_KIND, false],
     ['code', STR, false],
   ],
+  0,
 ]);
 const CommandAuthWire = add([
   'union',
@@ -246,6 +253,7 @@ const AddItem = add([
     ['title', STR, false],
     ['added', DATE, false],
   ],
+  0,
 ]);
 const SignUp = add([
   'struct',
@@ -255,6 +263,7 @@ const SignUp = add([
     ['user', STR, false],
     ['password', NewPassword, false],
   ],
+  0,
 ]);
 const Leave = add([
   'struct',
@@ -263,6 +272,7 @@ const Leave = add([
     ['type', LEAVE, false],
     ['check', CommandAuth, false],
   ],
+  0,
 ]);
 const WriterCommands = add([
   'union',
@@ -296,6 +306,7 @@ const PatronInfo = add([
     ['id', STR, false],
     ['since', DATE, false],
   ],
+  -1,
 ]);
 const Patrons = add(['array', null, PatronInfo]);
 const ALL = add(['lit', 'AdminQueries.allPatrons']);
@@ -374,14 +385,12 @@ const itemAdded = { type: 'item-added', id: 'i1', title: 'Dune', added };
 
 /** bytes to the rich value of a type */
 function toJs(type: string, bytes: Uint8Array): unknown {
-  const out = reg.convert(type, { [MSGPACK]: bytes }, JS) as Record<number, unknown>;
-  return out[JS];
+  return reg.convert(type, bytes, MSGPACK, JS);
 }
 
 /** a rich value of a type to bytes */
 function toBytes(type: string, value: unknown): Uint8Array {
-  const out = reg.convert(type, { [JS]: value }, MSGPACK) as Record<number, unknown>;
-  return out[MSGPACK] as Uint8Array;
+  return reg.convert(type, value, JS, MSGPACK) as Uint8Array;
 }
 
 /** the bytes a value takes, decoded by the library as plain data */
@@ -607,17 +616,9 @@ describe('the whole value', () => {
     expect(() => toJs('Nope', encode(1))).toThrow(/Nope/);
   });
 
-  test('convert keeps the representations it was given and adds the wanted ones', () => {
+  test('convert answers a value in the same representation as it is', () => {
     const bytes = encode({ book: 'b1' });
-    const both = reg.convert('Target', { [MSGPACK]: bytes }, JS | MSGPACK) as Record<
-      number,
-      unknown
-    >;
-    expect(both[MSGPACK]).toBe(bytes);
-    expect(both[JS]).toEqual({ book: 'b1' });
-    const kept = reg.convert('Target', { [JS]: { book: 'b1' } }, JS) as Record<number, unknown>;
-    expect(kept[JS]).toEqual({ book: 'b1' });
-    expect(kept).not.toHaveProperty(String(MSGPACK));
+    expect(reg.convert('Target', bytes, MSGPACK, MSGPACK)).toBe(bytes);
   });
 });
 

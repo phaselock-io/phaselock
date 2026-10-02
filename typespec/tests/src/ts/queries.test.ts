@@ -7,7 +7,7 @@
 
 import { beforeAll, describe, expect, it } from 'vitest';
 
-import { JS, MSGPACK } from '../../../ts/assets/skeleton.ts';
+import { JS, MSGPACK, type Registry, type Rep } from '../../../ts/assets/skeleton.ts';
 
 import { emit, outDir } from './emit-harness.ts';
 
@@ -38,24 +38,20 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 /** a Registry whose bytes are JSON, recording the type each conversion was asked under */
-function fakeRegistry() {
+function fakeRegistry(): Registry & { asked: [string, 'toBytes' | 'toJs'][] } {
   const asked: [string, 'toBytes' | 'toJs'][] = [];
   return {
     asked,
     commands: '',
     eventTypes: {},
     storeTypes: {},
-    convert(type: string, value: any, want: number) {
-      const out = { ...value };
-      if (want & MSGPACK && !(MSGPACK in out)) {
+    convert(type: string, value: unknown, from: Rep, to: Rep): unknown {
+      if (from === JS && to === MSGPACK) {
         asked.push([type, 'toBytes']);
-        out[MSGPACK] = enc.encode(JSON.stringify(out[JS]));
+        return enc.encode(JSON.stringify(value));
       }
-      if (want & JS && !(JS in out)) {
-        asked.push([type, 'toJs']);
-        out[JS] = JSON.parse(dec.decode(out[MSGPACK]));
-      }
-      return out;
+      asked.push([type, 'toJs']);
+      return JSON.parse(dec.decode(value as Uint8Array));
     },
   };
 }

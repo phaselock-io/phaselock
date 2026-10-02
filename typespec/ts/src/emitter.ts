@@ -249,6 +249,10 @@ type Identities = Map<string, PType>;
 class NodeTable {
   readonly index = new Map<PType, number>();
   readonly order: PType[] = [];
+  // each union's solution, and the key each struct writes first: the field a union tells it
+  // apart from its other members by, the first union to name one winning
+  readonly #solutions = new Map<PUnion, Solution>();
+  readonly #discriminators = new Map<PType, string>();
 
   constructor(private readonly registry: PTypeRegistry) {}
 
@@ -267,6 +271,35 @@ class NodeTable {
     else if (t instanceof PUnion) for (const ut of t.types) this.visit(ut);
     else if (t instanceof PIntake) this.visit(t.wire);
     return i;
+  }
+
+  /** solve every union in the table, and learn the discriminator of each struct a `field` test
+      tells apart */
+  learn(): void {
+    const visit = (sln: Solution, key: string | null): void => {
+      if (sln instanceof Match) {
+        if (key !== null && !this.#discriminators.has(sln.typ)) {
+          this.#discriminators.set(sln.typ, key);
+        }
+      } else if (sln instanceof CheckJsonType || sln instanceof CheckLiteral) {
+        for (const sub of sln.options.values()) visit(sub, key);
+      } else if (sln instanceof CheckLength) {
+        for (const sub of sln.options.values()) visit(sub, key);
+        if (sln.default !== null) visit(sln.default, key);
+      } else if (sln instanceof GetIndex) {
+        visit(sln.solution, null);
+      } else if (sln instanceof GetField) {
+        visit(sln.solution, key ?? sln.key);
+      } else if (sln instanceof HasField) {
+        for (const [, sub] of sln.solutions) visit(sub, key);
+      }
+    };
+    for (const t of this.order) {
+      if (!(t instanceof PUnion)) continue;
+      const sln = solveUnion(this.registry, t.types);
+      this.#solutions.set(t, sln);
+      visit(sln, null);
+    }
   }
 
   /** a solution as data */
@@ -315,13 +348,15 @@ class NodeTable {
       const fields = [...t.fields].map(
         ([k, ft]) => `[${JSON.stringify(k)}, ${at(ft)}, ${t.maybes.has(k)}]`,
       );
-      return `["struct", ${name}, [${fields.join(', ')}]]`;
+      const key = this.#discriminators.get(t);
+      const disc = key === undefined ? -1 : [...t.fields.keys()].indexOf(key);
+      return `["struct", ${name}, [${fields.join(', ')}], ${disc}]`;
     }
     if (t instanceof PObject) return `["record", ${name}, ${at(t.valueType)}]`;
     if (t instanceof PArray) return `["array", ${name}, ${at(t.itemType)}]`;
     if (t instanceof PTuple) return `["tuple", ${name}, [${t.itemTypes.map(at).join(', ')}]]`;
     if (t instanceof PUnion) {
-      return `["union", ${name}, ${this.solution(solveUnion(this.registry, t.types))}]`;
+      return `["union", ${name}, ${this.solution(this.#solutions.get(t)!)}]`;
     }
     if (t instanceof PIntake) return `["intake", ${JSON.stringify(t.kind)}, ${at(t.wire)}]`;
     throw new Error(`unhandled type in the registry: ${t.constructor.name}`);
@@ -398,6 +433,7 @@ function generateSchema(
   // the table, in identity order
   const table = new NodeTable(registry);
   for (const t of ids.values()) table.visit(t);
+  table.learn();
 
   d.print('\n// the type registry: one node table, and the schema of each engine and database\n');
   d.print('const schemaNodes: SchemaNode[] = [\n');

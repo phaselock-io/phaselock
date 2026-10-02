@@ -49,13 +49,15 @@ layout, build commands, and the test suite.
   intake result's its vocabulary kind, an unnamed store value's `family/name` (`catalog/count`),
   a database's command union when it has no name `{Database}Command`, and a query's result its
   id plus `#result`.  A walk rejects fields the schema does not name for a commands identity and
-  drops them for any other; it writes a union member's discriminator first, then declaration
-  order, and a record's keys in insertion order; dates are the msgpack timestamp extension at
-  millisecond precision; and its error is the first mismatch with its path
-  (`$.items[2].added: expected a timestamp`).  Clients check what they read too, since a client
-  and the database can run different versions of the model.  Every store call names its type,
+  drops them for any other; it writes a struct's discriminator first, which the emitter names in
+  its node, then declaration order, and a record's keys in insertion order; dates are the
+  msgpack timestamp extension at millisecond precision; and its error is the first mismatch with
+  its path (`$.items[2].added: expected a timestamp`).  Clients check what they read too, since a
+  client and the database can run different versions of the model.  Every store call names its type,
   and a scan's range lies within one key template; the two key-derived paths are a backfill
-  blob's values (`storeTypes`) and an event's data (its family, through `eventTypes`).
+  blob's values (`storeTypes`) and an event's data (its family, through `eventTypes`).  A store
+  call and a conversion take one representation each way as plain arguments (`JS`, `HOST`,
+  `MSGPACK`); a caller wanting two asks twice.
 - **Handler tables.**  User code is object literals typed by generated interfaces: one reducer
   handler per event of a slice (`{Slice}Reducers`), one forecaster per engine command
   (`{Engine}Forecasters`, entries optional), one precommit handler per database command

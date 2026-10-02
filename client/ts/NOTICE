@@ -23,7 +23,7 @@ WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
 ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-Used for UTF-8 coding, 64-bit integers, timestamps, and the map key
-cache of the msgpack cursor, in these files:
+Used for UTF-8 coding, 64-bit integers, and timestamps in the msgpack
+cursor, in these files:
 
     - src/vendor/msgpack-javascript/ (dist/vendor/msgpack-javascript/)

@@ -14,23 +14,18 @@ import {
   resumeRange,
   type Store,
   type StoreRange,
-  type StoreValue,
-  txnGet,
   txnScanAll,
 } from '../../../ts/assets/skeleton.ts';
 
 import { registry } from './harness.ts';
 
 const T = '.json';
-const js = (v: unknown): StoreValue => ({ [JS]: v });
-const asJs = (v: StoreValue | undefined): unknown =>
-  (v as Record<number, unknown> | undefined)?.[JS];
 
 /** a store seeded with these keys, each holding its own name */
 function seeded(data: Record<string, unknown>, ...keys: string[]): InMemStore {
   const store = new InMemStore(registry, data);
   store.write((txn) => {
-    for (const k of keys) txn.set(k, T, js(k));
+    for (const k of keys) txn.set(k, T, JS, k);
   });
   return store;
 }
@@ -100,7 +95,7 @@ describe('scan', () => {
     ]);
   });
 
-  test('keys only versus values with a want', () => {
+  test('keys only versus values in a representation', () => {
     const store = seeded({}, 'k1', 'k2');
     const keysOnly = store.read((txn) => {
       return txnScanAll(txn, prefixRange('k', 10, false));
@@ -110,9 +105,9 @@ describe('scan', () => {
       ['k2', undefined],
     ]);
     const withValues = store.read((txn) => {
-      return txnScanAll(txn, prefixRange('k', 10, { type: T, want: JS }));
+      return txnScanAll(txn, prefixRange('k', 10, { type: T, rep: JS }));
     });
-    expect(withValues.map(([k, v]) => [k, asJs(v)])).toEqual([
+    expect(withValues.map(([k, v]) => [k, v])).toEqual([
       ['k1', 'k1'],
       ['k2', 'k2'],
     ]);
@@ -132,8 +127,8 @@ describe('scan', () => {
     const seen = store.write((txn) => {
       const first = txn.scan(prefixRange('k', 1, false));
       expect(first.entries.map(([k]) => k)).toEqual(['k1']);
-      txn.set('k1a', T, js('k1a'));
-      txn.set('k0', T, js('k0'));
+      txn.set('k1a', T, JS, 'k1a');
+      txn.set('k0', T, JS, 'k0');
       txn.del('k3');
       const rest = txnScanAll(txn, resumeRange(prefixRange('k', 10, false), first.next!));
       return rest.map(([k]) => k);
@@ -190,17 +185,22 @@ describe('delPrefix and move', () => {
 });
 
 describe('overlay', () => {
+  test('refuses to move keys, which no forecast does', () => {
+    const base = seeded({}, 'k1');
+    const overlay = new Overlay(registry);
+    expect(() => base.read((b) => overlay.apply(b, (txn) => txn.move('k', 'j')))).toThrow(
+      'the overlay does not move keys',
+    );
+  });
+
   test('scan answers with pending writes merged in and pending deletes removed', () => {
     const base = seeded({}, 'k1', 'k2', 'k3');
     const overlay = new Overlay(registry);
     const inside = base.read((b) =>
       overlay.apply(b, (txn) => {
-        txn.set('k4', T, js('k4'));
+        txn.set('k4', T, JS, 'k4');
         txn.del('k2');
-        return txnScanAll(txn, prefixRange('k', 10, { type: T, want: JS })).map(([k, v]) => [
-          k,
-          asJs(v),
-        ]);
+        return txnScanAll(txn, prefixRange('k', 10, { type: T, rep: JS })).map(([k, v]) => [k, v]);
       }),
     );
     expect(inside).toEqual([
@@ -213,7 +213,7 @@ describe('overlay', () => {
     );
     expect(after).toEqual(['k1', 'k3', 'k4']);
     expect(scanKeys(base, prefixRange('k', 10, false))).toEqual(['k1', 'k2', 'k3']);
-    const gone = base.read((b) => txnGet(overlay.view(b), 'k2', T));
+    const gone = base.read((b) => overlay.view(b).get('k2', T, JS));
     expect(gone).toBeUndefined();
   });
 });
@@ -235,11 +235,11 @@ describe('ownership', () => {
     const data: Record<string, unknown> = {};
     const store = new InMemStore(registry, data);
     store.write((txn) => {
-      txn.set('k', T, js({ n: 1, list: [1] }));
+      txn.set('k', T, JS, { n: 1, list: [1] });
     });
     const read = () =>
       store.read((txn) => {
-        return txnGet(txn, 'k', T) as { n: number; list: number[] };
+        return txn.get('k', T, JS) as { n: number; list: number[] };
       });
     const first = read();
     first.n = 2;
@@ -255,7 +255,7 @@ describe('ownership', () => {
     const store = new InMemStore(registry, data);
     const obj = { n: 1 };
     store.write((txn) => {
-      txn.set('k', T, js(obj));
+      txn.set('k', T, JS, obj);
     });
     obj.n = 2;
     expect(data['k']).toEqual({ n: 1 });
@@ -265,9 +265,9 @@ describe('ownership', () => {
     const data = { k1: { n: 1 } };
     const store = new InMemStore(registry, data);
     const entries = store.read((txn) => {
-      return txnScanAll(txn, prefixRange('k', 10, { type: T, want: JS }));
+      return txnScanAll(txn, prefixRange('k', 10, { type: T, rep: JS }));
     });
-    (asJs(entries[0][1]) as { n: number }).n = 2;
+    (entries[0][1] as { n: number }).n = 2;
     expect(data.k1).toEqual({ n: 1 });
   });
 
@@ -277,16 +277,16 @@ describe('ownership', () => {
     const obj = { n: 1 };
     base.read((b) =>
       overlay.apply(b, (txn) => {
-        txn.set('k2', T, js(obj));
+        txn.set('k2', T, JS, obj);
       }),
     );
     obj.n = 2;
     const read = () =>
       base.read((b) => {
         const txn = overlay.view(b);
-        const got = txnGet(txn, 'k2', T) as { n: number };
-        const all = txnScanAll(txn, prefixRange('k', 10, { type: T, want: JS }));
-        return { got, scanned: asJs(all[1][1]) as { n: number }, base: asJs(all[0][1]) };
+        const got = txn.get('k2', T, JS) as { n: number };
+        const all = txnScanAll(txn, prefixRange('k', 10, { type: T, rep: JS }));
+        return { got, scanned: all[1][1] as { n: number }, base: all[0][1] };
       });
     const first = read();
     expect(first).toEqual({ got: { n: 1 }, scanned: { n: 1 }, base: 'k1' });
@@ -301,7 +301,7 @@ describe('transactions', () => {
     const data: Record<string, unknown> = {};
     const store = new InMemStore(registry, data);
     const out = store.write((txn) => {
-      txn.set('k', T, js('v'));
+      txn.set('k', T, JS, 'v');
       return 'done';
     });
     expect(out).toBe('done');
@@ -313,7 +313,7 @@ describe('transactions', () => {
     const store = seeded(data, 'k1');
     expect(() =>
       store.write((txn) => {
-        txn.set('k2', T, js('k2'));
+        txn.set('k2', T, JS, 'k2');
         txn.del('k1');
         throw new Error('boom');
       }),
@@ -324,7 +324,7 @@ describe('transactions', () => {
     expect(() =>
       store.read((b) =>
         overlay.apply(b, (txn) => {
-          txn.set('k2', T, js('k2'));
+          txn.set('k2', T, JS, 'k2');
           throw new Error('boom');
         }),
       ),
@@ -351,7 +351,7 @@ describe('external store', () => {
         get: (key) => {
           calls.push(`get ${key}`);
           if (fail.in) throw new Error('get failed');
-          return js(key);
+          return key;
         },
         scan: () => ({ entries: [], next: null }),
         set: (key) => void calls.push(`set ${key}`),
@@ -372,8 +372,8 @@ describe('external store', () => {
   test('a transaction that returns commits, and its answers come from the host', () => {
     const { store, calls } = external();
     const got = store.write((txn) => {
-      txn.set('k', T, js(1));
-      return txnGet(txn, 'k', T);
+      txn.set('k', T, JS, 1);
+      return txn.get('k', T, JS);
     });
     expect(got).toBe('k');
     expect(calls).toEqual(['open write', 'set k', 'get k', 'commit']);

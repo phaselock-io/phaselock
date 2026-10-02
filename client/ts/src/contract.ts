@@ -104,18 +104,12 @@ export type ConnectorFactory = (
 // the store's value bundles and the Registry, with the registry data a host builds one from
 
 /** The representations a value can be in: JS is the rich JS value, HOST the host language's,
-    MSGPACK the bytes.  They are bits, so a Wants is a mask of them: what an ask wants back, and
-    a store produces every wanted one it does not already hold, in one read.  0 means "as held",
-    which only move uses. */
+    MSGPACK the bytes.  Every get names the one it wants and every set the one it gives; a store
+    converts to what it keeps on the way in and to what was asked for on the way out. */
 export const JS = 1;
 export const HOST = 2;
-export const MSGPACK = 4;
-export type Wants = number;
-
-/** A StoreValue is a value keyed by representation, in one, or in several when several were
-    wanted.  What arrives may not be what a caller asked for; a store converts to what it keeps
-    on the way in and to what was wanted on the way out. */
-export type StoreValue = { [JS]: unknown } | { [HOST]: unknown } | { [MSGPACK]: Uint8Array };
+export const MSGPACK = 3;
+export type Rep = typeof JS | typeof HOST | typeof MSGPACK;
 
 /** Registry converts between representations of typed values and names the types the store
     holds.  Types are model names from the TypeSpec, plus three reserved names: `.json` for the
@@ -124,9 +118,8 @@ export type StoreValue = { [JS]: unknown } | { [HOST]: unknown } | { [MSGPACK]: 
     wire pair `[env, data]` in `msgpack` and a DbEvent in `js`, its `data` converted through the
     union of the stream's slice. */
 export interface Registry {
-  /** the value of type `type` carrying every representation in `want`: present ones are kept,
-      the rest produced in one pass */
-  convert(type: string, value: StoreValue, want: Wants): StoreValue;
+  /** a value of type `type`, given in one representation, in another */
+  convert(type: string, value: unknown, from: Rep, to: Rep): unknown;
   /** the commands union this engine may submit */
   commands: string;
   /** stream prefix (before the first dot) to the slice's events union */
@@ -136,10 +129,11 @@ export interface Registry {
 }
 
 /** One type of the model, as the generated registry describes it; children are indices into
-    the same node table.  A struct lists its fields in declaration order; a union carries the
-    solver's decision tree; an intake node names a field the database prepares for precommit,
-    over the wire type a client sends.  The identities of a struct, record, array, tuple, or union
-    are its name, or null when the type has none. */
+    the same node table.  A struct lists its fields in declaration order, and names the one it
+    writes first, the field a union tells it apart from its other members by, or -1; a union
+    carries the solver's decision tree; an intake node names a field the database prepares for
+    precommit, over the wire type a client sends.  The identities of a struct, record, array,
+    tuple, or union are its name, or null when the type has none. */
 export type SchemaNode =
   | ['null']
   | ['int']
@@ -148,7 +142,12 @@ export type SchemaNode =
   | ['date']
   | ['json']
   | ['lit', string | number | boolean]
-  | ['struct', string | null, [key: string, type: number, optional: boolean][]]
+  | [
+      'struct',
+      string | null,
+      [key: string, type: number, optional: boolean][],
+      discriminator: number,
+    ]
   | ['record', string | null, number]
   | ['array', string | null, number]
   | ['tuple', string | null, number[]]

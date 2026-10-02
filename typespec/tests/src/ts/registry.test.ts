@@ -23,7 +23,7 @@ const SOURCE = `
   union CatalogEvents { ItemAdded, ItemRemoved, Noted }
 
   model ItemAdded { type: "item-added"; id: Id; title: string; added: utcDateTime; }
-  model ItemRemoved { type: "item-removed"; id: Id; target: Target; }
+  model ItemRemoved { id: Id; target: Target; type: "item-removed"; }
 
   // a one-of union, a tuple union, a literal union, and a nullable
   union Target { ByBook, ByEdition }
@@ -189,6 +189,22 @@ describe('the node table', () => {
       ['added', false],
       ['meta', true],
     ]);
+  });
+
+  it('names the field a struct writes first: the one a union tells it apart by, or -1', () => {
+    const s = M.appDBSchema;
+    // told apart by a literal `type` field, its first
+    expect(node(s, 'ItemAdded')[3]).toBe(0);
+    expect(node(s, 'SignUp')[3]).toBe(0);
+    // declared last, and still the one it writes first
+    expect(node(s, 'ItemRemoved')[3]).toBe(2);
+    // CommandAuth's anonymous members, told apart by `kind`
+    const check = s.nodes[field(s, node(s, 'Leave'), 'check')[2]];
+    const [, byKind] = check[2][1].find(([jt]: [string]) => jt === 'object');
+    for (const [, m] of byKind[2][1]) expect(s.nodes[m[1]][3]).toBe(0);
+    // in no union, or in one told apart by which fields are present
+    expect(node(s, 'Item')[3]).toBe(-1);
+    expect(node(s, 'ByBook')[3]).toBe(-1);
   });
 
   it('describes records, arrays, and tuples', () => {

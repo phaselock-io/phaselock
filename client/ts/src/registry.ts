@@ -1,20 +1,18 @@
-// The Registry of a JS host: an interpreted walk over the generated registry data, converting
-// msgpack bytes to rich values and back, checked against the schema in both directions, plus the
-// Engine's reserved identities.
+// The Registry of a JS host: the generated registry data compiled into linked plans, and a walk
+// over them converting msgpack bytes to rich values and back, checked against the schema in both
+// directions, plus the Engine's reserved identities.
 
-import { decode, encode } from '@msgpack/msgpack';
 import {
+  type Command,
   type DbEvent,
   JS,
   MSGPACK,
   type Registry,
+  type Rep,
   type Schema,
-  type SchemaNode,
   type SchemaSolution,
-  type StoreValue,
-  type Wants,
 } from './contract.js';
-import { Reader, Writer } from './msgpack.js';
+import { decodeAny, encodeAny, Reader, setEntry, Writer } from './msgpack.js';
 
 const utf8 = new TextEncoder();
 
@@ -30,17 +28,95 @@ export class ConvertError extends Error {
     the database rejects them too; anything else's are dropped */
 type Policy = 'reject' | 'drop';
 
-type Struct = Extract<SchemaNode, { 0: 'struct' }>;
+// plan kinds
+const NULL = 0;
+const INT = 1;
+const STR = 2;
+const BOOL = 3;
+const DATE = 4;
+const JSON_ = 5;
+const LIT = 6;
+const STRUCT = 7;
+const RECORD = 8;
+const ARRAY = 9;
+const TUPLE = 10;
+const UNION = 11;
+const INTAKE = 12;
+
+// json types, as the union solver names them, indexing a jsontype solution's options
+const JT_NULL = 0;
+const JT_INT = 1;
+const JT_STRING = 2;
+const JT_BOOLEAN = 3;
+const JT_OBJECT = 4;
+const JT_ARRAY = 5;
+const JT_FLOAT = 6;
+const JT_BIN = 7;
+const JT_NAMES = ['null', 'int', 'string', 'boolean', 'object', 'array', 'float', 'bin'];
+const JT_CODES: Record<string, number> = Object.fromEntries(JT_NAMES.map((n, i) => [n, i]));
+
+// solution kinds
+const MATCH = 0;
+const JSONTYPE = 1;
+const LITERAL = 2;
+const LENGTH = 3;
+const INDEX = 4;
+const FIELD = 5;
+const HASFIELD = 6;
+
+/** One node of the registry, compiled: children are linked directly, and a struct carries its
+    keys as UTF-8, its required fields as a bitmask, and its write order.  Every plan has every
+    field, so the walk's property reads stay monomorphic. */
+class Plan {
+  k = NULL;
+  // a literal, and a string literal's UTF-8
+  lit: string | number | boolean = '';
+  litBytes: Uint8Array[] = [];
+  // a struct
+  keys: string[] = [];
+  keyBytes: Uint8Array[] = [];
+  types: Plan[] = [];
+  optional: boolean[] = [];
+  // the required fields, for a struct of at most 31 fields
+  required = 0;
+  order: number[] = [];
+  index = new Map<string, number>();
+  // a record's values, an array's items, an intake field's wire type
+  child: Plan = this;
+  // a tuple's items
+  items: Plan[] = [];
+  sol: Sol | null = null;
+}
+
+/** One step of a union's decision tree, compiled, every kind with every field. */
+class Sol {
+  k = MATCH;
+  plan: Plan | null = null;
+  // jsontype: the option per json type code, and the one for any type
+  byType: (Sol | null)[] = [];
+  any: Sol | null = null;
+  // literal: the options in order, string ones also as UTF-8 to compare as bytes
+  lits: (string | number | boolean)[] = [];
+  litBytes: Uint8Array[] = [];
+  strings = true;
+  subs: Sol[] = [];
+  // length
+  lengths = new Map<number, Sol>();
+  dflt: Sol | null = null;
+  // index
+  at = 0;
+  sub: Sol | null = null;
+  // field, and hasfield's keys in order
+  key = '';
+  keyBytes: Uint8Array[] = [];
+  keys: string[] = [];
+}
 
 /** a conversion in progress: the path to the value being converted, for its error, as object
     keys and array indices */
 class Walk {
   path: (string | number)[] = [];
-
-  constructor(
-    readonly reg: Registry_,
-    readonly policy: Policy,
-  ) {}
+  policy: Policy = 'drop';
 
   fail(message: string): never {
     const path = this.path.map((p) => (typeof p === 'number' ? `[${p}]` : `.${p}`)).join('');
@@ -49,109 +125,121 @@ class Walk {
 
   // reading //////////////////////////////////////////////////////////////////
 
-  read(r: Reader, i: number): unknown {
-    const n = this.reg.schema.nodes[i];
-    switch (n[0]) {
-      case 'null':
-        if (r.kind() !== 'nil') this.fail('expected null');
-        r.nil();
+  read(r: Reader, p: Plan): unknown {
+    switch (p.k) {
+      case NULL:
+        if (!r.tryNil()) this.fail('expected null');
         return null;
-      case 'int':
+      case INT:
         return this.readInt(r);
-      case 'str':
-        if (r.kind() !== 'str') this.fail('expected a string');
-        return r.str();
-      case 'bool':
-        if (r.kind() !== 'bool') this.fail('expected a bool');
-        return r.bool();
-      case 'date':
-        if (r.kind() !== 'ext') this.fail('expected a timestamp');
-        return r.timestamp();
-      case 'json':
-        return decode(r.view());
-      case 'lit':
-        return this.readLiteral(r, n[1]);
-      case 'struct':
-        return this.readStruct(r, n);
-      case 'record': {
-        if (r.kind() !== 'map') this.fail('expected an object');
-        const count = r.mapHeader();
+      case STR: {
+        const v = r.tryStr();
+        if (v === undefined) this.fail('expected a string');
+        return v;
+      }
+      case BOOL: {
+        const v = r.tryBool();
+        if (v === undefined) this.fail('expected a bool');
+        return v;
+      }
+      case DATE: {
+        const v = r.tryTimestamp();
+        if (v === undefined) this.fail('expected a timestamp');
+        return v;
+      }
+      case JSON_:
+        return r.any();
+      case LIT:
+        return this.readLiteral(r, p);
+      case STRUCT:
+        return this.readStruct(r, p);
+      case RECORD: {
+        const count = r.tryMapHeader();
+        if (count < 0) this.fail('expected an object');
         const out: Record<string, unknown> = {};
         for (let k = 0; k < count; k++) {
           if (r.kind() !== 'str') this.fail('expected a string key');
-          const key = r.key();
+          const key = r.str();
           this.path.push(key);
-          out[key] = this.read(r, n[2]);
+          setEntry(out, key, this.read(r, p.child));
           this.path.pop();
         }
         return out;
       }
-      case 'array': {
-        if (r.kind() !== 'array') this.fail('expected an array');
-        const count = r.arrayHeader();
+      case ARRAY: {
+        const count = r.tryArrayHeader();
+        if (count < 0) this.fail('expected an array');
         const out = new Array<unknown>(count);
         for (let k = 0; k < count; k++) {
           this.path.push(k);
-          out[k] = this.read(r, n[2]);
+          out[k] = this.read(r, p.child);
           this.path.pop();
         }
         return out;
       }
-      case 'tuple': {
-        if (r.kind() !== 'array') this.fail('expected an array');
-        const count = r.arrayHeader();
-        if (count !== n[2].length) this.fail(`expected ${n[2].length} items, not ${count}`);
+      case TUPLE: {
+        const count = r.tryArrayHeader();
+        if (count < 0) this.fail('expected an array');
+        const items = p.items;
+        if (count !== items.length) this.fail(`expected ${items.length} items, not ${count}`);
         const out = new Array<unknown>(count);
         for (let k = 0; k < count; k++) {
           this.path.push(k);
-          out[k] = this.read(r, n[2][k]);
+          out[k] = this.read(r, items[k]);
           this.path.pop();
         }
         return out;
       }
-      case 'union':
-        return this.readUnion(r, n[2], r.pos, r.pos, r.pos);
-      case 'intake':
-        return this.read(r, n[2]);
+      case UNION: {
+        const at = r.pos;
+        return this.readUnion(r, p.sol!, at, at, at);
+      }
+      default:
+        return this.read(r, p.child);
     }
   }
 
   // an int in any msgpack form, an integral float included
   readInt(r: Reader): number {
-    const kind = r.kind();
-    const v = kind === 'int' ? r.int() : kind === 'float' ? r.float() : NaN;
+    const v = r.tryNumber();
     if (!Number.isSafeInteger(v)) this.fail('expected an int');
     return v;
   }
 
-  readLiteral(r: Reader, lit: string | number | boolean): unknown {
-    const kind = r.kind();
-    const v =
-      typeof lit === 'string' && kind === 'str'
-        ? r.str()
-        : typeof lit === 'number' && (kind === 'int' || kind === 'float')
-          ? this.readInt(r)
-          : typeof lit === 'boolean' && kind === 'bool'
-            ? r.bool()
-            : undefined;
+  readLiteral(r: Reader, p: Plan): unknown {
+    const lit = p.lit;
+    let v: unknown;
+    if (typeof lit === 'string') {
+      // a string literal compares as bytes
+      const i = r.keyIndex(p.litBytes, 0);
+      if (i === 0) return lit;
+      v = i === -1 ? r.lastKey() : undefined;
+    } else if (typeof lit === 'number') {
+      const n = r.tryNumber();
+      v = Number.isNaN(n) ? undefined : n;
+    } else {
+      v = r.tryBool();
+    }
     if (v !== lit) this.fail(`expected ${JSON.stringify(lit)}, not ${JSON.stringify(v)}`);
     return v;
   }
 
-  readStruct(r: Reader, n: Struct): unknown {
-    if (r.kind() !== 'map') this.fail('expected an object');
-    const fields = n[2];
-    const keys = this.reg.encodedKeys(n);
-    const count = r.mapHeader();
+  readStruct(r: Reader, p: Plan): unknown {
+    const count = r.tryMapHeader();
+    if (count < 0) this.fail('expected an object');
+    const keys = p.keys;
+    const nf = keys.length;
     const out: Record<string, unknown> = {};
-    const seen = new Uint8Array(fields.length);
+    // the fields seen, as a bitmask while they fit in one
+    let seen = 0;
+    const many = nf > 31 ? new Uint8Array(nf) : null;
 
     // each entry: a declared field, read once, or a foreign one, under the policy; fields are
     // usually in declaration order, so each search starts after the last match
     let hint = 0;
     for (let k = 0; k < count; k++) {
-      if (r.kind() !== 'str') this.fail('expected a string key');
-      const f = r.keyIndex(keys, hint);
+      const f = r.keyIndex(p.keyBytes, hint);
+      if (f === -2) this.fail('expected a string key');
       if (f < 0) {
         if (this.policy === 'reject') {
           this.path.push(r.lastKey());
@@ -160,19 +248,26 @@ class Walk {
         r.skip();
         continue;
       }
-      const key = fields[f][0];
+      const key = keys[f];
       this.path.push(key);
-      if (seen[f]) this.fail('repeated field');
-      seen[f] = 1;
-      out[key] = this.read(r, fields[f][1]);
+      if (many === null) {
+        if (seen & (1 << f)) this.fail('repeated field');
+        seen |= 1 << f;
+      } else {
+        if (many[f]) this.fail('repeated field');
+        many[f] = 1;
+      }
+      out[key] = this.read(r, p.types[f]);
       this.path.pop();
-      hint = f + 1 < fields.length ? f + 1 : 0;
+      hint = f + 1 < nf ? f + 1 : 0;
     }
 
     // every required field was present
-    for (let f = 0; f < fields.length; f++) {
-      if (seen[f] || fields[f][2]) continue;
-      this.path.push(fields[f][0]);
+    if (many === null && (seen & p.required) === p.required) return out;
+    for (let f = 0; f < nf; f++) {
+      const have = many === null ? seen & (1 << f) : many[f];
+      if (have || p.optional[f]) continue;
+      this.path.push(keys[f]);
       this.fail('missing required field');
     }
     return out;
@@ -181,120 +276,128 @@ class Walk {
   /* A solution is evaluated by looking ahead from the cursor, never consuming: `obj` is the
      container being navigated, `subj` the value being tested, and `root` the union value, which
      a match reads in full. */
-  readUnion(r: Reader, s: SchemaSolution, obj: number, subj: number, root: number): unknown {
-    switch (s[0]) {
-      case 'match':
+  readUnion(r: Reader, s: Sol, obj: number, subj: number, root: number): unknown {
+    switch (s.k) {
+      case MATCH:
         r.pos = root;
-        return this.read(r, s[1]);
-      case 'jsontype': {
+        return this.read(r, s.plan!);
+      case JSONTYPE: {
         const jt = this.jsonTypeAt(r, subj);
-        const opt = s[1].find(([k]) => k === jt) ?? s[1].find(([k]) => k === '*');
-        if (opt === undefined) this.fail(`type ${jt} not allowed here`);
-        return this.readUnion(r, opt[1], obj, subj, root);
+        const sub = s.byType[jt] ?? s.any;
+        if (sub === null) this.fail(`type ${JT_NAMES[jt]} not allowed here`);
+        return this.readUnion(r, sub, obj, subj, root);
       }
-      case 'literal': {
-        const v = this.literalAt(r, subj);
-        const opt = s[1].find(([lit]) => lit === v);
-        if (opt === undefined) this.fail(`unexpected value ${JSON.stringify(v)}`);
-        return this.readUnion(r, opt[1], obj, subj, root);
+      case LITERAL: {
+        const i = this.literalAt(r, s, subj);
+        if (i < 0) this.fail(`unexpected value ${this.valueAt(r, subj)}`);
+        return this.readUnion(r, s.subs[i], obj, subj, root);
       }
-      case 'length': {
+      case LENGTH: {
         r.pos = subj;
         if (r.kind() !== 'array') this.fail('expected an array');
         const len = r.arrayHeader();
-        const opt = s[1].find(([n]) => n === len);
-        const sub = opt !== undefined ? opt[1] : s[2];
+        const sub = s.lengths.get(len) ?? s.dflt;
         if (sub === null) this.fail(`unexpected length ${len}`);
         return this.readUnion(r, sub, obj, subj, root);
       }
-      case 'index': {
+      case INDEX: {
         r.pos = subj;
         if (r.kind() !== 'array') this.fail('expected an array');
         const len = r.arrayHeader();
-        if (s[1] >= len) this.fail(`missing index ${s[1]}`);
-        for (let k = 0; k < s[1]; k++) r.skip();
+        if (s.at >= len) this.fail(`missing index ${s.at}`);
+        for (let k = 0; k < s.at; k++) r.skip();
         const at = r.pos;
-        return this.readUnion(r, s[2], at, at, root);
+        return this.readUnion(r, s.sub!, at, at, root);
       }
-      case 'field': {
-        const at = this.findField(r, obj, s[1]);
-        if (at < 0) this.fail(`missing discriminator ${JSON.stringify(s[1])}`);
-        return this.readUnion(r, s[2], obj, at, root);
+      case FIELD: {
+        const at = this.findField(r, obj, s.keyBytes);
+        if (at < 0) this.fail(`missing discriminator ${JSON.stringify(s.key)}`);
+        return this.readUnion(r, s.sub!, obj, at, root);
       }
-      case 'hasfield': {
-        for (const [key, sub] of s[1]) {
-          if (this.findField(r, obj, key) >= 0) return this.readUnion(r, sub, obj, obj, root);
-        }
-        return this.fail(`none of the fields ${s[1].map(([k]) => k).join(', ')}`);
+      default: {
+        const i = this.findAnyField(r, obj, s.keyBytes);
+        if (i < 0) this.fail(`none of the fields ${s.keys.join(', ')}`);
+        return this.readUnion(r, s.subs[i], obj, obj, root);
       }
     }
   }
 
-  // the json type the solver names for the value at pos
-  jsonTypeAt(r: Reader, pos: number): string {
+  // the json type code the solver names for the value at pos
+  jsonTypeAt(r: Reader, pos: number): number {
     const saved = r.pos;
     r.pos = pos;
-    const kind = r.kind();
-    let jt: string;
-    switch (kind) {
+    let jt: number;
+    switch (r.kind()) {
       case 'nil':
-        jt = 'null';
+        jt = JT_NULL;
         break;
       case 'bool':
-        jt = 'boolean';
+        jt = JT_BOOLEAN;
         break;
       case 'int':
-        jt = 'int';
+        jt = JT_INT;
         break;
       case 'float':
-        jt = Number.isInteger(r.float()) ? 'int' : 'float';
+        jt = Number.isInteger(r.float()) ? JT_INT : JT_FLOAT;
         break;
       case 'str':
       case 'ext':
-        jt = 'string';
+        jt = JT_STRING;
         break;
       case 'map':
-        jt = 'object';
+        jt = JT_OBJECT;
         break;
       case 'array':
-        jt = 'array';
+        jt = JT_ARRAY;
         break;
       case 'bin':
-        jt = 'bin';
+        jt = JT_BIN;
         break;
     }
     r.pos = saved;
     return jt;
   }
 
-  // the scalar at pos, when it is one a literal can be
-  literalAt(r: Reader, pos: number): unknown {
+  // the index of the literal option the scalar at pos is, or -1
+  literalAt(r: Reader, s: Sol, pos: number): number {
     const saved = r.pos;
     r.pos = pos;
     const kind = r.kind();
-    const v =
-      kind === 'str'
-        ? r.str()
-        : kind === 'int' || kind === 'float'
-          ? this.readInt(r)
-          : kind === 'bool'
-            ? r.bool()
-            : undefined;
+    let i = -1;
+    if (kind === 'str') {
+      if (s.strings) i = r.keyIndex(s.litBytes, 0);
+      else i = s.lits.indexOf(r.str());
+    } else if (kind === 'int' || kind === 'float') {
+      const v = kind === 'int' ? r.int() : r.float();
+      i = s.lits.indexOf(v);
+    } else if (kind === 'bool') {
+      i = s.lits.indexOf(r.bool());
+    }
     r.pos = saved;
-    return v;
+    return i;
   }
 
-  // the position of the value of key in the map at pos, or -1
-  findField(r: Reader, pos: number, key: string): number {
+  // the value at pos, for an error
+  valueAt(r: Reader, pos: number): string {
     const saved = r.pos;
     r.pos = pos;
-    const want = [this.reg.encodedKey(key)];
+    try {
+      return JSON.stringify(r.any());
+    } finally {
+      r.pos = saved;
+    }
+  }
+
+  // the position of the value of a key in the map at pos, or -1
+  findField(r: Reader, pos: number, key: Uint8Array[]): number {
+    const saved = r.pos;
+    r.pos = pos;
     let at = -1;
     if (r.kind() === 'map') {
       const count = r.mapHeader();
       for (let k = 0; k < count; k++) {
         if (r.kind() !== 'str') this.fail('expected a string key');
-        if (r.keyIndex(want, 0) === 0) {
+        if (r.keyIndex(key, 0) === 0) {
           at = r.pos;
           break;
         }
@@ -305,71 +408,90 @@ class Walk {
     return at;
   }
 
+  // the index of the first of keys, in their order, that the map at pos has; -1 for none
+  findAnyField(r: Reader, pos: number, keys: Uint8Array[]): number {
+    const saved = r.pos;
+    r.pos = pos;
+    let best = -1;
+    if (r.kind() === 'map') {
+      const count = r.mapHeader();
+      for (let k = 0; k < count; k++) {
+        if (r.kind() !== 'str') this.fail('expected a string key');
+        const i = r.keyIndex(keys, 0);
+        if (i >= 0 && (best < 0 || i < best)) best = i;
+        r.skip();
+      }
+    }
+    r.pos = saved;
+    return best;
+  }
+
   // writing //////////////////////////////////////////////////////////////////
 
-  write(w: Writer, i: number, v: unknown): void {
-    const n = this.reg.schema.nodes[i];
-    switch (n[0]) {
-      case 'null':
+  write(w: Writer, p: Plan, v: unknown): void {
+    switch (p.k) {
+      case NULL:
         if (v !== null) this.fail('expected null');
         return w.nil();
-      case 'int':
+      case INT:
         if (typeof v !== 'number' || !Number.isSafeInteger(v)) this.fail('expected an int');
         return w.int(v);
-      case 'str':
+      case STR:
         if (typeof v !== 'string') this.fail('expected a string');
         return w.str(v);
-      case 'bool':
+      case BOOL:
         if (typeof v !== 'boolean') this.fail('expected a bool');
         return w.bool(v);
-      case 'date':
+      case DATE:
         if (!(v instanceof Date) || Number.isNaN(v.getTime())) this.fail('expected a Date');
         return w.timestamp(v);
-      case 'json':
-        return w.raw(encode(v, { ignoreUndefined: true }));
-      case 'lit':
-        if (v !== n[1]) this.fail(`expected ${JSON.stringify(n[1])}, not ${JSON.stringify(v)}`);
-        return this.writeScalar(w, n[1]);
-      case 'struct':
-        return this.writeStruct(w, i, n, v);
-      case 'record': {
-        if (typeof v !== 'object' || v === null || Array.isArray(v))
+      case JSON_:
+        return w.any(v);
+      case LIT:
+        if (v !== p.lit) this.fail(`expected ${JSON.stringify(p.lit)}, not ${JSON.stringify(v)}`);
+        return this.writeScalar(w, p.lit);
+      case STRUCT:
+        return this.writeStruct(w, p, v);
+      case RECORD: {
+        if (typeof v !== 'object' || v === null || Array.isArray(v)) {
           this.fail('expected an object');
+        }
         const entries = Object.entries(v).filter(([, x]) => x !== undefined);
         w.mapHeader(entries.length);
         for (const [key, x] of entries) {
           w.str(key);
           this.path.push(key);
-          this.write(w, n[2], x);
+          this.write(w, p.child, x);
           this.path.pop();
         }
         return;
       }
-      case 'array': {
+      case ARRAY: {
         if (!Array.isArray(v)) this.fail('expected an array');
         w.arrayHeader(v.length);
         for (let k = 0; k < v.length; k++) {
           this.path.push(k);
-          this.write(w, n[2], v[k]);
+          this.write(w, p.child, v[k]);
           this.path.pop();
         }
         return;
       }
-      case 'tuple': {
+      case TUPLE: {
         if (!Array.isArray(v)) this.fail('expected an array');
-        if (v.length !== n[2].length) this.fail(`expected ${n[2].length} items, not ${v.length}`);
+        const items = p.items;
+        if (v.length !== items.length) this.fail(`expected ${items.length} items, not ${v.length}`);
         w.arrayHeader(v.length);
         for (let k = 0; k < v.length; k++) {
           this.path.push(k);
-          this.write(w, n[2][k], v[k]);
+          this.write(w, items[k], v[k]);
           this.path.pop();
         }
         return;
       }
-      case 'union':
-        return this.writeUnion(w, n[2], v, v, v);
-      case 'intake':
-        return this.write(w, n[2], v);
+      case UNION:
+        return this.writeUnion(w, p.sol!, v, v, v);
+      default:
+        return this.write(w, p.child, v);
     }
   }
 
@@ -379,16 +501,15 @@ class Walk {
     else w.bool(v);
   }
 
-  writeStruct(w: Writer, i: number, n: Struct, v: unknown): void {
+  writeStruct(w: Writer, p: Plan, v: unknown): void {
     if (typeof v !== 'object' || v === null || Array.isArray(v)) this.fail('expected an object');
     const o = v as Record<string, unknown>;
-    const fields = n[2];
+    const keys = p.keys;
 
     // a command's foreign fields are an error; anything else's are left out
     if (this.policy === 'reject') {
-      const index = this.reg.fieldIndex(n);
       for (const key of Object.keys(o)) {
-        if (!index.has(key) && o[key] !== undefined) {
+        if (!p.index.has(key) && o[key] !== undefined) {
           this.path.push(key);
           this.fail('unknown field');
         }
@@ -397,65 +518,67 @@ class Walk {
 
     // the fields present, the discriminator first and then declaration order
     let present = 0;
-    for (const [key, , optional] of fields) {
-      if (o[key] !== undefined) {
+    for (let f = 0; f < keys.length; f++) {
+      if (o[keys[f]] !== undefined) {
         present++;
-      } else if (!optional) {
-        this.path.push(key);
+      } else if (!p.optional[f]) {
+        this.path.push(keys[f]);
         this.fail('missing required field');
       }
     }
     w.mapHeader(present);
-    for (const f of this.reg.writeOrder(i, n)) {
-      const [key, type] = fields[f];
+    for (const f of p.order) {
+      const key = keys[f];
       const x = o[key];
       if (x === undefined) continue;
       w.str(key);
       this.path.push(key);
-      this.write(w, type, x);
+      this.write(w, p.types[f], x);
       this.path.pop();
     }
   }
 
   // the solution evaluated over the value itself
-  writeUnion(w: Writer, s: SchemaSolution, obj: unknown, subj: unknown, root: unknown): void {
-    switch (s[0]) {
-      case 'match':
-        return this.write(w, s[1], root);
-      case 'jsontype': {
+  writeUnion(w: Writer, s: Sol, obj: unknown, subj: unknown, root: unknown): void {
+    switch (s.k) {
+      case MATCH:
+        return this.write(w, s.plan!, root);
+      case JSONTYPE: {
         const jt = jsTypeOf(subj);
-        const opt = s[1].find(([k]) => k === jt) ?? s[1].find(([k]) => k === '*');
-        if (opt === undefined) this.fail(`type ${jt} not allowed here`);
-        return this.writeUnion(w, opt[1], obj, subj, root);
+        const sub = (jt >= 0 ? s.byType[jt] : null) ?? s.any;
+        if (sub === null)
+          this.fail(`type ${jt >= 0 ? JT_NAMES[jt] : typeof subj} not allowed here`);
+        return this.writeUnion(w, sub, obj, subj, root);
       }
-      case 'literal': {
-        const opt = s[1].find(([lit]) => lit === subj);
-        if (opt === undefined) this.fail(`unexpected value ${JSON.stringify(subj)}`);
-        return this.writeUnion(w, opt[1], obj, subj, root);
+      case LITERAL: {
+        const i = s.lits.indexOf(subj as string | number | boolean);
+        if (i < 0) this.fail(`unexpected value ${JSON.stringify(subj)}`);
+        return this.writeUnion(w, s.subs[i], obj, subj, root);
       }
-      case 'length': {
+      case LENGTH: {
         if (!Array.isArray(subj)) this.fail('expected an array');
-        const opt = s[1].find(([n]) => n === subj.length);
-        const sub = opt !== undefined ? opt[1] : s[2];
+        const sub = s.lengths.get(subj.length) ?? s.dflt;
         if (sub === null) this.fail(`unexpected length ${subj.length}`);
         return this.writeUnion(w, sub, obj, subj, root);
       }
-      case 'index': {
-        if (!Array.isArray(subj) || s[1] >= subj.length) this.fail(`missing index ${s[1]}`);
-        const at = subj[s[1]];
-        return this.writeUnion(w, s[2], at, at, root);
+      case INDEX: {
+        if (!Array.isArray(subj) || s.at >= subj.length) this.fail(`missing index ${s.at}`);
+        const at = subj[s.at];
+        return this.writeUnion(w, s.sub!, at, at, root);
       }
-      case 'field': {
-        const at = hasKey(obj, s[1]) ? obj[s[1]] : undefined;
-        if (at === undefined) this.fail(`missing discriminator ${JSON.stringify(s[1])}`);
-        return this.writeUnion(w, s[2], obj, at, root);
+      case FIELD: {
+        const at = hasKey(obj, s.key) ? obj[s.key] : undefined;
+        if (at === undefined) this.fail(`missing discriminator ${JSON.stringify(s.key)}`);
+        return this.writeUnion(w, s.sub!, obj, at, root);
       }
-      case 'hasfield': {
-        for (const [key, sub] of s[1]) {
-          if (hasKey(obj, key) && obj[key] !== undefined)
-            return this.writeUnion(w, sub, obj, obj, root);
+      default: {
+        for (let i = 0; i < s.keys.length; i++) {
+          const key = s.keys[i];
+          if (hasKey(obj, key) && obj[key] !== undefined) {
+            return this.writeUnion(w, s.subs[i], obj, obj, root);
+          }
         }
-        return this.fail(`none of the fields ${s[1].map(([k]) => k).join(', ')}`);
+        return this.fail(`none of the fields ${s.keys.join(', ')}`);
       }
     }
   }
@@ -465,22 +588,168 @@ function hasKey(v: unknown, key: string): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && key in v;
 }
 
-// the json type the solver names for a rich value
-function jsTypeOf(v: unknown): string {
-  if (v === null) return 'null';
-  if (Array.isArray(v)) return 'array';
+// the json type code the solver names for a rich value, -1 for one it never names
+function jsTypeOf(v: unknown): number {
+  if (v === null) return JT_NULL;
+  if (Array.isArray(v)) return JT_ARRAY;
   switch (typeof v) {
     case 'boolean':
-      return 'boolean';
+      return JT_BOOLEAN;
     case 'number':
-      return Number.isInteger(v) ? 'int' : 'float';
+      return Number.isInteger(v) ? JT_INT : JT_FLOAT;
     case 'string':
-      return 'string';
+      return JT_STRING;
     case 'object':
-      return v instanceof Date ? 'string' : 'object';
+      return v instanceof Date ? JT_STRING : JT_OBJECT;
     default:
-      return typeof v;
+      return -1;
   }
+}
+
+// compiling the registry ////////////////////////////////////////////////////
+
+/** the plan of every node, linked, from the registry data */
+function compile(schema: Schema): Plan[] {
+  const plans = schema.nodes.map(() => new Plan());
+
+  const sol = (s: SchemaSolution): Sol => {
+    const out = new Sol();
+    switch (s[0]) {
+      case 'match':
+        out.k = MATCH;
+        out.plan = plans[s[1]];
+        break;
+      case 'jsontype':
+        out.k = JSONTYPE;
+        out.byType = JT_NAMES.map(() => null);
+        for (const [jt, sub] of s[1]) {
+          if (jt === '*') out.any = sol(sub);
+          else out.byType[JT_CODES[jt]] = sol(sub);
+        }
+        break;
+      case 'literal':
+        out.k = LITERAL;
+        out.lits = s[1].map(([lit]) => lit);
+        out.strings = out.lits.every((lit) => typeof lit === 'string');
+        out.litBytes = out.strings ? out.lits.map((lit) => utf8.encode(lit as string)) : [];
+        out.subs = s[1].map(([, sub]) => sol(sub));
+        break;
+      case 'length':
+        out.k = LENGTH;
+        for (const [n, sub] of s[1]) out.lengths.set(n, sol(sub));
+        out.dflt = s[2] === null ? null : sol(s[2]);
+        break;
+      case 'index':
+        out.k = INDEX;
+        out.at = s[1];
+        out.sub = sol(s[2]);
+        break;
+      case 'field':
+        out.k = FIELD;
+        out.key = s[1];
+        out.keyBytes = [utf8.encode(s[1])];
+        out.sub = sol(s[2]);
+        break;
+      case 'hasfield':
+        out.k = HASFIELD;
+        out.keys = s[1].map(([k]) => k);
+        out.keyBytes = out.keys.map((k) => utf8.encode(k));
+        out.subs = s[1].map(([, sub]) => sol(sub));
+        break;
+    }
+    return out;
+  };
+
+  schema.nodes.forEach((n, i) => {
+    const p = plans[i];
+    switch (n[0]) {
+      case 'null':
+        p.k = NULL;
+        break;
+      case 'int':
+        p.k = INT;
+        break;
+      case 'str':
+        p.k = STR;
+        break;
+      case 'bool':
+        p.k = BOOL;
+        break;
+      case 'date':
+        p.k = DATE;
+        break;
+      case 'json':
+        p.k = JSON_;
+        break;
+      case 'lit':
+        p.k = LIT;
+        p.lit = n[1];
+        if (typeof n[1] === 'string') p.litBytes = [utf8.encode(n[1])];
+        break;
+      case 'struct': {
+        const fields = n[2];
+        p.k = STRUCT;
+        p.keys = fields.map(([key]) => key);
+        p.keyBytes = p.keys.map((key) => utf8.encode(key));
+        p.types = fields.map(([, t]) => plans[t]);
+        p.optional = fields.map(([, , opt]) => opt);
+        p.required = fields.reduce((m, [, , opt], f) => (opt || f > 30 ? m : m | (1 << f)), 0);
+        p.index = new Map(p.keys.map((key, f) => [key, f]));
+        const all = p.keys.map((_, f) => f);
+        const first = n[3];
+        p.order = first < 0 ? all : [first, ...all.filter((f) => f !== first)];
+        break;
+      }
+      case 'record':
+        p.k = RECORD;
+        p.child = plans[n[2]];
+        break;
+      case 'array':
+        p.k = ARRAY;
+        p.child = plans[n[2]];
+        break;
+      case 'tuple':
+        p.k = TUPLE;
+        p.items = n[2].map((t) => plans[t]);
+        break;
+      case 'union':
+        p.k = UNION;
+        p.sol = sol(n[2]);
+        break;
+      case 'intake':
+        p.k = INTAKE;
+        p.child = plans[n[2]];
+        break;
+    }
+  });
+  return plans;
+}
+
+/* An outbox row, `.command`, is the map {id, data}, data the command's wire bytes as bin. */
+
+function readCommand(bytes: Uint8Array): Command<Uint8Array> {
+  const r = new Reader(bytes);
+  const n = r.mapHeader();
+  let id: string | undefined;
+  let data: Uint8Array | undefined;
+  for (let k = 0; k < n; k++) {
+    const key = r.str();
+    if (key === 'id') id = r.str();
+    else if (key === 'data') data = r.bin();
+    else r.skip();
+  }
+  if (id === undefined || data === undefined || !r.done) throw new Error('malformed outbox row');
+  return { id, data };
+}
+
+function writeCommand(c: Command<Uint8Array>): Uint8Array {
+  const w = new Writer();
+  w.mapHeader(2);
+  w.str('id');
+  w.str(c.id);
+  w.str('data');
+  w.bin(c.data);
+  return w.bytes();
 }
 
 /** the family of a stream name: the part before the first dot */
@@ -493,7 +762,7 @@ function familyOf(stream: string): string {
 function isSystemEvent(r: Reader): boolean {
   const saved = r.pos;
   let sys = false;
-  if (r.kind() === 'map' && r.mapHeader() > 0 && r.kind() === 'str') sys = r.key() === '$sys';
+  if (r.kind() === 'map' && r.mapHeader() > 0 && r.kind() === 'str') sys = r.str() === '$sys';
   r.pos = saved;
   return sys;
 }
@@ -502,127 +771,56 @@ class Registry_ implements Registry {
   readonly commands: string;
   readonly eventTypes: Record<string, string>;
   readonly storeTypes: Record<string, string>;
-  // the key each struct's walk writes first, where the struct is a union member told apart by it
-  readonly #discriminators = new Map<number, string>();
-  // each struct's field names to their positions, built on first use
-  readonly #fieldIndexes = new Map<Struct, Map<string, number>>();
-  readonly #writeOrders = new Map<number, number[]>();
-  readonly #encodedKeys = new Map<Struct, Uint8Array[]>();
-  readonly #encodedKey = new Map<string, Uint8Array>();
-  // one cursor every conversion from bytes reads with
+  // each type identity's plan
+  readonly #plans = new Map<string, Plan>();
+  // one walk, one cursor, and one buffer every conversion uses, reset first
+  readonly #walk = new Walk();
   readonly #reader = new Reader(new Uint8Array(0));
-  // one buffer every conversion to bytes writes into, emptied first and copied out after
   readonly #writer = new Writer();
 
-  constructor(readonly schema: Schema) {
+  constructor(schema: Schema) {
     this.commands = schema.commands ?? '';
     this.eventTypes = schema.eventTypes;
     this.storeTypes = schema.storeTypes;
-    for (const n of schema.nodes) if (n[0] === 'union') this.#learnDiscriminators(n[2], null);
+    const plans = compile(schema);
+    for (const [id, i] of Object.entries(schema.ids)) this.#plans.set(id, plans[i]);
   }
 
-  // every struct matched under a `field` test of a union's object members writes that key first
-  #learnDiscriminators(s: SchemaSolution, key: string | null): void {
-    switch (s[0]) {
-      case 'match':
-        if (key !== null && !this.#discriminators.has(s[1])) this.#discriminators.set(s[1], key);
-        return;
-      case 'jsontype':
-      case 'literal':
-      case 'hasfield':
-        for (const [, sub] of s[1]) this.#learnDiscriminators(sub, key);
-        return;
-      case 'length':
-        for (const [, sub] of s[1]) this.#learnDiscriminators(sub, key);
-        if (s[2] !== null) this.#learnDiscriminators(s[2], key);
-        return;
-      case 'index':
-        return this.#learnDiscriminators(s[2], null);
-      case 'field':
-        return this.#learnDiscriminators(s[2], key ?? s[1]);
-    }
+  #plan(type: string): Plan {
+    const p = this.#plans.get(type);
+    if (p === undefined) throw new ConvertError(`no registry entry for type ${type}`);
+    return p;
   }
 
-  /** a struct's field names, UTF-8, in declaration order */
-  encodedKeys(n: Struct): Uint8Array[] {
-    let keys = this.#encodedKeys.get(n);
-    if (keys === undefined) {
-      keys = n[2].map(([key]) => utf8.encode(key));
-      this.#encodedKeys.set(n, keys);
-    }
-    return keys;
+  // the walk, emptied, under the policy of a type identity
+  #begin(type: string): Walk {
+    const walk = this.#walk;
+    if (walk.path.length > 0) walk.path.length = 0;
+    walk.policy = type === this.commands ? 'reject' : 'drop';
+    return walk;
   }
 
-  /** one key, UTF-8 */
-  encodedKey(key: string): Uint8Array {
-    let k = this.#encodedKey.get(key);
-    if (k === undefined) {
-      k = utf8.encode(key);
-      this.#encodedKey.set(key, k);
-    }
-    return k;
-  }
-
-  fieldIndex(n: Struct): Map<string, number> {
-    let index = this.#fieldIndexes.get(n);
-    if (index === undefined) {
-      index = new Map(n[2].map(([key], f) => [key, f]));
-      this.#fieldIndexes.set(n, index);
-    }
-    return index;
-  }
-
-  /** the order a struct's fields are written in: its discriminator, then declaration order */
-  writeOrder(i: number, n: Struct): number[] {
-    let order = this.#writeOrders.get(i);
-    if (order === undefined) {
-      const all = n[2].map((_, f) => f);
-      const key = this.#discriminators.get(i);
-      const first = key === undefined ? -1 : n[2].findIndex(([k]) => k === key);
-      order = first < 0 ? all : [first, ...all.filter((f) => f !== first)];
-      this.#writeOrders.set(i, order);
-    }
-    return order;
-  }
-
-  // the node and policy of a type identity
-  #resolve(type: string): [number, Policy] {
-    const i = this.schema.ids[type];
-    if (i === undefined) throw new ConvertError(`no registry entry for type ${type}`);
-    return [i, type === this.commands ? 'reject' : 'drop'];
-  }
-
-  convert(type: string, value: StoreValue, want: Wants): StoreValue {
-    const out = { ...value } as Record<number, unknown>;
-    if (want & JS && !(JS in out)) {
-      if (!(MSGPACK in out)) throw new ConvertError(`no representation of ${type} to convert`);
-      out[JS] = this.#toJs(type, out[MSGPACK] as Uint8Array);
-    }
-    if (want & MSGPACK && !(MSGPACK in out)) {
-      if (!(JS in out)) throw new ConvertError(`no representation of ${type} to convert`);
-      out[MSGPACK] = this.#toBytes(type, out[JS]);
-    }
-    return out as StoreValue;
+  convert(type: string, value: unknown, from: Rep, to: Rep): unknown {
+    if (from === to) return value;
+    if (from === MSGPACK && to === JS) return this.#toJs(type, value as Uint8Array);
+    if (from === JS && to === MSGPACK) return this.#toBytes(type, value);
+    throw new ConvertError(`no conversion of ${type} from ${from} to ${to}`);
   }
 
   #toJs(type: string, bytes: Uint8Array): unknown {
-    if (type === '.json' || type === '.command') return decode(bytes);
+    if (type === '.json') return decodeAny(bytes);
+    if (type === '.command') return readCommand(bytes);
     const r = this.#reader;
     r.reset(bytes);
-    const walk = new Walk(this, 'drop');
+    const walk = this.#begin(type);
     try {
-      const v = type === '.event' ? this.#readEvent(r, walk) : this.#readTyped(r, type);
+      const v = type === '.event' ? this.#readEvent(r, walk) : walk.read(r, this.#plan(type));
       if (!r.done) walk.fail('trailing bytes after the value');
       return v;
     } catch (e: unknown) {
       if (e instanceof ConvertError) throw e;
       walk.fail(e instanceof Error ? e.message : String(e));
     }
-  }
-
-  #readTyped(r: Reader, type: string): unknown {
-    const [i, policy] = this.#resolve(type);
-    return new Walk(this, policy).read(r, i);
   }
 
   // the wire pair [env, data], data typed by its stream's family, system events untouched
@@ -646,32 +844,29 @@ class Registry_ implements Registry {
     // the data, under the type its family folds
     let data: unknown;
     if (isSystemEvent(r)) {
-      data = decode(r.view());
+      data = r.any();
     } else {
       const family = familyOf(stream);
       const type = this.eventTypes[family];
       if (type === undefined) walk.fail(`stream ${stream}: no events type for family ${family}`);
-      data = new Walk(this, 'drop').read(r, this.#resolve(type)[0]);
+      data = walk.read(r, this.#plan(type));
     }
     for (let k = 2; k < pair; k++) r.skip();
     return { id, data, position, stream, seq, servertime };
   }
 
   #toBytes(type: string, v: unknown): Uint8Array {
-    if (type === '.json' || type === '.command') return encode(v, { ignoreUndefined: true });
+    if (type === '.json') return encodeAny(v);
+    if (type === '.command') return writeCommand(v as Command<Uint8Array>);
     const w = this.#writer;
     w.reset();
-    if (type === '.event') {
-      this.#writeEvent(w, v as DbEvent<unknown>);
-    } else {
-      const [i, policy] = this.#resolve(type);
-      new Walk(this, policy).write(w, i, v);
-    }
+    const walk = this.#begin(type);
+    if (type === '.event') this.#writeEvent(w, walk, v as DbEvent<unknown>);
+    else walk.write(w, this.#plan(type), v);
     return w.bytes();
   }
 
-  #writeEvent(w: Writer, ev: DbEvent<unknown>): void {
-    const walk = new Walk(this, 'drop');
+  #writeEvent(w: Writer, walk: Walk, ev: DbEvent<unknown>): void {
     w.arrayHeader(2);
     w.arrayHeader(5);
     w.int(ev.position);
@@ -682,11 +877,11 @@ class Registry_ implements Registry {
     w.timestamp(ev.servertime);
     const data = ev.data;
     if (typeof data === 'object' && data !== null && '$sys' in data) {
-      w.raw(encode(data));
+      w.any(data);
     } else {
       const type = this.eventTypes[familyOf(ev.stream)];
       if (type === undefined) walk.fail(`stream ${ev.stream}: no events type for its family`);
-      walk.write(w, this.#resolve(type)[0], data);
+      walk.write(w, this.#plan(type), data);
     }
   }
 }

@@ -1,70 +1,18 @@
 // The cursor and writer against @msgpack/msgpack as an oracle: every value the library encodes,
 // the cursor reads back equal; every value the writer writes, byte for byte what the library
-// writes; and every truncation of a value, an error.
+// writes; and every truncation of a value, an error.  The library is a test dependency only.
 
 import { describe, expect, test } from 'vitest';
 import { decode, encode } from '@msgpack/msgpack';
-import { Reader, Writer } from '../src/msgpack.js';
+import { decodeAny, encodeAny, Reader, Writer } from '../src/msgpack.js';
+import { buildRegistry } from '../src/registry.js';
+import { JS, MSGPACK } from '../src/contract.js';
 
-/** read any value with the cursor, the way the library decodes it */
-function readAny(r: Reader): unknown {
-  switch (r.kind()) {
-    case 'nil':
-      r.nil();
-      return null;
-    case 'bool':
-      return r.bool();
-    case 'int':
-      return r.int();
-    case 'float':
-      return r.float();
-    case 'str':
-      return r.str();
-    case 'ext':
-      return r.timestamp();
-    case 'array': {
-      const n = r.arrayHeader();
-      const out: unknown[] = [];
-      for (let i = 0; i < n; i++) out.push(readAny(r));
-      return out;
-    }
-    case 'map': {
-      const n = r.mapHeader();
-      const out: Record<string, unknown> = {};
-      for (let i = 0; i < n; i++) {
-        const k = r.key();
-        out[k] = readAny(r);
-      }
-      return out;
-    }
-    case 'bin':
-      throw new Error('bin is not a value here');
-  }
-}
-
-/** write any value with the writer, the way the library encodes it */
-function writeAny(w: Writer, v: unknown): void {
-  if (v === null) return w.nil();
-  if (typeof v === 'boolean') return w.bool(v);
-  if (typeof v === 'number') return Number.isSafeInteger(v) ? w.int(v) : w.float64(v);
-  if (typeof v === 'string') return w.str(v);
-  if (v instanceof Date) return w.timestamp(v);
-  if (Array.isArray(v)) {
-    w.arrayHeader(v.length);
-    for (const x of v) writeAny(w, x);
-    return;
-  }
-  const entries = Object.entries(v as Record<string, unknown>);
-  w.mapHeader(entries.length);
-  for (const [k, x] of entries) {
-    w.str(k);
-    writeAny(w, x);
-  }
-}
+const readAny = (r: Reader): unknown => r.any();
 
 function written(v: unknown): Uint8Array {
   const w = new Writer();
-  writeAny(w, v);
+  w.any(v);
   return w.bytes();
 }
 
@@ -247,5 +195,85 @@ describe('timestamps the library writes but the cursor refuses', () => {
   test('a timestamp extension of no valid size', () => {
     const bytes = Uint8Array.of(0xc7, 5, 0xff, 0, 0, 0, 0, 0);
     expect(() => new Reader(bytes).timestamp()).toThrow(/timestamp/);
+  });
+});
+
+describe('values with no schema', () => {
+  test('undefined properties are left out and undefined items are nil, as the library does', () => {
+    const v = { a: 1, gone: undefined, list: [1, undefined, 3], nested: { x: undefined } };
+    expect(encodeAny(v)).toEqual(encode(v, { ignoreUndefined: true }));
+    expect(decodeAny(encodeAny(v))).toEqual({ a: 1, list: [1, null, 3], nested: {} });
+  });
+
+  test('bin and extensions other than timestamps are refused', () => {
+    expect(() => decodeAny(encode(new Uint8Array([1, 2])))).toThrow(/bin/);
+    expect(() => decodeAny(Uint8Array.of(0xd4, 1, 9))).toThrow(/timestamp/);
+    expect(() => decodeAny(encode({ a: new Uint8Array(1) }))).toThrow(/bin/);
+  });
+
+  test('a map key that is not a string is refused', () => {
+    expect(() => decodeAny(Uint8Array.of(0x81, 0x01, 0xc0))).toThrow(/not a string/);
+  });
+
+  test('a __proto__ key is an own property, not the prototype', () => {
+    const bytes = Uint8Array.of(0x81, ...encode('__proto__'), ...encode({ polluted: true }));
+    const v = decodeAny(bytes) as Record<string, unknown>;
+    expect(Object.getPrototypeOf(v)).toBe(Object.prototype);
+    expect(Object.keys(v)).toEqual(['__proto__']);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  test('trailing bytes are refused', () => {
+    expect(() => decodeAny(Uint8Array.of(0xc0, 0xc0))).toThrow(/trailing/);
+  });
+
+  test('values with no msgpack form are refused', () => {
+    expect(() => encodeAny(new Uint8Array(1))).toThrow(/no msgpack form/);
+    expect(() => encodeAny(new Map())).toThrow(/no msgpack form/);
+    expect(() => encodeAny(new Set())).toThrow(/no msgpack form/);
+    expect(() => encodeAny(1n)).toThrow(/no msgpack form/);
+    expect(() => encodeAny(() => 1)).toThrow(/no msgpack form/);
+  });
+
+  test('nesting past the limit is refused both ways', () => {
+    let deep: unknown = 1;
+    for (let i = 0; i < 600; i++) deep = [deep];
+    expect(() => encodeAny(deep)).toThrow(/nested too deeply/);
+    // 600 one-item arrays around an int, by hand, since the library stops at depth 100
+    const bytes = new Uint8Array(601).fill(0x91);
+    bytes[600] = 1;
+    expect(() => decodeAny(bytes)).toThrow(/nested too deeply/);
+  });
+
+  test('bin reads and writes as the library does, at every length header', () => {
+    for (const n of [0, 255, 256, 65535, 65536]) {
+      const b = new Uint8Array(n).fill(7);
+      const w = new Writer();
+      w.bin(b);
+      expect(w.bytes()).toEqual(encode(b));
+      expect(new Reader(encode(b)).bin()).toEqual(b);
+    }
+  });
+});
+
+describe("the registry's own identities", () => {
+  const reg = buildRegistry({ nodes: [], ids: {}, commands: null, eventTypes: {}, storeTypes: {} });
+
+  test("an outbox row is the library's encoding of {id, data}, data as bin", () => {
+    const row = { id: 'c1', data: encode({ type: 'noted' }) };
+    const bytes = reg.convert('.command', row, JS, MSGPACK) as Uint8Array;
+    expect(bytes).toEqual(encode(row));
+    expect(reg.convert('.command', encode(row), MSGPACK, JS)).toEqual(row);
+  });
+
+  test('an Engine record is any value, undefined properties left out', () => {
+    const record = { epoch: 'e', position: 3, gone: undefined, at: new Date(0) };
+    const bytes = reg.convert('.json', record, JS, MSGPACK) as Uint8Array;
+    expect(bytes).toEqual(encode(record, { ignoreUndefined: true }));
+    expect(reg.convert('.json', bytes, MSGPACK, JS)).toEqual({
+      epoch: 'e',
+      position: 3,
+      at: new Date(0),
+    });
   });
 });

@@ -1,6 +1,5 @@
 // The HTTP connector.
 
-import { decode } from '@msgpack/msgpack';
 import type {
   Backfill,
   BackfillOutcome,
@@ -11,7 +10,7 @@ import type {
   ConnectorHooks,
   WireEvent,
 } from './contract.js';
-import { be, utf8, Writer } from './msgpack.js';
+import { be, decodeAny, utf8, Writer } from './msgpack.js';
 import { crc32c, Fnv64, sameBytes } from './checksum.js';
 import { ByteReader } from './bytes.js';
 import { frames } from './frames.js';
@@ -197,7 +196,7 @@ export class HTTPConnector implements Connector {
       const hdr = br.take(hlen).slice();
       const crc = readU32(br.take(4));
       if (crc !== crc32c(hdr)) throw new Error(`snapshot ${b.ref}: header crc`);
-      const header = decode(hdr) as BlobHeader;
+      const header = decodeAny(hdr) as BlobHeader;
       if (header.position !== position) throw new Error(`snapshot ${b.ref}: position mismatch`);
       await b.push({ header: { position, seqs: header.streams ?? {} } });
     }
@@ -334,7 +333,7 @@ export class HTTPConnector implements Connector {
       body: w.bytes(),
     });
     if (resp.status !== 200) throw new Error(`commands: ${resp.status} ${resp.statusText}`);
-    const outcomes = decode(new Uint8Array(await resp.arrayBuffer())) as unknown[][];
+    const outcomes = decodeAny(new Uint8Array(await resp.arrayBuffer())) as unknown[][];
     return outcomes.map((o): CommandResult => {
       switch (o[0]) {
         case 'ack':

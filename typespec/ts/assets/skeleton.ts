@@ -395,22 +395,16 @@ function readOnlySet<K>(base: Set<K>, label: string): Readonly<Set<K>> {
 
 // store //////////////////////////////////////////////////////////////////////
 
-/* A transactional key-value store, with values that travel as bundles of representations and a
+/* A transactional key-value store, whose values travel in one of several representations, and a
    Registry that converts between them. */
 
 /** The representations a value can be in: JS is the rich JS value, HOST the host language's,
-    MSGPACK the bytes.  They are bits, so a Wants is a mask of them: what an ask wants back, and
-    a store produces every wanted one it does not already hold, in one read.  0 means "as held",
-    which only move uses. */
+    MSGPACK the bytes.  Every get names the one it wants and every set the one it gives; a store
+    converts to what it keeps on the way in and to what was asked for on the way out. */
 export const JS = 1;
 export const HOST = 2;
-export const MSGPACK = 4;
-export type Wants = number;
-
-/** A StoreValue is a value keyed by representation, in one, or in several when several were
-    wanted.  What arrives may not be what a caller asked for; a store converts to what it keeps
-    on the way in and to what was wanted on the way out. */
-export type StoreValue = { [JS]: unknown } | { [HOST]: unknown } | { [MSGPACK]: Uint8Array };
+export const MSGPACK = 3;
+export type Rep = typeof JS | typeof HOST | typeof MSGPACK;
 
 /** Registry converts between representations of typed values and names the types the store
     holds.  Types are model names from the TypeSpec, plus three reserved names: `.json` for the
@@ -419,9 +413,8 @@ export type StoreValue = { [JS]: unknown } | { [HOST]: unknown } | { [MSGPACK]: 
     wire pair `[env, data]` in `msgpack` and a DbEvent in `js`, its `data` converted through the
     union of the stream's slice. */
 export interface Registry {
-  /** the value of type `type` carrying every representation in `want`: present ones are kept,
-      the rest produced in one pass */
-  convert(type: string, value: StoreValue, want: Wants): StoreValue;
+  /** a value of type `type`, given in one representation, in another */
+  convert(type: string, value: unknown, from: Rep, to: Rep): unknown;
   /** the commands union this engine may submit */
   commands: string;
   /** stream prefix (before the first dot) to the slice's events union */
@@ -431,10 +424,11 @@ export interface Registry {
 }
 
 /** One type of the model, as the generated registry describes it; children are indices into
-    the same node table.  A struct lists its fields in declaration order; a union carries the
-    solver's decision tree; an intake node names a field the database prepares for precommit,
-    over the wire type a client sends.  The identities of a struct, record, array, tuple, or union
-    are its name, or null when the type has none. */
+    the same node table.  A struct lists its fields in declaration order, and names the one it
+    writes first, the field a union tells it apart from its other members by, or -1; a union
+    carries the solver's decision tree; an intake node names a field the database prepares for
+    precommit, over the wire type a client sends.  The identities of a struct, record, array,
+    tuple, or union are its name, or null when the type has none. */
 export type SchemaNode =
   | ['null']
   | ['int']
@@ -443,7 +437,12 @@ export type SchemaNode =
   | ['date']
   | ['json']
   | ['lit', string | number | boolean]
-  | ['struct', string | null, [key: string, type: number, optional: boolean][]]
+  | [
+      'struct',
+      string | null,
+      [key: string, type: number, optional: boolean][],
+      discriminator: number,
+    ]
   | ['record', string | null, number]
   | ['array', string | null, number]
   | ['tuple', string | null, number[]]
@@ -504,12 +503,12 @@ export type StoreRange = {
   reverse?: boolean;
   // entries per batch
   limit: number;
-  // keys only, or values of this type in the wanted representation
-  values: false | { type: string; want: Wants };
+  // keys only, or values of this type in this representation
+  values: false | { type: string; rep: Rep };
 };
 /** one batch; a keys-only scan carries undefined values; next is the key to resume from (gt, or
     lt when reversed), null when the range is done */
-export type StoreScan = { entries: [string, StoreValue | undefined][]; next: string | null };
+export type StoreScan = { entries: [string, unknown][]; next: string | null };
 
 /** the exclusive upper bound of the keys sharing prefix; undefined for the empty prefix */
 export function prefixEnd(prefix: string): string | undefined {
@@ -530,15 +529,15 @@ export function prefixRange(
 }
 
 export interface RTxn {
-  /** the value at key in the wanted representation, converted by the store; undefined when the
-      key is absent */
-  get(key: string, type: string, want: Wants): StoreValue | undefined;
+  /** the value at key in a representation, converted by the store; undefined when the key is
+      absent */
+  get(key: string, type: string, rep: Rep): unknown;
   scan(range: StoreRange): StoreScan;
 }
 
 export interface WTxn extends RTxn {
-  /** persist the value in the representation the store keeps, converting from the one given */
-  set(key: string, type: string, value: StoreValue): void;
+  /** persist the value, given in a representation, in the one the store keeps */
+  set(key: string, type: string, rep: Rep, value: unknown): void;
   del(key: string): void;
   /** delete every key under prefix; returns the keys deleted */
   delPrefix(prefix: string): string[];
@@ -558,15 +557,9 @@ export interface Store {
   read<T>(fn: (txn: RTxn) => T): T;
 }
 
-/** the value at key in the one wanted representation, undefined when absent */
-export function txnGet(txn: RTxn, key: string, type: string, want: Wants = JS): unknown {
-  const value = txn.get(key, type, want);
-  return value === undefined ? undefined : (value as Record<number, unknown>)[want];
-}
-
 /** every entry of a range, batch by batch */
-export function txnScanAll(txn: RTxn, range: StoreRange): [string, StoreValue | undefined][] {
-  const all: [string, StoreValue | undefined][] = [];
+export function txnScanAll(txn: RTxn, range: StoreRange): [string, unknown][] {
+  const all: [string, unknown][] = [];
   let r = range;
   for (;;) {
     const { entries, next } = txn.scan(r);
@@ -602,25 +595,16 @@ function readHalf(txn: RTxn): WTxn {
 
 type Layer = Record<string, unknown>;
 
-// the js value to keep for a set, and the wanted representation of a kept value
-function toJs(reg: Registry, type: string, value: StoreValue): unknown {
-  return (reg.convert(type, value, JS) as Record<number, unknown>)[JS];
-}
-function fromJs(reg: Registry, type: string, js: unknown, want: Wants): StoreValue {
-  return reg.convert(type, { [JS]: js }, want);
-}
-
 /* The in-memory layers hand values across their boundary by copy.  On the way in, a JS value the
    caller supplied is copied, and a conversion from another representation is already fresh; on
-   the way out, the kept value is copied before it is converted to the want.  copyValue is the one
-   place to point at a host's own clone, should one measure faster. */
+   the way out, a JS value is copied, and a conversion to another representation is fresh.
+   copyValue is the one place to point at a host's own clone, should one measure faster. */
 const copyValue = <T>(v: T): T => deepCopy(v);
-function layerIn(reg: Registry, type: string, value: StoreValue): unknown {
-  const js = toJs(reg, type, value);
-  return JS in value ? copyValue(js) : js;
+function layerIn(reg: Registry, type: string, rep: Rep, value: unknown): unknown {
+  return rep === JS ? copyValue(value) : reg.convert(type, value, rep, JS);
 }
-function layerOut(reg: Registry, type: string, js: unknown, want: Wants): StoreValue {
-  return fromJs(reg, type, copyValue(js), want);
+function layerOut(reg: Registry, type: string, js: unknown, rep: Rep): unknown {
+  return rep === JS ? copyValue(js) : reg.convert(type, js, JS, rep);
 }
 
 function inRange(key: string, r: StoreRange): boolean {
@@ -658,9 +642,9 @@ function batch(
 ): StoreScan {
   const page = keys.slice(0, r.limit);
   const v = r.values;
-  const entries: [string, StoreValue | undefined][] = page.map((k) => [
+  const entries: [string, unknown][] = page.map((k) => [
     k,
-    v ? fromJs(reg, v.type, get(k), v.want) : undefined,
+    v ? layerOut(reg, v.type, get(k), v.rep) : undefined,
   ]);
   const next = keys.length > r.limit ? page[page.length - 1] : null;
   return { entries, next };
@@ -734,13 +718,13 @@ class InMemTxn implements WTxn {
     this.#updates = updates;
   }
 
-  get(key: string, type: string, want: Wants): StoreValue | undefined {
+  get(key: string, type: string, rep: Rep): unknown {
     const js = layerGet(this.#data, this.#updates, key);
-    return js === undefined ? undefined : layerOut(this.#reg, type, js, want);
+    return js === undefined ? undefined : layerOut(this.#reg, type, js, rep);
   }
 
-  set(key: string, type: string, value: StoreValue): void {
-    this.#updates[key] = layerIn(this.#reg, type, value);
+  set(key: string, type: string, rep: Rep, value: unknown): void {
+    this.#updates[key] = layerIn(this.#reg, type, rep, value);
   }
 
   del(key: string): void {
@@ -817,14 +801,14 @@ class OverlayTxn implements WTxn {
     return key in this.#updates || key in this.#data;
   }
 
-  get(key: string, type: string, want: Wants): StoreValue | undefined {
-    if (!this.#has(key)) return this.#base.get(key, type, want);
+  get(key: string, type: string, rep: Rep): unknown {
+    if (!this.#has(key)) return this.#base.get(key, type, rep);
     const js = layerGet(this.#data, this.#updates, key);
-    return js === undefined ? undefined : layerOut(this.#reg, type, js, want);
+    return js === undefined ? undefined : layerOut(this.#reg, type, js, rep);
   }
 
-  set(key: string, type: string, value: StoreValue): void {
-    this.#updates[key] = layerIn(this.#reg, type, value);
+  set(key: string, type: string, rep: Rep, value: unknown): void {
+    this.#updates[key] = layerIn(this.#reg, type, rep, value);
   }
 
   del(key: string): void {
@@ -848,25 +832,9 @@ class OverlayTxn implements WTxn {
     return keys;
   }
 
-  move(src: string, dst: string): string[] {
-    const moved: string[] = [];
-    for (const k of this.#keysUnder(src)) {
-      const to = dst + k.slice(src.length);
-      moved.push(to);
-
-      // a layer key moves within the layer
-      if (this.#has(k)) {
-        this.#updates[to] = layerGet(this.#data, this.#updates, k);
-        this.#updates[k] = undefined;
-        continue;
-      }
-
-      // a base key: copy its value up into the layer under the new name, as the base holds it
-      const held = this.#base.get(k, '', 0);
-      this.#updates[to] = held === undefined ? undefined : Object.values(held)[0];
-      this.#updates[k] = undefined;
-    }
-    return moved;
+  /** forecasts never move keys, so the overlay does not */
+  move(): string[] {
+    throw new Error('the overlay does not move keys');
   }
 
   scan(range: StoreRange): StoreScan {
@@ -883,13 +851,13 @@ class OverlayTxn implements WTxn {
     }
 
     // merge the layers' keys in the span over the base's; the base's answers are already the
-    // caller's in the wanted representation, and layer entries are copied and converted here
-    const merged = new Map<string, StoreValue | undefined>();
+    // caller's in the asked-for representation, and layer entries are copied and converted here
+    const merged = new Map<string, unknown>();
     for (const [k, v] of result.entries) if (!this.#has(k)) merged.set(k, v);
     const v = range.values;
     for (const k of layerKeys(this.#data, this.#updates, span)) {
       const js = layerGet(this.#data, this.#updates, k);
-      merged.set(k, v ? layerOut(this.#reg, v.type, js, v.want) : undefined);
+      merged.set(k, v ? layerOut(this.#reg, v.type, js, v.rep) : undefined);
     }
 
     // cut the merged keys to one batch
@@ -911,7 +879,7 @@ class OverlayTxn implements WTxn {
 // external stores ///////////////////////////////////////////////////////////
 
 /** ExternalStoreTxn is one transaction of an ExternalStore, a WTxn that also commits and aborts.
-    The store converts: it persists the representation it keeps and answers in the one wanted,
+    The store converts: it persists the representation it keeps and answers in the one asked for,
     undefined for an absent key. */
 export interface ExternalStoreTxn extends WTxn {
   commit(): void;
@@ -973,9 +941,9 @@ export interface ReducerTxn extends ReadTxn {
 function reducerTxn(txn: WTxn, stream: string, updates: Record<string, true>): ReducerTxn {
   const prefix = `${stream}/`;
   return {
-    get: (key, type) => txnGet(txn, prefix + key, type),
+    get: (key, type) => txn.get(prefix + key, type, JS),
     set(key, type, value) {
-      txn.set(prefix + key, type, { [JS]: value });
+      txn.set(prefix + key, type, JS, value);
       updates[prefix + key] = true;
     },
     del(key) {
@@ -1162,7 +1130,7 @@ function readTxn(txn: RTxn, keys?: Record<string, true>): ReadTxn {
   return {
     get(key, type) {
       if (keys !== undefined) keys[key] = true;
-      const value = txnGet(txn, key, type);
+      const value = txn.get(key, type, JS);
       return DEV ? readOnly(value, key) : value;
     },
   };
@@ -1339,13 +1307,11 @@ export class RemoteQueries {
   }
 
   newQuery<T>(wireType: string, call: unknown[], id: string): Query<T> {
-    const bytes = this.#reg.convert(wireType, { [JS]: call }, MSGPACK) as Record<number, unknown>;
-    const query = bytes[MSGPACK] as Uint8Array;
+    const query = this.#reg.convert(wireType, call, JS, MSGPACK) as Uint8Array;
     const resultType = `${id}#result`;
     return new RemoteQuery<T>((onResult: (result: T) => void) => {
       return this.#io.createQuery(query, (result: Uint8Array) => {
-        const v = this.#reg.convert(resultType, { [MSGPACK]: result }, JS);
-        onResult((v as Record<number, unknown>)[JS] as T);
+        onResult(this.#reg.convert(resultType, result, MSGPACK, JS) as T);
       });
     });
   }
@@ -1830,38 +1796,36 @@ export class Engine<QX, C, N = never> {
   }
 
   #initialize(): void {
-    const js = (v: StoreValue) => (v as Record<number, unknown>)[JS];
-
     // load the persisted state into memory
     this.#store.read((txn) => {
-      const checkpoint = txnGet(txn, '/checkpoint', '.json') as CheckpointRecord | undefined;
+      const checkpoint = txn.get('/checkpoint', '.json', JS) as CheckpointRecord | undefined;
       this.#checkpoint = checkpoint ?? null;
-      this.#view = (txnGet(txn, '/view', '.json') as ViewRecord | undefined) ?? null;
+      this.#view = (txn.get('/view', '.json', JS) as ViewRecord | undefined) ?? null;
 
       // the streams table: seq per held stream, or the marker for a stream under a backfill
-      const seqRows = txnScanAll(txn, prefixRange('/seq.', 1000, { type: '.json', want: JS }));
+      const seqRows = txnScanAll(txn, prefixRange('/seq.', 1000, { type: '.json', rep: JS }));
       for (const [key, value] of seqRows) {
-        this.#streams.set(key.slice('/seq.'.length), js(value!) as number | 'backfill');
+        this.#streams.set(key.slice('/seq.'.length), value as number | 'backfill');
       }
 
       // the outbox in ordinal order; the next ordinal continues from the last key
       const commandRows = txnScanAll(
         txn,
-        prefixRange('/command.', 1000, { type: '.command', want: JS }),
+        prefixRange('/command.', 1000, { type: '.command', rep: JS }),
       );
       for (const [key, value] of commandRows) {
         const ordinal = Number(key.slice('/command.'.length));
-        this.#outbox.set((js(value!) as Command<Uint8Array>).id, ordinal);
+        this.#outbox.set((value as Command<Uint8Array>).id, ordinal);
         this.#nextOrdinal = ordinal + 1;
       }
 
       // the backfills in flight, each with a fresh controller
       const backfillRows = txnScanAll(
         txn,
-        prefixRange('/backfill.', 1000, { type: '.json', want: JS }),
+        prefixRange('/backfill.', 1000, { type: '.json', rep: JS }),
       );
       for (const [key, value] of backfillRows) {
-        const record = js(value!) as BackfillRecord;
+        const record = value as BackfillRecord;
         this.#backfills.set(key.slice('/backfill.'.length), {
           record,
           controller: new AbortController(),
@@ -1903,7 +1867,7 @@ export class Engine<QX, C, N = never> {
       // every view ref outside the wants, so the next frame grants what it covered afresh
       if (this.#view !== null && !this.#view.refs.every(wanted)) {
         this.#view = { ...this.#view, refs: this.#view.refs.filter(wanted) };
-        txn.set('/view', '.json', { [JS]: this.#view });
+        txn.set('/view', '.json', JS, this.#view);
       }
 
       // did the purge end the last replacing backfill?  Then this is the unfreeze.  Either way,
@@ -2020,13 +1984,12 @@ export class Engine<QX, C, N = never> {
       // new commands are converted to wire bytes here, by the vocabulary that made them, and take
       // the next ordinals
       for (const data of fresh) {
-        const bytes = this.#reg.convert(this.#reg.commands, { [JS]: data }, MSGPACK);
         const command: Command<Uint8Array> = {
           id: generateUuid(),
-          data: (bytes as Record<number, unknown>)[MSGPACK] as Uint8Array,
+          data: this.#reg.convert(this.#reg.commands, data, JS, MSGPACK) as Uint8Array,
         };
         const ordinal = this.#nextOrdinal++;
-        txn.set(commandKey(ordinal), '.command', { [JS]: command });
+        txn.set(commandKey(ordinal), '.command', JS, command);
         this.#outbox.set(command.id, ordinal);
       }
 
@@ -2039,7 +2002,7 @@ export class Engine<QX, C, N = never> {
       // rows go on the wire as stored, whatever vocabulary wrote them
       const out: Command<Uint8Array>[] = [];
       for (const [, ordinal] of pending) {
-        out.push(txnGet(txn, commandKey(ordinal), '.command') as Command<Uint8Array>);
+        out.push(txn.get(commandKey(ordinal), '.command', JS) as Command<Uint8Array>);
       }
       return out;
     });
@@ -2157,14 +2120,14 @@ export class Engine<QX, C, N = never> {
         snapshotDone: false,
         tailDone: false,
       };
-      txn.set(`/backfill-seqs.${ref}`, '.json', { [JS]: seqs });
+      txn.set(`/backfill-seqs.${ref}`, '.json', JS, seqs);
     } else if ('values' in item) {
       // park each value under this backfill's own range, and mark its stream
       for (const [key, bytes] of item.values) {
         // a key no slice declares is from a newer vocabulary, so it is dropped
         const type = storeTypeOf(this.#reg, key);
         if (type === undefined) continue;
-        txn.set(`/park.kv.${ref}/${key}`, type, { [MSGPACK]: bytes });
+        txn.set(`/park.kv.${ref}/${key}`, type, MSGPACK, bytes);
         this.#maybeMarkBackfilling(txn, key.slice(0, key.indexOf('/')), record.replacing);
       }
       record.resume!.skipBytes = item.skip;
@@ -2173,7 +2136,7 @@ export class Engine<QX, C, N = never> {
     } else if ('events' in item) {
       // park each event by stream and seq, and mark its stream
       for (const ev of item.events) {
-        txn.set(parkedEventKey(ev.stream, ev.seq), '.event', { [MSGPACK]: ev.raw });
+        txn.set(parkedEventKey(ev.stream, ev.seq), '.event', MSGPACK, ev.raw);
         this.#maybeMarkBackfilling(txn, ev.stream, record.replacing);
         record.resume!.fromPosition = Math.max(record.resume!.fromPosition, ev.position);
       }
@@ -2184,7 +2147,7 @@ export class Engine<QX, C, N = never> {
     }
 
     if (record.resume!.snapshotDone && record.resume!.tailDone) entry.status = 'ready';
-    txn.set(`/backfill.${ref}`, '.json', { [JS]: record });
+    txn.set(`/backfill.${ref}`, '.json', JS, record);
   }
 
   // an additive backfill leaves a held stream held and lands around it; a replacing one takes it
@@ -2192,7 +2155,7 @@ export class Engine<QX, C, N = never> {
     const held = this.#streams.get(stream);
     if (held === 'backfill' || (typeof held === 'number' && !replacing)) return;
     this.#streams.set(stream, 'backfill');
-    txn.set(`/seq.${stream}`, '.json', { [JS]: 'backfill' });
+    txn.set(`/seq.${stream}`, '.json', JS, 'backfill');
   }
 
   /* every queued outcome in one transaction.  Completion is known from the pushes themselves, so
@@ -2219,7 +2182,7 @@ export class Engine<QX, C, N = never> {
           txn.delPrefix(`/park.kv.${ref}/`);
           const r = entry.record.resume;
           if (r !== null) entry.record.resume = { ...r, skipBytes: 0, snapshotDone: false };
-          txn.set(`/backfill.${ref}`, '.json', { [JS]: entry.record });
+          txn.set(`/backfill.${ref}`, '.json', JS, entry.record);
           this.#startBackfill(ref);
         } else {
           // a rejection: ours, if the entry's signal fired, else a failure to retry after backoff
@@ -2355,7 +2318,7 @@ export class Engine<QX, C, N = never> {
 
   // a ref's blob header: the seq of every stream in its blob at the cut
   #headerOf(txn: RTxn, ref: string): Record<string, number> {
-    return (txnGet(txn, `/backfill-seqs.${ref}`, '.json') ?? {}) as Record<string, number>;
+    return (txn.get(`/backfill-seqs.${ref}`, '.json', JS) ?? {}) as Record<string, number>;
   }
 
   // a subtree's seqs at its cuts: the ref's header with each child's laid over it, deepest winning
@@ -2472,7 +2435,7 @@ export class Engine<QX, C, N = never> {
       e.parent = ref;
       entry.record.children.push(other);
     }
-    txn.set(`/backfill.${ref}`, '.json', { [JS]: entry.record });
+    txn.set(`/backfill.${ref}`, '.json', JS, entry.record);
   }
 
   // a replacing ref takes every held stream under it, so their events park from here
@@ -2507,7 +2470,7 @@ export class Engine<QX, C, N = never> {
     // {stream: seq}, the header seqs, then the last seq walked
     const seqs = new Map(Object.entries(header));
     const walked: string[] = [];
-    let range = this.#parkRange(ref, { type: '.event', want: JS });
+    let range = this.#parkRange(ref, { type: '.event', rep: JS });
     let stream = '';
     let run: DbEvent<unknown>[] = [];
 
@@ -2515,7 +2478,7 @@ export class Engine<QX, C, N = never> {
     for (;;) {
       const { entries, next } = txn.scan(range);
       for (const [, value] of entries) {
-        const ev = (value as Record<number, unknown>)[JS] as DbEvent<unknown>;
+        const ev = value as DbEvent<unknown>;
         const held = this.#streams.get(ev.stream);
 
         // a stream under some other backfill is not ours to land
@@ -2546,7 +2509,7 @@ export class Engine<QX, C, N = never> {
     // hold every landed stream at its new seq
     for (const [name, seq] of seqs) {
       this.#streams.set(name, seq);
-      txn.set(`/seq.${name}`, '.json', { [JS]: seq });
+      txn.set(`/seq.${name}`, '.json', JS, seq);
     }
   }
 
@@ -2596,7 +2559,7 @@ export class Engine<QX, C, N = never> {
     entry.record.resume = null;
     entry.status = 'downloading';
     entry.attempts = 0;
-    txn.set(`/backfill.${ref}`, '.json', { [JS]: entry.record });
+    txn.set(`/backfill.${ref}`, '.json', JS, entry.record);
     this.#startBackfill(ref);
   }
 
@@ -2611,7 +2574,7 @@ export class Engine<QX, C, N = never> {
   ): void {
     for (const ref of refs) {
       const record: BackfillRecord = { until, resume: null, replacing, children: [] };
-      txn.set(`/backfill.${ref}`, '.json', { [JS]: record });
+      txn.set(`/backfill.${ref}`, '.json', JS, record);
       this.#backfills.set(ref, {
         record,
         controller: new AbortController(),
@@ -2631,7 +2594,7 @@ export class Engine<QX, C, N = never> {
     if (parent !== null) {
       const p = this.#backfills.get(parent)!;
       p.record.children.push(...refs);
-      txn.set(`/backfill.${parent}`, '.json', { [JS]: p.record });
+      txn.set(`/backfill.${parent}`, '.json', JS, p.record);
     }
   }
 
@@ -2651,7 +2614,7 @@ export class Engine<QX, C, N = never> {
     if (entry.parent !== null) {
       const p = this.#backfills.get(entry.parent)!;
       p.record.children = p.record.children.filter((c) => c !== ref);
-      txn.set(`/backfill.${entry.parent}`, '.json', { [JS]: p.record });
+      txn.set(`/backfill.${entry.parent}`, '.json', JS, p.record);
     }
 
     // re-parent each child to the next covering entry, if any
@@ -2662,7 +2625,7 @@ export class Engine<QX, C, N = never> {
       if (c.parent === null) continue;
       const p = this.#backfills.get(c.parent)!;
       p.record.children.push(child);
-      txn.set(`/backfill.${c.parent}`, '.json', { [JS]: p.record });
+      txn.set(`/backfill.${c.parent}`, '.json', JS, p.record);
     }
   }
 
@@ -2775,14 +2738,14 @@ export class Engine<QX, C, N = never> {
         park = true;
       }
 
-      txn.set(parkedEventKey(ev.stream, ev.seq), '.event', { [MSGPACK]: ev.raw });
+      txn.set(parkedEventKey(ev.stream, ev.seq), '.event', MSGPACK, ev.raw);
     }
 
     // reduce each stream's run and hold it at its new seq
     for (const [stream, run] of runs) this.#reduceStreamIn(txn, stream, run, dirty);
     for (const [stream, seq] of seqs) {
       this.#streams.set(stream, seq);
-      txn.set(`/seq.${stream}`, '.json', { [JS]: seq });
+      txn.set(`/seq.${stream}`, '.json', JS, seq);
     }
 
     // an atom that froze part way reduced up to the event before the gap
@@ -2806,14 +2769,12 @@ export class Engine<QX, C, N = never> {
   // a live event as the reducers see it; one that fails its schema is an error naming it, since
   // the client and the database can run different versions of the model
   #decode(ev: WireEvent): DbEvent<unknown> {
-    let v: StoreValue;
     try {
-      v = this.#reg.convert('.event', { [MSGPACK]: ev.raw }, JS);
+      return this.#reg.convert('.event', ev.raw, MSGPACK, JS) as DbEvent<unknown>;
     } catch (e: unknown) {
       const why = e instanceof Error ? e.message : String(e);
       throw new Error(`event ${ev.stream}@${ev.position}: ${why}`);
     }
-    return (v as Record<number, unknown>)[JS] as DbEvent<unknown>;
   }
 
   // the checkpoint moves forward, never back, under the connection's epoch
@@ -2821,7 +2782,7 @@ export class Engine<QX, C, N = never> {
     if (this.#epoch === null) throw new Error('cursor with no epoch');
     if (this.#checkpoint !== null && position <= this.#checkpoint.position) return;
     this.#checkpoint = { epoch: this.#epoch, position, reduced: this.#reduced };
-    txn.set('/checkpoint', '.json', { [JS]: this.#checkpoint });
+    txn.set('/checkpoint', '.json', JS, this.#checkpoint);
   }
 
   // the base has been reduced through position, so every acked command at or below it is in the
@@ -2831,7 +2792,7 @@ export class Engine<QX, C, N = never> {
     this.#reduced = position;
     if (this.#checkpoint !== null) {
       this.#checkpoint = { ...this.#checkpoint, reduced: position };
-      txn.set('/checkpoint', '.json', { [JS]: this.#checkpoint });
+      txn.set('/checkpoint', '.json', JS, this.#checkpoint);
     }
     this.#releaseAckedIn(txn);
   }
@@ -2940,7 +2901,7 @@ export class Engine<QX, C, N = never> {
       this.#adoptChildrenIn(txn, ref);
     }
 
-    txn.set('/view', '.json', { [JS]: view });
+    txn.set('/view', '.json', JS, view);
     this.#view = view;
 
     // did a drop end the last replacing backfill?  Then this is the unfreeze, and whatever
@@ -2990,10 +2951,10 @@ export class Engine<QX, C, N = never> {
       if (forecaster !== null && this.#outbox.size > 0) {
         const rows = txnScanAll(
           base,
-          prefixRange('/command.', 1000, { type: '.command', want: JS }),
+          prefixRange('/command.', 1000, { type: '.command', rep: JS }),
         );
         for (const [, value] of rows) {
-          const command = (value as Record<number, unknown>)[JS] as Command<Uint8Array>;
+          const command = value as Command<Uint8Array>;
 
           // a command this vocabulary cannot read is still sent; it just forecasts nothing
           const data = this.#commandData(command.data);
@@ -3025,8 +2986,7 @@ export class Engine<QX, C, N = never> {
   // cannot read them, which is an outbox row written by an earlier build of the app
   #commandData(bytes: Uint8Array): C | undefined {
     try {
-      const v = this.#reg.convert(this.#reg.commands, { [MSGPACK]: bytes }, JS);
-      return (v as Record<number, unknown>)[JS] as C;
+      return this.#reg.convert(this.#reg.commands, bytes, MSGPACK, JS) as C;
     } catch {
       return undefined;
     }

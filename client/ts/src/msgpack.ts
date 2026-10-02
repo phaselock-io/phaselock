@@ -1,21 +1,20 @@
-// A msgpack cursor: measure a value without decoding it, read one value at a time by its type,
-// skip or slice anything else, and a writer that builds msgpack from headers, scalars, and
-// pre-encoded values.  Dates are the timestamp extension.  UTF-8, 64-bit integers, timestamps,
-// and the map key cache are msgpack-javascript's, vendored under ./vendor.
+// A msgpack cursor: measure a value without decoding it, read one value at a time by its type or
+// any value with no schema, skip or slice anything else, and a writer that builds msgpack from
+// headers, scalars, any value, and pre-encoded values.  Dates are the timestamp extension.  UTF-8, 64-bit integers, and the
+// timestamp forms are msgpack-javascript's, vendored under ./vendor.
 
-import { CachedKeyDecoder } from './vendor/msgpack-javascript/CachedKeyDecoder.js';
 import { getInt64, getUint64, setInt64, setUint64 } from './vendor/msgpack-javascript/int.js';
 import { encodeDateToTimeSpec, EXT_TIMESTAMP } from './vendor/msgpack-javascript/timestamp.js';
 import { utf8Count, utf8Decode, utf8Encode } from './vendor/msgpack-javascript/utf8.js';
 
 export const utf8 = new TextDecoder();
 
-// one cache of decoded map keys for every reader
-const keyDecoder = new CachedKeyDecoder();
-
 // the largest seconds of the 32- and 64-bit timestamp forms
 const TIMESTAMP32_MAX_SEC = 0x100000000 - 1;
 const TIMESTAMP64_MAX_SEC = 0x400000000 - 1;
+
+// a value is a tree, so nothing legitimate nests this deep
+const MAX_DEPTH = 512;
 
 /** the kinds of msgpack value a cursor can be on */
 export type Kind = 'nil' | 'bool' | 'int' | 'float' | 'str' | 'bin' | 'array' | 'map' | 'ext';
@@ -148,6 +147,36 @@ export function measure(buf: Uint8Array, pos: number, end: number): number {
     pending += children - 1;
   }
   return pos;
+}
+
+/** set a key of an object read from msgpack, an own property whatever its name, `__proto__`
+    included */
+export function setEntry(out: Record<string, unknown>, key: string, value: unknown): void {
+  if (key === '__proto__') {
+    Object.defineProperty(out, key, {
+      value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  } else {
+    out[key] = value;
+  }
+}
+
+/** one whole msgpack value with no schema, as Reader.any reads it; trailing bytes are an error */
+export function decodeAny(bytes: Uint8Array): unknown {
+  const r = new Reader(bytes);
+  const v = r.any();
+  if (!r.done) throw new Error('trailing bytes after the msgpack value');
+  return v;
+}
+
+/** any value as msgpack, as Writer.any writes it */
+export function encodeAny(v: unknown): Uint8Array {
+  const w = new Writer();
+  w.any(v);
+  return w.bytes();
 }
 
 /** Reader walks one complete msgpack value at a time from a buffer. */
@@ -286,6 +315,15 @@ export class Reader {
 
   // the byte length of the string at the cursor, consuming its header
   #strHeader(): number {
+    const n = this.#tryStrHeader();
+    if (n < 0)
+      throw new Error(`expected msgpack string, got 0x${this.#buf[this.#pos].toString(16)}`);
+    return n;
+  }
+
+  // the byte length of the string at the cursor, consuming its header; -1, consuming nothing,
+  // for any other value
+  #tryStrHeader(): number {
     this.#need(1);
     const b = this.#buf[this.#pos];
     if (b >= 0xa0 && b <= 0xbf) {
@@ -295,7 +333,89 @@ export class Reader {
     if (b === 0xd9) return this.#length(1);
     if (b === 0xda) return this.#length(2);
     if (b === 0xdb) return this.#length(4);
-    throw new Error(`expected msgpack string, got 0x${b.toString(16)}`);
+    return -1;
+  }
+
+  /* The typed reads a schema walk makes: each checks the header and reads in one step, and
+     answers a marker (-1, undefined, NaN, false), consuming nothing, for a value of another
+     type. */
+
+  /** the entry count of the map at the cursor, consuming its header; -1 for another value */
+  tryMapHeader(): number {
+    this.#need(1);
+    const b = this.#buf[this.#pos];
+    if (b >= 0x80 && b <= 0x8f) {
+      this.#pos++;
+      return b & 0x0f;
+    }
+    if (b === 0xde) return this.#length(2);
+    if (b === 0xdf) return this.#length(4);
+    return -1;
+  }
+
+  /** the element count of the array at the cursor, consuming its header; -1 for another value */
+  tryArrayHeader(): number {
+    this.#need(1);
+    const b = this.#buf[this.#pos];
+    if (b >= 0x90 && b <= 0x9f) {
+      this.#pos++;
+      return b & 0x0f;
+    }
+    if (b === 0xdc) return this.#length(2);
+    if (b === 0xdd) return this.#length(4);
+    return -1;
+  }
+
+  /** the string at the cursor; undefined for another value */
+  tryStr(): string | undefined {
+    const n = this.#tryStrHeader();
+    if (n < 0) return undefined;
+    this.#need(n);
+    const s = utf8Decode(this.#buf, this.#pos, n);
+    this.#pos += n;
+    return s;
+  }
+
+  /** the bool at the cursor; undefined for another value */
+  tryBool(): boolean | undefined {
+    this.#need(1);
+    const b = this.#buf[this.#pos];
+    if (b !== 0xc2 && b !== 0xc3) return undefined;
+    this.#pos++;
+    return b === 0xc3;
+  }
+
+  /** whether the value at the cursor is nil, consuming it if so */
+  tryNil(): boolean {
+    this.#need(1);
+    if (this.#buf[this.#pos] !== 0xc0) return false;
+    this.#pos++;
+    return true;
+  }
+
+  /** the number at the cursor, an integer or a float; NaN for another value */
+  tryNumber(): number {
+    this.#need(1);
+    const b = this.#buf[this.#pos];
+    if (b <= 0x7f) {
+      this.#pos++;
+      return b;
+    }
+    if (b >= 0xe0) {
+      this.#pos++;
+      return b - 256;
+    }
+    if (b >= 0xcc && b <= 0xd3) return this.int();
+    if (b === 0xca || b === 0xcb) return this.float();
+    return NaN;
+  }
+
+  /** the timestamp at the cursor; undefined for a value that is not an extension */
+  tryTimestamp(): Date | undefined {
+    this.#need(1);
+    const b = this.#buf[this.#pos];
+    if (b !== 0xd6 && b !== 0xd7 && b !== 0xc7) return undefined;
+    return this.timestamp();
   }
 
   str(): string {
@@ -307,10 +427,12 @@ export class Reader {
   }
 
   /** The index of the key at the cursor among keys, each UTF-8, compared as bytes with no
-      string made; -1 for none, and the key is then lastKey().  The search starts at hint, the
-      index a caller expects, and wraps. */
+      string made; -1 for none, and the key is then lastKey(); -2, consuming nothing, for a
+      value that is not a string.  The search starts at hint, the index a caller expects, and
+      wraps. */
   keyIndex(keys: readonly Uint8Array[], hint: number): number {
-    const n = this.#strHeader();
+    const n = this.#tryStrHeader();
+    if (n < 0) return -2;
     this.#need(n);
     const at = this.#pos;
     this.#pos += n;
@@ -332,17 +454,6 @@ export class Reader {
   /** the key keyIndex last read */
   lastKey(): string {
     return utf8Decode(this.#buf, this.#lastKey, this.#lastKeyLen);
-  }
-
-  /** a string in map key position, short ones through the shared key cache */
-  key(): string {
-    const n = this.#strHeader();
-    this.#need(n);
-    const s = keyDecoder.canBeCached(n)
-      ? keyDecoder.decode(this.#buf, this.#pos, n)
-      : utf8Decode(this.#buf, this.#pos, n);
-    this.#pos += n;
-    return s;
   }
 
   int(): number {
@@ -483,6 +594,61 @@ export class Reader {
     if (nsec > 999_999_999) throw new Error('malformed msgpack timestamp');
     this.#pos = at + size;
     return new Date(sec * 1e3 + Math.floor(nsec / 1e6));
+  }
+
+  /** Any value, with no schema: maps with string keys as objects, arrays, strings, numbers,
+      bools, nil as null, and timestamps as Dates.  bin and any other extension are refused,
+      as the wire carries neither. */
+  any(depth = 0): unknown {
+    if (depth > MAX_DEPTH) throw new Error('msgpack value nested too deeply');
+    switch (this.kind()) {
+      case 'nil':
+        this.nil();
+        return null;
+      case 'bool':
+        return this.bool();
+      case 'int':
+        return this.int();
+      case 'float':
+        return this.float();
+      case 'str':
+        return this.str();
+      case 'ext':
+        return this.timestamp();
+      case 'array': {
+        const n = this.arrayHeader();
+        const out = new Array<unknown>(n);
+        for (let i = 0; i < n; i++) out[i] = this.any(depth + 1);
+        return out;
+      }
+      case 'map': {
+        const n = this.mapHeader();
+        const out: Record<string, unknown> = {};
+        for (let i = 0; i < n; i++) {
+          const key = this.tryStr();
+          if (key === undefined) throw new Error('msgpack map key is not a string');
+          setEntry(out, key, this.any(depth + 1));
+        }
+        return out;
+      }
+      case 'bin':
+        throw new Error('msgpack bin is not a value here');
+    }
+  }
+
+  /** a bin value's bytes, as their own copy */
+  bin(): Uint8Array {
+    this.#need(1);
+    const b = this.#buf[this.#pos];
+    let n: number;
+    if (b === 0xc4) n = this.#length(1);
+    else if (b === 0xc5) n = this.#length(2);
+    else if (b === 0xc6) n = this.#length(4);
+    else throw new Error(`expected msgpack bin, got 0x${b.toString(16)}`);
+    this.#need(n);
+    const out = this.#buf.slice(this.#pos, this.#pos + n);
+    this.#pos += n;
+    return out;
   }
 
   /** skip one value of any type */
@@ -662,6 +828,61 @@ export class Writer {
       setInt64(v, this.#pos + 4, sec);
       this.#pos += 12;
     }
+  }
+
+  /** Any value, with no schema, as Reader.any reads it back: an object's properties holding
+      undefined are left out, and an array's undefined items are nil.  Anything with no msgpack
+      form throws: a byte array, a Map or Set, a bigint, a function. */
+  any(v: unknown, depth = 0): void {
+    if (depth > MAX_DEPTH) throw new Error('value nested too deeply for msgpack');
+    if (v === null || v === undefined) return this.nil();
+    switch (typeof v) {
+      case 'boolean':
+        return this.bool(v);
+      case 'number':
+        return Number.isSafeInteger(v) ? this.int(v) : this.float64(v);
+      case 'string':
+        return this.str(v);
+      case 'object':
+        break;
+      default:
+        throw new Error(`a ${typeof v} has no msgpack form`);
+    }
+    if (v instanceof Date) return this.timestamp(v);
+    if (Array.isArray(v)) {
+      this.arrayHeader(v.length);
+      for (const x of v) this.any(x, depth + 1);
+      return;
+    }
+    if (ArrayBuffer.isView(v) || v instanceof Map || v instanceof Set) {
+      throw new Error(`a ${v.constructor.name} has no msgpack form`);
+    }
+    const entries = Object.entries(v).filter(([, x]) => x !== undefined);
+    this.mapHeader(entries.length);
+    for (const [key, x] of entries) {
+      this.str(key);
+      this.any(x, depth + 1);
+    }
+  }
+
+  /** bytes as a bin value */
+  bin(b: Uint8Array): void {
+    const n = b.length;
+    this.#ensure(n + 5);
+    if (n < 0x100) {
+      this.#buf[this.#pos++] = 0xc4;
+      this.#buf[this.#pos++] = n;
+    } else if (n < 0x10000) {
+      this.#buf[this.#pos++] = 0xc5;
+      this.#data.setUint16(this.#pos, n);
+      this.#pos += 2;
+    } else {
+      this.#buf[this.#pos++] = 0xc6;
+      this.#data.setUint32(this.#pos, n);
+      this.#pos += 4;
+    }
+    this.#buf.set(b, this.#pos);
+    this.#pos += n;
   }
 
   /** raw appends an already-encoded value verbatim */

@@ -21,8 +21,8 @@ import {
   type ReadTxn,
   type ReducerTxn,
   type Registry,
+  type Rep,
   type SliceReducer,
-  type StoreValue,
   type WireEvent,
 } from '../../../ts/assets/skeleton.ts';
 
@@ -52,23 +52,19 @@ function wireFromEvent(ev: DbEvent<unknown>): [Env, unknown] {
 export const INVALID = 'invalid';
 
 export const registry: Registry = {
-  convert(type: string, value: StoreValue, want: number): StoreValue {
-    const out = { ...value } as Record<number, unknown>;
-    if (want & JS && !(JS in out) && MSGPACK in out) {
-      const raw = parse(out[MSGPACK] as Uint8Array);
-      if (type === '.event') {
-        const ev = eventFromWire(raw);
-        if ((ev.data as { type?: string }).type === INVALID) throw new Error('$.type: invalid');
-        out[JS] = ev;
-      } else {
-        out[JS] = raw;
-      }
+  convert(type: string, value: unknown, from: Rep, to: Rep): unknown {
+    if (from === to) return value;
+    if (from === MSGPACK && to === JS) {
+      const raw = parse(value as Uint8Array);
+      if (type !== '.event') return raw;
+      const ev = eventFromWire(raw);
+      if ((ev.data as { type?: string }).type === INVALID) throw new Error('$.type: invalid');
+      return ev;
     }
-    if (want & MSGPACK && !(MSGPACK in out) && JS in out) {
-      const js = out[JS];
-      out[MSGPACK] = bytes(type === '.event' ? wireFromEvent(js as DbEvent<unknown>) : js);
+    if (from === JS && to === MSGPACK) {
+      return bytes(type === '.event' ? wireFromEvent(value as DbEvent<unknown>) : value);
     }
-    return out as StoreValue;
+    throw new Error(`no conversion from ${from} to ${to}`);
   },
   commands: 'cmd',
   eventTypes: { patron: 'patronEvent', book: 'bookEvent' },
