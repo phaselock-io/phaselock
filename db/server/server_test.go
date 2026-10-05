@@ -38,14 +38,17 @@ func startIn(t *testing.T, dir string) *harness {
 	return startWith(t, t.Context(), Options{DataDir: dir})
 }
 
-// startWith opens a server under ctx with the test defaults filled into o: the test bundle, dev
-// auth, a fixed secret, and an attempt budget no test of other features runs out of.
+// startWith opens a server under ctx with the test defaults filled into o: the dev test bundle
+// unless o names another, dev auth, a fixed secret, and an attempt budget no test of other
+// features runs out of.
 func startWith(t *testing.T, ctx context.Context, o Options) *harness {
 	t.Helper()
 	if o.DataDir == "" {
 		o.DataDir = t.TempDir()
 	}
-	o.Bundle = filepath.Join("testdata", "bundle.js")
+	if o.Bundle == "" {
+		o.Bundle = filepath.Join("testdata", "bundle.js")
+	}
 	o.DevAuth = true
 	o.Secret = []byte("test-secret")
 	if o.AuthBurst == 0 {
@@ -286,9 +289,14 @@ func (h *harness) streamOpen(token string, since int64, view string, start chan 
 
 func (s *stream) close() { s.resp.Body.Close() }
 
-// next returns the next frame or fails.
+// next returns the next frame or fails; a frame read before the stream ended comes first.
 func (s *stream) next() []any {
 	s.t.Helper()
+	select {
+	case f := <-s.frames:
+		return f.([]any)
+	default:
+	}
 	select {
 	case f := <-s.frames:
 		return f.([]any)
@@ -1936,5 +1944,104 @@ func TestABootstrapThatFailsStopsTheOpen(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "bootstrap") {
 		t.Fatalf("a bootstrap emitting to a malformed stream: %v", err)
+	}
+}
+
+func TestValidRef(t *testing.T) {
+	for ref, want := range map[string]bool{
+		"*":                 true,
+		"book":              true,
+		"patron.p1":         true,
+		"patron.*":          true,
+		"chat.acme.*":       true,
+		"chat.acme.gen.e~1": true,
+		"patron.p1.":        true,
+		"":                  false,
+		".*":                false,
+		"*.*":               false,
+		"patron.":           false,
+		"patron..*":         false,
+		"pa~tron.p1":        false,
+		"pa.tron":           true,
+		"patron.p/1":        false,
+		"patron.p*":         false,
+		"patron.p 1":        false,
+		"patron.p%2F1":      false,
+	} {
+		if got := validRef(ref); got != want {
+			t.Errorf("validRef(%q) = %v, want %v", ref, got, want)
+		}
+	}
+}
+
+func TestStreamNamesFillTheirTemplates(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+
+	// a family template's terminal parameter may hold . and ~
+	h.ack(admin, cmd("c1", "add-patron", "id", "p.1~x", "name", "Ann"))
+	if _, ok := h.snapshot(admin, "patron.p.1~x").records["patron.p.1~x/patron"]; !ok {
+		t.Fatalf("patron.p.1~x was not written")
+	}
+
+	// a precommit reading through a parameter that no stream name could hold is rejected before
+	// it labels anything
+	outs := h.commands(admin,
+		cmd("c2", "add-patron", "id", "p/1", "name", "Bob"),
+		cmd("c3", "add-patron", "id", "", "name", "Cy"),
+	)
+	for i, id := range []string{"p/1", ""} {
+		if outs[i].kind != "reject" || !strings.Contains(outs[i].reason, fmt.Sprintf("patron: patron %q", id)) {
+			t.Fatalf("add-patron %q: %+v", id, outs[i])
+		}
+	}
+
+	// a dev bundle's error carries its stack, mapped through the bundle's source map
+	if !strings.Contains(outs[0].reason, "(db.ts:") || strings.Contains(outs[0].reason, "bundle.js:") {
+		t.Fatalf("an unmapped stack: %s", outs[0].reason)
+	}
+}
+
+func TestAProductionBundleAnswersBugsWithInternalError(t *testing.T) {
+	h := startWith(t, t.Context(), Options{Bundle: filepath.Join("testdata", "bundle.prod.js")})
+	admin := h.admin()
+	if outs := h.commands(admin, cmd("c1", "add-patron", "id", "p/1", "name", "Bob")); outs[0].reason != "internal error" {
+		t.Fatalf("a bug in a production bundle: %+v", outs[0])
+	}
+
+	// a rejection's reason is still the app's own
+	h.ack(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
+	if outs := h.commands(admin, cmd("c3", "add-patron", "id", "p1", "name", "Ann")); outs[0].reason != "patron exists" {
+		t.Fatalf("a rejection in a production bundle: %+v", outs[0])
+	}
+}
+
+func TestAFailingMaySeeGrantsNothing(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.ack(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.ack(admin, cmd("c2", "create-account", "user", "p1", "password", "hunter2"))
+	ann := h.token("p1")
+	s := h.stream(ann, -1)
+	s.live()
+
+	// a granted wildcard that cuts into a stream's terminal parameter ends the connection
+	h.ack(admin, cmd("c3", "grant-view", "user", "p1", "prefix", "patron.p1.*"))
+	f := s.nextTagged("end")
+	if f[1] != "error" || !strings.Contains(f[2].(string), "malformed ref: patron.p1.*") {
+		t.Fatalf("end frame: %v", f)
+	}
+	select {
+	case <-s.errs:
+	case f := <-s.frames:
+		t.Fatalf("a frame after end: %v", f)
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the connection stayed open after end")
+	}
+
+	// and a new connection is refused with the failure
+	status, _, body := h.do("GET", "/stream?since=-1", ann, nil)
+	if status != 500 || !strings.Contains(string(body), "malformed ref: patron.p1.*") {
+		t.Fatalf("a stream under a failing maySee: %d %s", status, body)
 	}
 }

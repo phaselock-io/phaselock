@@ -936,6 +936,50 @@ export interface ReducerTxn extends ReadTxn {
   del(key: string): void;
 }
 
+// stream names and keys ////////////////////////////////////////////////////
+
+/* A slice's family template and each of its key templates is a name, then one `.{param}` segment
+   per parameter.  A parameter the template ends with is terminal and holds the rest of the string.
+   Every other parameter is a segment, a non-empty run of `A-Z a-z 0-9 _ -`, so `chat.acme.general`
+   parses back as `chat.{org}.{channel}` unambiguously and `chat.acme.*` covers one org's channels.
+   A stream name's terminal parameter is non-empty and may also hold `.` and `~`, the rest of the
+   RFC 3986 unreserved set, since stream names appear in URLs.  A local key's terminal parameter
+   may hold anything a key may, the empty string included. */
+
+const SEGMENT = '[A-Za-z0-9_-]+';
+const STREAM_REST = '[A-Za-z0-9_.~-]+';
+const SEGMENT_RE = new RegExp(`^${SEGMENT}$`);
+const STREAM_REST_RE = new RegExp(`^${STREAM_REST}$`);
+// the shape of a stream name of any family, for a family whose template is not at hand
+const ANY_STREAM_RE = new RegExp(`^${SEGMENT}(\\.${STREAM_REST})?$`);
+
+/** a template parameter's value, other than a terminal one, checked; a generated accessor passes
+    each of its parameters through this or asStreamRest before building a key */
+export function asSegment(value: string, accessor: string, param: string): string {
+  if (!SEGMENT_RE.test(value)) {
+    const v = JSON.stringify(value);
+    throw new Error(`${accessor}: ${param} ${v} is not a non-empty run of A-Z a-z 0-9 _ -`);
+  }
+  return value;
+}
+
+/** the value of a family template's terminal parameter, checked */
+export function asStreamRest(value: string, accessor: string, param: string): string {
+  if (!STREAM_REST_RE.test(value)) {
+    const v = JSON.stringify(value);
+    throw new Error(`${accessor}: ${param} ${v} is not a non-empty run of A-Z a-z 0-9 _ - . ~`);
+  }
+  return value;
+}
+
+// a family template as the pattern of the stream names that fill it
+function streamPattern(tpl: string): RegExp {
+  const parts = tpl.split('.');
+  const last = parts.length - 1;
+  const src = parts.map((p, i) => (!p.startsWith('{') ? p : i === last ? STREAM_REST : SEGMENT));
+  return new RegExp(`^${src.join('\\.')}$`);
+}
+
 // a ReducerTxn over a store transaction for one stream's keys, marking every key it writes in
 // updates
 function reducerTxn(txn: WTxn, stream: string, updates: Record<string, true>): ReducerTxn {
@@ -1076,7 +1120,8 @@ export type BootstrapContext = {
 /** Bundle is what a database runs: the app's handlers behind the generated wrappers, installed
     as `globalThis.__bundle`, and the registry the database converts and checks every value by.
     precommit, maySee, and lookup read global keys; each reducer reads and writes its own stream's
-    keys.  Values are rich JS values. */
+    keys.  Values are rich JS values.  `dev` is the bundle's DEV, so a host answers the errors of
+    a dev bundle in full, and `mapStack` maps an error's stack through the bundle's source map. */
 export type Bundle = {
   schema: Schema;
   precommit: (
@@ -1088,7 +1133,104 @@ export type Bundle = {
   maySee: (txn: ReadTxn, principal: Principal) => string[];
   lookup: (txn: ReadTxn, ident: LookupIdent) => LookupResult | null;
   bootstrap?: (ctx: BootstrapContext) => void;
+  dev: boolean;
+  mapStack: typeof mapStack;
 };
+
+// source maps ////////////////////////////////////////////////////////////////
+
+/** a source map (ECMA-426), as far as mapStack reads it */
+export type SourceMap = { sources: string[]; mappings: string };
+
+const BASE64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+/* One segment of a source map's mappings, decoded into its fields (ECMA-426, "Mappings
+   structure").  Each field is a base64 VLQ: every digit carries 5 bits of the value, least
+   significant first, and a sixth bit set when another digit follows.  The value's lowest bit is
+   its sign. */
+function segmentFields(segment: string): number[] {
+  const fields: number[] = [];
+  let value = 0;
+  let scale = 1;
+  for (const c of segment) {
+    const digit = BASE64.indexOf(c);
+    value += (digit & 31) * scale;
+    if (digit & 32) {
+      scale *= 32;
+      continue;
+    }
+    const magnitude = Math.floor(value / 2);
+    fields.push(value % 2 === 1 ? -magnitude : magnitude);
+    value = 0;
+    scale = 1;
+  }
+  return fields;
+}
+
+/* A source map's mappings, one array per generated line, each segment with its fields made
+   absolute: the generated column, then the source index, original line, and original column when
+   the segment maps to a source.  The generated column is relative within a line; the other fields
+   accumulate across the whole of the mappings. */
+function decodeMappings(mappings: string): number[][][] {
+  const lines: number[][][] = [];
+  let source = 0;
+  let line = 0;
+  let col = 0;
+  for (const text of mappings.split(';')) {
+    const segments: number[][] = [];
+    let genCol = 0;
+    for (const segment of text.split(',')) {
+      if (segment === '') continue;
+      const f = segmentFields(segment);
+      genCol += f[0];
+      if (f.length < 4) {
+        segments.push([genCol]);
+        continue;
+      }
+      source += f[1];
+      line += f[2];
+      col += f[3];
+      segments.push([genCol, source, line, col]);
+    }
+    lines.push(segments);
+  }
+  return lines;
+}
+
+// each map's decoded mappings, decoded on its first use
+const decodedMaps = new WeakMap<SourceMap, number[][][]>();
+
+// a stack frame's location: `(file:line:col)`, line and column 1-based
+const FRAME_LOCATION = /\(([^():\n]+):(\d+):(\d+)\)/g;
+
+/** A stack with every location in `file` mapped through the file's source map to its source,
+    line, and column.  A location in another file, or one the map does not cover, is left as it
+    is.  Lines and columns are 1-based in a stack and 0-based in the map. */
+export function mapStack(stack: string, file: string, map: SourceMap): string {
+  let lines = decodedMaps.get(map);
+  if (lines === undefined) {
+    lines = decodeMappings(map.mappings);
+    decodedMaps.set(map, lines);
+  }
+  const decoded = lines;
+  return stack.replace(FRAME_LOCATION, (location, f: string, lineText: string, colText: string) => {
+    if (f !== file) return location;
+
+    // the last segment of the line that starts at or before the column
+    const col = Number(colText) - 1;
+    let found: number[] | undefined;
+    for (const segment of decoded[Number(lineText) - 1] ?? []) {
+      if (segment[0] > col) break;
+      found = segment;
+    }
+    if (found === undefined || found.length < 4) return location;
+
+    // its source, its leading `../` steps dropped, since sources are relative to the map
+    let source = map.sources[found[1]] ?? '?';
+    while (source.startsWith('../')) source = source.slice(3);
+    return `(${source}:${found[2] + 1}:${found[3] + 1})`;
+  });
+}
 
 // queries ////////////////////////////////////////////////////////////////////
 
@@ -1518,9 +1660,12 @@ export type WireEvent = DbEvent<Uint8Array> & { raw: Uint8Array };
     ReducerTxn over that stream's own keys.  `pending` is true when the events are a forecast
     folded onto the overlay, and false for real events folded onto the base, so a reducer may mark
     what it writes as pending; the base, the only state ever stored or synced, is always folded
-    with false. */
+    with false.  `template` is the slice's family template and `keys` its key templates, as
+    declared, which every stream name and every key the reducer writes must fill. */
 export type SliceReducer = {
   reducer: (txn: ReducerTxn, events: unknown[], stream: string, pending: boolean) => void;
+  template: string;
+  keys: string[];
 };
 
 /** the view, as persisted at /view when a reconciliation commits */
@@ -1628,6 +1773,8 @@ export class Engine<QX, C, N = never> {
   #reg: Registry;
   #connect: ConnectorFactory;
   #reducers: Record<string, SliceReducer>;
+  // the pattern of each reducer's stream names, by stream prefix
+  #streamPatterns: Record<string, RegExp>;
   // runs against the overlay for every outbox command in order on every rebuild; a string is a
   // rejection and forecasts nothing
   #forecaster: null | Forecaster<QX, C>;
@@ -1728,6 +1875,10 @@ export class Engine<QX, C, N = never> {
     this.#reg = reg;
     this.#connect = connect;
     this.#reducers = callbacks.reducers;
+    this.#streamPatterns = {};
+    for (const [family, slice] of Object.entries(callbacks.reducers)) {
+      this.#streamPatterns[family] = streamPattern(slice.template);
+    }
     this.#wants = callbacks.wants;
     this.#forecaster = callbacks.forecaster ?? null;
     this.#signal = callbacks.signal ?? new AbortController().signal;
@@ -3009,6 +3160,14 @@ export class Engine<QX, C, N = never> {
     };
 
     for (const out of forecaster(this.#context(readTxn(txn)), command)) {
+      // the label fills its slice's family template, or has the shape of a stream name when this
+      // Engine holds no slice of its family; an invalid one throws, forecasting nothing
+      const pattern = this.#streamPatterns[out.stream.split('.')[0]] ?? ANY_STREAM_RE;
+      const valid = pattern.test(out.stream);
+      if (!valid) {
+        throw new Error(`forecast labels an invalid stream ${JSON.stringify(out.stream)}`);
+      }
+
       if (out.stream !== stream) {
         flush();
         stream = out.stream;

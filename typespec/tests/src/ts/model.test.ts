@@ -503,6 +503,12 @@ describe('reducer contexts', () => {
     ).toThrow('profile');
   });
 
+  it('gives each SliceReducer its family template and its key templates', () => {
+    const reducer = M.inboxSliceReducer({ profileSet: () => {}, noted: () => {} });
+    expect(reducer.template).toBe('inbox.{org}.{user}');
+    expect(reducer.keys).toEqual(['note.{note}', 'profile']);
+  });
+
   it('generates a handler table per slice: one reducer handler per event type', () => {
     expect(text).toContain('export type CatalogSliceReducers = {');
     expect(text).toContain('export type InboxSliceReducers = {');
@@ -591,6 +597,30 @@ describe('global contexts', () => {
       ['get', 'inbox.acme.u1/note.n1', 'inbox/note'],
       ['get', 'secret.u1/secret', 'PasswordHash'],
     ]);
+  });
+
+  it('checks each parameter against its place in its template', () => {
+    const { txn, calls } = fakeTxn();
+    const ctx = M.appDBTxn(txn);
+
+    // a terminal family parameter may hold . and ~, and a terminal key parameter anything
+    ctx.get.note('acme', 'u.1~x', 'a/b.c');
+    ctx.get.note('acme', 'u1', '');
+    expect(calls).toEqual([
+      ['get', 'inbox.acme.u.1~x/note.a/b.c', 'inbox/note'],
+      ['get', 'inbox.acme.u1/note.', 'inbox/note'],
+    ]);
+
+    // any other parameter is a non-empty run of A-Z a-z 0-9 _ -, and a terminal family one may
+    // not be empty or hold what a URL must encode
+    expect(() => ctx.get.profile('ac.me', 'u1')).toThrow(
+      'profile: org "ac.me" is not a non-empty run of A-Z a-z 0-9 _ -',
+    );
+    expect(() => ctx.get.profile('', 'u1')).toThrow('profile: org ""');
+    expect(() => ctx.get.profile('acme', 'u/1')).toThrow('profile: user "u/1"');
+    expect(() => ctx.get.profile('acme', '')).toThrow('profile: user ""');
+    expect(() => ctx.get.secret('u*')).toThrow('secret: user "u*"');
+    expect(calls).toHaveLength(2);
   });
 });
 

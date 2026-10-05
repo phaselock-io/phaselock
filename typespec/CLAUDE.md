@@ -71,11 +71,12 @@ layout, build commands, and the test suite.
   (`TryHold.patron`), and precommit checks those claims against `auth`, usually before calling
   the engine's forecaster for the same command.
 - **Rejection and authorization.**  A handler rejects by throwing `Reject(reason)`, whose reason
-  goes to the client; any other throw is a bug, answered with a generic rejection.  Authorization
-  fails closed: each call gets a fresh `Auth`, and a handler that returns without
-  `auth.authorize(condition, reason?)` or `auth.authorizeAnyone()` is rejected, loudly in dev
-  mode, naming the handler.  An outcome someone must learn about, success or failure, is a
-  modeled event on a synced slice, named in the command's `@command`.
+  goes to the client; any other throw is a bug, answered with a generic rejection, or in full by a
+  dev bundle (the `Bundle`'s `dev`, the skeleton's `DEV`).  Authorization fails closed: each call
+  gets a fresh `Auth`, and a handler that returns without `auth.authorize(condition, reason?)` or
+  `auth.authorizeAnyone()` is rejected, loudly in dev mode, naming the handler.  An outcome
+  someone must learn about, success or failure, is a modeled event on a synced slice, named in the
+  command's `@command`.
 - **`@command` outputs.**  The argument is the precommit handler's return type, taken
   literally, generated as `{Command}Output`: each event wrapped as `{stream, event}` with the
   stream of a slice that folds it (a singleton slice's label is its literal family name; an event

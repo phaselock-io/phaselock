@@ -20,6 +20,6 @@ test: core/libpldb.a bundle
 
 clean:
 	$(MAKE) -C core clean
-	rm -f pldb $(BUNDLE) server/testdata/model.gen.ts
+	rm -f pldb $(BUNDLE) server/testdata/bundle.prod.js server/testdata/model.gen.ts
 
 .PHONY: all bundle test clean

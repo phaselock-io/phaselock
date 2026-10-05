@@ -6,7 +6,7 @@ CPPFLAGS += -Ivendor/mpack -I$(QJS) -DMPACK_EXTENSIONS=1
 QJS = ../../examples/library/relay/quickjs
 QJS_OBJS = quickjs libregexp libunicode cutils dtoa
 
-OBJS = pldb.o store.o mpjs.o js.o walk.o crc32c.o mpack.o \
+OBJS = pldb.o store.o mpjs.o js.o walk.o names.o crc32c.o mpack.o \
        $(foreach o,$(QJS_OBJS),qjs_$(o).o)
 
 libpldb.a: $(OBJS)
@@ -17,6 +17,7 @@ store.o: store.c internal.h
 mpjs.o: mpjs.c internal.h
 js.o: js.c internal.h host_js.h walk.h
 walk.o: walk.c walk.h internal.h
+names.o: names.c internal.h
 crc32c.o: crc32c.c internal.h
 
 host_js.h: host.js

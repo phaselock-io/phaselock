@@ -16,8 +16,10 @@ const patrons: Blob = {
 };
 
 /** a reducer that records how it was called and writes a local `marker` key */
-function recorder(calls: { stream: string; pending: boolean }[]): SliceReducer {
+function recorder(calls: { stream: string; pending: boolean }[], family: string): SliceReducer {
   return {
+    template: `${family}.{id}`,
+    keys: ['marker'],
     reducer(txn: ReducerTxn, events: unknown[], stream: string, pending: boolean): void {
       calls.push({ stream, pending });
       txn.set('marker', 'state', { count: events.length, fields: {} });
@@ -28,7 +30,9 @@ function recorder(calls: { stream: string; pending: boolean }[]): SliceReducer {
 describe('the reducer protocol', () => {
   test('a reducer gets local keys, its stream, and pending false for real events', async () => {
     const calls: { stream: string; pending: boolean }[] = [];
-    const r = rig({ reducers: { patron: recorder(calls), book: recorder(calls) } });
+    const r = rig({
+      reducers: { patron: recorder(calls, 'patron'), book: recorder(calls, 'book') },
+    });
     await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
     r.server.events(ev('patron.p1', 3, 11));
     await settle();
@@ -42,7 +46,10 @@ describe('the reducer protocol', () => {
     const forecaster: Forecaster = () => [
       { stream: 'patron.p2', event: { id: 'p2', type: 'bump' } },
     ];
-    const r = rig({ forecaster, reducers: { patron: recorder(calls), book: recorder(calls) } });
+    const r = rig({
+      forecaster,
+      reducers: { patron: recorder(calls, 'patron'), book: recorder(calls, 'book') },
+    });
     await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
     r.engine.sendCommands([{}]);
     await settle();
@@ -76,6 +83,20 @@ describe('forecasts', () => {
     await settle();
     expect(p1.values.at(-1)).toEqual({ count: 2, fields: { a: 1, c: 1 } });
     expect(p2.values.at(-1)).toEqual({ count: 1, fields: {} });
+  });
+
+  test('a label that does not fill its family template forecasts nothing for that command', async () => {
+    const r = rig({ forecaster });
+    await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
+    const p1 = watch(r, 'patron.p1');
+    r.engine.sendCommands([
+      { emit: [set('patron.p1', 'a'), set('patron.', 'b')] },
+      { emit: [set('patron.p1', 'c'), { stream: '', death: true }] },
+      { emit: [set('patron.p1', 'd'), set('ghost.g/1', 'e')] },
+      { emit: [set('patron.p1', 'f'), set('ghost.g~1', 'g')] },
+    ]);
+    await settle();
+    expect(p1.values.at(-1)).toEqual({ count: 2, fields: { f: 1 } });
   });
 
   test("a forecast death drops the stream's keys from the overlay only", async () => {

@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "gen": "tsp compile model.tsp && node_modules/esbuild/bin/esbuild db.ts --bundle --format=iife --log-level=warning --define:process.env.NODE_ENV=\\\"development\\\" --outfile=bundle.js"
+    "gen": "tsp compile model.tsp && node_modules/esbuild/bin/esbuild db.ts --bundle --format=iife --log-level=warning --sourcemap=inline --define:process.env.NODE_ENV=\\\"development\\\" --outfile=bundle.js && node_modules/esbuild/bin/esbuild db.ts --bundle --format=iife --log-level=warning --define:process.env.NODE_ENV=\\\"production\\\" --outfile=bundle.prod.js"
   },
   "devDependencies": {
     "@phaselock/typespec-core": "link:../../../typespec/core",

@@ -9,6 +9,22 @@
 
 static jsrt *rt_of(JSContext *ctx) { return JS_GetContextOpaque(ctx); }
 
+/* a stack with its frames in the bundle mapped through the bundle's source map, or the stack as
+   it is when the bundle has no map or the mapping throws; takes stack */
+static JSValue map_stack(jsrt *js, JSValue stack) {
+    JSContext *ctx = js->ctx;
+    if (!JS_IsFunction(ctx, js->map_stack) || !JS_IsObject(js->source_map)) return stack;
+    JSValue args[3] = {stack, JS_NewString(ctx, js->bundle_file), js->source_map};
+    JSValue mapped = JS_Call(ctx, js->map_stack, JS_UNDEFINED, 3, args);
+    JS_FreeValue(ctx, args[1]);
+    if (JS_IsException(mapped)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return stack;
+    }
+    JS_FreeValue(ctx, stack);
+    return mapped;
+}
+
 /* format the pending exception into js->err */
 static void capture_exception(jsrt *js) {
     JSContext *ctx = js->ctx;
@@ -18,6 +34,7 @@ static void capture_exception(jsrt *js) {
     JSValue st = JS_UNDEFINED;
     if (JS_IsError(ctx, exc)) {
         st = JS_GetPropertyStr(ctx, exc, "stack");
+        if (!JS_IsUndefined(st)) st = map_stack(js, st);
         if (!JS_IsUndefined(st)) stack = JS_ToCString(ctx, st);
     }
     snprintf(js->err, sizeof js->err, "%s%s%s", msg ? msg : "exception", stack ? "\n" : "",
@@ -93,10 +110,23 @@ static JSValue native_get(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     return v;
 }
 
+/* whether a reducer may write key: only a reducer writes, and only to a key that fills one of its
+   slice's key templates; throws when not */
+static bool key_writable(JSContext *ctx, jsrt *js, const char *key) {
+    const slice_names *sl = js->reducing;
+    if (sl && strlen(key) >= js->reducing_skip && key_fills(sl, key + js->reducing_skip)) return true;
+    JS_ThrowTypeError(ctx, "key %s fills none of its slice's key templates", key);
+    return false;
+}
+
 static JSValue native_set(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     jsrt *js = rt_of(ctx);
     char *key = key_arg(ctx, argv[0]);
     if (!key) return JS_EXCEPTION;
+    if (!key_writable(ctx, js, key)) {
+        free(key);
+        return JS_EXCEPTION;
+    }
     long type = type_arg(ctx, js, argv[1]);
     if (type < 0) {
         free(key);
@@ -126,6 +156,10 @@ static JSValue native_del(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     jsrt *js = rt_of(ctx);
     char *key = key_arg(ctx, argv[0]);
     if (!key) return JS_EXCEPTION;
+    if (!key_writable(ctx, js, key)) {
+        free(key);
+        return JS_EXCEPTION;
+    }
     if (store_del(js->st, key)) {
         JSValue e = JS_ThrowInternalError(ctx, "store del %s: %s", key, store_err(js->st));
         free(key);
@@ -230,7 +264,68 @@ static int eval_text(jsrt *js, const char *text, size_t len, const char *name) {
     return 0;
 }
 
-static int eval_file(jsrt *js, const char *path) {
+/* base64 text decoded and appended to out; false on a character outside the alphabet */
+static bool base64_decode(const char *s, size_t n, buf *out) {
+    uint32_t acc = 0;
+    int bits = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t v;
+        switch (s[i]) {
+        case 'A' ... 'Z': v = (uint32_t)(s[i] - 'A'); break;
+        case 'a' ... 'z': v = (uint32_t)(s[i] - 'a' + 26); break;
+        case '0' ... '9': v = (uint32_t)(s[i] - '0' + 52); break;
+        case '+': v = 62; break;
+        case '/': v = 63; break;
+        case '=': return true;
+        default: return false;
+        }
+        acc = (acc << 6 | v) & 0xffffff;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            uint8_t byte = (uint8_t)(acc >> bits);
+            buf_append(out, &byte, 1);
+        }
+    }
+    return true;
+}
+
+/* the source map a bundle carries inline, as its last sourceMappingURL comment, parsed into
+   js->source_map; a bundle without one leaves it undefined */
+static void load_source_map(jsrt *js, const char *text, size_t len) {
+    static const char MARK[] = "//# sourceMappingURL=data:application/json;base64,";
+    size_t m = sizeof MARK - 1;
+
+    // the last comment, and the base64 that runs to the end of its line
+    const char *found = NULL;
+    for (size_t i = len >= m ? len - m + 1 : 0; i-- > 0;) {
+        if (memcmp(text + i, MARK, m) == 0) {
+            found = text + i + m;
+            break;
+        }
+    }
+    if (!found) return;
+    const char *end = found;
+    while (end < text + len && *end != '\n' && *end != '\r') end++;
+
+    // decoded and parsed; a map that will not parse is reported and left out
+    buf json = {0};
+    bool ok = base64_decode(found, (size_t)(end - found), &json);
+    buf_append(&json, "", 1);
+    JSValue map = ok ? JS_ParseJSON(js->ctx, (const char *)json.p, json.len - 1, "sourcemap")
+                     : JS_EXCEPTION;
+    buf_free(&json);
+    if (JS_IsException(map) || !JS_IsObject(map)) {
+        if (JS_IsException(map)) JS_FreeValue(js->ctx, JS_GetException(js->ctx));
+        else JS_FreeValue(js->ctx, map);
+        fprintf(stderr, "pldb: the bundle's source map is malformed; stacks stay unmapped\n");
+        return;
+    }
+    js->source_map = map;
+}
+
+/* evaluate the bundle at path, then load the source map it carries */
+static int eval_bundle(jsrt *js, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         snprintf(js->err, sizeof js->err, "open %s: %s", path, strerror(errno));
@@ -242,6 +337,7 @@ static int eval_file(jsrt *js, const char *path) {
     while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) buf_append(&b, chunk, n);
     fclose(f);
     int rc = eval_text(js, (const char *)b.p, b.len, path);
+    if (!rc) load_source_map(js, (const char *)b.p, b.len);
     buf_free(&b);
     return rc;
 }
@@ -268,6 +364,54 @@ static int load_schema(jsrt *js, JSValueConst bundle, char *err, size_t errlen) 
     return rc;
 }
 
+static int strings_of(jsrt *js, JSValueConst arr, strlist *out);
+
+/* every reducer's templates, from the bundle's SliceReducers; a template must name its own
+   family */
+static int load_slices(jsrt *js, JSValueConst bundle, char *err, size_t errlen) {
+    JSContext *ctx = js->ctx;
+    JSValue reducers = JS_GetPropertyStr(ctx, bundle, "reducers");
+    JSPropertyEnum *tab = NULL;
+    uint32_t n = 0;
+    if (!JS_IsObject(reducers) ||
+        JS_GetOwnPropertyNames(ctx, &tab, &n, reducers, JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, reducers);
+        snprintf(err, errlen, "bundle has no reducers");
+        return -1;
+    }
+    js->slices = calloc(n ? n : 1, sizeof *js->slices);
+    if (!js->slices) die("out of memory");
+
+    // each reducer's family template and key templates
+    int rc = 0;
+    for (uint32_t i = 0; i < n && !rc; i++) {
+        slice_names *sl = &js->slices[js->nslices++];
+        const char *family = JS_AtomToCString(ctx, tab[i].atom);
+        sl->family = xstrdup(family ? family : "");
+        if (family) JS_FreeCString(ctx, family);
+        JSValue slice = JS_GetProperty(ctx, reducers, tab[i].atom);
+        JSValue tpl = JS_GetPropertyStr(ctx, slice, "template");
+        JSValue keys = JS_GetPropertyStr(ctx, slice, "keys");
+        const char *t = JS_IsString(tpl) ? JS_ToCString(ctx, tpl) : NULL;
+        if (t) sl->stream = xstrdup(t);
+        if (!t || JS_IsArray(ctx, keys) != 1 || strings_of(js, keys, &sl->keys)) {
+            snprintf(err, errlen, "bundle reducer %s has no template or key templates", sl->family);
+            rc = -1;
+        } else if (slice_of(js, sl->stream) != sl) {
+            snprintf(err, errlen, "bundle reducer %s has the template %s", sl->family, sl->stream);
+            rc = -1;
+        }
+        if (t) JS_FreeCString(ctx, t);
+        JS_FreeValue(ctx, keys);
+        JS_FreeValue(ctx, tpl);
+        JS_FreeValue(ctx, slice);
+    }
+    JS_FreePropertyEnum(ctx, tab, n);
+    JS_FreeValue(ctx, reducers);
+    return rc;
+}
+
 /* what a bundle expects of its environment and QuickJS lacks */
 static const char ENV_SHIM[] =
     "if (typeof globalThis.process === 'undefined') {"
@@ -277,6 +421,9 @@ static const char ENV_SHIM[] =
 int js_open(jsrt *js, const char *bundle_path, store *st, char *err, size_t errlen) {
     memset(js, 0, sizeof *js);
     js->st = st;
+    js->source_map = JS_UNDEFINED;
+    js->map_stack = JS_UNDEFINED;
+    js->bundle_file = xstrdup(bundle_path);
     js->rt = JS_NewRuntime();
     js->ctx = JS_NewContext(js->rt);
     JS_SetContextOpaque(js->ctx, js);
@@ -303,7 +450,7 @@ int js_open(jsrt *js, const char *bundle_path, store *st, char *err, size_t errl
         JS_FreeValue(js->ctx, global);
         return -1;
     }
-    if (eval_file(js, bundle_path)) {
+    if (eval_bundle(js, bundle_path)) {
         snprintf(err, errlen, "bundle: %s", js->err);
         JS_FreeValue(js->ctx, global);
         return -1;
@@ -317,6 +464,13 @@ int js_open(jsrt *js, const char *bundle_path, store *st, char *err, size_t errl
         return -1;
     }
     int rc = load_schema(js, bundle, err, errlen);
+    if (!rc) rc = load_slices(js, bundle, err, errlen);
+
+    // its mode and its stack mapper
+    JSValue dev = JS_GetPropertyStr(js->ctx, bundle, "dev");
+    js->dev = JS_ToBool(js->ctx, dev) == 1;
+    JS_FreeValue(js->ctx, dev);
+    js->map_stack = JS_GetPropertyStr(js->ctx, bundle, "mapStack");
     JS_FreeValue(js->ctx, bundle);
     return rc;
 }
@@ -324,6 +478,15 @@ int js_open(jsrt *js, const char *bundle_path, store *st, char *err, size_t errl
 void js_close(jsrt *js) {
     if (!js->ctx) return;
     strlist_free(&js->env_names);
+    for (size_t i = 0; i < js->nslices; i++) {
+        free(js->slices[i].family);
+        free(js->slices[i].stream);
+        strlist_free(&js->slices[i].keys);
+    }
+    free(js->slices);
+    free(js->bundle_file);
+    JS_FreeValue(js->ctx, js->source_map);
+    JS_FreeValue(js->ctx, js->map_stack);
     schema_free(js->sc);
     JS_FreeValue(js->ctx, js->host);
     JS_FreeContext(js->ctx);
@@ -463,7 +626,10 @@ void pc_result_free(jsrt *js, pc_result *r) {
 int js_reduce(jsrt *js, const char *family, const char *stream, JSValueConst events) {
     JSContext *ctx = js->ctx;
     JSValue args[3] = {JS_NewString(ctx, family), JS_NewString(ctx, stream), JS_DupValue(ctx, events)};
+    js->reducing = slice_of(js, stream);
+    js->reducing_skip = strlen(stream) + 1;
     JSValue r = call_host(js, "reduce", 3, args);
+    js->reducing = NULL;
     for (int i = 0; i < 3; i++) JS_FreeValue(ctx, args[i]);
     if (JS_IsException(r)) return -1;
     int ran = JS_ToBool(ctx, r);

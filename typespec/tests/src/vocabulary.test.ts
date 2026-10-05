@@ -134,6 +134,22 @@ describe('slices', () => {
     expect(codes(l)).toContain('invalid-slice-family');
   });
 
+  it.each([
+    ['a trailing dot', 'book.'],
+    ['a parameter with no name before it', '{id}'],
+    ['a literal segment after a parameter', 'msg.{id}.reactions'],
+    ['a slash', 'book/{id}'],
+    ['a character outside the name set', 'bo~ok.{id}'],
+  ])('rejects a key template with %s', async (_, tpl) => {
+    const l = await lower(`
+      model Opened { type: "opened"; id: string; }
+      model Closed { type: "closed"; id: string; }
+      union BookEvents { Opened, Closed }
+      interface BookSlice extends Slice<"book", BookEvents, { "${tpl}": string; }> {}
+    `);
+    expect(codes(l)).toContain('invalid-key-template');
+  });
+
   it('requires the events to be a named union', async () => {
     const l = await lower(`
       model Opened { type: "opened"; id: string; }

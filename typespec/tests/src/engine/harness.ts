@@ -90,8 +90,10 @@ export type State = { count: number; fields: Record<string, unknown> };
 
 /** a family's reducer: every event lands on the stream's local `state` key and is logged on its
     `log` key, so a test can assert what was applied and in what order; a `boom` event throws */
-function familyReducer(): SliceReducer {
+function familyReducer(family: string): SliceReducer {
   return {
+    template: `${family}.{id}`,
+    keys: ['state', 'log'],
     reducer(txn: ReducerTxn, events: unknown[]): void {
       for (const e of events as TestEvent[]) {
         if (e.type === 'boom') throw new Error('reducer boom');
@@ -111,8 +113,8 @@ function familyReducer(): SliceReducer {
 }
 
 export const reducers: Record<string, SliceReducer> = {
-  patron: familyReducer(),
-  book: familyReducer(),
+  patron: familyReducer('patron'),
+  book: familyReducer('book'),
 };
 
 // events ////////////////////////////////////////////////////////////////////

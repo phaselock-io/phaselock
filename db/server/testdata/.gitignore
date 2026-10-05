@@ -1,3 +1,4 @@
 node_modules/
 model.gen.ts
 bundle.js
+bundle.prod.js

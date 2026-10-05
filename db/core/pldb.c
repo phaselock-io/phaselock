@@ -11,6 +11,19 @@
 
 enum { REQ_SUBMIT = 1, REQ_REGISTER, REQ_UNREGISTER, REQ_LOOKUP };
 
+/* a formatted string, malloc'd */
+static char *strf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    char *s = xmalloc((size_t)n + 1);
+    va_start(ap, fmt);
+    vsnprintf(s, (size_t)n + 1, fmt, ap);
+    va_end(ap);
+    return s;
+}
+
 typedef struct req {
     int kind;
     uint64_t reqid, conn;
@@ -33,6 +46,7 @@ typedef struct reg {
     strlist rkeys, rprefixes;
     uint64_t *conns;
     size_t nconns, capconns;
+    char *failure; /* what its connections are answered with when maySee failed, or NULL */
     struct reg *next;
 } reg;
 
@@ -120,6 +134,17 @@ static void item_set(pldb_item *it, uint64_t position, const char *stream, uint6
     encode_wire(&b, position, stream, seq, commandid, servertime, data, len);
     it->data = b.p;
     it->len = b.len;
+}
+
+/* What a client is told of a failure that is a bug, as opposed to a rejection: the whole error
+   when the bundle is a dev build, and "internal error" otherwise.  The whole error goes to the
+   log either way, under the command it failed when it failed one.  Takes msg. */
+static char *bug_reason(const pldb *db, const char *id, char *msg) {
+    if (id) fprintf(stderr, "pldb: command %s: %s\n", id, msg);
+    else fprintf(stderr, "pldb: %s\n", msg);
+    if (db->js.dev) return msg;
+    free(msg);
+    return xstrdup("internal error");
 }
 
 // results //////////////////////////////////////////////////////////////////
@@ -268,9 +293,11 @@ static void view_hash(const strlist *prefixes, char out[17]) {
     snprintf(out, 17, "%016llx", (unsigned long long)h);
 }
 
-static bool normalize_bundle_ref(char *ref);
+static bool normalize_bundle_ref(const jsrt *js, char *ref);
 
-/* run maySee for the registration, replacing its prefixes and read-set */
+/* Run maySee for the registration, replacing its prefixes and read-set.  A maySee that throws or
+   returns a malformed ref is a bug, and the registration fails closed: it grants nothing, and
+   every connection of it is answered with the failure. */
 static int reg_evaluate(pldb *db, reg *g) {
     JSValue principal = js_principal(&db->js, g->user, (const char *const *)g->traits.v, (int)g->traits.n);
     strlist_clear(&g->prefixes);
@@ -282,15 +309,22 @@ static int reg_evaluate(pldb *db, reg *g) {
     db->js.track_rkeys = NULL;
     db->js.track_rprefixes = NULL;
     JS_FreeValue(db->js.ctx, principal);
-    if (rc) fprintf(stderr, "pldb: maySee failed: %s\n", db->js.err);
-    for (size_t i = 0; !rc && i < g->prefixes.n; i++) {
-        if (!normalize_bundle_ref(g->prefixes.v[i])) {
-            fprintf(stderr, "pldb: maySee returned a malformed ref: %s\n", g->prefixes.v[i]);
-            rc = -1;
+
+    // every ref in wire form, or the first failure
+    char *msg = rc ? strf("maySee failed: %s", db->js.err) : NULL;
+    for (size_t i = 0; !msg && i < g->prefixes.n; i++) {
+        if (!normalize_bundle_ref(&db->js, g->prefixes.v[i])) {
+            msg = strf("maySee returned a malformed ref: %s", g->prefixes.v[i]);
         }
     }
+    free(g->failure);
+    g->failure = NULL;
+    if (msg) {
+        g->failure = bug_reason(db, NULL, msg);
+        strlist_clear(&g->prefixes);
+    }
     view_hash(&g->prefixes, g->hash);
-    return rc;
+    return g->failure ? -1 : 0;
 }
 
 static reg *reg_find(pldb *db, const char *canon) {
@@ -307,6 +341,7 @@ static void reg_free(reg *g) {
     strlist_free(&g->rkeys);
     strlist_free(&g->rprefixes);
     free(g->conns);
+    free(g->failure);
     free(g);
 }
 
@@ -318,8 +353,6 @@ static void reg_attach(reg *g, uint64_t conn) {
     }
     g->conns[g->nconns++] = conn;
 }
-
-static bool valid_stream(const char *s);
 
 /* A wire ref is a stream name, "family.*" for every stream under
    "family.", or "*" for every stream.  Wildcards are the prefix they
@@ -338,32 +371,34 @@ static void ref_prefix(const char *ref, char *out, size_t cap) {
     out[n] = 0;
 }
 
-static bool valid_ref(const char *ref) {
-    if (!is_wildcard(ref)) return valid_stream(ref);
-    if (strcmp(ref, "*") == 0) return true;
-    char prefix[1024];
-    ref_prefix(ref, prefix, sizeof prefix);
-    prefix[strlen(prefix) - 1] = 0; /* the name before the dot */
-    return valid_stream(prefix);
-}
-
 /* maySee returns refs with a terminator on every entry: "family.*", "*",
    or "name/" for an exact stream.  Strips the slash into wire form;
-   false on a malformed entry. */
-static bool normalize_bundle_ref(char *ref) {
+   false on a malformed entry, one whose name does not fill its family's
+   template, or a wildcard that cuts into a parameter. */
+static bool normalize_bundle_ref(const jsrt *js, char *ref) {
     size_t n = strlen(ref);
+    if (strcmp(ref, "*") == 0) return true;
     if (n > 1 && ref[n - 1] == '/') {
         ref[n - 1] = 0;
-        return valid_stream(ref);
+        return stream_fills(js, ref);
     }
-    return is_wildcard(ref) && valid_ref(ref);
+    if (!is_wildcard(ref)) return false;
+    ref[n - 2] = 0; /* the name before the dot */
+    bool ok = ref_prefix_fills(js, ref);
+    ref[n - 2] = '.';
+    return ok;
 }
 
-/* what maySee allows, sorted and unique */
+/* what maySee allows, sorted and unique, or its failure */
 static pldb_result *view_result(const reg *g, uint64_t conn, uint64_t position) {
     pldb_result *r = result_new(PLDB_R_VIEW);
     r->conn = conn;
     r->position = position;
+    if (g->failure) {
+        r->status = 500;
+        r->errmsg = xstrdup(g->failure);
+        return r;
+    }
     strlist sorted = {0};
     for (size_t i = 0; i < g->prefixes.n; i++)
         if (!strlist_has(&sorted, g->prefixes.v[i])) strlist_push(&sorted, g->prefixes.v[i]);
@@ -468,9 +503,10 @@ static void invalidate_views(pldb *db, const strlist *written, const strlist *de
         char old_hash[17];
         memcpy(old_hash, g->hash, sizeof old_hash);
         reg_evaluate(db, g);
-        /* the whole set goes out on every change; the server cuts it down
-           to each connection's wants and decides whether that view changed */
-        if (strcmp(old_hash, g->hash) != 0) {
+        /* the whole set goes out on every change, and a failure always;
+           the server cuts a set down to each connection's wants and
+           decides whether that view changed */
+        if (g->failure || strcmp(old_hash, g->hash) != 0) {
             for (size_t i = 0; i < g->nconns; i++) {
                 pldb_result *r = view_result(g, g->conns[i], db->position);
                 if (*tail) (*tail)->next = r;
@@ -510,18 +546,6 @@ static void family_of(const char *stream, char *out, size_t cap) {
     if (n >= cap) n = cap - 1;
     memcpy(out, stream, n);
     out[n] = 0;
-}
-
-/* a name never ends in a dot, so no name reads like a wildcard */
-static bool valid_stream(const char *s) {
-    if (!*s || s[strlen(s) - 1] == '.') return false;
-    for (; *s; s++) {
-        char c = *s;
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-              c == '.' || c == '_' || c == '-'))
-            return false;
-    }
-    return true;
 }
 
 /* one command: returns the outcome as an mpack write into w */
@@ -628,9 +652,7 @@ static char *apply_outputs(pldb *db, batch *b, const char *id, pc_result *pc) {
         char family[256];
         family_of(groups[j].stream, family, sizeof family);
         if (js_reduce(&db->js, family, groups[j].stream, groups[j].events) < 0) {
-            reason = xmalloc(strlen(db->js.err) + 32);
-            sprintf(reason, "reducer error: %s", db->js.err);
-            fprintf(stderr, "pldb: %s\n", reason);
+            reason = bug_reason(db, id, strf("reducer error: %s", db->js.err));
         }
     }
     db->js.track_wkeys = NULL;
@@ -671,18 +693,15 @@ static void run_command(pldb *db, batch *b, mpack_writer_t *w, const char *id, J
     char *reason = NULL;
     pc_result pc = {0};
     if (js_precommit(&db->js, id, data, principal, &pc)) {
-        reason = xmalloc(strlen(db->js.err) + 32);
-        sprintf(reason, "precommit error: %s", db->js.err);
-        fprintf(stderr, "pldb: %s\n", reason);
+        reason = bug_reason(db, id, strf("precommit error: %s", db->js.err));
     } else if (pc.reason) {
         reason = pc.reason;
         pc.reason = NULL;
     }
     if (!reason) {
         for (size_t i = 0; i < pc.n && !reason; i++)
-            if (!valid_stream(pc.items[i].stream)) {
-                reason = xmalloc(64 + strlen(pc.items[i].stream));
-                sprintf(reason, "invalid stream name: %s", pc.items[i].stream);
+            if (!stream_fills(&db->js, pc.items[i].stream)) {
+                reason = bug_reason(db, id, strf("invalid stream name: %s", pc.items[i].stream));
             }
     }
     if (reason) {
@@ -776,8 +795,7 @@ static void handle_lookup(pldb *db, req *q, pldb_result **after_tail) {
     buf out = {0};
     if (js_lookup(&db->js, q->body, q->len, &out)) {
         r->status = 500;
-        r->errmsg = xstrdup(db->js.err);
-        fprintf(stderr, "pldb: lookup failed: %s\n", db->js.err);
+        r->errmsg = bug_reason(db, NULL, strf("lookup failed: %s", db->js.err));
     } else {
         r->buf = out.p;
         r->len = out.len;
@@ -917,7 +935,7 @@ static int run_bootstrap(pldb *db, char *err, size_t errlen) {
         return 0;
     }
     for (size_t i = 0; i < pc.n; i++) {
-        if (!valid_stream(pc.items[i].stream)) {
+        if (!stream_fills(&db->js, pc.items[i].stream)) {
             snprintf(err, errlen, "bootstrap: invalid stream name: %s", pc.items[i].stream);
             pc_result_free(&db->js, &pc);
             return -1;

@@ -126,12 +126,19 @@ plan above take precedence over it.
   fields the database prepares for precommit (a `NewPassword`'s hash)
   are collected by the check and replaced when the checked command is
   written out for the writer thread.
-- A reducer that throws while folding a command's outputs is a bug,
-  and in v0 it fails the whole group: the group's transaction rolls
-  back and every command in it is rejected.  Rolling back one
-  command's effects alone needs the same isolation as running commands
-  in parallel and validating each separately (DB.md, speculative
-  execution), so it can ride that codepath when it exists.
+- Each command runs in a nested transaction, a SQLite savepoint inside
+  the group's transaction.  A reducer that throws while folding a
+  command's outputs is a bug, and it rolls back that command alone:
+  its events, births, deaths, and state writes are undone, the command
+  is rejected, and the rest of the group commits.
+- A rejection's reason, a precommit handler's `Reject`, reaches the
+  client as it is.  Any other failure is a bug: a throw from
+  precommit, a reducer, or lookup, a precommit output whose stream
+  does not fill its family's template, or a reducer write to a key no
+  key template fills.  The client is told `internal error`, and the
+  log gets the whole error with its stack, under the command's id.  A
+  dev bundle answers the client with the whole error too.  Stacks are
+  mapped through the bundle's source map when it carries one.
 - precommit returns either a rejection reason or a list of
   `{stream, event}` pairs, any number per stream.  The C core stamps
   every emitted event with the command's id; precommit never sees or
@@ -155,13 +162,22 @@ plan above take precedence over it.
   deletion of the stream's keys.  Dead streams stay in the
   known-streams table as tombstones (name, birth, death); a new event
   to a dead name is a rebirth with a new birth position.
-- Store keys are plain strings: `<stream>/<local key>`.  Stream names
-  are `family` or `family.<instance>`; the family is the part before
-  the first dot.  Allowed characters in stream names and instance
-  values: `A-Z a-z 0-9 . _ -`.  A name never ends in a dot.
-- A ref names a set of streams: a stream name, `family.*` for every
-  stream under `family.`, or `*` for every stream.  `*` is legal only
-  alone or right after a dot.  That is the wire form, used in URLs and
+- Store keys are plain strings: `<stream>/<local key>`.  A stream name
+  fills its slice's family template (`chat.{org}.{channel}` names
+  `chat.acme.general`), and a local key one of the slice's key
+  templates (`note.{id}`).  The family is the part before the first
+  dot.  A parameter a template ends with is terminal and holds the rest
+  of the string; every other parameter is a non-empty run of
+  `A-Z a-z 0-9 _ -`.  A stream name's terminal parameter is non-empty
+  and may also hold `.` and `~`; a key's may hold anything, the empty
+  string included.  The core rejects a precommit or bootstrap output
+  whose stream does not fill its family's template, and a reducer
+  write whose key fills none of its slice's key templates.
+- A ref names a set of streams: a stream name, `prefix.*` for every
+  stream under `prefix.`, or `*` for every stream.  A wildcard's prefix
+  is the family alone or the family and whole parameters other than
+  the terminal one: `chat.*` and `chat.acme.*`, never
+  `chat.acme.gen.*`.  That is the wire form, used in URLs and
   `want`.  In the bundle, maySee returns refs with a terminator on
   every entry: `family.*`, `*`, and `name/` for an exact stream, so a
   bare name is a malformed ref and a bundle bug, never a grant.  The
@@ -214,6 +230,13 @@ Every frame is an array whose first element is a tag.
   horizon frame.
 - `want` is a list of refs: what the client can fold.  No `want`
   means `*`, everything maySee allows.
+- maySee that throws, or returns a ref that is malformed or does not
+  fill its family's template, fails closed: it grants nothing.  A
+  connection registering under it is refused with a 500, and a
+  connection it fails under when a commit re-runs it gets
+  `["end", "error", reason]` and is closed.  The reason is as for a
+  command's bug: `internal error`, or the whole error from a dev
+  bundle.
 - maySee returns refs (bundle form); the view is that set cut down to
   the wants, the narrower of each pair that covers the other, and the
   token is a hash of the view.  So the token names a principal and a
@@ -436,10 +459,13 @@ app's slots:
       schema,                   // the database's registry data
       precommit(txn, cmd, principal) → reason | [{stream, event} |
                                                  {stream, death: true}],
-      reducers: { family: { reducer(txn, events, stream, pending) } },
+      reducers: { family: { reducer(txn, events, stream, pending),
+                            template, keys } },
       maySee(txn, principal) → [ref...],
       lookup(txn, ident) → null | { user, traits, generation, secret },
       bootstrap(ctx),           // optional; see Bootstrap
+      dev,                      // the skeleton's DEV
+      mapStack(stack, file, map) → stack,
     }
 
 - `cmd` is `{id, data}`; `principal` is `{user, traits}` with `user`
@@ -448,6 +474,13 @@ app's slots:
 - The core defines `process.env.NODE_ENV` as `production` before
   evaluating the bundle, for a bundle built without a define; a build
   that defines it, as the test bundle does with `development`, wins.
+  `dev` is the bundle's resulting mode, which decides whether clients
+  see the whole error of a bug.
+- A bundle may carry its source map inline, as a final
+  `//# sourceMappingURL=data:application/json;base64,` comment (esbuild
+  `--sourcemap=inline`).  The core passes the stack of every error
+  through the bundle's own `mapStack`, so the mapping is the
+  skeleton's and every host shares it.
 - Every slot is a plain synchronous function over rich JS values.
   `txn` reads the store: `get(key, type)` answers the value or
   undefined.  A reducer's `txn` also has `set(key, type, value)` and
@@ -455,7 +488,9 @@ app's slots:
   names, a registry identity, so a value that does not fit its type
   fails the call.  A scan names one type too, so its range lies within
   one key template.
-- A reducer's keys are local: the core prefixes `<stream>/`.
+- A reducer's keys are local: the core prefixes `<stream>/`.  Its
+  `template` is the family template and `keys` the key templates, as
+  declared in the model.
   precommit, maySee, and lookup see global keys.
 - maySee is registered per distinct `principal` and re-run when a
   commit writes a key it read.
@@ -464,14 +499,16 @@ app's slots:
 
     db/core/      the C core (libpldb.a): pldb.c txn loop, queues, and
                   the command check, store.c SQLite, walk.c the
-                  conversion kernel, mpjs.c untyped msgpack<->JS, js.c
+                  conversion kernel, names.c stream names and keys
+                  against their templates, mpjs.c untyped msgpack<->JS, js.c
                   QuickJS host, host.js the JS glue, vendor/mpack
     db/server/    the Go layer: core.go cgo binding, server.go HTTP,
                   auth.go tokens and passwords, mp.go msgpack codec,
                   server_test.go feature tests
     db/server/testdata/
                   the test bundle: model.tsp and db.ts, generated into
-                  bundle.js by the TypeScript emitter and esbuild
+                  bundle.js (dev, with an inline source map) and
+                  bundle.prod.js by the TypeScript emitter and esbuild
 
 QuickJS objects come from the library example's checkout
 (`examples/library/relay/quickjs`, built by its Makefile); SQLite is

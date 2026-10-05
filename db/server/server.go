@@ -82,6 +82,7 @@ type conn struct {
 type frame struct {
 	pos  uint64
 	view bool
+	end  bool // the connection's last frame
 	data []byte
 }
 
@@ -232,6 +233,11 @@ func (s *Server) dispatch() {
 					s.send(c, frame{pos: r.position, view: true,
 						data: mpEncode([]any{"view", token, r.position, view})})
 				}
+			} else if c != nil && r.reqid == 0 && c.active {
+				// maySee failed when a commit re-ran it, so the connection ends
+				s.send(c, frame{pos: r.position, view: true, end: true,
+					data: mpEncode([]any{"end", "error", r.errmsg})})
+				c.active = false
 			}
 			s.mu.Unlock()
 			if r.reqid != 0 {
@@ -303,24 +309,40 @@ func matches(stream, ref string) bool {
 	return stream == ref
 }
 
-// validRef checks the wire form of a ref: a stream name, "family.*", or
-// "*".  Names never end in a dot.
+// validRef checks the wire form of a ref: a stream name, "prefix.*", or
+// "*".  A name's family, before its first dot, is a non-empty run of
+// A-Z a-z 0-9 _ -, and what follows the dot is a non-empty run of those and
+// . ~, the characters a URL carries unencoded.  The core checks a name
+// against its family's template.
 func validRef(ref string) bool {
 	if ref == "*" {
 		return true
 	}
-	name := strings.TrimSuffix(ref, ".*")
-	if name == "" || strings.HasSuffix(name, ".") {
+	family, rest, dotted := strings.Cut(strings.TrimSuffix(ref, ".*"), ".")
+	if family == "" || (dotted && rest == "") {
 		return false
 	}
-	for _, c := range name {
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
-		default:
+	for _, c := range family {
+		if !segmentChar(c) {
+			return false
+		}
+	}
+	for _, c := range rest {
+		if !segmentChar(c) && c != '.' && c != '~' {
 			return false
 		}
 	}
 	return true
+}
+
+// segmentChar reports whether c may appear in a family name or a parameter
+// other than a template's terminal one.
+func segmentChar(c rune) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '_', c == '-':
+		return true
+	}
+	return false
 }
 
 // eventsFrame encodes ["events", [ev...]] for the events of an atom that
@@ -518,7 +540,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 					s.mu.Lock()
 					prefixes = append([]string(nil), c.prefixes...)
 					s.mu.Unlock()
-					if !write(f.data) {
+					if !write(f.data) || f.end {
 						return false
 					}
 				}
@@ -594,7 +616,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if !f.view {
 				cursor = f.pos
 			}
-			if !write(f.data) {
+			if !write(f.data) || f.end {
 				return
 			}
 		case <-ticker.C:

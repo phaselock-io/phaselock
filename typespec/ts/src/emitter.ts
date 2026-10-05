@@ -559,14 +559,6 @@ function generateDispatch(
    the local template's.  Every accessor is named for its key template's name, which validation
    keeps unique across the slices of a context. */
 
-/** a key template as the text of a template literal, its parameters interpolated */
-function keyText(tpl: string): string {
-  const [chunks, params] = PStoreItem.parseTpl(tpl);
-  let out = chunks[0];
-  for (let i = 0; i < params.length; i++) out += '${' + params[i] + '}' + chunks[i + 1];
-  return out;
-}
-
 /** the type a store value travels under: its own name, or failing that the key it is kept at */
 function storeTypeName(slice: PSlice, item: PStoreItem): string {
   const t = item.type;
@@ -585,13 +577,30 @@ type Accessor = {
   updatable: boolean;
 };
 
+/** a template as the text of a template literal, each parameter interpolated through its check: a
+    terminal parameter of a family template as the rest of a stream name, a terminal parameter of a
+    key template as is, and every other parameter as a segment */
+function checkedText(accessor: string, tpl: string, family: boolean): string {
+  const [chunks, params] = PStoreItem.parseTpl(tpl);
+  let out = chunks[0];
+  for (let i = 0; i < params.length; i++) {
+    const p = params[i];
+    const args = `${p}, ${JSON.stringify(accessor)}, ${JSON.stringify(p)}`;
+    let value = `asSegment(${args})`;
+    if (i === params.length - 1) value = family ? `asStreamRest(${args})` : p;
+    out += '${' + value + '}' + chunks[i + 1];
+  }
+  return out;
+}
+
 /** the accessors over a slice's keys, local for its reducer, or global for any other context */
 function accessors(annos: Annos, slice: PSlice, global: boolean): Accessor[] {
-  const prefix = global ? `${keyText(slice.template)}/` : '';
   return slice.store.items.map((item) => ({
     name: item.name,
     params: global ? [...slice.params, ...item.params] : item.params,
-    key: prefix + keyText(item.tpl),
+    key:
+      (global ? `${checkedText(item.name, slice.template, true)}/` : '') +
+      checkedText(item.name, item.tpl, false),
     anno: annos.get(item.type)!,
     type: storeTypeName(slice, item),
     updatable: isUpdatable(item.type),
@@ -763,6 +772,8 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   d.print(`for (const event of events) ${reduce}(handlers, txn, pending, event);\n`);
   d.dedent();
   d.print('},\n');
+  d.print(`template: ${JSON.stringify(slice.template)},\n`);
+  d.print(`keys: ${JSON.stringify(slice.store.items.map((item) => item.tpl))},\n`);
   d.dedent();
   d.print('};\n');
   d.dedent();
@@ -997,6 +1008,8 @@ export function define${db.name}(slots: ${slotsType}): Bundle {
     maySee: (txn, principal) => slots.maySee(${lowerFirst(db.name)}Txn(txn), principal),
     lookup: (txn, ident) => slots.lookup(${lowerFirst(db.name)}Txn(txn), ident),
     bootstrap: bootstrap === undefined ? undefined : (ctx) => bootstrap(ctx as ${ctxType}),
+    dev: DEV,
+    mapStack,
   };
   (globalThis as { __bundle?: Bundle }).__bundle = bundle;
   return bundle;

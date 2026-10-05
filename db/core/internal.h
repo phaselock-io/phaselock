@@ -85,6 +85,13 @@ JSValue mpjs_decode(JSContext *ctx, const uint8_t *data, size_t len);
 JSValue mpjs_decode_node(JSContext *ctx, mpack_node_t node);
 int mpjs_encode(JSContext *ctx, JSValueConst v, buf *out);
 
+/* one slice's templates, from its SliceReducer */
+typedef struct slice_names {
+    char *family;
+    char *stream; /* the family template */
+    strlist keys; /* the key templates */
+} slice_names;
+
 /* js.c: the QuickJS host */
 typedef struct jsrt {
     JSRuntime *rt;
@@ -98,7 +105,17 @@ typedef struct jsrt {
     strlist *track_rkeys;
     strlist *track_rprefixes;
     strlist *track_wkeys;
-    char err[1024];
+    slice_names *slices; /* every reducer's templates */
+    size_t nslices;
+    /* while a reducer runs, its slice, whose key templates every key it writes must fill, and the
+       length of the "<stream>/" prefix of those keys */
+    const slice_names *reducing;
+    size_t reducing_skip;
+    bool dev;           /* the bundle's DEV: its errors go to clients in full */
+    char *bundle_file;  /* the name the bundle's stack frames carry */
+    JSValue source_map; /* the bundle's inline source map, parsed, or undefined */
+    JSValue map_stack;  /* the bundle's mapStack */
+    char err[4096];
 } jsrt;
 
 typedef struct pc_item {
@@ -126,5 +143,16 @@ int js_reduce(jsrt *js, const char *family, const char *stream, JSValueConst eve
 int js_maysee(jsrt *js, JSValueConst principal, strlist *out);
 int js_lookup(jsrt *js, const uint8_t *ident, size_t len, buf *out);
 int64_t js_generation(jsrt *js, JSValueConst principal);
+
+/* names.c: stream names and keys against their slice's templates */
+/* the slice whose family a stream name's first segment names, or NULL */
+const slice_names *slice_of(const jsrt *js, const char *stream);
+/* whether a stream name fills its family's template */
+bool stream_fills(const jsrt *js, const char *name);
+/* whether a ref "prefix.*" covers whole parameters of its family's template: the family alone,
+   or the family and parameters other than the terminal one */
+bool ref_prefix_fills(const jsrt *js, const char *prefix);
+/* whether a local key fills the key template its name picks */
+bool key_fills(const slice_names *sl, const char *key);
 
 #endif

@@ -84,8 +84,8 @@ export interface LoweredProgram {
   sources: Map<PSlice | PCommand | PEngine | PDatabase, Type>;
 }
 
-// a family name, then only `.{param}` segments
-const FAMILY_PATTERN = /^[A-Za-z0-9_-]+((\.\{[A-Za-z_][A-Za-z0-9_]*\})*)$/;
+// a name, then only `.{param}` segments: the shape of a family template and of a key template
+const TEMPLATE_PATTERN = /^[A-Za-z0-9_-]+((\.\{[A-Za-z_][A-Za-z0-9_]*\})*)$/;
 
 /**
  * A template argument may arrive as an IndeterminateEntity (an entity the checker hasn't
@@ -321,7 +321,7 @@ export function lowerProgram(program: Program): LoweredProgram {
       return undefined;
     }
     const tpl = familyArg.value;
-    if (!FAMILY_PATTERN.test(tpl)) {
+    if (!TEMPLATE_PATTERN.test(tpl)) {
       reportDiagnostic(program, {
         code: 'invalid-slice-family',
         format: { family: tpl },
@@ -364,6 +364,16 @@ export function lowerProgram(program: Program): LoweredProgram {
     if (specArg?.kind !== 'Model') {
       invalidArgs(iface, `Slice 'Spec' argument of '${iface.name}' must be a model`);
       return undefined;
+    }
+    for (const tpl of specArg.properties.keys()) {
+      if (!TEMPLATE_PATTERN.test(tpl)) {
+        reportDiagnostic(program, {
+          code: 'invalid-key-template',
+          format: { tpl, name: iface.name },
+          target: iface,
+        });
+        return undefined;
+      }
     }
     let store: PStore;
     try {
