@@ -1,0 +1,106 @@
+/* PhaseLock database core: the C API the Go layer binds through cgo. */
+
+#ifndef PLDB_H
+#define PLDB_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct pldb pldb;
+
+enum {
+    PLDB_R_SHUTDOWN = 0,
+    PLDB_R_COMMIT = 1,  /* items: every event of one group commit, in order */
+    PLDB_R_OUTCOME = 2, /* reqid, buf: msgpack array of per-command outcomes */
+    PLDB_R_VIEW = 3,    /* conn: initial or changed maySee result */
+    PLDB_R_LOOKUP = 4,  /* reqid, buf: msgpack of lookup's return, len 0 for null */
+};
+
+/* One event as the wire sees it: data is the encoded [envelope, data] value. */
+typedef struct pldb_item {
+    char *stream;
+    char *commandid;
+    uint64_t position;
+    uint8_t *data;
+    size_t len;
+} pldb_item;
+
+typedef struct pldb_result {
+    int kind;
+    int status;        /* 0 ok; 401 stale token; 500 with errmsg */
+    uint64_t reqid;
+    uint64_t conn;
+    uint64_t position; /* last committed position when this result was made */
+    pldb_item *items;
+    size_t nitems;
+    uint8_t *buf;
+    size_t len;
+    char **prefixes; /* what maySee allows, sorted and unique */
+    size_t nprefixes;
+    char *errmsg;
+    struct pldb_result *next;
+} pldb_result;
+
+/* What a hash function answers: a hash, a refusal of this request's hashing (the pool is full,
+   the client's budget is spent, or the client or server is going away), or a failure. */
+enum {
+    PLDB_HASH_OK = 0,
+    PLDB_HASH_BUSY = 1,
+    PLDB_HASH_LIMITED = 2,
+    PLDB_HASH_FAILED = -1,
+};
+
+/* Hashes a password into out (NUL-terminated), for the request arg names; answers one of the
+   PLDB_HASH_ codes. */
+typedef int (*pldb_hash_fn)(uintptr_t arg, const char *pw, size_t pwlen, char *out, size_t cap);
+
+/* env names the variables the bundle's bootstrap may read; on an empty log, open runs it. */
+int pldb_open(const char *dir, const char *bundle, pldb_hash_fn hasher, const char *const *env,
+              int nenv, pldb **out,
+              char *err, size_t errlen);
+void pldb_close(pldb *db);
+/* the id of this log instance; positions mean nothing across epochs */
+const char *pldb_epoch(pldb *db);
+
+/* Requests; answered through pldb_pop.  user NULL is anonymous; gen < 0 skips
+   the generation check. */
+int pldb_submit(pldb *db, uint64_t reqid, const char *user, const char *const *traits,
+                int ntraits, int64_t gen, const uint8_t *body, size_t len);
+int pldb_register(pldb *db, uint64_t reqid, uint64_t conn, const char *user,
+                  const char *const *traits, int ntraits, int64_t gen);
+int pldb_unregister(pldb *db, uint64_t conn);
+int pldb_lookup(pldb *db, uint64_t reqid, const uint8_t *ident, size_t len);
+
+/* Blocks until a result is available.  The caller frees it. */
+pldb_result *pldb_pop(pldb *db);
+void pldb_result_free(pldb_result *r);
+
+/* The check of a request's commands, on the caller's thread: every command is checked
+   against the bundle's registry, and the fields the database prepares for precommit are
+   prepared, before anything reaches the writer.  body holds the commands that passed, in
+   order; reasons has one entry per command of the request, NULL for one that passed and
+   why it was rejected otherwise.  arg is handed to the hash function for every password the
+   request carries.  Returns 0; -1 for a request that is not a sequence of [id, data] values;
+   or PLDB_HASH_BUSY or PLDB_HASH_LIMITED when the hash function refused, which refuses the
+   whole request, so the client can retry it later under the same ids. */
+typedef struct pldb_prepared {
+    uint8_t *body;
+    size_t len;
+    char **reasons;
+    size_t n;
+} pldb_prepared;
+int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, pldb_prepared *out,
+                 char *err, size_t errlen);
+void pldb_prepared_free(pldb_prepared *p);
+
+/* Reader side: any thread, serialized internally. */
+int pldb_read_log(pldb *db, uint64_t from, uint64_t to, pldb_item **items, size_t *n);
+/* A ref's events with from < position < to, at most limit of them,
+   ascending or descending.  A ref is a stream name, "family.*", or "*". */
+int pldb_read_events(pldb *db, const char *ref, uint64_t from, uint64_t to, int reverse,
+                     size_t limit, pldb_item **items, size_t *n);
+void pldb_items_free(pldb_item *items, size_t n);
+int pldb_snapshot(pldb *db, const char *ref, uint8_t **out, size_t *len, uint64_t *position);
+void pldb_free(void *p);
+
+#endif

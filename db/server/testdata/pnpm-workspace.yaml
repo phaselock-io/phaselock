@@ -1,0 +1,4 @@
+# workspace marker: keeps installs local to the test bundle
+
+allowBuilds:
+  esbuild: true

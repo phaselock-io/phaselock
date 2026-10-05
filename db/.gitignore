@@ -1,0 +1,5 @@
+core/*.o
+core/*.a
+core/host_js.h
+pldb
+data/
