@@ -636,21 +636,6 @@ export class Reader {
     }
   }
 
-  /** a bin value's bytes, as their own copy */
-  bin(): Uint8Array {
-    this.#need(1);
-    const b = this.#buf[this.#pos];
-    let n: number;
-    if (b === 0xc4) n = this.#length(1);
-    else if (b === 0xc5) n = this.#length(2);
-    else if (b === 0xc6) n = this.#length(4);
-    else throw new Error(`expected msgpack bin, got 0x${b.toString(16)}`);
-    this.#need(n);
-    const out = this.#buf.slice(this.#pos, this.#pos + n);
-    this.#pos += n;
-    return out;
-  }
-
   /** skip one value of any type */
   skip(): void {
     const end = measure(this.#buf, this.#pos, this.#end);
@@ -863,26 +848,6 @@ export class Writer {
       this.str(key);
       this.any(x, depth + 1);
     }
-  }
-
-  /** bytes as a bin value */
-  bin(b: Uint8Array): void {
-    const n = b.length;
-    this.#ensure(n + 5);
-    if (n < 0x100) {
-      this.#buf[this.#pos++] = 0xc4;
-      this.#buf[this.#pos++] = n;
-    } else if (n < 0x10000) {
-      this.#buf[this.#pos++] = 0xc5;
-      this.#data.setUint16(this.#pos, n);
-      this.#pos += 2;
-    } else {
-      this.#buf[this.#pos++] = 0xc6;
-      this.#data.setUint32(this.#pos, n);
-      this.#pos += 4;
-    }
-    this.#buf.set(b, this.#pos);
-    this.#pos += n;
   }
 
   /** raw appends an already-encoded value verbatim */

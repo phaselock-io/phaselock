@@ -652,6 +652,12 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   if (updatable.length === 0) {
     d.print('update: {};\n');
   } else {
+    d.print(
+      '/** apply fn to the value at a key in place and set it, answering what fn returns; an\n',
+    );
+    d.print(
+      '    absent key throws, as a reducer does whenever the state is not what its event implies */\n',
+    );
     d.print('update: {\n');
     d.indent('  ');
     for (const a of updatable) {

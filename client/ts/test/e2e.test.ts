@@ -41,7 +41,7 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
       try {
         const auth = await fetch(`${url}/auth/token`, {
           method: 'POST',
-          body: encode({ kind: 'dev', user: 'root', traits: ['admin'] }),
+          body: encode({ kind: 'dev', identity: 'root' }),
         });
         token = (decode(new Uint8Array(await auth.arrayBuffer())) as { token: string }).token;
         return;

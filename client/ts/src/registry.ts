@@ -725,30 +725,23 @@ function compile(schema: Schema): Plan[] {
   return plans;
 }
 
-/* An outbox row, `.command`, is the map {id, data}, data the command's wire bytes as bin. */
+/* An outbox row, `.command`, is the pair [id, command], the command nested as the msgpack value
+   its wire bytes are, so a row reads back as those bytes with no vocabulary. */
 
 function readCommand(bytes: Uint8Array): Command<Uint8Array> {
   const r = new Reader(bytes);
-  const n = r.mapHeader();
-  let id: string | undefined;
-  let data: Uint8Array | undefined;
-  for (let k = 0; k < n; k++) {
-    const key = r.str();
-    if (key === 'id') id = r.str();
-    else if (key === 'data') data = r.bin();
-    else r.skip();
-  }
-  if (id === undefined || data === undefined || !r.done) throw new Error('malformed outbox row');
+  if (r.arrayHeader() < 2) throw new Error('malformed outbox row');
+  const id = r.str();
+  const data = r.raw();
+  if (!r.done) throw new Error('malformed outbox row');
   return { id, data };
 }
 
 function writeCommand(c: Command<Uint8Array>): Uint8Array {
   const w = new Writer();
-  w.mapHeader(2);
-  w.str('id');
+  w.arrayHeader(2);
   w.str(c.id);
-  w.str('data');
-  w.bin(c.data);
+  w.raw(c.data);
   return w.bytes();
 }
 

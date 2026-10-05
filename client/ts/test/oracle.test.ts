@@ -244,26 +244,16 @@ describe('values with no schema', () => {
     bytes[600] = 1;
     expect(() => decodeAny(bytes)).toThrow(/nested too deeply/);
   });
-
-  test('bin reads and writes as the library does, at every length header', () => {
-    for (const n of [0, 255, 256, 65535, 65536]) {
-      const b = new Uint8Array(n).fill(7);
-      const w = new Writer();
-      w.bin(b);
-      expect(w.bytes()).toEqual(encode(b));
-      expect(new Reader(encode(b)).bin()).toEqual(b);
-    }
-  });
 });
 
 describe("the registry's own identities", () => {
   const reg = buildRegistry({ nodes: [], ids: {}, commands: null, eventTypes: {}, storeTypes: {} });
 
-  test("an outbox row is the library's encoding of {id, data}, data as bin", () => {
+  test('an outbox row is the pair [id, command], the command nested as its own bytes', () => {
     const row = { id: 'c1', data: encode({ type: 'noted' }) };
     const bytes = reg.convert('.command', row, JS, MSGPACK) as Uint8Array;
-    expect(bytes).toEqual(encode(row));
-    expect(reg.convert('.command', encode(row), MSGPACK, JS)).toEqual(row);
+    expect(bytes).toEqual(encode(['c1', { type: 'noted' }]));
+    expect(reg.convert('.command', bytes, MSGPACK, JS)).toEqual(row);
   });
 
   test('an Engine record is any value, undefined properties left out', () => {
