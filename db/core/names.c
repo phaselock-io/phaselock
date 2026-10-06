@@ -2,7 +2,8 @@
    ".{param}" segment per parameter.  A parameter the template ends with is terminal and holds
    the rest of the string; every other parameter is a segment, a non-empty run of
    A-Z a-z 0-9 _ -.  A stream name's terminal parameter is non-empty and may also hold '.' and
-   '~'; a local key's may hold anything a key may, the empty string included. */
+   '~'; a local key's may hold anything a key may, the empty string included.  No key holds a
+   control character (U+0000-001F, U+007F-009F) or a lone surrogate. */
 
 #include "internal.h"
 
@@ -83,6 +84,17 @@ bool stream_fills(const jsrt *js, const char *name) {
 bool ref_prefix_fills(const jsrt *js, const char *prefix) {
     const slice_names *sl = slice_of(js, prefix);
     return sl && fills(sl->stream, prefix, AS_PREFIX);
+}
+
+/* QuickJS writes a key as UTF-8, except that a lone surrogate becomes ED A0-BF and a continuation
+   byte, so a control character is a byte below 0x20, 0x7F, or C2 80-9F */
+bool key_chars_ok(const char *key) {
+    for (const unsigned char *p = (const unsigned char *)key; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f) return false;
+        if (p[0] == 0xc2 && p[1] >= 0x80 && p[1] <= 0x9f) return false;
+        if (p[0] == 0xed && p[1] >= 0xa0) return false;
+    }
+    return true;
 }
 
 bool key_fills(const slice_names *sl, const char *key) {

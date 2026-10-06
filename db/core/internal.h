@@ -154,5 +154,7 @@ bool stream_fills(const jsrt *js, const char *name);
 bool ref_prefix_fills(const jsrt *js, const char *prefix);
 /* whether a local key fills the key template its name picks */
 bool key_fills(const slice_names *sl, const char *key);
+/* whether a key, as its C string, holds no control character and no lone surrogate */
+bool key_chars_ok(const char *key);
 
 #endif

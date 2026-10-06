@@ -1181,7 +1181,8 @@ export interface ReducerTxn extends ReadTxn {
    parses back as `chat.{org}.{channel}` unambiguously and `chat.acme.*` covers one org's channels.
    A stream name's terminal parameter is non-empty and may also hold `.` and `~`, the rest of the
    RFC 3986 unreserved set, since stream names appear in URLs.  A local key's terminal parameter
-   may hold anything a key may, the empty string included. */
+   may hold anything a key may, the empty string included.  No key holds a control character
+   (U+0000-001F, U+007F-009F) or a lone surrogate; the database refuses a reducer's write of one. */
 
 const SEGMENT = '[A-Za-z0-9_-]+';
 const STREAM_REST = '[A-Za-z0-9_.~-]+';

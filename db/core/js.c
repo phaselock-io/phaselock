@@ -45,9 +45,13 @@ static void capture_exception(jsrt *js) {
     JS_FreeValue(ctx, exc);
 }
 
-static char *key_arg(JSContext *ctx, JSValueConst v) {
-    const char *s = JS_ToCString(ctx, v);
+/* a name (a key, a stream, a variable) as a C string, or NULL with an exception; *nul says the
+   name holds U+0000, where the C string stops short */
+static char *name_arg(JSContext *ctx, JSValueConst v, bool *nul) {
+    size_t len;
+    const char *s = JS_ToCStringLen(ctx, &len, v);
     if (!s) return NULL;
+    *nul = strlen(s) != len;
     char *k = xstrdup(s);
     JS_FreeCString(ctx, s);
     return k;
@@ -85,8 +89,15 @@ static JSValue decode_stored(JSContext *ctx, jsrt *js, const char *key, long typ
 
 static JSValue native_get(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     jsrt *js = rt_of(ctx);
-    char *key = key_arg(ctx, argv[0]);
+    bool nul;
+    char *key = name_arg(ctx, argv[0], &nul);
     if (!key) return JS_EXCEPTION;
+
+    // no stored key holds U+0000, so a key that does is absent rather than read short
+    if (nul) {
+        free(key);
+        return JS_UNDEFINED;
+    }
     long type = type_arg(ctx, js, argv[1]);
     if (type < 0) {
         free(key);
@@ -110,9 +121,18 @@ static JSValue native_get(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     return v;
 }
 
-/* whether a reducer may write key: only a reducer writes, and only to a key that fills one of its
-   slice's key templates; throws when not */
-static bool key_writable(JSContext *ctx, jsrt *js, const char *key) {
+/* whether a reducer may write key: only a reducer writes, and only to a key that holds no control
+   character or lone surrogate and fills one of its slice's key templates; throws when not.  nul
+   says the key holds U+0000 where the C string stops. */
+static bool key_writable(JSContext *ctx, jsrt *js, const char *key, bool nul) {
+    if (nul) {
+        JS_ThrowTypeError(ctx, "a key beginning %s holds U+0000", key);
+        return false;
+    }
+    if (!key_chars_ok(key)) {
+        JS_ThrowTypeError(ctx, "key %s holds a control character or a lone surrogate", key);
+        return false;
+    }
     const slice_names *sl = js->reducing;
     if (sl && strlen(key) >= js->reducing_skip && key_fills(sl, key + js->reducing_skip)) return true;
     JS_ThrowTypeError(ctx, "key %s fills none of its slice's key templates", key);
@@ -121,9 +141,10 @@ static bool key_writable(JSContext *ctx, jsrt *js, const char *key) {
 
 static JSValue native_set(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     jsrt *js = rt_of(ctx);
-    char *key = key_arg(ctx, argv[0]);
+    bool nul;
+    char *key = name_arg(ctx, argv[0], &nul);
     if (!key) return JS_EXCEPTION;
-    if (!key_writable(ctx, js, key)) {
+    if (!key_writable(ctx, js, key, nul)) {
         free(key);
         return JS_EXCEPTION;
     }
@@ -154,9 +175,10 @@ static JSValue native_set(JSContext *ctx, JSValueConst this_val, int argc, JSVal
 
 static JSValue native_del(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     jsrt *js = rt_of(ctx);
-    char *key = key_arg(ctx, argv[0]);
+    bool nul;
+    char *key = name_arg(ctx, argv[0], &nul);
     if (!key) return JS_EXCEPTION;
-    if (!key_writable(ctx, js, key)) {
+    if (!key_writable(ctx, js, key, nul)) {
         free(key);
         return JS_EXCEPTION;
     }
@@ -196,8 +218,15 @@ static int scan_cb(void *arg, const char *key, const uint8_t *val, size_t len) {
 
 static JSValue native_scan(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     jsrt *js = rt_of(ctx);
-    char *prefix = key_arg(ctx, argv[0]);
+    bool nul;
+    char *prefix = name_arg(ctx, argv[0], &nul);
     if (!prefix) return JS_EXCEPTION;
+
+    // no stored key holds U+0000, so a prefix that does covers none
+    if (nul) {
+        free(prefix);
+        return JS_NewArray(ctx);
+    }
     long type = type_arg(ctx, js, argv[1]);
     if (type < 0) {
         free(prefix);
@@ -231,9 +260,10 @@ static JSValue native_hash(JSContext *ctx, JSValueConst this_val, int argc, JSVa
 /* bootstrap's env: a variable the operator named, or "" for any other or an unset one */
 static JSValue native_env(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     jsrt *js = rt_of(ctx);
-    char *name = key_arg(ctx, argv[0]);
+    bool nul;
+    char *name = name_arg(ctx, argv[0], &nul);
     if (!name) return JS_EXCEPTION;
-    const char *v = strlist_has(&js->env_names, name) ? getenv(name) : NULL;
+    const char *v = !nul && strlist_has(&js->env_names, name) ? getenv(name) : NULL;
     free(name);
     return JS_NewString(ctx, v ? v : "");
 }
@@ -527,14 +557,20 @@ static int strings_of(jsrt *js, JSValueConst arr, strlist *out) {
     JS_FreeValue(ctx, lenv);
     for (int64_t i = 0; i < n; i++) {
         JSValue item = JS_GetPropertyUint32(ctx, arr, (uint32_t)i);
-        const char *s = JS_ToCString(ctx, item);
+        bool nul;
+        char *s = name_arg(ctx, item, &nul);
         JS_FreeValue(ctx, item);
+        if (s && nul) {
+            JS_ThrowTypeError(ctx, "a string beginning %s holds U+0000", s);
+            free(s);
+            s = NULL;
+        }
         if (!s) {
             capture_exception(js);
             return -1;
         }
         strlist_push(out, s);
-        JS_FreeCString(ctx, s);
+        free(s);
     }
     return 0;
 }
@@ -553,7 +589,8 @@ static int parse_outputs(jsrt *js, JSValue r, pc_result *out) {
         JSValue item = JS_GetPropertyUint32(ctx, r, (uint32_t)i);
         pc_item *pi = &out->items[out->n];
         JSValue sv = JS_GetPropertyStr(ctx, item, "stream");
-        pi->stream = JS_IsString(sv) ? key_arg(ctx, sv) : NULL;
+        bool nul = false;
+        pi->stream = JS_IsString(sv) ? name_arg(ctx, sv, &nul) : NULL;
         JS_FreeValue(ctx, sv);
         JSValue dv = JS_GetPropertyStr(ctx, item, "death");
         pi->death = JS_ToBool(ctx, dv) == 1;
@@ -563,6 +600,12 @@ static int parse_outputs(jsrt *js, JSValue r, pc_result *out) {
         JS_FreeValue(ctx, item);
         if (!pi->stream) {
             snprintf(js->err, sizeof js->err, "precommit item without a stream");
+            JS_FreeValue(ctx, r);
+            return -1;
+        }
+        if (nul) {
+            snprintf(js->err, sizeof js->err, "precommit emitted to a stream beginning %s, holding U+0000",
+                     pi->stream);
             JS_FreeValue(ctx, r);
             return -1;
         }
@@ -598,7 +641,9 @@ int js_precommit(jsrt *js, const char *id, JSValueConst data, JSValueConst princ
     JS_FreeValue(ctx, cmd);
     if (JS_IsException(r)) return -1;
     if (JS_IsString(r)) {
-        out->reason = key_arg(ctx, r);
+        // a reason is text to show, which a U+0000 in it ends
+        bool nul;
+        out->reason = name_arg(ctx, r, &nul);
         JS_FreeValue(ctx, r);
         return 0;
     }

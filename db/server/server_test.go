@@ -2002,6 +2002,40 @@ func TestStreamNamesFillTheirTemplates(t *testing.T) {
 	}
 }
 
+func TestKeysHoldNoControlCharacterOrLoneSurrogate(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+
+	// a key's terminal parameter may hold any other text, the empty string included
+	ok := []string{"b\U0001F600", "b\uFF0Cc", "b\u200Dc", "b\u00A0c", ""}
+	for i, id := range ok {
+		h.ack(admin, cmd(fmt.Sprintf("ok%d", i), "add-book", "id", id, "title", "T"))
+	}
+	records := h.snapshot(admin, "book").records
+	for _, id := range ok {
+		if _, found := records["book/book."+id]; !found {
+			t.Fatalf("book %q was not written", id)
+		}
+	}
+
+	// a key holding a control character or a lone surrogate is refused, and its command with it
+	bad := []string{"a\nb", "a\tb", "a\x7fb", "a\u0085b", "a\xed\xa0\x80b", "a\xed\xb0\x80b"}
+	for i, id := range bad {
+		o := h.commands(admin, cmd(fmt.Sprintf("bad%d", i), "add-book", "id", id, "title", "T"))[0]
+		if o.kind != "reject" || !strings.Contains(o.reason, "holds a control character or a lone surrogate") {
+			t.Fatalf("add-book %q: %+v", id, o)
+		}
+	}
+
+	// a key holding U+0000 is neither read short nor written: precommit's read of b1\x00x finds
+	// nothing although b1 is held, and the reducer's write is refused
+	h.ack(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
+	o := h.commands(admin, cmd("c2", "add-book", "id", "b1\x00x", "title", "Emma"))[0]
+	if o.kind != "reject" || !strings.Contains(o.reason, "a key beginning book/book.b1 holds U+0000") {
+		t.Fatalf("add-book with U+0000: %+v", o)
+	}
+}
+
 func TestAProductionBundleAnswersBugsWithInternalError(t *testing.T) {
 	h := startWith(t, t.Context(), Options{Bundle: filepath.Join("testdata", "bundle.prod.js")})
 	admin := h.admin()
