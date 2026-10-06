@@ -23,6 +23,15 @@ export type DbEvent<T> = {
     the bytes the server sent, and the whole wire pair `[env, data]` so parking it is a slice. */
 export type WireEvent = DbEvent<Uint8Array> & { raw: Uint8Array };
 
+/** A cancellation signal, as the Engine and its connectors use one: whether it has fired and why,
+    and a listener for when it does.  A browser's or Node's AbortSignal is one. */
+export interface Signal {
+  readonly aborted: boolean;
+  readonly reason: unknown;
+  addEventListener(type: 'abort', listener: () => void, options?: { once?: boolean }): void;
+  removeEventListener(type: 'abort', listener: () => void): void;
+}
+
 export type Backfill = {
   // what ref are we backfilling (stream name or prefix)
   ref: string;
@@ -42,7 +51,7 @@ export type Backfill = {
     tailDone: boolean;
   };
   // cancels this backfill alone; the connector's own signal cancels everything
-  signal: AbortSignal;
+  signal: Signal;
   // one call per delivery, resolved once the Engine has committed it
   push(item: BackfillItem): Promise<void>;
 };
@@ -98,7 +107,7 @@ export type ConnectorFactory = (
   since: number,
   view: string | null, // the Engine's stored view token; null to bootstrap
   wants: string[],
-  signal: AbortSignal,
+  signal: Signal,
   hooks: ConnectorHooks,
 ) => Connector;
 

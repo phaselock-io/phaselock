@@ -23,6 +23,7 @@ import {
   type Registry,
   type Rep,
   scanAll,
+  type Signal,
   type SliceReducer,
   type Store,
   storeTypeOf,
@@ -196,7 +197,7 @@ function newHold(): Hold {
   return { promise, resolve };
 }
 
-function raceAbort<T>(signal: AbortSignal, p: Promise<T>): Promise<T> {
+function raceAbort<T>(signal: Signal, p: Promise<T>): Promise<T> {
   if (signal.aborted) return Promise.reject(new Error('aborted'));
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => reject(new Error('aborted'));
@@ -220,7 +221,7 @@ export class FakeConn {
     public since: number,
     public view: string | null,
     public wants: string[],
-    public signal: AbortSignal,
+    public signal: Signal,
     public hooks: ConnectorHooks,
   ) {}
 }

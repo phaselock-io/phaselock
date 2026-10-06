@@ -8,6 +8,7 @@ import type {
   Connector,
   ConnectorFactory,
   ConnectorHooks,
+  Signal,
   WireEvent,
 } from './contract.js';
 import { be, decodeAny, utf8, Writer } from './msgpack.js';
@@ -57,12 +58,12 @@ export class HTTPConnector implements Connector {
     since: number,
     view: string | null,
     wants: string[],
-    signal: AbortSignal,
+    signal: Signal,
     hooks: ConnectorHooks,
   ) {
     this.#url = url;
     this.#token = token;
-    this.#signal = AbortSignal.any([signal, this.#stop.signal]);
+    this.#signal = AbortSignal.any([nativeSignal(signal), this.#stop.signal]);
     this.#hooks = hooks;
     void this.#run(since, view, wants);
   }
@@ -127,7 +128,7 @@ export class HTTPConnector implements Connector {
   async backfill(b: Backfill): Promise<BackfillOutcome> {
     // when one download fails the other is pointless
     const sibling = new AbortController();
-    const signal = AbortSignal.any([b.signal, sibling.signal]);
+    const signal = AbortSignal.any([nativeSignal(b.signal), sibling.signal]);
     const r = b.resume;
 
     // the snapshot half, unless a previous attempt finished it
@@ -355,6 +356,20 @@ export class HTTPConnector implements Connector {
     this.#end(code, e instanceof Error ? e.message : String(e));
     this.#stop.abort();
   }
+}
+
+/** The native AbortSignal behind a contract Signal, for fetch: the signal itself when the host's
+    AbortController made a native one, as a browser's or Node's does, else a native one that
+    follows it. */
+function nativeSignal(signal: Signal): AbortSignal {
+  if (signal instanceof AbortSignal) return signal;
+  const c = new AbortController();
+  if (signal.aborted) {
+    c.abort(signal.reason);
+  } else {
+    signal.addEventListener('abort', () => c.abort(signal.reason), { once: true });
+  }
+  return c.signal;
 }
 
 /** resolves after ms, or at once when the signal fires */

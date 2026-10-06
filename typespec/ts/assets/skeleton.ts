@@ -31,32 +31,75 @@ export function setdefault<T>(obj: Record<string, T>, key: string, dfault: T): T
 
 const NIBBLE = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'];
 
-// generateUuid is either injected into the environment or we expect to use crypto.getRandomValues()
-if (!(globalThis as any).generateUuid) {
-  // eslint-disable-next-line no-var -- we mean to mutate the global state in an if statement
-  var generateUuid = function (): string {
-    let out = '';
+/** A cancellation signal, as the Engine and its connectors use one: whether it has fired and why,
+    and a listener for when it does.  A browser's or Node's AbortSignal is one. */
+export interface Signal {
+  readonly aborted: boolean;
+  readonly reason: unknown;
+  addEventListener(type: 'abort', listener: () => void, options?: { once?: boolean }): void;
+  removeEventListener(type: 'abort', listener: () => void): void;
+}
 
-    // Get 128 bits of randomness.
-    const values = new Uint8Array(16);
-    crypto.getRandomValues(values);
+/** what makes a Signal and fires it, as an AbortController does */
+export type SignalController = { readonly signal: Signal; abort(reason?: unknown): void };
 
-    // rfc4122 compliance: type 4 uuid
-    values[6] = 0x40 | (values[6] & 0x0f);
-    values[8] = 0x80 | (values[8] & 0x3f);
+/** What the Engine needs from its host beyond ES2022, read from globalThis.  A browser and Node
+    provide all of it.  A host embedding a JS engine (QuickJS, goja, JavaScriptCore) installs it:
+    timers that run their callback on the JS thread; an AbortController whose signals, and those
+    AbortSignal.any combines, are of the host's own kind, for its connectors to use as they are,
+    each firing its abort listeners on the JS thread; and randomness for command ids, as
+    crypto.getRandomValues or a generateUuid of its own.  An Engine checks for them when built. */
+export type HostGlobals = {
+  setTimeout(callback: () => void, ms: number): unknown;
+  clearTimeout(timer: unknown): void;
+  AbortController: new () => SignalController;
+  AbortSignal: { any(signals: Signal[]): Signal };
+  crypto?: { getRandomValues(bytes: Uint8Array): Uint8Array };
+  generateUuid?: () => string;
+};
 
-    values.forEach((x) => {
-      out += NIBBLE[x >>> 4] + NIBBLE[x & 0x0f];
-    });
+const host = globalThis as unknown as HostGlobals;
 
-    return [
-      out.substring(0, 8),
-      out.substring(8, 12),
-      out.substring(12, 16),
-      out.substring(16, 20),
-      out.substring(20, 32),
-    ].join('-');
-  };
+// throw naming whatever of HostGlobals the host lacks
+function checkHost(): void {
+  const missing: string[] = [];
+  if (typeof host.setTimeout !== 'function') missing.push('setTimeout');
+  if (typeof host.clearTimeout !== 'function') missing.push('clearTimeout');
+  if (typeof host.AbortController !== 'function') missing.push('AbortController');
+  if (typeof host.AbortSignal?.any !== 'function') missing.push('AbortSignal.any');
+  if (
+    typeof host.generateUuid !== 'function' &&
+    typeof host.crypto?.getRandomValues !== 'function'
+  ) {
+    missing.push('crypto.getRandomValues or generateUuid');
+  }
+  if (missing.length > 0) {
+    throw new Error(`the host lacks what the Engine needs: ${missing.join(', ')}`);
+  }
+}
+
+// a fresh command id: the host's own uuid when it mints them, else a version 4 uuid from its
+// randomness
+function generateUuid(): string {
+  if (host.generateUuid !== undefined) return host.generateUuid();
+
+  // 128 random bits, marked as RFC 4122 version 4
+  const values = host.crypto!.getRandomValues(new Uint8Array(16));
+  values[6] = 0x40 | (values[6] & 0x0f);
+  values[8] = 0x80 | (values[8] & 0x3f);
+
+  // in hex, grouped 8-4-4-4-12
+  let out = '';
+  values.forEach((x) => {
+    out += NIBBLE[x >>> 4] + NIBBLE[x & 0x0f];
+  });
+  return [
+    out.substring(0, 8),
+    out.substring(8, 12),
+    out.substring(12, 16),
+    out.substring(16, 20),
+    out.substring(20, 32),
+  ].join('-');
 }
 
 // a value is a tree, so nothing legitimate nests this deep
@@ -2320,7 +2363,7 @@ export type Backfill = {
     tailDone: boolean;
   };
   // cancels this backfill alone; the connector's own signal cancels everything
-  signal: AbortSignal;
+  signal: Signal;
   // one call per delivery, resolved once the Engine has committed it
   push(item: BackfillItem): Promise<void>;
 };
@@ -2376,7 +2419,7 @@ export type ConnectorFactory = (
   since: number,
   view: string | null, // the Engine's stored view token; null to bootstrap
   wants: string[],
-  signal: AbortSignal,
+  signal: Signal,
   hooks: ConnectorHooks,
 ) => Connector;
 
@@ -2522,12 +2565,12 @@ export type BackfillRecord = {
 /** the in-memory side of a backfill: its record, written through, plus what the disk needs not */
 type BackfillEntry = {
   record: BackfillRecord;
-  controller: AbortController;
+  controller: SignalController;
   status: 'downloading' | 'ready';
   parent: string | null;
   // failed attempts in a row, for backoff, and the retry waiting to run
   attempts: number;
-  retryTimer: ReturnType<typeof setTimeout> | null;
+  retryTimer: unknown;
 };
 /** whether a wire ref covers a stream name or a narrower ref: a wildcard (`*`, `chat:*`,
     `chat:acme,*`) covers the names under the prefix before its star, and a name covers itself */
@@ -2638,7 +2681,7 @@ export class Engine<QX, C, N = never> {
   // rejection and forecasts nothing
   #forecaster: null | Forecaster<QX, C>;
   #wants: string[];
-  #signal: AbortSignal;
+  #signal: Signal;
 
   #overlay: Overlay;
   #graph: QueryGraph<QX>;
@@ -2652,9 +2695,9 @@ export class Engine<QX, C, N = never> {
   // the live connection: one connector per attempt, its lifetime (replaced as soon as it is
   // spent), and the backoff between attempts
   #connector: Connector | null = null;
-  #connectorAbort: AbortController = new AbortController();
+  #connectorAbort: SignalController;
   #attempt: number = 0;
-  #retryTimer: ReturnType<typeof setTimeout> | null = null;
+  #retryTimer: unknown = null;
   #connectNow: boolean = false;
 
   // the persisted state, held in memory and written through
@@ -2694,7 +2737,7 @@ export class Engine<QX, C, N = never> {
   #backfillOutcomes: {
     ref: string;
     outcome: BackfillOutcome | { failed: unknown };
-    conn: AbortController;
+    conn: SignalController;
   }[] = [];
   // how each sendCommands() call ended, with the ids it carried in order
   #commandOutcomes: { ids: string[]; results: CommandResult[] | { failed: unknown } }[] = [];
@@ -2721,12 +2764,13 @@ export class Engine<QX, C, N = never> {
       // earlier outbox commands leave
       forecaster?: Forecaster<QX, C>;
       // optional: ends the Engine, its connector, and every backfill
-      signal?: AbortSignal;
+      signal?: Signal;
       // optional: receives the error that ended the Engine; without it the error is thrown out
       // of the timer callback that ran the advancer
       onError?: (e: unknown) => void;
     },
   ) {
+    checkHost();
     this.#context = context;
     this.#store = store ?? new InMemStore(reg);
     this.#reg = reg;
@@ -2738,7 +2782,8 @@ export class Engine<QX, C, N = never> {
     }
     this.#wants = callbacks.wants;
     this.#forecaster = callbacks.forecaster ?? null;
-    this.#signal = callbacks.signal ?? new AbortController().signal;
+    this.#signal = callbacks.signal ?? new host.AbortController().signal;
+    this.#connectorAbort = new host.AbortController();
     this.#onError =
       callbacks.onError ??
       ((e) => {
@@ -2797,10 +2842,10 @@ export class Engine<QX, C, N = never> {
   #schedule(): void {
     if (this.#scheduled) return;
     this.#scheduled = true;
-    setTimeout(() => {
+    host.setTimeout(() => {
       this.#scheduled = false;
       this.#run();
-    });
+    }, 0);
   }
 
   // one run of the advancer; a throw out of it ends the Engine
@@ -2851,7 +2896,7 @@ export class Engine<QX, C, N = never> {
         const record = value as BackfillRecord;
         this.#backfills.set(key.slice('!backfill:'.length), {
           record,
-          controller: new AbortController(),
+          controller: new host.AbortController(),
           status: 'downloading',
           parent: null,
           attempts: 0,
@@ -3099,7 +3144,7 @@ export class Engine<QX, C, N = never> {
   #onConnect(): void {
     this.#connectNow = false;
     if (this.#retryTimer !== null) {
-      clearTimeout(this.#retryTimer);
+      host.clearTimeout(this.#retryTimer);
       this.#retryTimer = null;
     }
 
@@ -3249,7 +3294,7 @@ export class Engine<QX, C, N = never> {
           if (entry.controller.signal.aborted) continue;
           entry.status = 'downloading';
           const delay = backoffDelay(entry.attempts++);
-          entry.retryTimer = setTimeout(() => {
+          entry.retryTimer = host.setTimeout(() => {
             entry.retryTimer = null;
             // the entry may have gone, or the Engine, while the timer ran
             if (this.#backfills.get(ref) === entry && !this.#signal.aborted) {
@@ -3275,7 +3320,7 @@ export class Engine<QX, C, N = never> {
       ref,
       until: entry.record.until,
       resume: entry.record.resume,
-      signal: AbortSignal.any([conn.signal, entry.controller.signal]),
+      signal: host.AbortSignal.any([conn.signal, entry.controller.signal]),
       push: (item) =>
         new Promise<void>((resolve, reject) => {
           this.#backfillWork.push({ ref, item, resolve, reject });
@@ -3641,7 +3686,7 @@ export class Engine<QX, C, N = never> {
       txn.set(`!backfill:${ref}`, '.json', JS, record);
       this.#backfills.set(ref, {
         record,
-        controller: new AbortController(),
+        controller: new host.AbortController(),
         status: 'downloading',
         parent,
         attempts: 0,
@@ -3667,7 +3712,7 @@ export class Engine<QX, C, N = never> {
   #dropBackfillIn(txn: WTxn, ref: string): void {
     const entry = this.#backfills.get(ref)!;
     entry.controller.abort();
-    if (entry.retryTimer !== null) clearTimeout(entry.retryTimer);
+    if (entry.retryTimer !== null) host.clearTimeout(entry.retryTimer);
     txn.delPrefix(`!park-kv:${ref}!`);
     txn.del(`!backfill:${ref}`);
     txn.del(`!backfill-seqs:${ref}`);
@@ -4027,13 +4072,13 @@ export class Engine<QX, C, N = never> {
   #onEnd(): void {
     this.#connector = null;
     this.#connectorAbort.abort();
-    this.#connectorAbort = new AbortController();
+    this.#connectorAbort = new host.AbortController();
     this.#sent.clear();
     this.#live = false;
     this.#epoch = null;
 
     // the next attempt, after backoff
-    this.#retryTimer = setTimeout(() => {
+    this.#retryTimer = host.setTimeout(() => {
       this.#retryTimer = null;
       this.#schedule();
     }, backoffDelay(this.#attempt++));
@@ -4149,7 +4194,7 @@ export class Engine<QX, C, N = never> {
   // at the last commit
   #shutdown(): void {
     if (this.#retryTimer !== null) {
-      clearTimeout(this.#retryTimer);
+      host.clearTimeout(this.#retryTimer);
       this.#retryTimer = null;
     }
 
@@ -4157,7 +4202,7 @@ export class Engine<QX, C, N = never> {
     this.#connectorAbort.abort();
     this.#connector = null;
     for (const entry of this.#backfills.values()) {
-      if (entry.retryTimer !== null) clearTimeout(entry.retryTimer);
+      if (entry.retryTimer !== null) host.clearTimeout(entry.retryTimer);
     }
 
     // the pushes waiting for a transaction they will never get

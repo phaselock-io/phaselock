@@ -969,7 +969,7 @@ export class ${e.name} extends Engine<${txnType}, ${C}, ${N}> {
       // optional: forecast what the database will do with a command
       forecasters?: ${tableType};
       // optional: ends the Engine, its connector, and every backfill
-      signal?: AbortSignal;
+      signal?: Signal;
       // optional: receives the error that ended the Engine
       onError?: (e: unknown) => void;
     },
