@@ -70,9 +70,10 @@ export type BackfillOutcome = 'done' | 'stale';
 
 export interface Connector {
   backfill(backfill: Backfill): Promise<BackfillOutcome>;
-  // Calls are applied in call order, and a call that fails also fails every call behind it,
-  // unsent, so the Engine's outbox order survives a retry.  Within a call, array order.
-  sendCommand(commands: Command<Uint8Array>[]): Promise<CommandResult[]>;
+  // Calls are applied in call order, and within a call, array order.  A call that fails also
+  // fails every call behind it, unsent, and ends the connection, so the next connection's resend
+  // keeps the Engine's order.  Retrying before giving up is the connector's choice.
+  sendCommands(commands: Command<Uint8Array>[]): Promise<CommandResult[]>;
 }
 
 export interface ConnectorHooks {

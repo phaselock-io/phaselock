@@ -72,7 +72,7 @@ type SendCall = {
   reject: (e: unknown) => void;
 };
 
-/** take over the server's sendCommand: every call is recorded and answered by the test */
+/** take over the server's sendCommands: every call is recorded and answered by the test */
 function sendControl(server: FakeServer): SendCall[] {
   const calls: SendCall[] = [];
   server.onSend = (cmds) =>
@@ -112,12 +112,10 @@ async function freeze(r: Rig, position = 11): Promise<() => void> {
 }
 
 describe('outbox rows and sends', () => {
-  test('sendCommands writes padded ordinal rows holding the envelope and sends them in order', async () => {
+  test('sendCommand writes padded ordinal rows holding the envelope and sends them in order', async () => {
     const r = await held();
-    r.engine.sendCommands([
-      { field: 'a', value: 1 },
-      { field: 'b', value: 2 },
-    ]);
+    r.engine.sendCommand({ field: 'a', value: 1 });
+    r.engine.sendCommand({ field: 'b', value: 2 });
     await settle();
     const rows = outbox(r.data);
     expect(rows.map((x) => x.key)).toEqual([
@@ -141,7 +139,10 @@ describe('outbox rows and sends', () => {
   test('ack and dup release once the reduced position reaches them; reject and conflict at once', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    r.engine.sendCommands([{ field: 'a' }, { field: 'b' }, { field: 'c' }, { field: 'd' }]);
+    r.engine.sendCommand({ field: 'a' });
+    r.engine.sendCommand({ field: 'b' });
+    r.engine.sendCommand({ field: 'c' });
+    r.engine.sendCommand({ field: 'd' });
     await settle();
     calls[0].resolve([ack(15), dup(16), reject, conflict]);
     await settle();
@@ -158,7 +159,7 @@ describe('outbox rows and sends', () => {
   test('an event carrying the command id releases it when reduced, before the ack', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    r.engine.sendCommands([{ field: 'a' }]);
+    r.engine.sendCommand({ field: 'a' });
     await settle();
     const id = outbox(r.data)[0].id;
     r.server.events(ev('patron.p1', 3, 11, { type: 'set', field: 'a', value: 1 }, id));
@@ -172,22 +173,33 @@ describe('outbox rows and sends', () => {
     expect(state(r.data, 'patron.p1')).toEqual({ count: 2, fields: { a: 1 } });
   });
 
-  test('a failed sendCommand keeps the commands queued; the next connection flushes them in order in one call', async () => {
+  test("a failed call's commands wait for the connection's end; the next connection resends them in order in one call", async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    r.engine.sendCommands([{ field: 'a' }, { field: 'b' }]);
+    r.engine.sendCommand({ field: 'a' });
+    r.engine.sendCommand({ field: 'b' });
     await settle();
     calls[0].reject(new Error('500'));
     await settle();
     expect(outbox(r.data).length).toBe(2);
-    expect(r.server.sends.length).toBe(1);
+    // the connection has not ended yet, so a new command goes alone
+    r.engine.sendCommand({ field: 'c' });
+    await settle();
+    expect(r.server.sends.map((call) => call.map((c) => parse(c.data)))).toEqual([
+      [{ field: 'a' }, { field: 'b' }],
+      [{ field: 'c' }],
+    ]);
+    calls[1].reject(new Error('500'));
     r.server.end();
     r.engine.reconnectNow();
     await settle();
     expect(r.server.conns.length).toBe(2);
-    expect(r.server.sends.length).toBe(2);
-    expect(r.server.sends[1].map((c) => parse(c.data))).toEqual([{ field: 'a' }, { field: 'b' }]);
-    expect(calls.length).toBe(2);
+    expect(r.server.sends.length).toBe(3);
+    expect(r.server.sends[2].map((c) => parse(c.data))).toEqual([
+      { field: 'a' },
+      { field: 'b' },
+      { field: 'c' },
+    ]);
   });
 
   test('a row an earlier build wrote, unreadable now, is still sent as stored and forecasts nothing', async () => {
@@ -225,11 +237,12 @@ describe('outbox rows and sends', () => {
   test('a new connection flushes every command not acked, in ordinal order, in one call', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    r.engine.sendCommands([{ field: 'a' }]);
+    r.engine.sendCommand({ field: 'a' });
     await settle();
     calls[0].resolve([ack(500)]);
     await settle();
-    r.engine.sendCommands([{ field: 'b' }, { field: 'c' }]);
+    r.engine.sendCommand({ field: 'b' });
+    r.engine.sendCommand({ field: 'c' });
     await settle();
     expect(calls.length).toBe(2);
     // the connection ends with b and c unanswered; a is acked and waits for the cursor
@@ -244,7 +257,8 @@ describe('outbox rows and sends', () => {
   test('commands survive a restart in order and are flushed on connect; the next ordinal continues', async () => {
     const r = await held();
     sendControl(r.server);
-    r.engine.sendCommands([{ field: 'a' }, { field: 'b' }]);
+    r.engine.sendCommand({ field: 'a' });
+    r.engine.sendCommand({ field: 'b' });
     await settle();
     r.abort.abort();
     await settle();
@@ -256,7 +270,7 @@ describe('outbox rows and sends', () => {
     expect(server.sends.length).toBe(1);
     expect(server.sends[0].map((c) => parse(c.data))).toEqual([{ field: 'a' }, { field: 'b' }]);
     expect(calls.length).toBe(1);
-    r2.engine.sendCommands([{ field: 'c' }]);
+    r2.engine.sendCommand({ field: 'c' });
     await settle();
     expect(outbox(r2.data).map((x) => x.key)).toEqual([
       '/command.00000000000000000000',
@@ -268,7 +282,7 @@ describe('outbox rows and sends', () => {
   test('acks are memory only: acked before a crash, resent, dup at the same position, dropped the same way', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    r.engine.sendCommands([{ field: 'a' }]);
+    r.engine.sendCommand({ field: 'a' });
     await settle();
     calls[0].resolve([ack(15)]);
     await settle();
@@ -298,7 +312,8 @@ describe('forecasts', () => {
     const w = watch(r, 'patron.p1');
     await settle();
     expect(w.values).toEqual([{ count: 2, fields: {} }]);
-    r.engine.sendCommands([{ throws: true }, { field: 'a', value: 1 }]);
+    r.engine.sendCommand({ throws: true });
+    r.engine.sendCommand({ field: 'a', value: 1 });
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1 } });
     // a base change rebuilds the overlay over the new base, forecasts still on top
@@ -311,9 +326,9 @@ describe('forecasts', () => {
   test('forecasts run in outbox order, each reading the overlay the earlier ones left', async () => {
     const r = await held();
     const w = watch(r, 'patron.p1');
-    r.engine.sendCommands([{ field: 'a', value: 1 }]);
+    r.engine.sendCommand({ field: 'a', value: 1 });
     await settle();
-    r.engine.sendCommands([{ reads: true }]);
+    r.engine.sendCommand({ reads: true });
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1, seen: '{"a":1}' } });
   });
@@ -322,7 +337,8 @@ describe('forecasts', () => {
     const r = await held();
     const w = watch(r, 'patron.p1');
     await settle();
-    r.engine.sendCommands([{ reason: true }, { ghost: true }]);
+    r.engine.sendCommand({ reason: true });
+    r.engine.sendCommand({ ghost: true });
     await settle();
     expect(outbox(r.data).length).toBe(2);
     expect(w.values.at(-1)).toEqual({ count: 2, fields: {} });
@@ -333,7 +349,7 @@ describe('forecasts', () => {
     const r = await held();
     const w = watch(r, 'patron.p1');
     const calls = sendControl(r.server);
-    r.engine.sendCommands([{ field: 'a', value: 1 }]);
+    r.engine.sendCommand({ field: 'a', value: 1 });
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1 } });
     await freeze(r);
@@ -350,10 +366,8 @@ describe('the reduced position', () => {
     const r = await held();
     const w = watch(r, 'patron.p1');
     const calls = sendControl(r.server);
-    r.engine.sendCommands([
-      { field: 'a', value: 1 },
-      { field: 'b', value: 2 },
-    ]);
+    r.engine.sendCommand({ field: 'a', value: 1 });
+    r.engine.sendCommand({ field: 'b', value: 2 });
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1, b: 2 } });
     // p1 reduces at 11, then p2's gap at 12 freezes the rest of the atom
@@ -374,7 +388,7 @@ describe('the reduced position', () => {
     expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 20, reduced: 11 });
     expect(outbox(r.data).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
     // an ack at a position already reduced past releases at once, frozen or not
-    r.engine.sendCommands([{ field: 'c', value: 3 }]);
+    r.engine.sendCommand({ field: 'c', value: 3 });
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 3, fields: { b: 2, c: 3 } });
     calls[1].resolve([ack(5)]);
@@ -412,7 +426,8 @@ describe('the reduced position', () => {
     const r2 = rig({ data: r.data, server, forecaster });
     await settle();
     expect(server.conn.since).toBe(20);
-    r2.engine.sendCommands([{ field: 'a' }, { field: 'b' }]);
+    r2.engine.sendCommand({ field: 'a' });
+    r2.engine.sendCommand({ field: 'b' });
     await settle();
     calls[0].resolve([ack(11), ack(12)]);
     await settle();
@@ -425,7 +440,7 @@ describe('the reduced position', () => {
     const r = rig({ forecaster, server });
     await bootstrap(r, ['patron.*'], {});
     sendControl(server);
-    r.engine.sendCommands([{ field: 'a' }]);
+    r.engine.sendCommand({ field: 'a' });
     await settle();
     const id = outbox(r.data)[0].id;
     server.blobs.set('patron.*', {
@@ -443,7 +458,7 @@ describe('the reduced position', () => {
   test('the round trip is observed in the frozen walk', async () => {
     const r = await held();
     sendControl(r.server);
-    r.engine.sendCommands([{ field: 'a' }]);
+    r.engine.sendCommand({ field: 'a' });
     await settle();
     const id = outbox(r.data)[0].id;
     const unfreeze = await freeze(r);
@@ -461,7 +476,7 @@ describe('the reduced position', () => {
     const r = await held();
     const calls = sendControl(r.server);
     const unfreeze = await freeze(r);
-    r.engine.sendCommands([{ field: 'a' }]);
+    r.engine.sendCommand({ field: 'a' });
     await settle();
     calls[0].resolve([ack(15)]);
     r.server.vouch(15);
@@ -472,5 +487,204 @@ describe('the reduced position', () => {
     await settle();
     expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 15, reduced: 15 });
     expect(outbox(r.data)).toEqual([]);
+  });
+});
+
+/** a promise's outcome, observed as it happens without awaiting it */
+function track<T>(p: Promise<T>): { settled: boolean; value?: T; error?: unknown } {
+  const t: { settled: boolean; value?: T; error?: unknown } = { settled: false };
+  p.then(
+    (value) => Object.assign(t, { settled: true, value }),
+    (error: unknown) => Object.assign(t, { settled: true, error }),
+  );
+  return t;
+}
+
+describe('@online commands', () => {
+  test('one goes in a call of its own, behind the commands submitted before it and ahead of those after', async () => {
+    const r = await held();
+    const w = watch(r, 'patron.p1');
+    sendControl(r.server);
+    r.engine.sendCommand({ field: 'a' });
+    void r.engine.sendOnlineCommand({ field: 'x' });
+    r.engine.sendCommand({ field: 'b' });
+    await settle();
+    expect(r.server.sends.map((call) => call.map((c) => parse(c.data)))).toEqual([
+      [{ field: 'a' }],
+      [{ field: 'x' }],
+      [{ field: 'b' }],
+    ]);
+    // never persisted, never forecast
+    expect(outbox(r.data).map((x) => x.data)).toEqual([{ field: 'a' }, { field: 'b' }]);
+    expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1, b: 1 } });
+  });
+
+  test('after a reconnect it goes behind the resent outbox', async () => {
+    const r = await held();
+    const calls = sendControl(r.server);
+    r.engine.sendCommand({ field: 'a' });
+    await settle();
+    calls[0].reject(new Error('500'));
+    r.server.end();
+    await settle();
+    r.engine.sendCommand({ field: 'b' });
+    r.engine.reconnectNow();
+    await settle();
+    void r.engine.sendOnlineCommand({ field: 'x' });
+    await settle();
+    expect(r.server.sends.slice(1).map((call) => call.map((c) => parse(c.data)))).toEqual([
+      [{ field: 'a' }, { field: 'b' }],
+      [{ field: 'x' }],
+    ]);
+  });
+
+  test('a reject or a conflict settles it at once', async () => {
+    const r = await held();
+    const calls = sendControl(r.server);
+    const rejected = r.engine.sendOnlineCommand({ field: 'x' });
+    const conflicted = r.engine.sendOnlineCommand({ field: 'y' });
+    await settle();
+    calls[0].resolve([reject]);
+    calls[1].resolve([conflict]);
+    expect(await rejected).toEqual(reject);
+    expect(await conflicted).toEqual(conflict);
+  });
+
+  test('an ack settles on the round trip, once the queries show its event', async () => {
+    const r = await held();
+    const w = watch(r, 'patron.p1');
+    const calls = sendControl(r.server);
+    let shown: State | undefined;
+    const t = track(
+      r.engine.sendOnlineCommand({ field: 'x' }).finally(() => (shown = w.values.at(-1))),
+    );
+    await settle();
+    // the command also wrote past the event this client sees
+    calls[0].resolve([ack(12)]);
+    await settle();
+    expect(t.settled).toBe(false);
+    const id = r.server.sends[0][0].id;
+    r.server.events(ev('patron.p1', 3, 11, { type: 'set', field: 'x', value: 1 }, id));
+    await settle();
+    expect(t.value).toEqual(ack(12));
+    expect(shown).toEqual({ count: 2, fields: { x: 1 } });
+  });
+
+  test('an event carrying its id that arrives before the answer settles it on the answer', async () => {
+    const r = await held();
+    const calls = sendControl(r.server);
+    const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
+    await settle();
+    const id = r.server.sends[0][0].id;
+    r.server.events(ev('patron.p1', 3, 11, { type: 'set', field: 'x', value: 1 }, id));
+    await settle();
+    expect(t.settled).toBe(false);
+    calls[0].resolve([ack(12)]);
+    await settle();
+    expect(t.value).toEqual(ack(12));
+  });
+
+  test('an ack with no visible events settles once the base is reduced through its position', async () => {
+    const r = await held();
+    const calls = sendControl(r.server);
+    const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
+    await settle();
+    calls[0].resolve([ack(15)]);
+    r.server.vouch(14);
+    await settle();
+    expect(t.settled).toBe(false);
+    r.server.vouch(15);
+    await settle();
+    expect(t.value).toEqual(ack(15));
+  });
+
+  test('an acked command whose round trip is observed during a freeze settles at the unfreeze', async () => {
+    const r = await held();
+    const calls = sendControl(r.server);
+    const unfreeze = await freeze(r);
+    const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
+    await settle();
+    calls[0].resolve([ack(5)]);
+    await settle();
+    expect(t.settled).toBe(false);
+    unfreeze();
+    await settle();
+    expect(t.value).toEqual(ack(5));
+  });
+
+  test('with no connection it rejects at once, while outbox commands wait for the next one', async () => {
+    const r = await held();
+    r.server.end();
+    await settle();
+    r.engine.sendCommand({ field: 'a' });
+    const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
+    await settle();
+    expect((t.error as Error).message).toBe('no connection');
+    expect(outbox(r.data).map((x) => x.data)).toEqual([{ field: 'a' }]);
+    r.engine.reconnectNow();
+    await settle();
+    expect(r.server.sends.map((call) => call.map((c) => parse(c.data)))).toEqual([
+      [{ field: 'a' }],
+    ]);
+  });
+
+  test('a failed call rejects it, and it is never resent', async () => {
+    const r = await held();
+    const calls = sendControl(r.server);
+    r.engine.sendCommand({ field: 'a' });
+    const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
+    await settle();
+    const failure = new Error('500');
+    calls[0].reject(failure);
+    calls[1].reject(failure);
+    await settle();
+    expect(t.error).toBe(failure);
+    r.server.end();
+    r.engine.reconnectNow();
+    await settle();
+    expect(r.server.sends.slice(2).map((call) => call.map((c) => parse(c.data)))).toEqual([
+      [{ field: 'a' }],
+    ]);
+  });
+
+  test('a connection that ends after the ack leaves it waiting for the next connection to show the round trip', async () => {
+    const r = await held();
+    const calls = sendControl(r.server);
+    const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
+    await settle();
+    calls[0].resolve([ack(15)]);
+    await settle();
+    r.server.end();
+    await settle();
+    expect(t.settled).toBe(false);
+    r.engine.reconnectNow();
+    await settle();
+    expect(r.server.sends.length).toBe(1);
+    r.server.open();
+    r.server.live(15);
+    await settle();
+    expect(t.value).toEqual(ack(15));
+  });
+
+  test('the Engine ending rejects every one waiting, and one sent afterwards', async () => {
+    const r = await held();
+    const calls = sendControl(r.server);
+    const answered = track(r.engine.sendOnlineCommand({ field: 'x' }));
+    const inFlight = track(r.engine.sendOnlineCommand({ field: 'y' }));
+    await settle();
+    calls[0].resolve([ack(15)]);
+    await settle();
+    r.abort.abort();
+    await settle();
+    expect((answered.error as Error).message).toBe('engine shut down');
+    expect((inFlight.error as Error).message).toBe('engine shut down');
+    await expect(r.engine.sendOnlineCommand({ field: 'z' })).rejects.toThrow('engine ended');
+  });
+
+  test('a command that fails to convert ends the Engine and rejects with its error', async () => {
+    const r = await held();
+    const t = track(r.engine.sendOnlineCommand({ field: 'x', value: 1n }));
+    await expect(settle()).rejects.toThrow('BigInt');
+    expect((t.error as Error).message).toMatch('BigInt');
   });
 });

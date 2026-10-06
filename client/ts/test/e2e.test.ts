@@ -120,14 +120,14 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
     expect(epoch).toMatch(/^[0-9a-f]{32}$/);
 
     // commands: ack, ack, dup, reject
-    const res = await conn.sendCommand([
+    const res = await conn.sendCommands([
       { id: 'c1', data: encode({ type: 'add-patron', id: 'p1', name: 'Ann' }) },
       { id: 'c2', data: encode({ type: 'add-patron', id: 'p2', name: 'Bob' }) },
       { id: 'c1', data: encode({ type: 'add-patron', id: 'p1', name: 'Ann' }) },
       { id: 'c3', data: encode({ type: 'nope' }) },
     ]);
     expect(res.map((r) => r.kind)).toEqual(['ack', 'ack', 'dup', 'reject']);
-    const rename = await conn.sendCommand([
+    const rename = await conn.sendCommands([
       { id: 'c4', data: encode({ type: 'rename-patron', id: 'p1', name: 'Anne' }) },
     ]);
     expect(rename[0].kind).toBe('ack');
@@ -192,7 +192,7 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
     expect(back.values).toEqual([]);
 
     // stale: the position no longer matches after a write
-    await conn.sendCommand([
+    await conn.sendCommands([
       { id: 'c5', data: encode({ type: 'rename-patron', id: 'p2', name: 'Rob' }) },
     ]);
     const stale = await run(conn, 'patron.p1', cursor, {

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { decode, decodeMulti, encode } from '@msgpack/msgpack';
-import { NewHTTPConnector } from '../src/http.js';
+import { NewHTTPConnector, postCommand } from '../src/http.js';
 import type {
   Backfill,
   BackfillOutcome,
@@ -220,19 +220,32 @@ describe('the live stream', () => {
   });
 });
 
-describe('sendCommand', () => {
+describe('sendCommands', () => {
   let conn: Connector;
+  let stream: ReturnType<Stub['stream']>;
   let seen: string[];
-  let fail: boolean;
+  // how many requests fail, with what status; 0 destroys the socket instead of answering
+  let failures: number;
+  let failStatus: number;
+  let endStreamOnFirst: boolean;
+  let log: unknown[][];
   beforeEach(() => {
-    stub.stream();
+    stream = stub.stream();
     seen = [];
-    fail = false;
-    stub.routes.set('/commands', (_req, body, res) => {
+    failures = 0;
+    failStatus = 500;
+    endStreamOnFirst = false;
+    log = [];
+    stub.routes.set('/commands', (req, body, res) => {
       seen.push((decode(body) as [string, unknown])[0]);
-      if (fail) {
-        fail = false;
-        res.writeHead(500);
+      if (endStreamOnFirst && seen.length === 1) stream.end();
+      if (failures > 0) {
+        failures--;
+        if (failStatus === 0) {
+          req.socket.destroy();
+          return;
+        }
+        res.writeHead(failStatus);
         res.end('boom');
         return;
       }
@@ -248,10 +261,11 @@ describe('sendCommand', () => {
       null,
       ['*'],
       new AbortController().signal,
-      hooks([]),
+      hooks(log),
     );
   });
-  const send = (id: string) => conn.sendCommand([{ id, data: encode({ type: 'noop' }) }]);
+  const ends = () => log.filter((entry) => entry[0] === 'end');
+  const send = (id: string) => conn.sendCommands([{ id, data: encode({ type: 'noop' }) }]);
 
   test('calls are applied in call order even when the first is slow', async () => {
     const [a, b, c] = await Promise.all([send('a'), send('b'), send('c')]);
@@ -266,13 +280,48 @@ describe('sendCommand', () => {
     expect(decode(req.body)).toEqual(['a', { type: 'noop' }]);
   });
 
-  test('a failure fails every call queued behind it, unsent, and the queue recovers', async () => {
+  test('a 5xx is retried under the same ids, and the call succeeds', async () => {
+    failures = 1;
+    failStatus = 503;
+    expect((await send('a'))[0]).toEqual({ kind: 'ack', position: 2 });
+    expect(seen).toEqual(['a', 'a']);
+    expect(ends()).toEqual([]);
+  });
+
+  test('a failure that stands fails every call queued behind it, unsent, and ends the connection with its status', async () => {
     await send('a');
-    fail = true;
+    failures = Infinity;
     const results = await Promise.allSettled([send('b'), send('c'), send('d')]);
     expect(results.map((r) => r.status)).toEqual(['rejected', 'rejected', 'rejected']);
-    expect(seen).toEqual(['a', 'b']);
-    expect((await send('e'))[0]).toEqual({ kind: 'ack', position: 3 });
+    expect(seen).toEqual(['a', 'b', 'b', 'b', 'b']);
+    expect(ends()).toEqual([['end', 500, expect.stringContaining('commands: 500')]]);
+    await expect(send('e')).rejects.toThrow('the connection has ended');
+    expect(seen.length).toBe(5);
+  });
+
+  test('a 4xx is not retried', async () => {
+    failures = Infinity;
+    failStatus = 400;
+    await expect(send('a')).rejects.toThrow('commands: 400');
+    expect(seen).toEqual(['a']);
+    expect(ends()).toEqual([['end', 400, expect.stringContaining('commands: 400')]]);
+  });
+
+  test('a request that gets no response is retried, then ends the connection with code 0', async () => {
+    failures = Infinity;
+    failStatus = 0;
+    await expect(send('a')).rejects.toThrow();
+    expect(seen).toEqual(['a', 'a', 'a', 'a']);
+    expect(ends()).toEqual([['end', 0, expect.any(String)]]);
+  });
+
+  test('retries stop once the stream has ended', async () => {
+    failures = Infinity;
+    failStatus = 503;
+    endStreamOnFirst = true;
+    await expect(send('a')).rejects.toThrow('commands: 503');
+    expect(seen).toEqual(['a']);
+    expect(ends()).toEqual([['end', 0, 'stream closed']]);
   });
 
   test('every outcome kind, and several commands in one call', async () => {
@@ -292,13 +341,43 @@ describe('sendCommand', () => {
         ),
       );
     });
-    const r = await conn.sendCommand(['a', 'b', 'c', 'd'].map((id) => ({ id, data: encode({}) })));
+    const r = await conn.sendCommands(['a', 'b', 'c', 'd'].map((id) => ({ id, data: encode({}) })));
     expect(r).toEqual([
       { kind: 'ack', position: 10 },
       { kind: 'dup', position: 3 },
       { kind: 'reject', reason: 'no' },
       { kind: 'conflict', current: { 'patron.p1': 4 } },
     ]);
+  });
+});
+
+describe('postCommand', () => {
+  test('one command, with the token when given, answered with its outcome', async () => {
+    stub.routes.set('/commands', (_req, _body, res) => {
+      res.writeHead(200);
+      res.end(Buffer.from(encode([['reject', 'taken']])));
+    });
+    const command = { id: 'c1', data: encode({ type: 'create-account' }) };
+    expect(await postCommand(stub.url, command, 'jwt')).toEqual({
+      kind: 'reject',
+      reason: 'taken',
+    });
+    expect(await postCommand(stub.url, command)).toEqual({ kind: 'reject', reason: 'taken' });
+    const [signed, anonymous] = stub.requests;
+    expect(signed.headers.authorization).toBe('Bearer jwt');
+    expect(signed.headers['content-type']).toBe('application/msgpack');
+    expect(decode(signed.body)).toEqual(['c1', { type: 'create-account' }]);
+    expect(anonymous.headers.authorization).toBeUndefined();
+  });
+
+  test('a failed request rejects and is not retried', async () => {
+    stub.routes.set('/commands', (_req, _body, res) => {
+      res.writeHead(503);
+      res.end('busy');
+    });
+    const command = { id: 'c1', data: encode({}) };
+    await expect(postCommand(stub.url, command)).rejects.toThrow('commands: 503');
+    expect(stub.requests.length).toBe(1);
   });
 });
 

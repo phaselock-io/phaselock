@@ -279,7 +279,7 @@ describe('freeze and group land', () => {
     await settle();
     expect(w.values).toEqual([{ count: 2, fields: {} }]);
     const { release } = await freeze(r);
-    r.engine.sendCommands([{ field: 'x', value: 1 }]);
+    r.engine.sendCommand({ field: 'x', value: 1 });
     await settle();
     expect(w.values).toEqual([
       { count: 2, fields: {} },

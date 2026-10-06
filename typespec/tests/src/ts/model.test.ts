@@ -336,14 +336,14 @@ const SNIPPETS: Record<string, string> = {
     declare const add: AddItem;
     declare const leave: Leave;
 
-    writer.sendCommands([add]);
+    writer.sendCommand(add);
     // @ts-expect-error an @online command never enters the outbox
-    writer.sendCommands([leave]);
-    export const outcome: Promise<CommandResult> = writer.sendNow(leave);
+    writer.sendCommand(leave);
+    export const outcome: Promise<CommandResult> = writer.sendOnlineCommand(leave);
     // @ts-expect-error a command that is not @online goes through the outbox
-    void writer.sendNow(add);
+    void writer.sendOnlineCommand(add);
     // @ts-expect-error the reader engine sends no @online command
-    void reader.sendNow(leave);
+    void reader.sendOnlineCommand(leave);
 
     export const q: Query<Item | undefined> = writer.newQuery((txn) => txn.get.item('i1'));
   `,
@@ -815,7 +815,7 @@ describe('intake types', () => {
 });
 
 describe('sending commands', () => {
-  it('accepts @online commands only through sendNow and the rest only through sendCommands', () => {
+  it('accepts @online commands only through sendOnlineCommand and the rest only through sendCommand', () => {
     compiles('sending');
   });
 
@@ -874,7 +874,7 @@ describe('schema and bundle', () => {
     const rig = { server, engine, data: {}, abort };
     await bootstrap(rig as any, ['catalog'], { catalog: { position: 10, seqs: {}, values: [] } });
     const q = engine.newQuery((txn: any) => txn.get.item('i1'));
-    engine.sendCommands([{ type: 'add-item', id: 'i1', title: 'T', added }]);
+    engine.sendCommand({ type: 'add-item', id: 'i1', title: 'T', added });
     await settle();
     expect(q.latest).toEqual({ id: 'i1', title: 'T' });
     expect(errors).toEqual([]);

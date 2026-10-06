@@ -88,8 +88,11 @@ layout, build commands, and the test suite.
   shape that no command may carry.  A command with such a field gets `{Command}ForPrecommit`,
   with each field replaced by its result.  Outward-facing text says the database prepares the
   command for precommit; "intake" is an internal word.
-- **`@online` routing.**  The generated engine takes `@online` commands through `sendNow` and
-  every other command through `sendCommands`, and passing one to the other is a compile error.
+- **`@online` routing.**  The generated engine takes `@online` commands through
+  `sendOnlineCommand` and every other command through `sendCommand`, and passing one to the
+  other is a compile error.  An online command is a web form: sent once, behind every command
+  submitted before it, and never persisted, forecast, or resent.  Its promise settles on a reject
+  or conflict at once, and on an ack at the round trip, like an outbox command's release.
 - **Missing versus null.**  A get answers `undefined` for a missing key and `null` for a stored
   `null`, in every context and every language; a host whose language has one null needs a
   separate marker for missing.

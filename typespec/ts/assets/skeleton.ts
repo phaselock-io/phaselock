@@ -1513,9 +1513,10 @@ export type BackfillOutcome = 'done' | 'stale';
 
 export interface Connector {
   backfill(backfill: Backfill): Promise<BackfillOutcome>;
-  // Calls are applied in call order, and a call that fails also fails every call behind it,
-  // unsent, so the Engine's outbox order survives a retry.  Within a call, array order.
-  sendCommand(commands: Command<Uint8Array>[]): Promise<CommandResult[]>;
+  // Calls are applied in call order, and within a call, array order.  A call that fails also
+  // fails every call behind it, unsent, and ends the connection, so the next connection's resend
+  // keeps the Engine's order.  Retrying before giving up is the connector's choice.
+  sendCommands(commands: Command<Uint8Array>[]): Promise<CommandResult[]>;
 }
 
 export interface ConnectorHooks {
@@ -1629,7 +1630,7 @@ export type WireEvent = DbEvent<Uint8Array> & { raw: Uint8Array };
 
        E: fresh query results are delivered to the UI
 
-       F: UI submits new commands with Engine.sendCommands()
+       F: UI submits new commands with Engine.sendCommand()
 
        G: new commands trigger forecaster; forecasted events are reduced onto storage overlay
 
@@ -1703,6 +1704,21 @@ type BackfillWork = {
   item: BackfillItem;
   resolve: () => void;
   reject: (e: unknown) => void;
+};
+
+/** one command the app submitted: one for the outbox, or an @online one with its promise's
+    resolvers */
+type Submission<C, N> =
+  | { outbox: C }
+  | { online: N; resolve: (result: CommandResult) => void; reject: (e: unknown) => void };
+
+/** an @online command handed to a connector and not yet settled: its promise's resolvers, the
+    database's ack once it arrives, and whether an event carrying its id has been reduced */
+type OnlineCommand = {
+  resolve: (result: CommandResult) => void;
+  reject: (e: unknown) => void;
+  ack: { kind: 'ack' | 'dup'; position: number } | null;
+  seen: boolean;
 };
 
 /** the store key prefix a ref covers: everything for `*`, `family.` for a family, and the
@@ -1812,6 +1828,8 @@ export class Engine<QX, C, N = never> {
   // the position they landed at, waiting for the checkpoint to reach it
   #sent: Set<string> = new Set();
   #acked: Map<string, number> = new Map();
+  // @online commands handed to a connector and not yet settled, by id
+  #online: Map<string, OnlineCommand> = new Map();
   // set by a release inside a transaction, read by the refresh after its commit
   #outboxChanged: boolean = false;
   // how far the base has been reduced, -1 for never: the checkpoint, except while frozen, when it
@@ -1835,14 +1853,10 @@ export class Engine<QX, C, N = never> {
     outcome: BackfillOutcome | { failed: unknown };
     conn: AbortController;
   }[] = [];
-  // how each sendCommand() call ended, with the ids it carried in order, and on which connection
-  #commandOutcomes: {
-    ids: string[];
-    results: CommandResult[] | { failed: unknown };
-    conn: AbortController;
-  }[] = [];
+  // how each sendCommands() call ended, with the ids it carried in order
+  #commandOutcomes: { ids: string[]; results: CommandResult[] | { failed: unknown } }[] = [];
   // work received from the app
-  #sendCommands: C[] = [];
+  #submitted: Submission<C, N>[] = [];
   #newQueries: boolean = false;
   // every new connection resends the outbox
   #resend: boolean = false;
@@ -1898,17 +1912,28 @@ export class Engine<QX, C, N = never> {
 
   //// public api ////
 
-  /** After forecasting and saving to the outbox, commands are sent through the connector in
-      order.  Commands are given in rich format (Date, Maps, and Sets intact). */
-  sendCommands(commands: C[]): void {
-    this.#sendCommands.push(...commands);
+  /** After forecasting and saving to the outbox, the command is sent through the connector, in
+      order with every command submitted before it.  It is given in rich format (Date, Maps, and
+      Sets intact). */
+  sendCommand(command: C): void {
+    this.#submitted.push({ outbox: command });
     this.#schedule();
   }
 
-  /** The route for @online commands, which never enter the outbox and answer with their outcome.
-      Its runtime is not built yet, so every call rejects. */
-  sendNow(_command: N): Promise<CommandResult> {
-    return Promise.reject(new Error('sendNow is not built yet'));
+  /** Sends an @online command behind every command submitted before it, and settles with the
+      database's answer.  A reject or a conflict settles at once.  An ack settles on the round
+      trip, once the queries have run over the base the command's events reached.  It rejects when
+      there is no connection to send it on, when its call fails, and when the Engine ends.  It is
+      never persisted, forecast, or resent. */
+  sendOnlineCommand(command: N): Promise<CommandResult> {
+    return new Promise((resolve, reject) => {
+      if (this.#ended || this.#signal.aborted) {
+        reject(new Error('engine ended'));
+        return;
+      }
+      this.#submitted.push({ online: command, resolve, reject });
+      this.#schedule();
+    });
   }
 
   /** connect now rather than when the backoff timer fires */
@@ -1942,6 +1967,7 @@ export class Engine<QX, C, N = never> {
       this.#advancer();
     } catch (e: unknown) {
       this.#ended = true;
+      this.#rejectOnline(e);
       this.#onError(e);
     }
   }
@@ -2071,10 +2097,10 @@ export class Engine<QX, C, N = never> {
         return;
       }
 
-      if (this.#sendCommands.length > 0 || this.#resend) {
+      if (this.#submitted.length > 0 || this.#resend) {
         // the tightest loop we serve: write to the outbox, forecast, and the UI sees the
-        // optimistic update; then send through the connector in order
-        this.#onSendCommands();
+        // optimistic update; then send through the connector in submission order
+        this.#onSubmitted();
         continue;
       }
 
@@ -2124,57 +2150,94 @@ export class Engine<QX, C, N = never> {
     }
   }
 
-  // the app's new commands go into the outbox, and every outbox command not yet handed to this
-  // connection is sent in ordinal order
-  #onSendCommands(): void {
-    const fresh = this.#sendCommands.splice(0);
+  /* The app's submissions, sent in submission order.  A new connection first resends every outbox
+     command it has not been handed, in ordinal order.  Then each submission in turn: an outbox
+     command goes into the outbox and joins the current call, and an @online command goes in a
+     call of its own.  The connector fails every call behind a failed one, which keeps that order.
+     Without a connector the outbox waits for the next connection, and every @online command
+     rejects. */
+  #onSubmitted(): void {
+    const submitted = this.#submitted.splice(0);
     const connector = this.#connector;
+    const resend = this.#resend && connector !== null;
     this.#resend = false;
 
-    const wire = this.#store.write((txn) => {
-      // new commands are converted to wire bytes here, by the vocabulary that made them, and take
-      // the next ordinals
-      for (const data of fresh) {
-        const command: Command<Uint8Array> = {
-          id: generateUuid(),
-          data: this.#reg.convert(this.#reg.commands, data, JS, MSGPACK) as Uint8Array,
-        };
-        const ordinal = this.#nextOrdinal++;
-        txn.set(commandKey(ordinal), '.command', JS, command);
-        this.#outbox.set(command.id, ordinal);
-      }
+    // the calls in order: runs of outbox commands, and each @online command alone between them
+    const calls: { wire: Command<Uint8Array>[]; online: OnlineCommand | null }[] = [
+      { wire: [], online: null },
+    ];
+    let fresh = false;
+    try {
+      this.#store.write((txn) => {
+        // the resend goes first, rows on the wire as stored, whatever vocabulary wrote them
+        if (resend) {
+          const pending = [...this.#outbox]
+            .filter(([id]) => !this.#sent.has(id) && !this.#acked.has(id))
+            .sort((a, b) => a[1] - b[1]);
+          for (const [, ordinal] of pending) {
+            calls[0].wire.push(txn.get(commandKey(ordinal), '.command', JS) as Command<Uint8Array>);
+          }
+        }
 
-      // without a connector, the next connection resends
-      if (connector === null) return [];
-      const pending = [...this.#outbox]
-        .filter(([id]) => !this.#sent.has(id) && !this.#acked.has(id))
-        .sort((a, b) => a[1] - b[1]);
+        // each submission, converted to wire bytes here by the vocabulary that made it
+        for (const s of submitted) {
+          if ('online' in s) {
+            const data = this.#reg.convert(this.#reg.commands, s.online, JS, MSGPACK) as Uint8Array;
+            const online = { resolve: s.resolve, reject: s.reject, ack: null, seen: false };
+            calls.push(
+              { wire: [{ id: generateUuid(), data }], online },
+              { wire: [], online: null },
+            );
+            continue;
+          }
 
-      // rows go on the wire as stored, whatever vocabulary wrote them
-      const out: Command<Uint8Array>[] = [];
-      for (const [, ordinal] of pending) {
-        out.push(txn.get(commandKey(ordinal), '.command', JS) as Command<Uint8Array>);
-      }
-      return out;
-    });
-    if (fresh.length > 0) this.#outboxChanged = true;
+          // an outbox command takes the next ordinal
+          const command: Command<Uint8Array> = {
+            id: generateUuid(),
+            data: this.#reg.convert(this.#reg.commands, s.outbox, JS, MSGPACK) as Uint8Array,
+          };
+          const ordinal = this.#nextOrdinal++;
+          txn.set(commandKey(ordinal), '.command', JS, command);
+          this.#outbox.set(command.id, ordinal);
+          calls[calls.length - 1].wire.push(command);
+          fresh = true;
+        }
+      });
+    } catch (e: unknown) {
+      // the pass ends the Engine, and the @online commands taken from the queue reject with it
+      for (const s of submitted) if ('online' in s) s.reject(e);
+      throw e;
+    }
+    if (fresh) this.#outboxChanged = true;
     this.#refresh({});
-    if (wire.length === 0) return;
 
-    // the results come back through the outcomes, tagged with this connection
-    const ids = wire.map((c) => c.id);
-    const conn = this.#connectorAbort;
-    for (const id of ids) this.#sent.add(id);
-    connector!.sendCommand(wire).then(
-      (results) => {
-        this.#commandOutcomes.push({ ids, results, conn });
-        this.#schedule();
-      },
-      (e: unknown) => {
-        this.#commandOutcomes.push({ ids, results: { failed: e }, conn });
-        this.#schedule();
-      },
-    );
+    // no connection, so every @online command rejects at once
+    if (connector === null) {
+      const e = new Error('no connection');
+      for (const { online } of calls) online?.reject(e);
+      return;
+    }
+
+    // each call on this connection; the results come back through the outcomes
+    for (const { wire, online } of calls) {
+      if (wire.length === 0) continue;
+      const ids = wire.map((c) => c.id);
+      if (online !== null) {
+        this.#online.set(ids[0], online);
+      } else {
+        for (const id of ids) this.#sent.add(id);
+      }
+      connector.sendCommands(wire).then(
+        (results) => {
+          this.#commandOutcomes.push({ ids, results });
+          this.#schedule();
+        },
+        (e: unknown) => {
+          this.#commandOutcomes.push({ ids, results: { failed: e } });
+          this.#schedule();
+        },
+      );
+    }
   }
 
   #onNewQueries(): void {
@@ -2666,8 +2729,9 @@ export class Engine<QX, C, N = never> {
 
   /* One stream's run of events, in order, through its slice's reducer.  Births and deaths are the
      Engine's: a death drops the stream's keys, the stream stays known so a rebirth chains, and
-     neither reaches a reducer.  This is where events enter the base, so an event carrying an
-     outbox command's id is that command's round trip, whichever path parked or delivered it. */
+     neither reaches a reducer.  This is where events enter the base, so an event carrying the id
+     of an outbox or @online command is that command's round trip, whichever path parked or
+     delivered it. */
   #reduceStreamIn(
     txn: WTxn,
     stream: string,
@@ -2689,6 +2753,8 @@ export class Engine<QX, C, N = never> {
     for (const ev of events) {
       // our own command's event: the round trip is observed
       if (this.#outbox.has(ev.id)) this.#releaseIn(txn, [ev.id]);
+      const online = this.#online.get(ev.id);
+      if (online !== undefined) online.seen = true;
 
       const sys = sysOf(ev.data);
       if (sys === 'death') {
@@ -2905,8 +2971,9 @@ export class Engine<QX, C, N = never> {
     this.#advanceCursorIn(txn, last);
   }
 
-  // after a commit, the graph learns what changed and runs when live; base changes reach queries
-  // only when not frozen, outbox changes always, since forecasts are not base state
+  /* After a commit, the graph learns what changed and runs when live.  Base changes reach queries
+     only when not frozen, outbox changes always, since forecasts are not base state.  Then each
+     @online command whose round trip the queries now show settles. */
   #refresh(dirty: Record<string, true>, always = false): void {
     this.#graph.dirty(dirty);
     const outbox = this.#outboxChanged;
@@ -2915,6 +2982,27 @@ export class Engine<QX, C, N = never> {
     if (this.#live && (always || outbox || (changed && this.#replacing === 0))) {
       this.#rebuildOverlay();
     }
+    this.#settleOnline();
+  }
+
+  /* An acked @online command has made its round trip once an event carrying its id is reduced, or
+     the base is reduced through its ack's position.  Queries show the base only when live and not
+     frozen, so it settles then. */
+  #settleOnline(): void {
+    if (!this.#live || this.#replacing > 0) return;
+    for (const [id, online] of this.#online) {
+      if (online.ack === null) continue;
+      if (!online.seen && online.ack.position > this.#reduced) continue;
+      this.#online.delete(id);
+      online.resolve(online.ack);
+    }
+  }
+
+  // every @online command, queued or in flight, rejects with the reason the Engine ended
+  #rejectOnline(reason: unknown): void {
+    for (const s of this.#submitted) if ('online' in s) s.reject(reason);
+    for (const online of this.#online.values()) online.reject(reason);
+    this.#online.clear();
   }
 
   // a live event as the reducers see it; one that fails its schema is an error naming it, since
@@ -2973,17 +3061,21 @@ export class Engine<QX, C, N = never> {
     this.#advanceCursorIn(txn, position);
   }
 
-  // every queued sendCommand result, and one release for all of them
+  // every queued sendCommands result, and one release for all of them
   #onCommandOutcomes(): void {
     const drop: string[] = [];
     while (this.#commandOutcomes.length > 0) {
-      const { ids, results, conn } = this.#commandOutcomes.shift()!;
+      const { ids, results } = this.#commandOutcomes.shift()!;
 
-      // a failed call leaves its commands unsent for the next resend, unless the connection it
-      // was on has already ended, which resent them
+      /* A failed call rejects its @online command, which is never resent.  Its outbox commands
+         wait for the connection's end, which a failed call brings, and the next connection resends
+         them. */
       if ('failed' in results) {
-        if (conn === this.#connectorAbort) {
-          for (const id of ids) this.#sent.delete(id);
+        for (const id of ids) {
+          const online = this.#online.get(id);
+          if (online === undefined) continue;
+          this.#online.delete(id);
+          online.reject(results.failed);
         }
         continue;
       }
@@ -2991,6 +3083,19 @@ export class Engine<QX, C, N = never> {
       // answers count from any connection, they are the server's
       results.forEach((r, i) => {
         const id = ids[i];
+
+        // an @online command: a reject or a conflict settles it now, and an ack waits for the
+        // round trip, which the refresh after this commit may already find
+        const online = this.#online.get(id);
+        if (online !== undefined) {
+          if (r.kind === 'ack' || r.kind === 'dup') {
+            online.ack = r;
+          } else {
+            this.#online.delete(id);
+            online.resolve(r);
+          }
+          return;
+        }
 
         // a command already released, by its round trip or by an earlier answer to a resend
         if (!this.#outbox.has(id)) return;
@@ -3202,6 +3307,9 @@ export class Engine<QX, C, N = never> {
     const reason = new Error('engine shut down');
     for (const work of this.#backfillWork) work.reject(reason);
     this.#backfillWork = [];
+
+    // the @online commands, which can never settle now
+    this.#rejectOnline(reason);
   }
 }
 

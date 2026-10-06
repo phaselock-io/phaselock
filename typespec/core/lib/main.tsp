@@ -73,9 +73,10 @@ interface Queries {}
 extern dec command(target: Model, output: unknown);
 
 /**
- * Marks a command that only makes sense online: its UI waits on the ack, not on the round trip
- * through sync, so it is sent with `sendNow` and never queued in the outbox.  A command carrying a
- * field the database prepares for precommit, such as a `NewPassword`, must be `@online`.
+ * Marks a command that only makes sense online: its UI waits for the database's answer instead of
+ * a forecast, so it is sent once with `sendOnlineCommand` and never queued in the outbox.  A
+ * command carrying a field the database prepares for precommit, such as a `NewPassword`, must be
+ * `@online`.
  */
 extern dec online(target: Model);
 

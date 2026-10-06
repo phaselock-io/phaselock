@@ -51,7 +51,7 @@ describe('the reducer protocol', () => {
       reducers: { patron: recorder(calls, 'patron'), book: recorder(calls, 'book') },
     });
     await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
-    r.engine.sendCommands([{}]);
+    r.engine.sendCommand({});
     await settle();
     expect(calls).toContainEqual({ stream: 'patron.p2', pending: true });
     expect(calls).not.toContainEqual({ stream: 'patron.p2', pending: false });
@@ -74,12 +74,12 @@ describe('forecasts', () => {
     await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
     const p1 = watch(r, 'patron.p1');
     const p2 = watch(r, 'patron.p2');
-    r.engine.sendCommands([
-      { emit: [set('patron.p1', 'a')] },
-      // its event on patron.p2 is rolled back with the throw on patron.p1
-      { emit: [set('patron.p2', 'b'), { stream: 'patron.p1', event: { id: 'p1', type: 'boom' } }] },
-      { emit: [set('patron.p1', 'c')] },
-    ]);
+    r.engine.sendCommand({ emit: [set('patron.p1', 'a')] });
+    // its event on patron.p2 is rolled back with the throw on patron.p1
+    r.engine.sendCommand({
+      emit: [set('patron.p2', 'b'), { stream: 'patron.p1', event: { id: 'p1', type: 'boom' } }],
+    });
+    r.engine.sendCommand({ emit: [set('patron.p1', 'c')] });
     await settle();
     expect(p1.values.at(-1)).toEqual({ count: 2, fields: { a: 1, c: 1 } });
     expect(p2.values.at(-1)).toEqual({ count: 1, fields: {} });
@@ -89,12 +89,10 @@ describe('forecasts', () => {
     const r = rig({ forecaster });
     await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
     const p1 = watch(r, 'patron.p1');
-    r.engine.sendCommands([
-      { emit: [set('patron.p1', 'a'), set('patron.', 'b')] },
-      { emit: [set('patron.p1', 'c'), { stream: '', death: true }] },
-      { emit: [set('patron.p1', 'd'), set('ghost.g/1', 'e')] },
-      { emit: [set('patron.p1', 'f'), set('ghost.g~1', 'g')] },
-    ]);
+    r.engine.sendCommand({ emit: [set('patron.p1', 'a'), set('patron.', 'b')] });
+    r.engine.sendCommand({ emit: [set('patron.p1', 'c'), { stream: '', death: true }] });
+    r.engine.sendCommand({ emit: [set('patron.p1', 'd'), set('ghost.g/1', 'e')] });
+    r.engine.sendCommand({ emit: [set('patron.p1', 'f'), set('ghost.g~1', 'g')] });
     await settle();
     expect(p1.values.at(-1)).toEqual({ count: 2, fields: { f: 1 } });
   });
@@ -103,7 +101,7 @@ describe('forecasts', () => {
     const r = rig({ forecaster });
     await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
     const p1 = watch(r, 'patron.p1');
-    r.engine.sendCommands([{ emit: [{ stream: 'patron.p1', death: true }] }]);
+    r.engine.sendCommand({ emit: [{ stream: 'patron.p1', death: true }] });
     await settle();
     expect(p1.values.at(-1)).toBeUndefined();
     expect(state(r.data, 'patron.p1')).toEqual({ count: 2, fields: {} });

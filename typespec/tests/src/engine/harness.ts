@@ -224,9 +224,9 @@ export class FakeServer {
   blobs = new Map<string, Blob>();
   /** every backfill() call, in order */
   backfills: BackfillCall[] = [];
-  /** every sendCommand() call, in order */
+  /** every sendCommands() call, in order */
   sends: Command<Uint8Array>[][] = [];
-  /** what sendCommand answers; the default acks each command at a new position */
+  /** what sendCommands answers; the default acks each command at a new position */
   onSend: (cmds: Command<Uint8Array>[]) => Promise<CommandResult[]> = (cmds) =>
     Promise.resolve(cmds.map(() => ({ kind: 'ack' as const, position: this.nextAckPosition++ })));
   nextAckPosition = 1000;
@@ -247,7 +247,7 @@ export class FakeServer {
     const server = this;
     const connector: Connector = {
       backfill: (b) => server.#backfill(conn, b),
-      sendCommand: (cmds) => {
+      sendCommands: (cmds) => {
         server.sends.push(cmds);
         return raceAbort(signal, server.onSend(cmds));
       },
@@ -368,7 +368,7 @@ export type Forecaster = EngineForecaster<ReadTxn, unknown>;
 export type Rig = {
   server: FakeServer;
   data: Record<string, unknown>;
-  engine: Engine<ReadTxn, unknown>;
+  engine: Engine<ReadTxn, unknown, unknown>;
   abort: AbortController;
 };
 
@@ -386,7 +386,7 @@ export function rig(
   const server = opts.server ?? new FakeServer();
   const data = opts.data ?? {};
   const abort = new AbortController();
-  const engine = new Engine<ReadTxn, unknown>(
+  const engine = new Engine<ReadTxn, unknown, unknown>(
     (txn) => txn,
     new InMemStore(registry, data),
     registry,

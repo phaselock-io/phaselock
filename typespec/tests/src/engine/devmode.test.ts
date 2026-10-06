@@ -57,7 +57,7 @@ describe('dev mode', () => {
     await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
     const { values } = watch(r, 'patron.p1');
     await settle();
-    r.engine.sendCommands([{}]);
+    r.engine.sendCommand({});
     await settle();
     expect(values).toEqual([{ count: 2, fields: { tags: ['a'] } }]);
   });

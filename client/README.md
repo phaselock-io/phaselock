@@ -180,7 +180,7 @@ export type BackfillOutcome = 'done' | 'stale';
 
 export interface Connector {
   backfill(backfill: Backfill): Promise<BackfillOutcome>;
-  sendCommand(commands: Command<Uint8Array>[]): Promise<CommandResult[]>;
+  sendCommands(commands: Command<Uint8Array>[]): Promise<CommandResult[]>;
 }
 ```
 
@@ -269,19 +269,25 @@ export type CommandResult =
   | { kind: 'conflict'; current: Record<string, number> };
 ```
 
-`sendCommand` mirrors the wire outcomes one for one.  `expect` has no
+`sendCommands` mirrors the wire outcomes one for one.  `expect` has no
 place on `Command` yet.
 
 **Ordering is the connector's guarantee.**  Calls are applied in call
-order, and a call that fails also fails every call behind it, unsent,
-so the Engine's outbox order survives a retry; within a call, array
-order.  The Engine writes to that rule without awaiting between calls.
-How a connector delivers it is its own business: the HTTP connector
+order, and within a call, array order.  A call that fails also fails
+every call behind it, unsent, and ends the connection, so the next
+connection's resend keeps the Engine's outbox order.  Retrying before
+giving up is the connector's choice.  The HTTP connector retries a
+failure that may not recur, a network failure or a 5xx, a few times
+within a second under the same ids, which dedup makes safe; a 4xx
+stands at once.  Then it gives up with the response's status as the
+end code, and the Engine's reconnect with backoff takes over.  The
+Engine writes to that rule without awaiting between calls.  How a
+connector delivers it is its own business: the HTTP connector
 serializes, one request in flight, because two requests have no
 ordering between them; a WebSocket connector sends every call down its
 one ordered stream at once and matches replies to calls, so the Engine
-gets pipelining wherever the transport can give it.  Batching stays the
-Engine's lever, since one call is one request.
+gets pipelining wherever the transport can give it.  Batching stays
+the Engine's lever, since one call is one request.
 
 ## What the Engine does with all this
 

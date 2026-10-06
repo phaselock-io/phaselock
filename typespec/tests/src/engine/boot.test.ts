@@ -238,7 +238,7 @@ describe('boot', () => {
     await settle();
     expect(r.server.sends.length).toBe(1);
     expect(r.server.sends[0].map((c) => c.id)).toEqual(['c3', 'c5', 'c10']);
-    r.engine.sendCommands([{ type: 'bump', id: 'p2' }]);
+    r.engine.sendCommand({ type: 'bump', id: 'p2' });
     await settle();
     expect(keys(r.data, '/command.')).toEqual([
       commandKey(3),
@@ -262,13 +262,13 @@ describe('boot', () => {
     // an ack above the restored reduced position waits
     r.server.onSend = (cmds) =>
       Promise.resolve(cmds.map(() => ({ kind: 'ack' as const, position: 35 })));
-    r.engine.sendCommands([{ type: 'bump', id: 'p1' }]);
+    r.engine.sendCommand({ type: 'bump', id: 'p1' });
     await settle();
     expect(keys(r.data, '/command.').length).toBe(1);
     // one at it releases at once
     r.server.onSend = (cmds) =>
       Promise.resolve(cmds.map(() => ({ kind: 'ack' as const, position: 30 })));
-    r.engine.sendCommands([{ type: 'noop', id: 'p1' }]);
+    r.engine.sendCommand({ type: 'noop', id: 'p1' });
     await settle();
     expect(r.server.sends.length).toBe(2);
     expect(keys(r.data, '/command.').length).toBe(1);

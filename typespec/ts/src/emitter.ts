@@ -873,7 +873,7 @@ function generateEngine(d: Denter, annos: Annos, registry: PTypeRegistry, e: PEn
     },
   );
 
-  // the commands sendCommands takes, and those sendNow takes
+  // the commands sendCommand takes, and those sendOnlineCommand takes
   const C =
     offline.length === 0
       ? 'never'

@@ -42,7 +42,7 @@ function recording(): { server: FakeServer; backfills: Backfill[] } {
         backfills.push(b);
         return c.backfill(b);
       },
-      sendCommand: (cmds) => c.sendCommand(cmds),
+      sendCommands: (cmds) => c.sendCommands(cmds),
     };
   };
   return { server, backfills };

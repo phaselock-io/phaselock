@@ -22,6 +22,10 @@ const pageSize = 1000;
 const batchRecords = 1000;
 const batchBytes = 256 * 1024;
 const maxRecord = 16 * 1024 * 1024;
+// a send that fails for a reason that may not recur is tried again this many times, waiting
+// this long before the first retry and twice as long before each one after
+const sendRetries = 3;
+const sendRetryDelay = 100;
 
 type BlobHeader = { position: number; streams: Record<string, number> };
 
@@ -35,8 +39,11 @@ export class HTTPConnector implements Connector {
   #signal: AbortSignal;
   #hooks: ConnectorHooks;
   #ended = false;
-  // the send queue: one call in flight, and a failure rejects every call queued at that moment
-  // without sending it; calls made afterwards start on an empty queue
+  // ends the connection from inside, when a send fails
+  #stop = new AbortController();
+  // the send queue: one call in flight, retried a few times when its failure may not recur, and
+  // a failure that stands rejects every call queued at that moment without sending it and ends
+  // the connection, after which every call rejects
   #sends: {
     commands: Command<Uint8Array>[];
     resolve: (r: CommandResult[]) => void;
@@ -55,7 +62,7 @@ export class HTTPConnector implements Connector {
   ) {
     this.#url = url;
     this.#token = token;
-    this.#signal = signal;
+    this.#signal = AbortSignal.any([signal, this.#stop.signal]);
     this.#hooks = hooks;
     void this.#run(since, view, wants);
   }
@@ -296,8 +303,12 @@ export class HTTPConnector implements Connector {
     }
   }
 
-  sendCommand(commands: Command<Uint8Array>[]): Promise<CommandResult[]> {
+  sendCommands(commands: Command<Uint8Array>[]): Promise<CommandResult[]> {
     return new Promise((resolve, reject) => {
+      if (this.#ended) {
+        reject(new Error('commands: the connection has ended'));
+        return;
+      }
       this.#sends.push({ commands, resolve, reject });
       void this.#pump();
     });
@@ -314,41 +325,119 @@ export class HTTPConnector implements Connector {
       } catch (e: unknown) {
         next.reject(e);
         for (const behind of this.#sends.splice(0)) behind.reject(e);
+        this.#failed(e);
       }
     }
     this.#sending = false;
   }
 
+  /* One call, as up to one request plus the retries.  A retry repeats the request under the same
+     ids, which the database's dedup makes safe: a command the first attempt committed answers dup.
+     A 4xx answer is the client's own doing and stands at once; so does any failure once the
+     stream has ended or the connection was aborted, since the next connection resends. */
   async #post(commands: Command<Uint8Array>[]): Promise<CommandResult[]> {
-    const w = new Writer();
-    for (const c of commands) {
-      w.arrayHeader(2);
-      w.str(c.id);
-      w.raw(c.data);
-    }
-    const resp = await fetch(`${this.#url}/commands`, {
-      method: 'POST',
-      signal: this.#signal,
-      headers: this.#headers({ 'Content-Type': 'application/msgpack' }),
-      body: w.bytes(),
-    });
-    if (resp.status !== 200) throw new Error(`commands: ${resp.status} ${resp.statusText}`);
-    const outcomes = decodeAny(new Uint8Array(await resp.arrayBuffer())) as unknown[][];
-    return outcomes.map((o): CommandResult => {
-      switch (o[0]) {
-        case 'ack':
-          return { kind: 'ack', position: o[1] as number };
-        case 'dup':
-          return { kind: 'dup', position: o[1] as number };
-        case 'reject':
-          return { kind: 'reject', reason: o[1] as string };
-        case 'conflict':
-          return { kind: 'conflict', current: o[1] as Record<string, number> };
-        default:
-          throw new Error(`unknown command outcome ${String(o[0])}`);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await postCommands(this.#url, this.#headers(), commands, this.#signal);
+      } catch (e: unknown) {
+        const clientError = e instanceof StatusError && e.status >= 400 && e.status < 500;
+        if (attempt === sendRetries || clientError || this.#ended || this.#signal.aborted) throw e;
+        await sleep(sendRetryDelay * 2 ** attempt, this.#signal);
+        if (this.#ended) throw e;
       }
-    });
+    }
   }
+
+  // a send that failed ends the connection: the one onEnd carries the response's status, or 0
+  // when no response arrived, and the stream stops
+  #failed(e: unknown): void {
+    const code = e instanceof StatusError ? e.status : 0;
+    this.#end(code, e instanceof Error ? e.message : String(e));
+    this.#stop.abort();
+  }
+}
+
+/** resolves after ms, or at once when the signal fires */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/** a /commands response whose status answers no command */
+class StatusError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+/* One POST of commands, answered with their outcomes in order.  Any status but 200 rejects, since
+   such a response answers no command. */
+async function postCommands(
+  url: string,
+  headers: Record<string, string>,
+  commands: Command<Uint8Array>[],
+  signal?: AbortSignal,
+): Promise<CommandResult[]> {
+  const w = new Writer();
+  for (const c of commands) {
+    w.arrayHeader(2);
+    w.str(c.id);
+    w.raw(c.data);
+  }
+  const resp = await fetch(`${url}/commands`, {
+    method: 'POST',
+    signal,
+    headers: { ...headers, 'Content-Type': 'application/msgpack' },
+    body: w.bytes(),
+  });
+  if (resp.status !== 200) {
+    throw new StatusError(resp.status, `commands: ${resp.status} ${resp.statusText}`);
+  }
+  const outcomes = decodeAny(new Uint8Array(await resp.arrayBuffer())) as unknown[][];
+  return outcomes.map((o): CommandResult => {
+    switch (o[0]) {
+      case 'ack':
+        return { kind: 'ack', position: o[1] as number };
+      case 'dup':
+        return { kind: 'dup', position: o[1] as number };
+      case 'reject':
+        return { kind: 'reject', reason: o[1] as string };
+      case 'conflict':
+        return { kind: 'conflict', current: o[1] as Record<string, number> };
+      default:
+        throw new Error(`unknown command outcome ${String(o[0])}`);
+    }
+  });
+}
+
+/** Sends one command outside any Engine, such as one that creates an account before there is a
+    token to connect with, and answers with its outcome.  The command is the wire envelope: an id
+    the caller mints and the command's wire bytes.  The token is null for an anonymous request.  A
+    failed request rejects, and nothing is retried. */
+export async function postCommand(
+  url: string,
+  command: Command<Uint8Array>,
+  token: string | null = null,
+): Promise<CommandResult> {
+  const headers: Record<string, string> =
+    token === null ? {} : { Authorization: `Bearer ${token}` };
+  const [result] = await postCommands(url, headers, [command]);
+  return result;
 }
 
 export function NewHTTPConnector(url: string, token: TokenSource = () => null): ConnectorFactory {
