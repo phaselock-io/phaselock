@@ -1,9 +1,10 @@
-/* Stream names and keys against their slice's templates.  A template is a name, then one
-   ".{param}" segment per parameter.  A parameter the template ends with is terminal and holds
-   the rest of the string; every other parameter is a segment, a non-empty run of
-   A-Z a-z 0-9 _ -.  A stream name's terminal parameter is non-empty and may also hold '.' and
-   '~'; a local key's may hold anything a key may, the empty string included.  No key holds a
-   control character (U+0000-001F, U+007F-009F) or a lone surrogate. */
+/* Stream names and keys against their slice's templates.  A template is a name, then, if it has
+   parameters, ":{param}" and ",{param}" for each further one: "chat:{org},{channel}",
+   "post:{id}", "meta".  A parameter the template ends with is terminal and holds the rest of the
+   string; every other parameter is a segment, a non-empty run of A-Z a-z 0-9 _ -.  A stream
+   name's terminal parameter is non-empty and may also hold '.' and '~'; a local key's may hold
+   anything a key may, the empty string included.  No key holds a control character
+   (U+0000-001F, U+007F-009F) or a lone surrogate. */
 
 #include "internal.h"
 
@@ -24,13 +25,13 @@ static bool segment_char(char c) {
 typedef enum { AS_STREAM, AS_KEY, AS_PREFIX } fill_as;
 
 /* Whether s fills tpl: the template's literal text exactly, and a value per parameter.  As a
-   prefix, s fills tpl when it ends at the dot before a parameter, every parameter before it
-   filled, so "chat" and "chat.acme" are prefixes of "chat.{org}.{channel}" and
-   "chat.acme.general" is not. */
+   prefix, s fills tpl when it ends at the separator before a parameter, every parameter before
+   it filled, so "chat:" and "chat:acme," are prefixes of "chat:{org},{channel}" and "chat:ac"
+   and "chat:acme,general" are not. */
 static bool fills(const char *tpl, const char *s, fill_as as) {
     while (*tpl) {
-        // a prefix may end at the dot before any parameter
-        if (as == AS_PREFIX && !*s && tpl[0] == '.' && tpl[1] == '{') return true;
+        // a prefix may end at the separator before any parameter
+        if (as == AS_PREFIX && !*s && tpl[0] == '{') return true;
 
         // literal text matches itself
         if (*tpl != '{') {
@@ -61,10 +62,10 @@ static bool fills(const char *tpl, const char *s, fill_as as) {
     return as != AS_PREFIX && !*s;
 }
 
-/* the length of a name's first segment, its family or its key name */
+/* the length of a name's first segment, its family or its key name, which ends at its ':' */
 static size_t first_segment(const char *s) {
-    const char *dot = strchr(s, '.');
-    return dot ? (size_t)(dot - s) : strlen(s);
+    const char *colon = strchr(s, ':');
+    return colon ? (size_t)(colon - s) : strlen(s);
 }
 
 const slice_names *slice_of(const jsrt *js, const char *stream) {

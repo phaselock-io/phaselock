@@ -166,8 +166,8 @@ interface DemoSlice
     "demo",
     Events,
     {
-      `plain.{id}`: Plain;
-      `timed.{id}`: Timed;
+      `plain:{id}`: Plain;
+      `timed:{id}`: Timed;
     }
   > {}
 

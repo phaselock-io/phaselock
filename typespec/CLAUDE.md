@@ -7,13 +7,21 @@ layout, build commands, and the test suite.
 ## Design decisions
 
 - **Declaration style: interface templates.**
-  `interface PatronSlice extends Slice<"patron.{patron}", PatronEvents, {"patron": Patron}> {}`,
+  `interface PatronSlice extends Slice<"patron:{patron}", PatronEvents, {"patron": Patron}> {}`,
   `interface UserEngine extends Engine<[BookSlice, PatronSlice], UserCommands> {}`, and
   `interface LibraryDB extends Database<[UserEngine, AdminEngine], [LoginSlice], DbCommands> {}`.
   Quoted property names carry key templates directly, lists are tuple template params
   (templates have no varargs), and interfaces don't pollute the data-type space.  Lowering
   discovers them via `sourceInterfaces` + `templateMapper.args` (unwrapping `Indeterminate`
   entities — model expressions and tuple literals arrive as type-or-value).
+- **Stream names and keys sort in tuple order.**  A template is a name, then optionally
+  `:{param}` and `,{param}` for each further one (`chat:{org},{channel}`, `reply:{thread},{id}`,
+  `meta`); a store key is `{stream}!{local key}`, its stream everything before the first `!`.
+  Keys compare in code-point order, and each separator sorts below every character the
+  parameter before it may hold (`,` below `-`, `!` below everything), so a walk visits a family's
+  streams and a template's keys in the order of their parameters (`gen` before `gen-2`).  Wire
+  refs are a stream name, `chat:*` or `chat:acme,*` (whole leading parameters only), or `*`;
+  maySee returns them with an exact stream terminated, `name!`, so a bare name is malformed.
 - **Queries are interfaces too**: `interface AdminQueries extends Queries { allPatrons(): AdminPatronInfo[]; }`
   declares a typed query contract — a message contract only, binding no store (which store backs
   an implementation is the implementation's business).  Lowering collects them as `PQueries`

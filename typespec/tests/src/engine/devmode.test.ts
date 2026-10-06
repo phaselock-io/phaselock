@@ -16,8 +16,8 @@ import {
 
 const patrons: Blob = {
   position: 10,
-  seqs: { 'patron.p1': 2 },
-  values: [['patron.p1/state', { count: 2, fields: { tags: ['a'] } }]],
+  seqs: { 'patron:p1': 2 },
+  values: [['patron:p1!state', { count: 2, fields: { tags: ['a'] } }]],
 };
 
 describe('dev mode', () => {
@@ -27,22 +27,22 @@ describe('dev mode', () => {
 
   test('a query result is read-only, and the throw names the key and the property', async () => {
     const r = rig();
-    await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
-    const { values } = watch(r, 'patron.p1');
+    await bootstrap(r, ['patron:*'], { 'patron:*': patrons });
+    const { values } = watch(r, 'patron:p1');
     await settle();
     const v = values[0]!;
     const fields = v.fields as { tags: string[] };
     expect(v).toEqual({ count: 2, fields: { tags: ['a'] } });
     expect(() => {
       v.count = 3;
-    }).toThrow('patron.p1/state.count is read-only: set');
+    }).toThrow('patron:p1!state.count is read-only: set');
     expect(() => {
       fields.tags = [];
-    }).toThrow('patron.p1/state.fields.tags is read-only: set');
-    expect(() => fields.tags.push('b')).toThrow('patron.p1/state.fields.tags is read-only: push');
+    }).toThrow('patron:p1!state.fields.tags is read-only: set');
+    expect(() => fields.tags.push('b')).toThrow('patron:p1!state.fields.tags is read-only: push');
     expect(() => {
       delete (v.fields as Record<string, unknown>).tags;
-    }).toThrow('patron.p1/state.fields.tags is read-only: delete');
+    }).toThrow('patron:p1!state.fields.tags is read-only: delete');
     // reading is unaffected
     expect(fields.tags.map((t) => t.toUpperCase())).toEqual(['A']);
     expect(fields.tags.length).toBe(1);
@@ -50,12 +50,12 @@ describe('dev mode', () => {
 
   test('a forecast that mutates what it read throws, so it forecasts nothing', async () => {
     const forecaster: Forecaster = (qx) => {
-      (qx.get('patron.p1/state', 'state') as State).count++;
-      return [{ stream: 'patron.p1', event: { id: 'p1', type: 'bump' } }];
+      (qx.get('patron:p1!state', 'state') as State).count++;
+      return [{ stream: 'patron:p1', event: { id: 'p1', type: 'bump' } }];
     };
     const r = rig({ forecaster });
-    await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
-    const { values } = watch(r, 'patron.p1');
+    await bootstrap(r, ['patron:*'], { 'patron:*': patrons });
+    const { values } = watch(r, 'patron:p1');
     await settle();
     r.engine.sendCommand({});
     await settle();

@@ -60,7 +60,7 @@ def main():
     # add patrons (each on their own stream)
     for patron_id, name, researcher in patrons:
         new_eventses.append(kdbc.NewEvents(
-            stream_name=f"patron.{patron_id}",
+            stream_name=f"patron:{patron_id}",
             events=[event({"type": "add-patron", "id": patron_id, "name": name, "researcher": researcher, "timestamp": ts()})],
             current_version=kdbc.StreamState.ANY,
         ))

@@ -123,9 +123,9 @@ export interface Registry {
   convert(type: string, value: unknown, from: Rep, to: Rep): unknown;
   /** the commands union this engine may submit */
   commands: string;
-  /** stream prefix (before the first dot) to the slice's events union */
+  /** a family, a stream name before its first ':', to the slice's events union */
   eventTypes: Record<string, string>;
-  /** slicePrefix/subkeyPrefix (each before its first dot) to the store value's type */
+  /** family/name, a key's family and its local key's name, to the store value's type */
   storeTypes: Record<string, string>;
 }
 

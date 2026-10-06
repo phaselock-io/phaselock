@@ -97,7 +97,7 @@ export type State = { count: number; fields: Record<string, unknown> };
     `log` key, so a test can assert what was applied and in what order; a `boom` event throws */
 function familyReducer(family: string): SliceReducer {
   return {
-    template: `${family}.{id}`,
+    template: `${family}:{id}`,
     keys: ['state', 'log'],
     reducer(txn: ReducerTxn, events: unknown[]): void {
       for (const e of events as TestEvent[]) {
@@ -134,7 +134,7 @@ export function ev(
   data: Partial<TestEvent> & { type: TestEvent['type'] } = { type: 'bump' },
   id?: string,
 ): WireEvent {
-  const inst = stream.slice(stream.indexOf('.') + 1);
+  const inst = stream.slice(stream.indexOf(':') + 1);
   const full = { id: inst, ...data } as TestEvent;
   const e: DbEvent<unknown> = {
     id: id ?? `ev${nextId++}`,
@@ -413,12 +413,13 @@ export function rig(
 
 // the store type of a key the Engine writes
 function typeOf(key: string): string {
-  if (key.startsWith('/command.')) return '.command';
-  if (key.startsWith('/park.ev.')) return '.event';
+  if (key.startsWith('!command:')) return '.command';
+  if (key.startsWith('!park-ev:')) return '.event';
 
   // a parked value has the type of the key it parks
-  const local = key.startsWith('/park.kv.') ? key.slice(key.indexOf('/', 1) + 1) : key;
-  if (local.startsWith('/')) return '.json';
+  const parked = '!park-kv:';
+  const local = key.startsWith(parked) ? key.slice(key.indexOf('!', parked.length) + 1) : key;
+  if (local.startsWith('!')) return '.json';
   const type = storeTypeOf(registry, local);
   if (type === undefined) throw new Error(`no store type for ${key}`);
   return type;
@@ -465,7 +466,7 @@ export function watch(
   let runs = 0;
   const q = r.engine.newQuery((qx) => {
     runs++;
-    return qx.get(`${stream}/state`, 'state') as State | undefined;
+    return qx.get(`${stream}!state`, 'state') as State | undefined;
   });
   q.subscribe((v) => values.push(v));
   return { values, runs: () => runs };
@@ -479,28 +480,28 @@ export function keys(data: Record<string, unknown>, prefix: string): string[] {
 }
 
 export function state(data: Record<string, unknown>, stream: string): State | undefined {
-  return data[`${stream}/state`] as State | undefined;
+  return data[`${stream}!state`] as State | undefined;
 }
 
 export function log(data: Record<string, unknown>, stream: string): string[] {
-  return (data[`${stream}/log`] as string[] | undefined) ?? [];
+  return (data[`${stream}!log`] as string[] | undefined) ?? [];
 }
 
 export function seq(
   data: Record<string, unknown>,
   stream: string,
 ): number | 'backfill' | undefined {
-  return data[`/seq.${stream}`] as number | 'backfill' | undefined;
+  return data[`!seq:${stream}`] as number | 'backfill' | undefined;
 }
 
 export function checkpoint(
   data: Record<string, unknown>,
 ): { epoch: string; position: number; reduced: number } | undefined {
-  return data['/checkpoint'] as { epoch: string; position: number; reduced: number } | undefined;
+  return data['!checkpoint'] as { epoch: string; position: number; reduced: number } | undefined;
 }
 
 export const parkedEvent = (stream: string, seq: number): string =>
-  `/park.ev.${stream}/${String(seq).padStart(20, '0')}`;
+  `!park-ev:${stream}!${String(seq).padStart(20, '0')}`;
 
 /** bootstrap: connect, present the first view with these refs, serve their blobs, go live */
 export async function bootstrap(

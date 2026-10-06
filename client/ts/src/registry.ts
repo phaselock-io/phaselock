@@ -745,10 +745,10 @@ function writeCommand(c: Command<Uint8Array>): Uint8Array {
   return w.bytes();
 }
 
-/** the family of a stream name: the part before the first dot */
+/** the family of a stream name: the part before the first colon */
 function familyOf(stream: string): string {
-  const dot = stream.indexOf('.');
-  return dot < 0 ? stream : stream.slice(0, dot);
+  const colon = stream.indexOf(':');
+  return colon < 0 ? stream : stream.slice(0, colon);
 }
 
 /** whether the map at the cursor is a system event, `{$sys: ...}`, without consuming it */

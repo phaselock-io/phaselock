@@ -91,9 +91,9 @@ def stream_for(event: Dict[str, Any]) -> str:
         case "update-book-restricted": return "books"
         case "remove-book":            return "books"
 
-        case "add-patron":    return f'patron.{event["id"]}'
-        case "rename-patron": return f'patron.{event["id"]}'
-        case "assign-patron": return f'patron.{event["id"]}'
+        case "add-patron":    return f'patron:{event["id"]}'
+        case "rename-patron": return f'patron:{event["id"]}'
+        case "assign-patron": return f'patron:{event["id"]}'
 
         case "try-hold":     return "status"
         case "cancel-hold":  return "status"

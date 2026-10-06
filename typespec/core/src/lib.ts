@@ -30,13 +30,13 @@ export const $lib = createTypeSpecLibrary({
     'invalid-slice-family': {
       severity: 'error',
       messages: {
-        default: paramMessage`slice family '${'family'}' must be a name of A-Z a-z 0-9 _ -, followed only by .{param} segments`,
+        default: paramMessage`slice family '${'family'}' must be a name of A-Z a-z 0-9 _ -, then optionally :{param} and ,{param} for each further parameter`,
       },
     },
     'invalid-key-template': {
       severity: 'error',
       messages: {
-        default: paramMessage`key template '${'tpl'}' in slice '${'name'}' must be a name of A-Z a-z 0-9 _ -, followed only by .{param} segments`,
+        default: paramMessage`key template '${'tpl'}' in slice '${'name'}' must be a name of A-Z a-z 0-9 _ -, then optionally :{param} and ,{param} for each further parameter`,
       },
     },
     'slice-events-not-named': {

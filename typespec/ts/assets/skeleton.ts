@@ -417,9 +417,9 @@ export interface Registry {
   convert(type: string, value: unknown, from: Rep, to: Rep): unknown;
   /** the commands union this engine may submit */
   commands: string;
-  /** stream prefix (before the first dot) to the slice's events union */
+  /** a family, a stream name before its first ':', to the slice's events union */
   eventTypes: Record<string, string>;
-  /** slicePrefix/subkeyPrefix (each before its first dot) to the store value's type */
+  /** family/name, a key's family and its local key's name, to the store value's type */
   storeTypes: Record<string, string>;
 }
 
@@ -479,15 +479,15 @@ export type Schema = {
 /** the type of a store key's value, from the Registry's storeTypes; undefined for a key no slice
     declares */
 export function storeTypeOf(reg: Registry, key: string): string | undefined {
-  const slash = key.indexOf('/');
-  if (slash < 0) throw new Error(`invalid key has no '/': ${key}`);
-  const slice = key.slice(0, slash);
-  const sub = key.slice(slash + 1);
-  const dot = (x: string) => {
-    const i = x.indexOf('.');
+  const bang = key.indexOf('!');
+  if (bang < 0) throw new Error(`invalid key has no '!': ${key}`);
+  const stream = key.slice(0, bang);
+  const local = key.slice(bang + 1);
+  const name = (x: string) => {
+    const i = x.indexOf(':');
     return i < 0 ? x : x.slice(0, i);
   };
-  return reg.storeTypes[`${dot(slice)}/${dot(sub)}`]!;
+  return reg.storeTypes[`${name(stream)}/${name(local)}`]!;
 }
 
 /** A scan walks keys in code-point order (compareKeys) between a lower and an upper bound, either
@@ -1165,7 +1165,7 @@ export interface ReadTxn {
 }
 
 /** ReducerTxn is what a slice reducer reads and writes through, inside the Engine's transaction.
-    Its keys are local to one stream: the Engine prefixes `{stream}/`, so a reducer cannot name a
+    Its keys are local to one stream: the Engine prefixes `{stream}!`, so a reducer cannot name a
     key outside its own stream.  A reducer owns what it gets, and what it sets is the store's from
     that call on. */
 export interface ReducerTxn extends ReadTxn {
@@ -1175,21 +1175,28 @@ export interface ReducerTxn extends ReadTxn {
 
 // stream names and keys ////////////////////////////////////////////////////
 
-/* A slice's family template and each of its key templates is a name, then one `.{param}` segment
-   per parameter.  A parameter the template ends with is terminal and holds the rest of the string.
-   Every other parameter is a segment, a non-empty run of `A-Z a-z 0-9 _ -`, so `chat.acme.general`
-   parses back as `chat.{org}.{channel}` unambiguously and `chat.acme.*` covers one org's channels.
-   A stream name's terminal parameter is non-empty and may also hold `.` and `~`, the rest of the
+/* A slice's family template and each of its key templates is a name, then, if it has parameters,
+   `:{param}` and `,{param}` for each further one: `chat:{org},{channel}`, `post:{id}`, `meta`.  A
+   parameter the template ends with is terminal and holds the rest of the string.  Every other
+   parameter is a segment, a non-empty run of `A-Z a-z 0-9 _ -`, so `chat:acme,general` parses
+   back as `chat:{org},{channel}` unambiguously and `chat:acme,*` covers one org's channels.  A
+   stream name's terminal parameter is non-empty and may also hold `.` and `~`, the rest of the
    RFC 3986 unreserved set, since stream names appear in URLs.  A local key's terminal parameter
    may hold anything a key may, the empty string included.  No key holds a control character
-   (U+0000-001F, U+007F-009F) or a lone surrogate; the database refuses a reducer's write of one. */
+   (U+0000-001F, U+007F-009F) or a lone surrogate; the database refuses a reducer's write of one.
+
+   A store key is `{stream}!{local key}`, as in `chat:acme,general!reply:t1,m5`, and its stream is
+   everything before its first `!`.  Keys sort in code-point order, and each separator after a
+   parameter sorts below every character that parameter may hold: `,` below a segment's, and `!`
+   below a stream name's.  So a walk of a family visits its streams in the order of their
+   parameters, `gen` before `gen-2`, and a walk of a key template its keys likewise. */
 
 const SEGMENT = '[A-Za-z0-9_-]+';
 const STREAM_REST = '[A-Za-z0-9_.~-]+';
 const SEGMENT_RE = new RegExp(`^${SEGMENT}$`);
 const STREAM_REST_RE = new RegExp(`^${STREAM_REST}$`);
 // the shape of a stream name of any family, for a family whose template is not at hand
-const ANY_STREAM_RE = new RegExp(`^${SEGMENT}(\\.${STREAM_REST})?$`);
+const ANY_STREAM_RE = new RegExp(`^${SEGMENT}(:(${SEGMENT},)*${STREAM_REST})?$`);
 
 /** a template parameter's value, other than a terminal one, checked; a generated accessor passes
     each of its parameters through this or asStreamRest before building a key */
@@ -1212,16 +1219,17 @@ export function asStreamRest(value: string, accessor: string, param: string): st
 
 // a family template as the pattern of the stream names that fill it
 function streamPattern(tpl: string): RegExp {
-  const parts = tpl.split('.');
-  const last = parts.length - 1;
-  const src = parts.map((p, i) => (!p.startsWith('{') ? p : i === last ? STREAM_REST : SEGMENT));
-  return new RegExp(`^${src.join('\\.')}$`);
+  const [family, params] = tpl.split(':');
+  if (params === undefined) return new RegExp(`^${family}$`);
+  const n = params.split(',').length;
+  const src = [...Array<string>(n - 1).fill(SEGMENT), STREAM_REST];
+  return new RegExp(`^${family}:${src.join(',')}$`);
 }
 
 // a ReducerTxn over a store transaction for one stream's keys, marking every key it writes in
 // updates
 function reducerTxn(txn: WTxn, stream: string, updates: Record<string, true>): ReducerTxn {
-  const prefix = `${stream}/`;
+  const prefix = `${stream}!`;
   return {
     get: (key, type) => txn.get(prefix + key, type, JS),
     set(key, type, value) {
@@ -1876,22 +1884,26 @@ export type WireEvent = DbEvent<Uint8Array> & { raw: Uint8Array };
 
        I: new commands also trigger the user's onCommands() hook so they can be sent over transport
 
-   Engine-owned store keys.  Slice state lives at `{stream}/{local key}`; everything the Engine
-   keeps for itself starts with a slash, and the registry types it as `.json` unless noted:
+   Engine-owned store keys.  Slice state lives at `{stream}!{local key}`; everything the Engine
+   keeps for itself lives in the nameless stream, which no stream name can reach, so its keys
+   start with `!`.  Its local keys follow the template grammar, and the parked keys' terminal
+   parameter is itself a stream or ref, `!`, then the rest.  The registry types them as `.json`
+   unless noted:
 
-       /view                      ViewRecord: the view token, its position, and the refs granted
-       /checkpoint                CheckpointRecord: the cursor, advanced with every batch and
+       !view                      ViewRecord: the view token, its position, and the refs granted
+       !checkpoint                CheckpointRecord: the cursor, advanced with every batch and
                                   vouch, and how far the base is reduced
-       /seq.{stream}              the stream's last held seq, or 'backfill' while a backfill
+       !seq:{stream}              the stream's last held seq, or 'backfill' while a backfill
                                   covering it is in flight
-       /command.{ordinal}         Command<Uint8Array> (`.command`): the outbox, in send order,
+       !command:{ordinal}         Command<Uint8Array> (`.command`): the outbox, in send order,
                                   each command's data as its wire bytes
-       /backfill.{ref}            BackfillRecord: an in-flight backfill's until, resume, replacing,
+       !backfill:{ref}            BackfillRecord: an in-flight backfill's until, resume, replacing,
                                   and children
-       /backfill-seqs.{ref}       the backfill blob's header seqs, stream name to seq
-       /park.ev.{stream}/{seq}    a parked event (`.event`), raw as delivered; seq zero-padded to
-                                  20 digits so a stream's range walks its chain
-       /park.kv.{ref}/{key}       a slice value from the ref's backfill blob, typed as its key
+       !backfill-seqs:{ref}       the backfill blob's header seqs, stream name to seq
+       !park-ev:{stream}!{seq}    a parked event (`.event`), raw as delivered; seq zero-padded to
+                                  20 digits so a stream's range walks its chain; a ref's key
+                                  prefix after `!park-ev:` covers its streams' events
+       !park-kv:{ref}!{key}       a slice value from the ref's backfill blob, typed as its key
                                   is, moved to {key} when the backfill lands
 */
 /** one slice's reducer, keyed by stream prefix in the Engine's table.  The Engine calls it with a
@@ -1907,11 +1919,11 @@ export type SliceReducer = {
   keys: string[];
 };
 
-/** the view, as persisted at /view when a reconciliation commits */
+/** the view, as persisted at !view when a reconciliation commits */
 export type ViewRecord = { token: string; position: number; refs: string[] };
-/** the cursor, as persisted at /checkpoint with every batch and vouch */
+/** the cursor, as persisted at !checkpoint with every batch and vouch */
 export type CheckpointRecord = { epoch: string; position: number; reduced: number };
-/** a backfill in flight, as persisted at /backfill.{ref} */
+/** a backfill in flight, as persisted at !backfill:{ref} */
 export type BackfillRecord = {
   until: number;
   resume: Backfill['resume'];
@@ -1928,11 +1940,10 @@ type BackfillEntry = {
   attempts: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
 };
-/** whether a wire ref covers a stream name or a narrower ref: `*` covers everything, `family.*`
-    covers names under `family.`, and a name covers itself */
+/** whether a wire ref covers a stream name or a narrower ref: a wildcard (`*`, `chat:*`,
+    `chat:acme,*`) covers the names under the prefix before its star, and a name covers itself */
 export function refCovers(ref: string, name: string): boolean {
-  if (ref === '*') return true;
-  if (ref.endsWith('.*')) return name.startsWith(ref.slice(0, -1));
+  if (ref.endsWith('*')) return name.startsWith(ref.slice(0, -1));
   return name === ref;
 }
 
@@ -1959,12 +1970,11 @@ type OnlineCommand = {
   seen: boolean;
 };
 
-/** the store key prefix a ref covers: everything for `*`, `family.` for a family, and the
-    stream's own keys for a stream */
+/** the store key prefix a ref covers: a wildcard's text before its star (`chat:`, `chat:acme,`,
+    and the empty prefix for `*`), and `{stream}!` for a stream */
 export function refPrefix(ref: string): string {
-  if (ref === '*') return '';
-  if (ref.endsWith('.*')) return ref.slice(0, -1);
-  return `${ref}/`;
+  if (ref.endsWith('*')) return ref.slice(0, -1);
+  return `${ref}!`;
 }
 
 /** the delay before the n-th retry in a row: exponential from half a second, capped at half a
@@ -1986,19 +1996,20 @@ export function sysOf(data: unknown): 'birth' | 'death' | null {
 /** the key of a parked event: its stream, then its seq zero-padded so a scan of the stream's
     prefix walks its chain in order; a re-parked event overwrites itself */
 export function parkedEventKey(stream: string, seq: number): string {
-  return `/park.ev.${stream}/${String(seq).padStart(20, '0')}`;
+  return `!park-ev:${stream}!${String(seq).padStart(20, '0')}`;
 }
 
 /** the key of an outbox command: its ordinal zero-padded so a scan walks the outbox in send
     order */
 export function commandKey(ordinal: number): string {
-  return `/command.${String(ordinal).padStart(20, '0')}`;
+  return `!command:${String(ordinal).padStart(20, '0')}`;
 }
 
 /** the stream and seq a parked event key names */
 export function parsePark(key: string): { stream: string; seq: number } {
-  const slash = key.lastIndexOf('/');
-  return { stream: key.slice('/park.ev.'.length, slash), seq: Number(key.slice(slash + 1)) };
+  const at = '!park-ev:'.length;
+  const bang = key.indexOf('!', at);
+  return { stream: key.slice(at, bang), seq: Number(key.slice(bang + 1)) };
 }
 
 /** one thing a forecast emits: an event labelled with its stream, or the end of a stream */
@@ -2056,10 +2067,10 @@ export class Engine<QX, C, N = never> {
   #view: ViewRecord | null = null;
   #checkpoint: CheckpointRecord | null = null;
   // seq per held stream, or the marker for a stream under an in-flight ref; the marker is
-  // persisted at /seq.{stream} on first sight during the backfill, in the transaction that parks
+  // persisted at !seq:{stream} on first sight during the backfill, in the transaction that parks
   #streams: Map<string, number | 'backfill'> = new Map();
   #backfills: Map<string, BackfillEntry> = new Map();
-  // the outbox in send order: command id to its ordinal in /command.{ordinal}
+  // the outbox in send order: command id to its ordinal in !command:{ordinal}
   #outbox: Map<string, number> = new Map();
   #nextOrdinal: number = 0;
   // outbox commands handed to the current connection with no outcome yet, and those acked, with
@@ -2213,23 +2224,23 @@ export class Engine<QX, C, N = never> {
   #initialize(): void {
     // load the persisted state into memory
     this.#store.read((txn) => {
-      const checkpoint = txn.get('/checkpoint', '.json', JS) as CheckpointRecord | undefined;
+      const checkpoint = txn.get('!checkpoint', '.json', JS) as CheckpointRecord | undefined;
       this.#checkpoint = checkpoint ?? null;
-      this.#view = (txn.get('/view', '.json', JS) as ViewRecord | undefined) ?? null;
+      this.#view = (txn.get('!view', '.json', JS) as ViewRecord | undefined) ?? null;
 
       // the streams table: seq per held stream, or the marker for a stream under a backfill
-      const seqRows = txnScanAll(txn, prefixRange('/seq.', 1000, { type: '.json', rep: JS }));
+      const seqRows = txnScanAll(txn, prefixRange('!seq:', 1000, { type: '.json', rep: JS }));
       for (const [key, value] of seqRows) {
-        this.#streams.set(key.slice('/seq.'.length), value as number | 'backfill');
+        this.#streams.set(key.slice('!seq:'.length), value as number | 'backfill');
       }
 
       // the outbox in ordinal order; the next ordinal continues from the last key
       const commandRows = txnScanAll(
         txn,
-        prefixRange('/command.', 1000, { type: '.command', rep: JS }),
+        prefixRange('!command:', 1000, { type: '.command', rep: JS }),
       );
       for (const [key, value] of commandRows) {
-        const ordinal = Number(key.slice('/command.'.length));
+        const ordinal = Number(key.slice('!command:'.length));
         this.#outbox.set((value as Command<Uint8Array>).id, ordinal);
         this.#nextOrdinal = ordinal + 1;
       }
@@ -2237,11 +2248,11 @@ export class Engine<QX, C, N = never> {
       // the backfills in flight, each with a fresh controller
       const backfillRows = txnScanAll(
         txn,
-        prefixRange('/backfill.', 1000, { type: '.json', rep: JS }),
+        prefixRange('!backfill:', 1000, { type: '.json', rep: JS }),
       );
       for (const [key, value] of backfillRows) {
         const record = value as BackfillRecord;
-        this.#backfills.set(key.slice('/backfill.'.length), {
+        this.#backfills.set(key.slice('!backfill:'.length), {
           record,
           controller: new AbortController(),
           status: 'downloading',
@@ -2282,7 +2293,7 @@ export class Engine<QX, C, N = never> {
       // every view ref outside the wants, so the next frame grants what it covered afresh
       if (this.#view !== null && !this.#view.refs.every(wanted)) {
         this.#view = { ...this.#view, refs: this.#view.refs.filter(wanted) };
-        txn.set('/view', '.json', JS, this.#view);
+        txn.set('!view', '.json', JS, this.#view);
       }
 
       // did the purge end the last replacing backfill?  Then this is the unfreeze.  Either way,
@@ -2572,15 +2583,15 @@ export class Engine<QX, C, N = never> {
         snapshotDone: false,
         tailDone: false,
       };
-      txn.set(`/backfill-seqs.${ref}`, '.json', JS, seqs);
+      txn.set(`!backfill-seqs:${ref}`, '.json', JS, seqs);
     } else if ('values' in item) {
       // park each value under this backfill's own range, and mark its stream
       for (const [key, bytes] of item.values) {
         // a key no slice declares is from a newer vocabulary, so it is dropped
         const type = storeTypeOf(this.#reg, key);
         if (type === undefined) continue;
-        txn.set(`/park.kv.${ref}/${key}`, type, MSGPACK, bytes);
-        this.#maybeMarkBackfilling(txn, key.slice(0, key.indexOf('/')), record.replacing);
+        txn.set(`!park-kv:${ref}!${key}`, type, MSGPACK, bytes);
+        this.#maybeMarkBackfilling(txn, key.slice(0, key.indexOf('!')), record.replacing);
       }
       record.resume!.skipBytes = item.skip;
     } else if ('valuesDone' in item) {
@@ -2599,7 +2610,7 @@ export class Engine<QX, C, N = never> {
     }
 
     if (record.resume!.snapshotDone && record.resume!.tailDone) entry.status = 'ready';
-    txn.set(`/backfill.${ref}`, '.json', JS, record);
+    txn.set(`!backfill:${ref}`, '.json', JS, record);
   }
 
   // an additive backfill leaves a held stream held and lands around it; a replacing one takes it
@@ -2607,7 +2618,7 @@ export class Engine<QX, C, N = never> {
     const held = this.#streams.get(stream);
     if (held === 'backfill' || (typeof held === 'number' && !replacing)) return;
     this.#streams.set(stream, 'backfill');
-    txn.set(`/seq.${stream}`, '.json', JS, 'backfill');
+    txn.set(`!seq:${stream}`, '.json', JS, 'backfill');
   }
 
   /* every queued outcome in one transaction.  Completion is known from the pushes themselves, so
@@ -2631,10 +2642,10 @@ export class Engine<QX, C, N = never> {
           // the blob is gone: the parked values go, the parked events stay, and the download
           // starts over under the same until
           entry.attempts = 0;
-          txn.delPrefix(`/park.kv.${ref}/`);
+          txn.delPrefix(`!park-kv:${ref}!`);
           const r = entry.record.resume;
           if (r !== null) entry.record.resume = { ...r, skipBytes: 0, snapshotDone: false };
-          txn.set(`/backfill.${ref}`, '.json', JS, entry.record);
+          txn.set(`!backfill:${ref}`, '.json', JS, entry.record);
           this.#startBackfill(ref);
         } else {
           // a rejection: ours, if the entry's signal fired, else a failure to retry after backoff
@@ -2765,12 +2776,12 @@ export class Engine<QX, C, N = never> {
 
   // the parked event range of a ref, or of every stream for the frozen events (null)
   #parkRange(ref: string | null, values: StoreRange['values']): StoreRange {
-    return prefixRange(`/park.ev.${ref === null ? '' : refPrefix(ref)}`, 1000, values);
+    return prefixRange(`!park-ev:${ref === null ? '' : refPrefix(ref)}`, 1000, values);
   }
 
   // a ref's blob header: the seq of every stream in its blob at the cut
   #headerOf(txn: RTxn, ref: string): Record<string, number> {
-    return (txn.get(`/backfill-seqs.${ref}`, '.json', JS) ?? {}) as Record<string, number>;
+    return (txn.get(`!backfill-seqs:${ref}`, '.json', JS) ?? {}) as Record<string, number>;
   }
 
   // a subtree's seqs at its cuts: the ref's header with each child's laid over it, deepest winning
@@ -2853,10 +2864,10 @@ export class Engine<QX, C, N = never> {
         // a held stream at or past the cut keeps its state, and the blob values for it go
         kept.add(stream);
         delete header[stream];
-        for (const r of subtree) txn.delPrefix(`/park.kv.${r}/${stream}/`);
+        for (const r of subtree) txn.delPrefix(`!park-kv:${r}!${stream}!`);
       } else {
         // otherwise the stream loses its state to the blob
-        markDirty(dirty, txn.delPrefix(`${stream}/`));
+        markDirty(dirty, txn.delPrefix(`${stream}!`));
       }
     }
 
@@ -2869,11 +2880,11 @@ export class Engine<QX, C, N = never> {
   // a ref's parked values move into place, then each child's over them for the streams in the
   // child's blob, the deepest winning; a kept stream is never touched
   #moveValuesIn(txn: WTxn, ref: string, dirty: Record<string, true>, kept: Set<string>): void {
-    markDirty(dirty, txn.move(`/park.kv.${ref}/`, ''));
+    markDirty(dirty, txn.move(`!park-kv:${ref}!`, ''));
     for (const child of this.#childrenOf(ref)) {
       // clear the parent's values for the child's streams, so a key the child's blob lacks goes too
       for (const stream of Object.keys(this.#headerOf(txn, child))) {
-        if (!kept.has(stream)) markDirty(dirty, txn.delPrefix(`${stream}/`));
+        if (!kept.has(stream)) markDirty(dirty, txn.delPrefix(`${stream}!`));
       }
       this.#moveValuesIn(txn, child, dirty, kept);
     }
@@ -2887,7 +2898,7 @@ export class Engine<QX, C, N = never> {
       e.parent = ref;
       entry.record.children.push(other);
     }
-    txn.set(`/backfill.${ref}`, '.json', JS, entry.record);
+    txn.set(`!backfill:${ref}`, '.json', JS, entry.record);
   }
 
   // a replacing ref takes every held stream under it, so their events park from here
@@ -2902,8 +2913,8 @@ export class Engine<QX, C, N = never> {
   // a landed subtree's records and entries go
   #dropIn(txn: WTxn, ref: string): void {
     for (const child of this.#childrenOf(ref)) this.#dropIn(txn, child);
-    txn.del(`/backfill.${ref}`);
-    txn.del(`/backfill-seqs.${ref}`);
+    txn.del(`!backfill:${ref}`);
+    txn.del(`!backfill-seqs:${ref}`);
     const entry = this.#backfills.get(ref)!;
     this.#backfills.delete(ref);
     if (entry.record.replacing) this.#replacing--;
@@ -2956,12 +2967,12 @@ export class Engine<QX, C, N = never> {
     if (run.length > 0) this.#reduceStreamIn(txn, stream, run, dirty);
 
     // clear only the streams walked; a skipped stream's events stay for its own backfill's land
-    for (const name of walked) txn.delPrefix(`/park.ev.${name}/`);
+    for (const name of walked) txn.delPrefix(`!park-ev:${name}!`);
 
     // hold every landed stream at its new seq
     for (const [name, seq] of seqs) {
       this.#streams.set(name, seq);
-      txn.set(`/seq.${name}`, '.json', JS, seq);
+      txn.set(`!seq:${name}`, '.json', JS, seq);
     }
   }
 
@@ -2977,7 +2988,7 @@ export class Engine<QX, C, N = never> {
     dirty: Record<string, true>,
   ): void {
     // the server sends nothing outside the wants, and the wants are the families with reducers
-    const slice = this.#reducers[stream.split('.')[0]];
+    const slice = this.#reducers[stream.split(':')[0]];
     if (slice === undefined) throw new Error(`no reducer for ${stream}`);
     let data: unknown[] = [];
 
@@ -2998,7 +3009,7 @@ export class Engine<QX, C, N = never> {
       if (sys === 'death') {
         // the stream died: reduce what came before, then drop its state
         reduce();
-        markDirty(dirty, txn.delPrefix(`${stream}/`));
+        markDirty(dirty, txn.delPrefix(`${stream}!`));
       } else if (sys === null) {
         data.push(ev.data);
       }
@@ -3010,11 +3021,11 @@ export class Engine<QX, C, N = never> {
   // whose cut is past the gap; the parked events stay and chain from the live cut
   #restartIn(txn: WTxn, ref: string): void {
     const entry = this.#backfills.get(ref)!;
-    txn.delPrefix(`/park.kv.${ref}/`);
+    txn.delPrefix(`!park-kv:${ref}!`);
     entry.record.resume = null;
     entry.status = 'downloading';
     entry.attempts = 0;
-    txn.set(`/backfill.${ref}`, '.json', JS, entry.record);
+    txn.set(`!backfill:${ref}`, '.json', JS, entry.record);
     this.#startBackfill(ref);
   }
 
@@ -3029,7 +3040,7 @@ export class Engine<QX, C, N = never> {
   ): void {
     for (const ref of refs) {
       const record: BackfillRecord = { until, resume: null, replacing, children: [] };
-      txn.set(`/backfill.${ref}`, '.json', JS, record);
+      txn.set(`!backfill:${ref}`, '.json', JS, record);
       this.#backfills.set(ref, {
         record,
         controller: new AbortController(),
@@ -3049,7 +3060,7 @@ export class Engine<QX, C, N = never> {
     if (parent !== null) {
       const p = this.#backfills.get(parent)!;
       p.record.children.push(...refs);
-      txn.set(`/backfill.${parent}`, '.json', JS, p.record);
+      txn.set(`!backfill:${parent}`, '.json', JS, p.record);
     }
   }
 
@@ -3059,9 +3070,9 @@ export class Engine<QX, C, N = never> {
     const entry = this.#backfills.get(ref)!;
     entry.controller.abort();
     if (entry.retryTimer !== null) clearTimeout(entry.retryTimer);
-    txn.delPrefix(`/park.kv.${ref}/`);
-    txn.del(`/backfill.${ref}`);
-    txn.del(`/backfill-seqs.${ref}`);
+    txn.delPrefix(`!park-kv:${ref}!`);
+    txn.del(`!backfill:${ref}`);
+    txn.del(`!backfill-seqs:${ref}`);
     this.#backfills.delete(ref);
     if (entry.record.replacing) this.#replacing--;
 
@@ -3069,7 +3080,7 @@ export class Engine<QX, C, N = never> {
     if (entry.parent !== null) {
       const p = this.#backfills.get(entry.parent)!;
       p.record.children = p.record.children.filter((c) => c !== ref);
-      txn.set(`/backfill.${entry.parent}`, '.json', JS, p.record);
+      txn.set(`!backfill:${entry.parent}`, '.json', JS, p.record);
     }
 
     // re-parent each child to the next covering entry, if any
@@ -3080,15 +3091,15 @@ export class Engine<QX, C, N = never> {
       if (c.parent === null) continue;
       const p = this.#backfills.get(c.parent)!;
       p.record.children.push(child);
-      txn.set(`/backfill.${c.parent}`, '.json', JS, p.record);
+      txn.set(`!backfill:${c.parent}`, '.json', JS, p.record);
     }
   }
 
   // a stream leaves the Engine: its state, its seq, and its parked events
   #dropStreamIn(txn: WTxn, stream: string, dirty: Record<string, true>): void {
-    markDirty(dirty, txn.delPrefix(`${stream}/`));
-    txn.del(`/seq.${stream}`);
-    txn.delPrefix(`/park.ev.${stream}/`);
+    markDirty(dirty, txn.delPrefix(`${stream}!`));
+    txn.del(`!seq:${stream}`);
+    txn.delPrefix(`!park-ev:${stream}!`);
     this.#streams.delete(stream);
   }
 
@@ -3200,7 +3211,7 @@ export class Engine<QX, C, N = never> {
     for (const [stream, run] of runs) this.#reduceStreamIn(txn, stream, run, dirty);
     for (const [stream, seq] of seqs) {
       this.#streams.set(stream, seq);
-      txn.set(`/seq.${stream}`, '.json', JS, seq);
+      txn.set(`!seq:${stream}`, '.json', JS, seq);
     }
 
     // an atom that froze part way reduced up to the event before the gap
@@ -3259,7 +3270,7 @@ export class Engine<QX, C, N = never> {
     if (this.#epoch === null) throw new Error('cursor with no epoch');
     if (this.#checkpoint !== null && position <= this.#checkpoint.position) return;
     this.#checkpoint = { epoch: this.#epoch, position, reduced: this.#reduced };
-    txn.set('/checkpoint', '.json', JS, this.#checkpoint);
+    txn.set('!checkpoint', '.json', JS, this.#checkpoint);
   }
 
   // the base has been reduced through position, so every acked command at or below it is in the
@@ -3269,7 +3280,7 @@ export class Engine<QX, C, N = never> {
     this.#reduced = position;
     if (this.#checkpoint !== null) {
       this.#checkpoint = { ...this.#checkpoint, reduced: position };
-      txn.set('/checkpoint', '.json', JS, this.#checkpoint);
+      txn.set('!checkpoint', '.json', JS, this.#checkpoint);
     }
     this.#releaseAckedIn(txn);
   }
@@ -3395,7 +3406,7 @@ export class Engine<QX, C, N = never> {
       this.#adoptChildrenIn(txn, ref);
     }
 
-    txn.set('/view', '.json', JS, view);
+    txn.set('!view', '.json', JS, view);
     this.#view = view;
 
     // did a drop end the last replacing backfill?  Then this is the unfreeze, and whatever
@@ -3445,7 +3456,7 @@ export class Engine<QX, C, N = never> {
       if (forecaster !== null && this.#outbox.size > 0) {
         const rows = txnScanAll(
           base,
-          prefixRange('/command.', 1000, { type: '.command', rep: JS }),
+          prefixRange('!command:', 1000, { type: '.command', rep: JS }),
         );
         for (const [, value] of rows) {
           const command = value as Command<Uint8Array>;
@@ -3497,7 +3508,7 @@ export class Engine<QX, C, N = never> {
     // reduce the pending run; a family with no reducer forecasts nothing
     const flush = () => {
       if (run.length === 0) return;
-      const slice = this.#reducers[stream.split('.')[0]];
+      const slice = this.#reducers[stream.split(':')[0]];
       if (slice !== undefined) slice.reducer(reducerTxn(txn, stream, dirty), run, stream, true);
       run = [];
     };
@@ -3505,7 +3516,7 @@ export class Engine<QX, C, N = never> {
     for (const out of forecaster(this.#context(readTxn(txn)), command)) {
       // the label fills its slice's family template, or has the shape of a stream name when this
       // Engine holds no slice of its family; an invalid one throws, forecasting nothing
-      const pattern = this.#streamPatterns[out.stream.split('.')[0]] ?? ANY_STREAM_RE;
+      const pattern = this.#streamPatterns[out.stream.split(':')[0]] ?? ANY_STREAM_RE;
       const valid = pattern.test(out.stream);
       if (!valid) {
         throw new Error(`forecast labels an invalid stream ${JSON.stringify(out.stream)}`);
@@ -3517,7 +3528,7 @@ export class Engine<QX, C, N = never> {
       }
       if ('death' in out) {
         flush();
-        markDirty(dirty, txn.delPrefix(`${stream}/`));
+        markDirty(dirty, txn.delPrefix(`${stream}!`));
       } else {
         run.push(out.event);
       }

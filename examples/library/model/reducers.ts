@@ -166,7 +166,7 @@ function* precommitTryCheckout(
       },
     },
     // tell this patron they own the checkout
-    { stream: `patron.${cmd.patron}`,
+    { stream: `patron:${cmd.patron}`,
       event: {
         type: 'patron-checkout',
         id: cmd.id,
@@ -263,7 +263,7 @@ function* precommit(
     case 'add-patron':
     case 'assign-patron':
       if (!user.admin) return 'unauthorized';
-      return { stream: `patron.${cmd.id}`, event: cmd };
+      return { stream: `patron:${cmd.id}`, event: cmd };
 
     // admin-only commands which are not 1:1
     case 'try-checkout':
@@ -276,7 +276,7 @@ function* precommit(
     case 'rename-patron':
       if (!user.admin && cmd.id !== user.id) return 'unauthorized';
       if (!(yield* rx.get.patron(e.patron))) return 'no such patron';
-      return { stream: `patron.${cmd.id}`, event: cmd };
+      return { stream: `patron:${cmd.id}`, event: cmd };
 
     case 'cancel-hold':
       // for non-admins, they can only cancel one of their own holds

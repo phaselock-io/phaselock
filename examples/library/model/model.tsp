@@ -48,21 +48,21 @@ alias Isbn = string;
 
 // The public catalogue: editions, the books of each edition, and the state of every hold and
 // checkout, with no patron named anywhere, since every user syncs this slice.  Collections are
-// key ranges that readers scan, such as `edition_book.{isbn}.` for the books of one edition.
+// key ranges that readers scan, such as `edition_book:{isbn},` for the books of one edition.
 
 interface BookSlice extends Slice<"book", BookEvents, BookStore> {}
 
 alias BookStore = {
-  "edition.{isbn}": Edition;
-  "book.{book}": Book;
+  "edition:{isbn}": Edition;
+  "book:{book}": Book;
   // index: every book of an edition
-  "edition_book.{isbn}.{book}": true;
+  "edition_book:{isbn},{book}": true;
   // one key per open hold; closing a hold deletes its key
-  "hold.{hold}": Hold;
+  "hold:{hold}": Hold;
   // index: every open edition-level hold of an edition
-  "edition_hold.{isbn}.{hold}": true;
+  "edition_hold:{isbn},{hold}": true;
   // one key per open checkout; ending a checkout deletes its key
-  "checkout.{checkout}": Checkout;
+  "checkout:{checkout}": Checkout;
 };
 
 model Edition {
@@ -257,13 +257,13 @@ model CheckoutOverdue {
 // Every hold and checkout change that touches a patron reaches them as an event of their own,
 // since a reducer here cannot read the book slice.
 
-interface PatronSlice extends Slice<"patron.{patron}", PatronEvents, PatronStore> {}
+interface PatronSlice extends Slice<"patron:{patron}", PatronEvents, PatronStore> {}
 
 alias PatronStore = {
   "patron": Patron;
-  "patron_hold.{hold}": PatronHold;
-  "patron_checkout.{checkout}": Checkout;
-  "patron_notice.{notice}": Notice;
+  "patron_hold:{hold}": PatronHold;
+  "patron_checkout:{checkout}": Checkout;
+  "patron_notice:{notice}": Notice;
 };
 
 model Patron {
@@ -375,7 +375,7 @@ interface AdminSlice extends Slice<"admin", AdminEvents, AdminStore> {}
 
 alias AdminStore = {
   // one key per undismissed notice
-  "admin_notice.{notice}": Notice;
+  "admin_notice:{notice}": Notice;
 };
 
 union AdminEvents {
@@ -411,9 +411,9 @@ interface LoginSlice extends Slice<"login", LoginEvents, LoginStore> {}
 
 alias LoginStore = {
   // login names are globally unique and never change
-  "login.{login}": Login;
+  "login:{login}": Login;
   // index: the login name of each user
-  "user_login.{user}": string;
+  "user_login:{user}": string;
 };
 
 model Login {

@@ -204,6 +204,32 @@ describe('key order', () => {
     expect(prefixEnd('')).toBeUndefined();
   });
 
+  test("a walk visits a family's keys in the order of their template parameters", () => {
+    // the keys of x:{day},{channel} streams at reply:{thread},{id}, in the order of their
+    // parameters, where a value may be another followed by '-' or '.'
+    const days = ['2026-10', '2026-10-06'];
+    const channels = ['gen', 'gen-2', 'gen.x'];
+    const threads = ['t1', 't1-2'];
+    const ids = ['', 'm1', 'm1-2'];
+    const streams = days.flatMap((d) => channels.map((c) => `x:${d},${c}`));
+    const keys = streams.flatMap((st) =>
+      threads.flatMap((t) => ids.map((id) => `${st}!reply:${t},${id}`)),
+    );
+    const store = seeded(...[...keys].reverse());
+
+    // the family, one stream, and one stream's thread
+    expect(scanKeys(store, prefixRange('x:', 7, false))).toEqual(keys);
+    expect(scanKeys(store, prefixRange('x:2026-10,gen!', 7, false))).toEqual(
+      keys.filter((k) => k.startsWith('x:2026-10,gen!')),
+    );
+    expect(scanKeys(store, prefixRange('x:2026-10,gen!reply:t1,', 7, false))).toEqual(
+      ids.map((id) => `x:2026-10,gen!reply:t1,${id}`),
+    );
+
+    // stream names alone sort the same way
+    expect([...streams].reverse().sort(compareKeys)).toEqual(streams);
+  });
+
   test('a prefix range holds exactly the keys under its prefix', () => {
     const prefixes = ['k\uD7FF', 'k\uFFFF', 'k\u{1F600}', 'k\u{10FFFF}'];
     const keys = ordered.flatMap((a) => ordered.map((b) => 'k' + a + b));
@@ -243,12 +269,12 @@ describe('delPrefix and move', () => {
   });
 
   test('move to the empty prefix lands keys at their remainder', () => {
-    const store = seeded('/park.kv.x/a/1', '/park.kv.x/b/1');
+    const store = seeded('!park-kv:x!a/1', '!park-kv:x!b/1');
     const moved = store.write((txn) => {
-      return txn.move('/park.kv.x/', '');
+      return txn.move('!park-kv:x!', '');
     });
     expect(moved).toEqual(['a/1', 'b/1']);
-    expect(contents(store)).toEqual({ 'a/1': '/park.kv.x/a/1', 'b/1': '/park.kv.x/b/1' });
+    expect(contents(store)).toEqual({ 'a/1': '!park-kv:x!a/1', 'b/1': '!park-kv:x!b/1' });
   });
 });
 

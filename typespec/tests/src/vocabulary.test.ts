@@ -27,16 +27,16 @@ const BOOK = `
   model Closed { type: "closed"; id: string; }
   union BookEvents { Opened, Closed }
   model Book { id: string; }
-  interface BookSlice extends Slice<"book", BookEvents, { "book.{id}": Book; }> {}
+  interface BookSlice extends Slice<"book", BookEvents, { "book:{id}": Book; }> {}
 `;
 const PATRON = `
   model Joined { type: "joined"; name: string; }
   model Noted { type: "noted"; id: string; }
   union PatronEvents { Joined, Noted }
   model Patron { name: string; }
-  interface PatronSlice extends Slice<"patron.{patron}", PatronEvents, {
+  interface PatronSlice extends Slice<"patron:{patron}", PatronEvents, {
     "patron": Patron;
-    "note.{note}": string;
+    "note:{note}": string;
   }> {}
 `;
 const OPEN = '@command(Opened) model Open { type: "open"; id: string; }';
@@ -71,7 +71,7 @@ function show(o: POutput): string {
 describe('slices', () => {
   it('lowers a singleton slice: its family, events union, and instance-local key templates', async () => {
     const l = await lower(`
-      ${BOOK.replace('{ "book.{id}": Book; }', '{ "book.{id}": Book; "count": int32; }')}
+      ${BOOK.replace('{ "book:{id}": Book; }', '{ "book:{id}": Book; "count": int32; }')}
     `);
     expect(codes(l)).toEqual([]);
     expect(l.lowered.slices).toHaveLength(1);
@@ -82,7 +82,7 @@ describe('slices', () => {
     expect(slice.template).toBe('book');
     expect(slice.events).toBe(root(l.lowered, 'BookEvents'));
     expect(slice.eventTypes.map((t) => t.name)).toEqual(['Opened', 'Closed']);
-    expect(slice.store.items.map((i) => i.tpl)).toEqual(['book.{id}', 'count']);
+    expect(slice.store.items.map((i) => i.tpl)).toEqual(['book:{id}', 'count']);
   });
 
   it('parses a parameterized family into its parameters', async () => {
@@ -90,15 +90,15 @@ describe('slices', () => {
       model Said { type: "said"; text: string; }
       model Edited { type: "edited"; text: string; }
       union ChatEvents { Said, Edited }
-      interface ChatSlice extends Slice<"chat.{org}.{channel}", ChatEvents, {
-        "message.{message}": string;
+      interface ChatSlice extends Slice<"chat:{org},{channel}", ChatEvents, {
+        "message:{message}": string;
       }> {}
     `);
     expect(codes(l)).toEqual([]);
     const slice = l.lowered.slices[0];
     expect(slice.family).toBe('chat');
     expect(slice.params).toEqual(['org', 'channel']);
-    expect(slice.template).toBe('chat.{org}.{channel}');
+    expect(slice.template).toBe('chat:{org},{channel}');
   });
 
   it('takes an alias as the store spec', async () => {
@@ -107,39 +107,51 @@ describe('slices', () => {
       model Closed { type: "closed"; id: string; }
       union BookEvents { Opened, Closed }
       model Book { id: string; }
-      alias BookStore = { "book.{id}": Book; "shelf.{shelf}.{id}": true; };
+      alias BookStore = { "book:{id}": Book; "shelf:{shelf},{id}": true; };
       interface BookSlice extends Slice<"book", BookEvents, BookStore> {}
     `);
     expect(codes(l)).toEqual([]);
     expect(l.lowered.slices[0].store.items.map((i) => i.tpl)).toEqual([
-      'book.{id}',
-      'shelf.{shelf}.{id}',
+      'book:{id}',
+      'shelf:{shelf},{id}',
+    ]);
+    expect(l.lowered.slices[0].store.items.map((i) => [i.name, i.params, i.chunks])).toEqual([
+      ['book', ['id'], ['book:', '']],
+      ['shelf', ['shelf', 'id'], ['shelf:', ',', '']],
     ]);
   });
 
   it.each([
-    ['a trailing dot', 'book.'],
+    ['a trailing colon', 'book:'],
     ['a parameter with no family name', '{id}'],
-    ['a literal segment after a parameter', 'chat.{org}.room.{channel}'],
+    ['a literal segment after a parameter', 'chat:{org},room,{channel}'],
     ['a character outside the name set', 'bo ok'],
-    ['an empty parameter', 'chat.{}'],
-    ['an unclosed parameter', 'chat.{org'],
+    ['an empty parameter', 'chat:{}'],
+    ['an unclosed parameter', 'chat:{org'],
+    ['a dot before a parameter', 'chat.{org}'],
+    ['a comma before the first parameter', 'chat,{org}'],
+    ['a colon between parameters', 'chat:{org}:{channel}'],
+    ['adjacent parameters', 'chat:{org}{channel}'],
+    ['a trailing comma', 'chat:{org},'],
   ])('rejects a family template with %s', async (_, family) => {
     const l = await lower(`
       model Opened { type: "opened"; id: string; }
       model Closed { type: "closed"; id: string; }
       union BookEvents { Opened, Closed }
-      interface BookSlice extends Slice<"${family}", BookEvents, { "book.{id}": string; }> {}
+      interface BookSlice extends Slice<"${family}", BookEvents, { "book:{id}": string; }> {}
     `);
     expect(codes(l)).toContain('invalid-slice-family');
   });
 
   it.each([
-    ['a trailing dot', 'book.'],
+    ['a trailing colon', 'book:'],
     ['a parameter with no name before it', '{id}'],
-    ['a literal segment after a parameter', 'msg.{id}.reactions'],
+    ['a literal segment after a parameter', 'msg:{id},reactions'],
     ['a slash', 'book/{id}'],
-    ['a character outside the name set', 'bo~ok.{id}'],
+    ['a dot before a parameter', 'book.{id}'],
+    ['a bang before a parameter', 'book!{id}'],
+    ['a colon between parameters', 'shelf:{shelf}:{id}'],
+    ['a character outside the name set', 'bo~ok:{id}'],
   ])('rejects a key template with %s', async (_, tpl) => {
     const l = await lower(`
       model Opened { type: "opened"; id: string; }
@@ -154,7 +166,7 @@ describe('slices', () => {
     const l = await lower(`
       model Opened { type: "opened"; id: string; }
       model Closed { type: "closed"; id: string; }
-      interface BookSlice extends Slice<"book", Opened | Closed, { "book.{id}": string; }> {}
+      interface BookSlice extends Slice<"book", Opened | Closed, { "book:{id}": string; }> {}
     `);
     expect(codes(l)).toContain('slice-events-not-named');
   });
@@ -163,7 +175,7 @@ describe('slices', () => {
     const l = await lower(`
       model Opened { type: "opened"; id: string; }
       union BookEvents { Opened, [string, int32] }
-      interface BookSlice extends Slice<"book", BookEvents, { "book.{id}": string; }> {}
+      interface BookSlice extends Slice<"book", BookEvents, { "book:{id}": string; }> {}
     `);
     expect(codes(l)).toContain('slice-event-not-model');
   });
@@ -174,8 +186,8 @@ describe('slices', () => {
       model Closed { type: "closed"; id: string; }
       union BookEvents { Opened, Closed }
       interface BookSlice extends Slice<"book", BookEvents, {
-        "book.{id}": string;
-        "book.{shelf}.{id}": string;
+        "book:{id}": string;
+        "book:{shelf},{id}": string;
       }> {}
     `);
     expect(codes(l)).toContain('store-collision');
@@ -186,8 +198,8 @@ describe('slices', () => {
       model Joined { type: "joined"; name: string; }
       model Noted { type: "noted"; id: string; }
       union PatronEvents { Joined, Noted }
-      interface PatronSlice extends Slice<"patron.{patron}", PatronEvents, {
-        "hold.{patron}": string;
+      interface PatronSlice extends Slice<"patron:{patron}", PatronEvents, {
+        "hold:{patron}": string;
       }> {}
     `);
     expect(codes(l)).toContain('duplicate-key-param');
@@ -268,7 +280,7 @@ describe('engines', () => {
       model Shelved { type: "shelved"; id: string; }
       model Unshelved { type: "unshelved"; id: string; }
       union ShelfEvents { Shelved, Unshelved }
-      interface ShelfSlice extends Slice<"shelf.{shelf}", ShelfEvents, { "book.{id}": string; }> {}
+      interface ShelfSlice extends Slice<"shelf:{shelf}", ShelfEvents, { "book:{id}": string; }> {}
       interface UserEngine extends Engine<[BookSlice, ShelfSlice], Open> {}
     `);
     expect(codes(l)).toContain('key-name-collision');
@@ -280,7 +292,7 @@ describe('engines', () => {
       model Shelved { type: "shelved"; id: string; }
       model Unshelved { type: "unshelved"; id: string; }
       union ShelfEvents { Shelved, Unshelved }
-      interface OtherBookSlice extends Slice<"book", ShelfEvents, { "shelf.{id}": string; }> {}
+      interface OtherBookSlice extends Slice<"book", ShelfEvents, { "shelf:{id}": string; }> {}
       interface UserEngine extends Engine<[BookSlice, OtherBookSlice], Open> {}
     `);
     expect(codes(l)).toContain('family-collision');
@@ -292,7 +304,7 @@ describe('engines', () => {
       model Shelved { type: "shelved"; id: string; }
       model Unshelved { type: "unshelved"; id: string; }
       union ShelfEvents { Shelved, Unshelved }
-      interface ShelfSlice extends Slice<"shelf.{shelf}", ShelfEvents, { "book.{id}": string; }> {}
+      interface ShelfSlice extends Slice<"shelf:{shelf}", ShelfEvents, { "book:{id}": string; }> {}
       interface BookEngine extends Engine<[BookSlice], Open> {}
       interface ShelfEngine extends Engine<[ShelfSlice], Open> {}
     `);
@@ -305,7 +317,7 @@ describe('databases', () => {
     model Kept { type: "kept"; secret: string; }
     model Dropped { type: "dropped"; secret: string; }
     union SecretEvents { Kept, Dropped }
-    interface SecretSlice extends Slice<"secret", SecretEvents, { "secret.{id}": string; }> {}
+    interface SecretSlice extends Slice<"secret", SecretEvents, { "secret:{id}": string; }> {}
     @command(Kept) model Keep { type: "keep"; secret: string; }
   `;
 
@@ -376,7 +388,7 @@ describe('databases', () => {
       model Kept { type: "kept"; secret: string; }
       model Dropped { type: "dropped"; secret: string; }
       union SecretEvents { Kept, Dropped }
-      interface SecretSlice extends Slice<"secret", SecretEvents, { "book.{id}": string; }> {}
+      interface SecretSlice extends Slice<"secret", SecretEvents, { "book:{id}": string; }> {}
       interface UserEngine extends Engine<[BookSlice], Open> {}
       interface LibraryDB extends Database<[UserEngine], [SecretSlice]> {}
     `);
@@ -421,7 +433,7 @@ describe('commands', () => {
       @command(AddBook) model AddBook { type: "add-book"; id: string; }
       model Removed { type: "removed"; id: string; }
       union BookEvents { AddBook, Removed }
-      interface BookSlice extends Slice<"book", BookEvents, { "book.{id}": string; }> {}
+      interface BookSlice extends Slice<"book", BookEvents, { "book:{id}": string; }> {}
     `);
     expect(codes(l)).toEqual([]);
     const add = command(l.lowered, 'AddBook');
@@ -455,9 +467,9 @@ describe('commands', () => {
       model Alerted { type: "alerted"; id: string; reason: string; }
       union AdminEvents { Warned, Dismiss }
       union PatronEvents { Alerted, Dismiss }
-      interface AdminSlice extends Slice<"admin", AdminEvents, { "admin_notice.{notice}": string; }> {}
-      interface PatronSlice extends Slice<"patron.{patron}", PatronEvents, {
-        "patron_notice.{notice}": string;
+      interface AdminSlice extends Slice<"admin", AdminEvents, { "admin_notice:{notice}": string; }> {}
+      interface PatronSlice extends Slice<"patron:{patron}", PatronEvents, {
+        "patron_notice:{notice}": string;
       }> {}
     `);
     expect(codes(l)).toEqual([]);
@@ -520,7 +532,7 @@ describe('intake types', () => {
     model LoginCreated { type: "login-created"; login: string; password: PasswordHash; }
     model LoginDeleted { type: "login-deleted"; login: string; }
     union LoginEvents { LoginCreated, LoginDeleted }
-    interface LoginSlice extends Slice<"login", LoginEvents, { "login.{login}": PasswordHash; }> {}
+    interface LoginSlice extends Slice<"login", LoginEvents, { "login:{login}": PasswordHash; }> {}
   `;
 
   it('lowers NewPassword to an intake from a string to a PasswordHash', async () => {
@@ -628,7 +640,7 @@ describe('intake types', () => {
       `@online @command(Leaked) model Leaked { type: "leaked"; pw: NewPassword; }
        model Sealed { type: "sealed"; id: string; }
        union LeakEvents { Leaked, Sealed }
-       interface LeakSlice extends Slice<"leak", LeakEvents, { "leak.{id}": string; }> {}`,
+       interface LeakSlice extends Slice<"leak", LeakEvents, { "leak:{id}": string; }> {}`,
     ],
   ])('rejects an intake type %s', async (_, code) => {
     const l = await lower(`${LOGIN} ${code}`);

@@ -297,42 +297,68 @@ func groupAtoms(items []item) [][]item {
 }
 
 // matches reports whether a wire ref covers a stream name or a narrower
-// ref: "*" covers everything, "family.*" covers names under "family.",
-// and a name covers itself.
+// ref: a wildcard ("*", "chat:*", "chat:acme,*") covers the names that
+// begin with its text before the star, and a name covers itself.
 func matches(stream, ref string) bool {
-	if ref == "*" {
-		return true
-	}
-	if strings.HasSuffix(ref, ".*") {
-		return strings.HasPrefix(stream, ref[:len(ref)-1])
+	if prefix, wild := strings.CutSuffix(ref, "*"); wild {
+		return strings.HasPrefix(stream, prefix)
 	}
 	return stream == ref
 }
 
-// validRef checks the wire form of a ref: a stream name, "prefix.*", or
-// "*".  A name's family, before its first dot, is a non-empty run of
-// A-Z a-z 0-9 _ -, and what follows the dot is a non-empty run of those and
-// . ~, the characters a URL carries unencoded.  The core checks a name
-// against its family's template.
+// validRef checks the wire form of a ref: a stream name, a wildcard, or
+// "*".  A name is its family, a non-empty run of A-Z a-z 0-9 _ -, then, if
+// its family has parameters, ':' and their values separated by ','.  Every
+// value is non-empty; one before the last is a run of the family's
+// characters, and the last may also hold . and ~, the characters a URL
+// carries unencoded.  A wildcard is a family and ':', or a family, ':', and
+// whole leading values each followed by ',', then '*'.  The core checks a
+// name against its family's template.
 func validRef(ref string) bool {
 	if ref == "*" {
 		return true
 	}
-	family, rest, dotted := strings.Cut(strings.TrimSuffix(ref, ".*"), ".")
-	if family == "" || (dotted && rest == "") {
-		return false
-	}
-	for _, c := range family {
-		if !segmentChar(c) {
+
+	// a wildcard's values are all leading ones, followed by their separator
+	name, wild := strings.CutSuffix(ref, "*")
+	if wild {
+		var sep bool
+		if name, sep = strings.CutSuffix(name, ","); !sep {
+			if name, sep = strings.CutSuffix(name, ":"); !sep || strings.Contains(name, ":") {
+				return false
+			}
+		} else if !strings.Contains(name, ":") {
 			return false
 		}
 	}
-	for _, c := range rest {
-		if !segmentChar(c) && c != '.' && c != '~' {
+
+	// the family, then its values
+	family, rest, params := strings.Cut(name, ":")
+	if !segment(family) {
+		return false
+	}
+	if !params {
+		return true
+	}
+	values := strings.Split(rest, ",")
+	for i, v := range values {
+		if wild || i < len(values)-1 {
+			if !segment(v) {
+				return false
+			}
+		} else if v == "" || strings.IndexFunc(v, func(c rune) bool {
+			return !segmentChar(c) && c != '.' && c != '~'
+		}) >= 0 {
 			return false
 		}
 	}
 	return true
+}
+
+// segment reports whether s is a non-empty run of the characters a family
+// name or a parameter other than a template's terminal one may hold.
+func segment(s string) bool {
+	return s != "" && strings.IndexFunc(s, func(c rune) bool { return !segmentChar(c) }) < 0
 }
 
 // segmentChar reports whether c may appear in a family name or a parameter
@@ -732,7 +758,7 @@ func covers(prefixes []string, ref string) bool {
 
 // handleEvents serves a ref's events with after < position < before, for
 // a client tailing a snapshot.  The ref is the path after /events/: a
-// stream, "family.*", or "*"; the view must cover all of it.  Either bound may be omitted: no after is the start of
+// stream, a wildcard, or "*"; the view must cover all of it.  Either bound may be omitted: no after is the start of
 // the log, no before is the head.  The PhaseLock-Scanned header is the
 // client's next bound, to be used as-is: the last position delivered when
 // the page was full, the far bound when the range is exhausted, and the

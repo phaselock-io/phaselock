@@ -162,26 +162,34 @@ plan above take precedence over it.
   deletion of the stream's keys.  Dead streams stay in the
   known-streams table as tombstones (name, birth, death); a new event
   to a dead name is a rebirth with a new birth position.
-- Store keys are plain strings: `<stream>/<local key>`.  A stream name
-  fills its slice's family template (`chat.{org}.{channel}` names
-  `chat.acme.general`), and a local key one of the slice's key
-  templates (`note.{id}`).  The family is the part before the first
-  dot.  A parameter a template ends with is terminal and holds the rest
-  of the string; every other parameter is a non-empty run of
-  `A-Z a-z 0-9 _ -`.  A stream name's terminal parameter is non-empty
-  and may also hold `.` and `~`; a key's may hold anything, the empty
-  string included.  The core rejects a precommit or bootstrap output
+- Store keys are plain strings: `<stream>!<local key>`, as in
+  `chat:acme,general!reply:t1,m5`; a key's stream is everything
+  before its first `!`.  A template is a name, then, if it has
+  parameters, `:{param}` and `,{param}` for each further one.  A
+  stream name fills its slice's family template
+  (`chat:{org},{channel}` names `chat:acme,general`; `login` names
+  itself), and a local key one of the slice's key templates
+  (`note:{id}` names `note:n1`).  The family or key name is the part
+  before the first `:`.  A parameter a template ends with is terminal
+  and holds the rest of the string; every other parameter is a
+  non-empty run of `A-Z a-z 0-9 _ -`.  A stream name's terminal
+  parameter is non-empty and may also hold `.` and `~`; a key's may
+  hold anything, the empty string included.  Each separator after a
+  parameter (`,` and `!`) sorts below every character the parameter
+  may hold, so a scan of a family visits its streams, and a scan of a
+  key template its keys, in the order of their parameters: `gen`
+  before `gen-2`.  The core rejects a precommit or bootstrap output
   whose stream does not fill its family's template, and a reducer
   write whose key fills none of its slice's key templates.
-- A ref names a set of streams: a stream name, `prefix.*` for every
-  stream under `prefix.`, or `*` for every stream.  A wildcard's prefix
-  is the family alone or the family and whole parameters other than
-  the terminal one: `chat.*` and `chat.acme.*`, never
-  `chat.acme.gen.*`.  That is the wire form, used in URLs and
-  `want`.  In the bundle, maySee returns refs with a terminator on
-  every entry: `family.*`, `*`, and `name/` for an exact stream, so a
-  bare name is a malformed ref and a bundle bug, never a grant.  The
-  core strips the slash.
+- A ref names a set of streams: a stream name, a wildcard for every
+  stream whose name begins with its text before the `*`, or `*` for
+  every stream.  A wildcard covers the family alone or the family and
+  whole parameters other than the terminal one: `chat:*` and
+  `chat:acme,*`, never `chat:ac*` or `chat:acme,gen,*`.  That is the
+  wire form, used in URLs and `want`.  In the bundle, maySee returns
+  refs with a terminator on every entry: `chat:*`, `chat:acme,*`,
+  `*`, and `name!` for an exact stream, so a bare name is a malformed
+  ref and a bundle bug, never a grant.  The core strips the `!`.
 
 ### Wire protocol
 
@@ -301,7 +309,7 @@ Every frame is an array whose first element is a tag.
   means refresh and re-decide, where a reject is final.  It is opt-in
   per command; offline-queued work should not carry expectations.
 
-    GET /snapshot/<ref>          ref = stream, family.*, or *
+    GET /snapshot/<ref>          ref = stream, wildcard, or *
       → application/octet-stream: the blob (below), inline, not
         resumable; or
       → text/plain: one URL to fetch the blob from with Range; a 404
@@ -363,7 +371,7 @@ All integers big-endian.  Records sorted by key bytes.
     u32       crc32c of the footer's preceding 12 bytes
 
 Max record size 16 MiB; a larger klen or vlen is corruption.  Keys are
-the store keys with the ref's scope intact (`patron.X/patron`).
+the store keys with the ref's scope intact (`patron:X!patron`).
 `streams` maps every live stream the ref covers to its seq at the cut,
 and is the authoritative list of what the blob holds; a live stream
 with no keys appears in the map and nowhere else.  The optional header
@@ -488,7 +496,7 @@ app's slots:
   names, a registry identity, so a value that does not fit its type
   fails the call.  A scan names one type too, so its range lies within
   one key template.
-- A reducer's keys are local: the core prefixes `<stream>/`.  Its
+- A reducer's keys are local: the core prefixes `<stream>!`.  Its
   `template` is the family template and `keys` the key templates, as
   declared in the model.
   precommit, maySee, and lookup see global keys.

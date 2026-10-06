@@ -13,7 +13,7 @@ describe('crc32c', () => {
   });
 
   test('chains across pieces the way the blob checks key then value', () => {
-    const key = utf8.encode('patron.p1/patron');
+    const key = utf8.encode('patron:p1!patron');
     const value = utf8.encode('{"name":"Ann"}');
     const whole = new Uint8Array([...key, ...value]);
     expect(crc32c(value, crc32c(key))).toBe(crc32c(whole));

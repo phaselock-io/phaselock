@@ -325,9 +325,9 @@ export class PStoreItem {
   ) {}
 
   static fromSpec(tpl: string, type: PType): PStoreItem {
-    const name = tpl.split('.')[0];
+    const name = tpl.split(':')[0];
     if (name.includes('{')) {
-      throw new Error(`store key template '${tpl}' does not have a name before a '.'`);
+      throw new Error(`store key template '${tpl}' does not have a name before a ':'`);
     }
     const [chunks, params] = PStoreItem.parseTpl(tpl);
     return new PStoreItem(tpl, type, name, chunks, params);
@@ -377,7 +377,7 @@ export class PStore {
 
 /**
  * One family of event streams and the state folded from them.  `family` and `params` come from
- * the family template: `"chat.{org}.{channel}"` is family 'chat' with params ['org', 'channel'].
+ * the family template: `"chat:{org},{channel}"` is family 'chat' with params ['org', 'channel'].
  */
 export class PSlice {
   constructor(
@@ -389,9 +389,10 @@ export class PSlice {
     readonly store: PStore,
   ) {}
 
-  /** the family template, e.g. 'patron.{patron}' */
+  /** the family template, e.g. 'patron:{patron}' */
   get template(): string {
-    return [this.family, ...this.params.map((p) => `{${p}}`)].join('.');
+    if (this.params.length === 0) return this.family;
+    return `${this.family}:${this.params.map((p) => `{${p}}`).join(',')}`;
   }
 
   /** the event models, in declaration order */

@@ -463,10 +463,10 @@ func TestBootstrapAndLiveAtoms(t *testing.T) {
 	if len(evs) != 2 {
 		t.Fatalf("expected birth + event, got %v", evs)
 	}
-	if evs[0].data["$sys"] != "birth" || evs[0].stream != "patron.p1" {
-		t.Fatalf("expected birth on patron.p1, got %+v", evs[0])
+	if evs[0].data["$sys"] != "birth" || evs[0].stream != "patron:p1" {
+		t.Fatalf("expected birth on patron:p1, got %+v", evs[0])
 	}
-	if evs[1].data["type"] != "add-patron" || evs[1].stream != "patron.p1" {
+	if evs[1].data["type"] != "add-patron" || evs[1].stream != "patron:p1" {
 		t.Fatalf("expected add-patron, got %+v", evs[1])
 	}
 	if evs[0].position != live+1 || evs[1].position != live+2 || evs[1].position != pos {
@@ -487,7 +487,7 @@ func TestBootstrapAndLiveAtoms(t *testing.T) {
 	// a multi-stream atom arrives as one frame
 	h.ack(admin, cmd("c3", "try-hold", "id", "h1", "book", "b1", "patron", "p1"))
 	evs = events(s.nextTagged("events"))
-	if len(evs) != 2 || evs[0].stream != "book" || evs[1].stream != "patron.p1" {
+	if len(evs) != 2 || evs[0].stream != "book" || evs[1].stream != "patron:p1" {
 		t.Fatalf("expected book + patron events, got %+v", evs)
 	}
 	if evs[0].commandid != "c3" || evs[1].commandid != "c3" {
@@ -515,7 +515,7 @@ func TestLiveMultiAtomCommit(t *testing.T) {
 	}
 	first := events(s.nextTagged("events"))
 	second := events(s.nextTagged("events"))
-	if first[0].stream != "patron.p1" || second[0].stream != "patron.p2" {
+	if first[0].stream != "patron:p1" || second[0].stream != "patron:p2" {
 		t.Fatalf("expected both atoms live: %+v then %+v", first, second)
 	}
 }
@@ -533,7 +533,7 @@ func TestHistoryReplay(t *testing.T) {
 	for len(all) < 5 {
 		all = append(all, events(s.nextTagged("events"))...)
 	}
-	want := []string{"book", "book", "patron.p1", "patron.p1", "patron.p1"}
+	want := []string{"book", "book", "patron:p1", "patron:p1", "patron:p1"}
 	wantSeq := []int64{1, 2, 1, 2, 3}
 	for i, e := range all {
 		if e.stream != want[i] || e.position != int64(i+1) || e.seq != wantSeq[i] {
@@ -575,7 +575,7 @@ func TestViewAndWants(t *testing.T) {
 		all = append(all, events(s.nextTagged("events"))...)
 	}
 	for _, e := range all {
-		if e.stream != "book" && e.stream != "patron.p1" {
+		if e.stream != "book" && e.stream != "patron:p1" {
 			t.Fatalf("leaked event: %+v", e)
 		}
 	}
@@ -585,7 +585,7 @@ func TestViewAndWants(t *testing.T) {
 	s.quiet()
 	h.ack(admin, cmd("c5", "rename-patron", "id", "p1", "name", "Anne"))
 	evs := events(s.nextTagged("events"))
-	if evs[0].stream != "patron.p1" {
+	if evs[0].stream != "patron:p1" {
 		t.Fatalf("expected own event, got %+v", evs)
 	}
 
@@ -608,14 +608,14 @@ func TestViewAndWants(t *testing.T) {
 	}
 
 	// the narrower of a want and a grant is kept, and a want nothing grants
-	// vanishes: patron.* against patron.p1 is patron.p1, author.* is nothing
-	s4 := h.stream(ann, -1, "patron.*", "author.*")
-	if s4.first == nil || strings.Join(strs(s4.first[3]), ",") != "patron.p1" {
+	// vanishes: patron:* against patron:p1 is patron:p1, author:* is nothing
+	s4 := h.stream(ann, -1, "patron:*", "author:*")
+	if s4.first == nil || strings.Join(strs(s4.first[3]), ",") != "patron:p1" {
 		t.Fatalf("intersected view frame: %v", s4.first)
 	}
 	s4.live()
-	s5 := h.stream(admin, -1, "patron.*")
-	if s5.first == nil || strings.Join(strs(s5.first[3]), ",") != "patron.*" {
+	s5 := h.stream(admin, -1, "patron:*")
+	if s5.first == nil || strings.Join(strs(s5.first[3]), ",") != "patron:*" {
 		t.Fatalf("admin view cut down to a family: %v", s5.first)
 	}
 	s5.live()
@@ -641,12 +641,12 @@ func TestMaySeeInvalidation(t *testing.T) {
 	// two connections of the same principal with narrower wants
 	sb := h.stream(ann, -1, "book")
 	sb.live()
-	sp := h.stream(ann, -1, "patron.*")
+	sp := h.stream(ann, -1, "patron:*")
 	sp.live()
 
 	// granting a view rewrites maySee's read-set key: a view frame arrives,
 	// before any events of the same commit, carrying the whole set of refs
-	grantPos := h.ack(admin, cmd("c4", "grant-view", "user", "p1", "prefix", "patron.p2/"))
+	grantPos := h.ack(admin, cmd("c4", "grant-view", "user", "p1", "prefix", "patron:p2!"))
 	f := s.nextTagged("view")
 	if f[1].(string) == token0 {
 		t.Fatalf("token should change on grant")
@@ -655,14 +655,14 @@ func TestMaySeeInvalidation(t *testing.T) {
 	if asInt(f[2]) != grantPos {
 		t.Fatalf("view position %v, want %d", f[2], grantPos)
 	}
-	if got := strings.Join(strs(f[3]), ","); got != "book,patron.p1,patron.p2" {
+	if got := strings.Join(strs(f[3]), ","); got != "book,patron:p1,patron:p2" {
 		t.Fatalf("grant frame refs: %v", got)
 	}
 	token1 := f[1].(string)
 	// the grant is inside one connection's wants and outside the other's: the
 	// first gets its own view, the second's view is as it was, so no frame
 	f = sp.nextTagged("view")
-	if got := strings.Join(strs(f[3]), ","); got != "patron.p1,patron.p2" {
+	if got := strings.Join(strs(f[3]), ","); got != "patron:p1,patron:p2" {
 		t.Fatalf("grant frame refs under wants: %v", got)
 	}
 	sb.quiet()
@@ -670,7 +670,7 @@ func TestMaySeeInvalidation(t *testing.T) {
 	// now p2's events flow
 	h.ack(admin, cmd("c5", "rename-patron", "id", "p2", "name", "Robert"))
 	evs := events(s.nextTagged("events"))
-	if evs[0].stream != "patron.p2" {
+	if evs[0].stream != "patron:p2" {
 		t.Fatalf("expected granted stream, got %+v", evs)
 	}
 
@@ -681,7 +681,7 @@ func TestMaySeeInvalidation(t *testing.T) {
 	if v[1].(string) != token1 || fmt.Sprint(asInt(v[2])) != s2.header.Get("PhaseLock-Position") {
 		t.Fatalf("first view frame: %v (stream token %v)", v, token1)
 	}
-	if got := strings.Join(strs(v[3]), ","); got != "book,patron.p1,patron.p2" {
+	if got := strings.Join(strs(v[3]), ","); got != "book,patron:p1,patron:p2" {
 		t.Fatalf("first view refs: %v", got)
 	}
 	s2.resp.Body.Close()
@@ -692,9 +692,9 @@ func TestMaySeeInvalidation(t *testing.T) {
 	s3.resp.Body.Close()
 
 	// revocation: a view frame, and the same commit's events are withheld
-	h.ack(admin, cmd("c6", "revoke-view", "user", "p1", "prefix", "patron.p2/"))
+	h.ack(admin, cmd("c6", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
 	f = s.nextTagged("view")
-	if got := strings.Join(strs(f[3]), ","); got != "book,patron.p1" {
+	if got := strings.Join(strs(f[3]), ","); got != "book,patron:p1" {
 		t.Fatalf("revoke frame refs: %v", got)
 	}
 	if f[1].(string) != token0 {
@@ -706,32 +706,32 @@ func TestMaySeeInvalidation(t *testing.T) {
 	// refs are never expanded: a family grant is one ref, and the client
 	// learns the members from the blob
 	h.ack(admin, cmd("c8", "add-patron", "id", "p3", "name", "Cy"))
-	h.ack(admin, cmd("c9", "grant-view", "user", "p1", "prefix", "patron.*"))
+	h.ack(admin, cmd("c9", "grant-view", "user", "p1", "prefix", "patron:*"))
 	f = s.nextTagged("view")
-	if got := strings.Join(strs(f[3]), ","); got != "book,patron.*,patron.p1" {
+	if got := strings.Join(strs(f[3]), ","); got != "book,patron:*,patron:p1" {
 		t.Fatalf("wildcard grant frame refs: %v", got)
 	}
 	tokenFamily := f[1].(string)
 	// every change to the set is sent, even one that leaves coverage as it
-	// was: patron.p2 is inside the held patron.*
-	h.ack(admin, cmd("c9b", "grant-view", "user", "p1", "prefix", "patron.p2/"))
+	// was: patron:p2 is inside the held patron:*
+	h.ack(admin, cmd("c9b", "grant-view", "user", "p1", "prefix", "patron:p2!"))
 	f = s.nextTagged("view")
-	if got := strings.Join(strs(f[3]), ","); got != "book,patron.*,patron.p1,patron.p2" || f[1].(string) == tokenFamily {
+	if got := strings.Join(strs(f[3]), ","); got != "book,patron:*,patron:p1,patron:p2" || f[1].(string) == tokenFamily {
 		t.Fatalf("grant inside a held family: %v", f)
 	}
-	h.ack(admin, cmd("c9c", "revoke-view", "user", "p1", "prefix", "patron.p2/"))
+	h.ack(admin, cmd("c9c", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
 	f = s.nextTagged("view")
 	if f[1].(string) != tokenFamily {
 		t.Fatalf("revoke inside a held family: %v", f)
 	}
 	h.ack(admin, cmd("c10", "add-patron", "id", "p4", "name", "Di"))
 	evs = events(s.nextTagged("events"))
-	if evs[0].stream != "patron.p4" || evs[0].data["$sys"] != "birth" {
+	if evs[0].stream != "patron:p4" || evs[0].data["$sys"] != "birth" {
 		t.Fatalf("births under a held wildcard arrive in-stream: %+v", evs)
 	}
-	h.ack(admin, cmd("c11", "revoke-view", "user", "p1", "prefix", "patron.*"))
+	h.ack(admin, cmd("c11", "revoke-view", "user", "p1", "prefix", "patron:*"))
 	f = s.nextTagged("view")
-	if got := strings.Join(strs(f[3]), ","); got != "book,patron.p1" {
+	if got := strings.Join(strs(f[3]), ","); got != "book,patron:p1" {
 		t.Fatalf("wildcard revoke frame refs: %v", got)
 	}
 }
@@ -750,7 +750,7 @@ func TestBirthDeath(t *testing.T) {
 	s.live()
 	pos := h.ack(admin, cmd("c3", "remove-patron", "id", "p1"))
 	evs := events(s.nextTagged("events"))
-	if len(evs) != 1 || evs[0].data["$sys"] != "death" || evs[0].stream != "patron.p1" || evs[0].position != pos {
+	if len(evs) != 1 || evs[0].data["$sys"] != "death" || evs[0].stream != "patron:p1" || evs[0].position != pos {
 		t.Fatalf("expected death, got %+v", evs)
 	}
 	if evs[0].seq != 3 {
@@ -758,10 +758,10 @@ func TestBirthDeath(t *testing.T) {
 	}
 
 	// the dead stream is gone from the family's blob and its keys are gone
-	if fam := h.snapshot(admin, "patron.*"); len(fam.streams) != 1 || fam.streams["patron.p2"] != 2 {
+	if fam := h.snapshot(admin, "patron:*"); len(fam.streams) != 1 || fam.streams["patron:p2"] != 2 {
 		t.Fatalf("streams after death: %v", fam.streams)
 	}
-	blob := h.snapshot(admin, "patron.p1")
+	blob := h.snapshot(admin, "patron:p1")
 	if len(blob.records) != 0 {
 		t.Fatalf("dead stream still has state: %v", blob.records)
 	}
@@ -775,8 +775,8 @@ func TestBirthDeath(t *testing.T) {
 	if evs[0].seq != 4 || evs[1].seq != 5 {
 		t.Fatalf("seq continues across lives: %+v", evs)
 	}
-	blob = h.snapshot(admin, "patron.p1")
-	if blob.records["patron.p1/patron"] == nil {
+	blob = h.snapshot(admin, "patron:p1")
+	if blob.records["patron:p1!patron"] == nil {
 		t.Fatalf("reborn stream has no state: %v", blob.records)
 	}
 }
@@ -804,7 +804,7 @@ func (h *harness) snapshot(token, ref string) blob {
 	}
 	// every stream with a record is in the streams map
 	for _, k := range b.keys {
-		if _, ok := b.streams[k[:strings.Index(k, "/")]]; !ok {
+		if _, ok := b.streams[k[:strings.Index(k, "!")]]; !ok {
 			h.t.Fatalf("record %s for a stream missing from %v", k, b.streams)
 		}
 	}
@@ -892,27 +892,27 @@ func TestSnapshots(t *testing.T) {
 	h.ack(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
 	pos := h.ack(admin, cmd("c3", "add-patron", "id", "p2", "name", "Bob"))
 
-	one := h.snapshot(admin, "patron.p1")
-	if one.header["ref"] != "patron.p1" || one.position < pos || one.header["fold"] != h.epoch() {
+	one := h.snapshot(admin, "patron:p1")
+	if one.header["ref"] != "patron:p1" || one.position < pos || one.header["fold"] != h.epoch() {
 		t.Fatalf("header: %v", one.header)
 	}
-	if strings.Join(one.keys, ",") != "patron.p1/holds,patron.p1/messages,patron.p1/patron" {
+	if strings.Join(one.keys, ",") != "patron:p1!holds,patron:p1!messages,patron:p1!patron" {
 		t.Fatalf("keys: %v", one.keys)
 	}
-	if one.records["patron.p1/patron"].(map[string]any)["name"] != "Ann" {
+	if one.records["patron:p1!patron"].(map[string]any)["name"] != "Ann" {
 		t.Fatalf("value: %v", one.records)
 	}
 
 	// a family blob holds every instance, contiguous per instance, and
 	// names every live member with its seq
-	fam := h.snapshot(admin, "patron.*")
-	if len(fam.keys) != 6 || !strings.HasPrefix(fam.keys[0], "patron.p1/") || !strings.HasPrefix(fam.keys[5], "patron.p2/") {
+	fam := h.snapshot(admin, "patron:*")
+	if len(fam.keys) != 6 || !strings.HasPrefix(fam.keys[0], "patron:p1!") || !strings.HasPrefix(fam.keys[5], "patron:p2!") {
 		t.Fatalf("family keys: %v", fam.keys)
 	}
-	if len(fam.streams) != 2 || fam.streams["patron.p1"] != 2 || fam.streams["patron.p2"] != 2 {
+	if len(fam.streams) != 2 || fam.streams["patron:p1"] != 2 || fam.streams["patron:p2"] != 2 {
 		t.Fatalf("family streams: %v", fam.streams)
 	}
-	if one.streams["patron.p1"] != 2 || len(one.streams) != 1 {
+	if one.streams["patron:p1"] != 2 || len(one.streams) != 1 {
 		t.Fatalf("exact streams: %v", one.streams)
 	}
 
@@ -939,7 +939,7 @@ func TestSnapshots(t *testing.T) {
 
 	// snapshots are authorized against the view
 	anon := ""
-	if status, _, _ := h.do("GET", "/snapshot/patron.p1", anon, nil); status != 403 {
+	if status, _, _ := h.do("GET", "/snapshot/patron:p1", anon, nil); status != 403 {
 		t.Fatalf("anonymous snapshot of a patron: status %d", status)
 	}
 	if status, _, _ := h.do("GET", "/snapshot/book", anon, nil); status != 200 {
@@ -954,7 +954,7 @@ func TestPasswordAuth(t *testing.T) {
 
 	// anyone may create an account; the password is hashed at intake
 	h.ack("", cmd("c2", "create-account", "user", "ann", "password", "hunter2"))
-	acct := h.snapshot(admin, "account.ann").records["account.ann/account"].(map[string]any)
+	acct := h.snapshot(admin, "account:ann").records["account:ann!account"].(map[string]any)
 	hash := acct["hash"].(string)
 	if hash == "hunter2" || !strings.HasPrefix(hash, "$") {
 		t.Fatalf("password not hashed at intake: %q", hash)
@@ -1102,7 +1102,7 @@ func TestRestartKeepsEverything(t *testing.T) {
 	for len(all) < 6 {
 		all = append(all, events(s.nextTagged("events"))...)
 	}
-	if all[5].stream != "account.p1" || all[5].position != 6 {
+	if all[5].stream != "account:p1" || all[5].position != 6 {
 		t.Fatalf("history after restart: %+v", all)
 	}
 	next := h.ack(admin, cmd("c4", "add-patron", "id", "p2", "name", "Bob"))
@@ -1110,7 +1110,7 @@ func TestRestartKeepsEverything(t *testing.T) {
 		t.Fatalf("positions should continue at 7,8: got %d", next)
 	}
 	// state survives
-	if h.snapshot(admin, "patron.p1").records["patron.p1/patron"] == nil {
+	if h.snapshot(admin, "patron:p1").records["patron:p1!patron"] == nil {
 		t.Fatalf("state lost across restart")
 	}
 	// login survives
@@ -1245,12 +1245,12 @@ func TestStreamByteCounters(t *testing.T) {
 		eventBytes += int64(len(mpEncode(e.data)))
 	}
 
-	blob := h.snapshot(admin, "patron.p1")
+	blob := h.snapshot(admin, "patron:p1")
 	var stateBytes int64
 	for _, k := range blob.keys {
 		stateBytes += int64(len(k)) + int64(len(blob.raw[k]))
 	}
-	if blob.streams["patron.p1"] != 3 || len(blob.streams) != 1 {
+	if blob.streams["patron:p1"] != 3 || len(blob.streams) != 1 {
 		t.Fatalf("streams in header: %v", blob.streams)
 	}
 	if asInt(blob.header["event_bytes"]) != eventBytes {
@@ -1261,13 +1261,13 @@ func TestStreamByteCounters(t *testing.T) {
 	}
 
 	// family blobs carry no per-stream counters
-	if _, ok := h.snapshot(admin, "patron.*").header["state_bytes"]; ok {
+	if _, ok := h.snapshot(admin, "patron:*").header["state_bytes"]; ok {
 		t.Fatalf("family blob should not carry stream counters")
 	}
 
 	// death zeroes state and still counts its own event bytes
 	h.ack(admin, cmd("c3", "remove-patron", "id", "p1"))
-	dead := h.snapshot(admin, "patron.p1")
+	dead := h.snapshot(admin, "patron:p1")
 	if asInt(dead.header["state_bytes"]) != 0 || asInt(dead.header["event_bytes"]) <= eventBytes {
 		t.Fatalf("after death: %v", dead.header)
 	}
@@ -1280,16 +1280,16 @@ func TestExpectAndConflict(t *testing.T) {
 
 	// expectations are the stream's seq: exact, so a met one passes and
 	// the same one then conflicts, reporting the actual seq
-	o := h.expecting(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne"), map[string]any{"patron.p1": 2})
+	o := h.expecting(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne"), map[string]any{"patron:p1": 2})
 	if o.kind != "ack" {
 		t.Fatalf("matching expect: %+v", o)
 	}
-	o = h.expecting(admin, cmd("c3", "rename-patron", "id", "p1", "name", "Annie"), map[string]any{"patron.p1": 2})
-	if o.kind != "conflict" || o.current["patron.p1"] != 3 {
+	o = h.expecting(admin, cmd("c3", "rename-patron", "id", "p1", "name", "Annie"), map[string]any{"patron:p1": 2})
+	if o.kind != "conflict" || o.current["patron:p1"] != 3 {
 		t.Fatalf("stale expect: %+v", o)
 	}
 	// a conflicting command never entered the log
-	if got := h.snapshot(admin, "patron.p1").records["patron.p1/patron"].(map[string]any)["name"]; got != "Anne" {
+	if got := h.snapshot(admin, "patron:p1").records["patron:p1!patron"].(map[string]any)["name"]; got != "Anne" {
 		t.Fatalf("conflict should not fold: %v", got)
 	}
 
@@ -1298,13 +1298,13 @@ func TestExpectAndConflict(t *testing.T) {
 	if o.kind != "ack" {
 		t.Fatalf("expect 0 on unborn stream: %+v", o)
 	}
-	o = h.expecting(admin, cmd("c5", "add-patron", "id", "p2", "name", "Bob"), map[string]any{"patron.p2": 1})
-	if o.kind != "conflict" || o.current["patron.p2"] != 0 {
+	o = h.expecting(admin, cmd("c5", "add-patron", "id", "p2", "name", "Bob"), map[string]any{"patron:p2": 1})
+	if o.kind != "conflict" || o.current["patron:p2"] != 0 {
 		t.Fatalf("expect on unborn stream reports 0: %+v", o)
 	}
 
 	// several expectations: only the mismatches are reported
-	o = h.expecting(admin, cmd("c6", "rename-patron", "id", "p1", "name", "x"), map[string]any{"patron.p1": 3, "book": 5})
+	o = h.expecting(admin, cmd("c6", "rename-patron", "id", "p1", "name", "x"), map[string]any{"patron:p1": 3, "book": 5})
 	if o.kind != "conflict" || len(o.current) != 1 || o.current["book"] != 2 {
 		t.Fatalf("mixed expect: %+v", o)
 	}
@@ -1318,17 +1318,17 @@ func TestExpectAndConflict(t *testing.T) {
 	}
 
 	// dedup wins over a stale expectation
-	o = h.expecting(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne"), map[string]any{"patron.p1": 0})
+	o = h.expecting(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne"), map[string]any{"patron:p1": 0})
 	if o.kind != "dup" {
 		t.Fatalf("resubmit with stale expect: %+v", o)
 	}
 
 	// a hashed command keeps its expectation through intake
-	o = h.expecting("", cmd("c7", "create-account", "user", "p1", "password", "pw"), map[string]any{"account.p1": 1})
-	if o.kind != "conflict" || o.current["account.p1"] != 0 {
+	o = h.expecting("", cmd("c7", "create-account", "user", "p1", "password", "pw"), map[string]any{"account:p1": 1})
+	if o.kind != "conflict" || o.current["account:p1"] != 0 {
 		t.Fatalf("expect survives hash intake: %+v", o)
 	}
-	o = h.expecting("", cmd("c8", "create-account", "user", "p1", "password", "pw"), map[string]any{"account.p1": 0})
+	o = h.expecting("", cmd("c8", "create-account", "user", "p1", "password", "pw"), map[string]any{"account:p1": 0})
 	if o.kind != "ack" {
 		t.Fatalf("hashed command with matching expect: %+v", o)
 	}
@@ -1386,93 +1386,93 @@ func TestEventsRange(t *testing.T) {
 	head := last + 1                                                               // a position the client does not have yet
 
 	// forward: only p1's events, ascending, range exhausted in one page
-	evs, scanned, _ := h.eventsRange(admin, "patron.p1", 0, head, false, 0)
+	evs, scanned, _ := h.eventsRange(admin, "patron:p1", 0, head, false, 0)
 	if len(evs) != 7 || evs[0].position != 1 || evs[6].position != 9 || scanned != head {
 		t.Fatalf("forward: %d events, scanned %d", len(evs), scanned)
 	}
 	for i := 1; i < len(evs); i++ {
-		if evs[i].stream != "patron.p1" || evs[i].seq != evs[i-1].seq+1 {
+		if evs[i].stream != "patron:p1" || evs[i].seq != evs[i-1].seq+1 {
 			t.Fatalf("forward order/seq: %+v", evs)
 		}
 	}
 
 	// both bounds are exclusive: positions the client holds
-	evs, _, _ = h.eventsRange(admin, "patron.p1", 2, 6, false, 0)
+	evs, _, _ = h.eventsRange(admin, "patron:p1", 2, 6, false, 0)
 	if len(evs) != 1 || evs[0].position != 5 {
 		t.Fatalf("bounds: %+v", evs)
 	}
 
 	// reverse: descending, scanned is the next before
-	evs, scanned, _ = h.eventsRange(admin, "patron.p1", 0, head, true, 0)
+	evs, scanned, _ = h.eventsRange(admin, "patron:p1", 0, head, true, 0)
 	if len(evs) != 7 || evs[0].position != 9 || evs[6].position != 1 || scanned != 0 {
 		t.Fatalf("reverse: %+v scanned %d", evs, scanned)
 	}
 
 	// paging with max: the scanned value plugs straight into the next
 	// request, in both directions, with no arithmetic
-	evs, scanned, _ = h.eventsRange(admin, "patron.p1", 0, head, false, 3)
+	evs, scanned, _ = h.eventsRange(admin, "patron:p1", 0, head, false, 3)
 	if len(evs) != 3 || evs[2].position != 5 || scanned != 5 {
 		t.Fatalf("forward page: %+v scanned %d", evs, scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron.p1", scanned, head, false, 3)
+	evs, scanned, _ = h.eventsRange(admin, "patron:p1", scanned, head, false, 3)
 	if len(evs) != 3 || evs[0].position != 6 || evs[2].position != 8 || scanned != 8 {
 		t.Fatalf("forward page 2: %+v scanned %d", evs, scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron.p1", scanned, head, false, 3)
+	evs, scanned, _ = h.eventsRange(admin, "patron:p1", scanned, head, false, 3)
 	if len(evs) != 1 || evs[0].position != 9 || scanned != head {
 		t.Fatalf("forward page 3: %+v scanned %d", evs, scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron.p1", 0, head, true, 3)
+	evs, scanned, _ = h.eventsRange(admin, "patron:p1", 0, head, true, 3)
 	if len(evs) != 3 || evs[2].position != 7 || scanned != 7 {
 		t.Fatalf("reverse page: %+v scanned %d", evs, scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron.p1", 0, scanned, true, 3)
+	evs, scanned, _ = h.eventsRange(admin, "patron:p1", 0, scanned, true, 3)
 	if len(evs) != 3 || evs[0].position != 6 || evs[2].position != 2 || scanned != 2 {
 		t.Fatalf("reverse page 2: %+v scanned %d", evs, scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron.p1", 0, scanned, true, 3)
+	evs, scanned, _ = h.eventsRange(admin, "patron:p1", 0, scanned, true, 3)
 	if len(evs) != 1 || evs[0].position != 1 || scanned != 0 {
 		t.Fatalf("reverse page 3: %+v scanned %d", evs, scanned)
 	}
 
 	// the stream must be visible to the principal
-	if _, _, status := h.eventsRange(h.token("p1"), "patron.p2", 0, head, false, 0); status != 403 {
+	if _, _, status := h.eventsRange(h.token("p1"), "patron:p2", 0, head, false, 0); status != 403 {
 		t.Fatalf("invisible stream: status %d", status)
 	}
-	if _, _, status := h.eventsRange(h.token("p1"), "patron.p1", 0, head, false, 0); status != 200 {
+	if _, _, status := h.eventsRange(h.token("p1"), "patron:p1", 0, head, false, 0); status != 200 {
 		t.Fatalf("own stream: status %d", status)
 	}
 
 	// both bounds are optional: the start of the log and the head.  At the
 	// head, scanned is the last position delivered, or after if nothing was
-	evs, scanned, _ = h.eventsRange(admin, "patron.p1", -1, -1, false, 0)
+	evs, scanned, _ = h.eventsRange(admin, "patron:p1", -1, -1, false, 0)
 	if len(evs) != 7 || evs[0].position != 1 || evs[6].position != 9 || scanned != 9 {
 		t.Fatalf("unbounded forward: %d events, scanned %d", len(evs), scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron.p1", 9, -1, false, 0)
+	evs, scanned, _ = h.eventsRange(admin, "patron:p1", 9, -1, false, 0)
 	if len(evs) != 0 || scanned != 9 {
 		t.Fatalf("empty at head: %d events, scanned %d", len(evs), scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron.p1", -1, -1, true, 0)
+	evs, scanned, _ = h.eventsRange(admin, "patron:p1", -1, -1, true, 0)
 	if len(evs) != 7 || evs[0].position != 9 || scanned != 0 {
 		t.Fatalf("unbounded reverse: %d events, scanned %d", len(evs), scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron.p1", -1, 6, false, 0)
+	evs, scanned, _ = h.eventsRange(admin, "patron:p1", -1, 6, false, 0)
 	if len(evs) != 3 || evs[2].position != 5 || scanned != 6 {
 		t.Fatalf("no after: %+v scanned %d", evs, scanned)
 	}
 
 	// a family ref interleaves its streams in position order
-	evs, scanned, _ = h.eventsRange(admin, "patron.*", 0, head, true, 4)
+	evs, scanned, _ = h.eventsRange(admin, "patron:*", 0, head, true, 4)
 	if len(evs) != 4 || evs[0].position != 10 || evs[1].position != 9 || evs[3].position != 7 || scanned != 7 {
 		t.Fatalf("family reverse page: %+v scanned %d", evs, scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron.*", 0, scanned, true, 0)
+	evs, scanned, _ = h.eventsRange(admin, "patron:*", 0, scanned, true, 0)
 	if len(evs) != 6 || evs[0].position != 6 || evs[5].position != 1 || scanned != 0 {
 		t.Fatalf("family reverse page 2: %+v scanned %d", evs, scanned)
 	}
-	evs, _, _ = h.eventsRange(admin, "patron.*", 2, 5, false, 0)
-	if len(evs) != 2 || evs[0].position != 3 || evs[1].position != 4 || evs[0].stream != "patron.p2" {
+	evs, _, _ = h.eventsRange(admin, "patron:*", 2, 5, false, 0)
+	if len(evs) != 2 || evs[0].position != 3 || evs[1].position != 4 || evs[0].stream != "patron:p2" {
 		t.Fatalf("family bounds: %+v", evs)
 	}
 
@@ -1485,10 +1485,10 @@ func TestEventsRange(t *testing.T) {
 	if _, _, status := h.eventsRange(h.token("p1"), "*", 0, head, false, 0); status != 403 {
 		t.Fatalf("everything for p1: status %d", status)
 	}
-	if _, _, status := h.eventsRange(h.token("p1"), "patron.*", 0, head, false, 0); status != 403 {
+	if _, _, status := h.eventsRange(h.token("p1"), "patron:*", 0, head, false, 0); status != 403 {
 		t.Fatalf("family for p1: status %d", status)
 	}
-	for _, bad := range []string{"", "patron.", "patron.p1/", "patron*", "pat*ron", "*.patron"} {
+	for _, bad := range []string{"", "patron:", "patron:p1!", "patron*", "patron:p*", "pat*ron", "*:patron"} {
 		if _, _, status := h.eventsRange(admin, bad, 0, head, false, 0); status != 400 {
 			t.Fatalf("ref %q: status %d", bad, status)
 		}
@@ -1573,7 +1573,7 @@ func TestTypedValues(t *testing.T) {
 	if got, ok := evs[1].data["added"].(time.Time); !ok || !got.Equal(added) {
 		t.Fatalf("event date: %v", evs[1].data["added"])
 	}
-	book := h.snapshot(admin, "book").records["book/book.b1"].(map[string]any)
+	book := h.snapshot(admin, "book").records["book!book:b1"].(map[string]any)
 	if got, ok := book["added"].(time.Time); !ok || !got.Equal(added) {
 		t.Fatalf("stored date: %v", book["added"])
 	}
@@ -1595,7 +1595,7 @@ func TestTypedValues(t *testing.T) {
 
 	// an optional field left out stays out
 	h.ack(admin, cmd("c3", "add-book", "id", "b3", "title", "Emma"))
-	if _, ok := h.snapshot(admin, "book").records["book/book.b3"].(map[string]any)["added"]; ok {
+	if _, ok := h.snapshot(admin, "book").records["book!book:b3"].(map[string]any)["added"]; ok {
 		t.Fatalf("absent optional field written")
 	}
 }
@@ -1607,7 +1607,7 @@ func TestPreparedFields(t *testing.T) {
 
 	// a NewPassword is replaced by its argon2id hash before precommit sees it
 	h.ack("", cmd("c2", "create-account", "user", "ann", "password", "hunter2"))
-	acct := h.snapshot(admin, "account.ann").records["account.ann/account"].(map[string]any)
+	acct := h.snapshot(admin, "account:ann").records["account:ann!account"].(map[string]any)
 	hash := acct["hash"].(string)
 	if !strings.HasPrefix(hash, "$argon2id$") {
 		t.Fatalf("expected an argon2id hash, got %q", hash)
@@ -1686,7 +1686,7 @@ func TestCheckEdges(t *testing.T) {
 	h.ack(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune", "added", whole))
 	h.ack(admin, cmd("c2", "add-book", "id", "b2", "title", "Emma", "added", old))
 	records := h.snapshot(admin, "book").records
-	for key, want := range map[string]time.Time{"book/book.b1": whole, "book/book.b2": old} {
+	for key, want := range map[string]time.Time{"book!book:b1": whole, "book!book:b2": old} {
 		if got, ok := records[key].(map[string]any)["added"].(time.Time); !ok || !got.Equal(want) {
 			t.Fatalf("%s: stored date %v, want %v", key, records[key], want)
 		}
@@ -1901,7 +1901,7 @@ func TestBootstrapSeedsAnEmptyLog(t *testing.T) {
 		t.Fatalf("bootstrap's atom: %+v", evs)
 	}
 	for _, e := range evs {
-		if e.stream != "account.boss" || e.commandid != "bootstrap" {
+		if e.stream != "account:boss" || e.commandid != "bootstrap" {
 			t.Fatalf("bootstrap's event: %+v", e)
 		}
 	}
@@ -1951,22 +1951,39 @@ func TestValidRef(t *testing.T) {
 	for ref, want := range map[string]bool{
 		"*":                 true,
 		"book":              true,
-		"patron.p1":         true,
-		"patron.*":          true,
-		"chat.acme.*":       true,
-		"chat.acme.gen.e~1": true,
-		"patron.p1.":        true,
+		"login":             true,
+		"patron:p1":         true,
+		"patron:*":          true,
+		"chat:*":            true,
+		"chat:acme,*":       true,
+		"chat:acme,gen,*":   true,
+		"chat:acme,gen.e~1": true,
+		"chat:acme-2,gen-2": true,
+		"patron:p1.":        true,
+		"pa-tron:p1":        true,
 		"":                  false,
-		".*":                false,
-		"*.*":               false,
-		"patron.":           false,
-		"patron..*":         false,
-		"pa~tron.p1":        false,
-		"pa.tron":           true,
-		"patron.p/1":        false,
-		"patron.p*":         false,
-		"patron.p 1":        false,
-		"patron.p%2F1":      false,
+		":*":                false,
+		"*:*":               false,
+		"chat,*":            false,
+		"chat*":             false,
+		"chat::*":           false,
+		"chat:ac*":          false,
+		"chat:acme,g*":      false,
+		"chat:acme,,*":      false,
+		"chat:a.b,*":        false,
+		"chat:a.b,gen":      false,
+		"chat:acme,":        false,
+		"chat:,gen":         false,
+		"chat:acme:gen":     false,
+		"patron:":           false,
+		"patron.p1":         false,
+		"patron:p1!":        false,
+		"patron!":           false,
+		"pa~tron:p1":        false,
+		"pa.tron":           false,
+		"patron:p/1":        false,
+		"patron:p 1":        false,
+		"patron:p%2F1":      false,
 	} {
 		if got := validRef(ref); got != want {
 			t.Errorf("validRef(%q) = %v, want %v", ref, got, want)
@@ -1980,8 +1997,8 @@ func TestStreamNamesFillTheirTemplates(t *testing.T) {
 
 	// a family template's terminal parameter may hold . and ~
 	h.ack(admin, cmd("c1", "add-patron", "id", "p.1~x", "name", "Ann"))
-	if _, ok := h.snapshot(admin, "patron.p.1~x").records["patron.p.1~x/patron"]; !ok {
-		t.Fatalf("patron.p.1~x was not written")
+	if _, ok := h.snapshot(admin, "patron:p.1~x").records["patron:p.1~x!patron"]; !ok {
+		t.Fatalf("patron:p.1~x was not written")
 	}
 
 	// a precommit reading through a parameter that no stream name could hold is rejected before
@@ -2013,7 +2030,7 @@ func TestKeysHoldNoControlCharacterOrLoneSurrogate(t *testing.T) {
 	}
 	records := h.snapshot(admin, "book").records
 	for _, id := range ok {
-		if _, found := records["book/book."+id]; !found {
+		if _, found := records["book!book:"+id]; !found {
 			t.Fatalf("book %q was not written", id)
 		}
 	}
@@ -2031,7 +2048,7 @@ func TestKeysHoldNoControlCharacterOrLoneSurrogate(t *testing.T) {
 	// nothing although b1 is held, and the reducer's write is refused
 	h.ack(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
 	o := h.commands(admin, cmd("c2", "add-book", "id", "b1\x00x", "title", "Emma"))[0]
-	if o.kind != "reject" || !strings.Contains(o.reason, "a key beginning book/book.b1 holds U+0000") {
+	if o.kind != "reject" || !strings.Contains(o.reason, "a key beginning book!book:b1 holds U+0000") {
 		t.Fatalf("add-book with U+0000: %+v", o)
 	}
 }
@@ -2060,9 +2077,9 @@ func TestAFailingMaySeeGrantsNothing(t *testing.T) {
 	s.live()
 
 	// a granted wildcard that cuts into a stream's terminal parameter ends the connection
-	h.ack(admin, cmd("c3", "grant-view", "user", "p1", "prefix", "patron.p1.*"))
+	h.ack(admin, cmd("c3", "grant-view", "user", "p1", "prefix", "patron:p1,*"))
 	f := s.nextTagged("end")
-	if f[1] != "error" || !strings.Contains(f[2].(string), "malformed ref: patron.p1.*") {
+	if f[1] != "error" || !strings.Contains(f[2].(string), "malformed ref: patron:p1,*") {
 		t.Fatalf("end frame: %v", f)
 	}
 	select {
@@ -2075,7 +2092,61 @@ func TestAFailingMaySeeGrantsNothing(t *testing.T) {
 
 	// and a new connection is refused with the failure
 	status, _, body := h.do("GET", "/stream?since=-1", ann, nil)
-	if status != 500 || !strings.Contains(string(body), "malformed ref: patron.p1.*") {
+	if status != 500 || !strings.Contains(string(body), "malformed ref: patron:p1,*") {
 		t.Fatalf("a stream under a failing maySee: %d %s", status, body)
+	}
+}
+
+func TestMaySeeRefsCarryATerminator(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.ack(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.ack(admin, cmd("c2", "add-patron", "id", "p2", "name", "Bob"))
+	h.ack(admin, cmd("c3", "create-account", "user", "p1", "password", "hunter2"))
+	ann := h.token("p1")
+
+	// an exact stream is "name!", which grants the stream
+	h.ack(admin, cmd("c4", "grant-view", "user", "p1", "prefix", "patron:p2!"))
+	if _, _, status := h.eventsRange(ann, "patron:p2", 0, 100, false, 0); status != 200 {
+		t.Fatalf("a granted stream: status %d", status)
+	}
+	h.ack(admin, cmd("c5", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
+
+	// a bare name, a wildcard cutting into a parameter, and a wildcard after a singleton family
+	// are malformed, so the registration fails closed
+	for i, ref := range []string{"patron:p2", "patron:p*", "book:*", "patron:p2/"} {
+		h.ack(admin, cmd(fmt.Sprintf("g%d", i), "grant-view", "user", "p1", "prefix", ref))
+		status, _, body := h.do("GET", "/stream?since=-1", ann, nil)
+		if status != 500 || !strings.Contains(string(body), "malformed ref: "+ref) {
+			t.Fatalf("maySee returning %q: %d %s", ref, status, body)
+		}
+		h.ack(admin, cmd(fmt.Sprintf("r%d", i), "revoke-view", "user", "p1", "prefix", ref))
+	}
+}
+
+func TestAFamilyWalksInParameterOrder(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+
+	// a stream whose parameter is another's followed by '-' or '.' sorts after it
+	for i, id := range []string{"gen.x", "gen-2", "gen"} {
+		h.ack(admin, cmd(fmt.Sprintf("c%d", i), "add-patron", "id", id, "name", "N"))
+	}
+	fam := h.snapshot(admin, "patron:*")
+	want := []string{
+		"patron:gen!holds", "patron:gen!messages", "patron:gen!patron",
+		"patron:gen-2!holds", "patron:gen-2!messages", "patron:gen-2!patron",
+		"patron:gen.x!holds", "patron:gen.x!messages", "patron:gen.x!patron",
+	}
+	if got := strings.Join(fam.keys, ","); got != strings.Join(want, ",") {
+		t.Fatalf("family keys: %s", got)
+	}
+
+	// and so does a key whose parameter is another's followed by '-'
+	for i, id := range []string{"2026-10-06", "2026-10"} {
+		h.ack(admin, cmd(fmt.Sprintf("b%d", i), "add-book", "id", id, "title", "T"))
+	}
+	if got := strings.Join(h.snapshot(admin, "book").keys, ","); got != "book!book:2026-10,book!book:2026-10-06" {
+		t.Fatalf("book keys: %s", got)
 	}
 }

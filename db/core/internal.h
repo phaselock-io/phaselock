@@ -108,7 +108,7 @@ typedef struct jsrt {
     slice_names *slices; /* every reducer's templates */
     size_t nslices;
     /* while a reducer runs, its slice, whose key templates every key it writes must fill, and the
-       length of the "<stream>/" prefix of those keys */
+       length of the "<stream>!" prefix of those keys */
     const slice_names *reducing;
     size_t reducing_skip;
     bool dev;           /* the bundle's DEV: its errors go to clients in full */
@@ -149,8 +149,9 @@ int64_t js_generation(jsrt *js, JSValueConst principal);
 const slice_names *slice_of(const jsrt *js, const char *stream);
 /* whether a stream name fills its family's template */
 bool stream_fills(const jsrt *js, const char *name);
-/* whether a ref "prefix.*" covers whole parameters of its family's template: the family alone,
-   or the family and parameters other than the terminal one */
+/* whether a wildcard ref's text before its star ("chat:", "chat:acme,") covers whole parameters
+   of its family's template: the family alone, or the family and parameters other than the
+   terminal one */
 bool ref_prefix_fills(const jsrt *js, const char *prefix);
 /* whether a local key fills the key template its name picks */
 bool key_fills(const slice_names *sl, const char *key);

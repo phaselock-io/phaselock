@@ -197,12 +197,12 @@ static int64_t stored_size(store *s, const char *key) {
     return out;
 }
 
-/* charge delta bytes of state to the stream owning key */
+/* charge delta bytes of state to the stream owning key, the text before its first '!' */
 static int charge_state(store *s, const char *key, int64_t delta) {
     if (delta == 0) return 0;
-    const char *slash = strchr(key, '/');
-    if (!slash) return 0;
-    sqlite3_bind_text(s->stream_state, 1, key, (int)(slash - key), SQLITE_STATIC);
+    const char *bang = strchr(key, '!');
+    if (!bang) return 0;
+    sqlite3_bind_text(s->stream_state, 1, key, (int)(bang - key), SQLITE_STATIC);
     sqlite3_bind_int64(s->stream_state, 2, delta);
     return step_done(s, s->stream_state, "stream_state");
 }
@@ -256,7 +256,7 @@ int store_del_prefix(store *s, const char *prefix) {
     sqlite3_bind_text(s->del_prefix, 2, bound, -1, SQLITE_TRANSIENT);
     if (step_done(s, s->del_prefix, "del_prefix")) return -1;
     size_t n = strlen(prefix);
-    if (n > 1 && prefix[n - 1] == '/') {
+    if (n > 1 && prefix[n - 1] == '!') {
         sqlite3_bind_text(s->stream_state_zero, 1, prefix, (int)(n - 1), SQLITE_STATIC);
         return step_done(s, s->stream_state_zero, "stream_state_zero");
     }

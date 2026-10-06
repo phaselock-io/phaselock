@@ -13,7 +13,7 @@ const SOURCE = `
   alias Id = string;
 
   interface CatalogSlice extends Slice<"catalog", CatalogEvents, {
-    "item.{item}": Item;
+    "item:{item}": Item;
     "count": int32;
     "tags": string[];
   }> {}
@@ -33,9 +33,9 @@ const SOURCE = `
   union Color { "red", "green" }
   model Slot { pair: Pair; color: Color; note: string | null; blob: unknown; }
 
-  interface InboxSlice extends Slice<"inbox.{org}.{user}", InboxEvents, {
+  interface InboxSlice extends Slice<"inbox:{org},{user}", InboxEvents, {
     "profile": Profile;
-    "slot.{slot}": Slot;
+    "slot:{slot}": Slot;
   }> {}
 
   model Profile { name: string; }
@@ -45,7 +45,7 @@ const SOURCE = `
   @command(Noted)
   model Noted { type: "noted"; note: Id; text: string; }
 
-  interface SecretSlice extends Slice<"secret.{user}", SecretSet, { "secret": PasswordHash }> {}
+  interface SecretSlice extends Slice<"secret:{user}", SecretSet, { "secret": PasswordHash }> {}
   model SecretSet { type: "secret-set"; password: PasswordHash; }
 
   @command(ItemAdded)

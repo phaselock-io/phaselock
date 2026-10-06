@@ -599,7 +599,7 @@ function accessors(annos: Annos, slice: PSlice, global: boolean): Accessor[] {
     name: item.name,
     params: global ? [...slice.params, ...item.params] : item.params,
     key:
-      (global ? `${checkedText(item.name, slice.template, true)}/` : '') +
+      (global ? `${checkedText(item.name, slice.template, true)}!` : '') +
       checkedText(item.name, item.tpl, false),
     anno: annos.get(item.type)!,
     type: storeTypeName(slice, item),
@@ -742,7 +742,8 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
     (t) => `return handlers.${prop(lowerFirst(t.name!))}(txn, val as ${annos.get(t)!}, pending);\n`,
   );
 
-  // the stream's parameters, parsed from its name; the final one is the rest of the name
+  // the stream's parameters, parsed from its name: after the family and its ':', separated by
+  // ',', which no parameter holds
   const skip = slice.family.length + 1;
   const n = slice.params.length;
   let parsed: string;
@@ -751,10 +752,7 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   } else if (n === 1) {
     parsed = `{ ${slice.params[0]}: stream.slice(${skip}) }`;
   } else {
-    const fields = slice.params.map((p, i) =>
-      i < n - 1 ? `${p}: parts[${i}]` : `${p}: parts.slice(${i}).join(".")`,
-    );
-    parsed = `{ ${fields.join(', ')} }`;
+    parsed = `{ ${slice.params.map((p, i) => `${p}: parts[${i}]`).join(', ')} }`;
   }
 
   // the SliceReducer the Engine and the database call
@@ -767,7 +765,7 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
     'reducer($txn: ReducerTxn, events: unknown[], stream: string, pending: boolean): void {\n',
   );
   d.indent('  ');
-  if (n > 1) d.print(`const parts = stream.slice(${skip}).split(".");\n`);
+  if (n > 1) d.print(`const parts = stream.slice(${skip}).split(",");\n`);
   d.print(`const txn = ${lowerFirst(base)}Txn($txn, ${parsed});\n`);
   d.print(`for (const event of events) ${reduce}(handlers, txn, pending, event);\n`);
   d.dedent();
@@ -889,7 +887,7 @@ function generateEngine(d: Denter, annos: Annos, registry: PTypeRegistry, e: PEn
   d.print('}\n');
 
   // the engine itself
-  const wants = e.slices.map((s) => (s.params.length === 0 ? s.family : `${s.family}.*`));
+  const wants = e.slices.map((s) => (s.params.length === 0 ? s.family : `${s.family}:*`));
   const names = e.slices.map((s) => s.name).join(', ');
   d.print(`
 /** the Engine of ${e.name}, syncing ${names} */

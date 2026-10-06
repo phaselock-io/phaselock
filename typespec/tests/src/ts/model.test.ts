@@ -8,6 +8,7 @@
 
 import { beforeAll, describe, expect, it } from 'vitest';
 
+import { InMemStore, JS, prefixRange, txnScanAll } from '../../../ts/assets/skeleton.ts';
 import { bootstrap, FakeServer, registry, settle } from '../engine/harness.ts';
 
 import { emit, outDir, typecheck } from './emit-harness.ts';
@@ -17,7 +18,7 @@ const SOURCE = `
 
   // the catalog: a singleton slice
   interface CatalogSlice extends Slice<"catalog", CatalogEvents, {
-    "item.{item}": Item;
+    "item:{item}": Item;
     "count": int32;
   }> {}
 
@@ -29,9 +30,9 @@ const SOURCE = `
   model ItemRemoved { type: "item-removed"; id: Id; }
 
   // an inbox per org and user: a slice with two parameters
-  interface InboxSlice extends Slice<"inbox.{org}.{user}", InboxEvents, {
+  interface InboxSlice extends Slice<"inbox:{org},{user}", InboxEvents, {
     "profile": Profile;
-    "note.{note}": string;
+    "note:{note}": string;
   }> {}
 
   model Profile { name: string; }
@@ -45,7 +46,7 @@ const SOURCE = `
   model Noted { type: "noted"; note: Id; text: string; }
 
   // secrets: a database-only slice with a single event
-  interface SecretSlice extends Slice<"secret.{user}", SecretSet, { "secret": PasswordHash }> {}
+  interface SecretSlice extends Slice<"secret:{user}", SecretSet, { "secret": PasswordHash }> {}
 
   model SecretSet { type: "secret-set"; password: PasswordHash; }
 
@@ -204,7 +205,7 @@ const SNIPPETS: Record<string, string> = {
       },
       setProfile: (auth, _txn, cmd) => {
         auth.authorize(auth.user === cmd.user);
-        const stream = 'inbox.' + cmd.org + '.' + cmd.user;
+        const stream = 'inbox:' + cmd.org + ',' + cmd.user;
         return [
           { stream, event: { type: 'profile-set', name: cmd.name } },
           { stream, event: { type: 'noted', note: 'n1', text: 'profile set' } },
@@ -225,14 +226,14 @@ const SNIPPETS: Record<string, string> = {
         auth.authorizeAnyone();
         const hash: PasswordHash = cmd.password;
         return [
-          { stream: 'secret.' + cmd.user, event: { type: 'secret-set', password: hash } },
-          { stream: 'inbox.' + cmd.org + '.' + cmd.user, event: { type: 'profile-set', name: cmd.name } },
+          { stream: 'secret:' + cmd.user, event: { type: 'secret-set', password: hash } },
+          { stream: 'inbox:' + cmd.org + ',' + cmd.user, event: { type: 'profile-set', name: cmd.name } },
         ];
       },
       leave: (auth, txn, cmd) => {
         auth.authorize(cmd.check.kind === 'password');
         const gone = txn.get.item('i1') === undefined ? [] : [{ stream: 'catalog' as const, event: { type: 'item-removed' as const, id: 'i1' } }];
-        return [{ stream: 'inbox.acme.' + auth.user, death: true }, gone];
+        return [{ stream: 'inbox:acme,' + auth.user, death: true }, gone];
       },
       sweep,
     };
@@ -255,13 +256,13 @@ const SNIPPETS: Record<string, string> = {
 
     export const wrong: Partial<AppDBPrecommit> = {
       // @ts-expect-error a singleton slice's stream label is its family name
-      addItem: (_auth, _txn, cmd) => ({ stream: 'catalog.x', event: { ...cmd, type: 'item-added' } }),
+      addItem: (_auth, _txn, cmd) => ({ stream: 'catalog:x', event: { ...cmd, type: 'item-added' } }),
       // @ts-expect-error an event the output does not name
       removeItem: (_auth, _txn, cmd) => ({ stream: 'catalog', event: { type: 'item-added', id: cmd.id, title: '', added: new Date() } }),
       // @ts-expect-error a tuple output returns every item
-      setProfile: (_auth, _txn, cmd) => [{ stream: 'inbox.' + cmd.org, event: { type: 'profile-set', name: cmd.name } }],
+      setProfile: (_auth, _txn, cmd) => [{ stream: 'inbox:' + cmd.org, event: { type: 'profile-set', name: cmd.name } }],
       // @ts-expect-error a death is { stream, death: true }
-      leave: () => [{ stream: 'inbox.a.b', death: false }, []],
+      leave: () => [{ stream: 'inbox:a,b', death: false }, []],
     };
   `,
 
@@ -386,7 +387,7 @@ const SNIPPETS: Record<string, string> = {
 
     declare const ctx: AppDBBootstrapContext;
     ctx.emit('catalog', { type: 'item-added', id: 'i1', title: 'T', added: new Date() });
-    ctx.emit('secret.u1', { type: 'secret-set', password: ctx.hashPassword(ctx.env('PASSWORD')) });
+    ctx.emit('secret:u1', { type: 'secret-set', password: ctx.hashPassword(ctx.env('PASSWORD')) });
     // @ts-expect-error no slice folds such an event
     ctx.emit('catalog', { type: 'bogus' });
   `,
@@ -456,7 +457,7 @@ describe('reducer contexts', () => {
     });
     reducer.reducer(txn, [itemAdded], 'catalog', false);
     expect(calls).toEqual([
-      ['set', 'item.i1', 'Item', { id: 'i1', title: 'T', added }],
+      ['set', 'item:i1', 'Item', { id: 'i1', title: 'T', added }],
       ['set', 'count', 'catalog/count', 1],
     ]);
   });
@@ -467,10 +468,10 @@ describe('reducer contexts', () => {
       profileSet: (t: any) => t.get.profile(),
       noted: (t: any, e: any) => t.get.note(e.note),
     });
-    reducer.reducer(txn, [{ type: 'profile-set', name: 'Ann' }, noted], 'inbox.acme.u1', false);
+    reducer.reducer(txn, [{ type: 'profile-set', name: 'Ann' }, noted], 'inbox:acme,u1', false);
     expect(calls).toEqual([
       ['get', 'profile', 'Profile'],
-      ['get', 'note.n1', 'inbox/note'],
+      ['get', 'note:n1', 'inbox/note'],
     ]);
     compiles('reducers');
   });
@@ -487,11 +488,11 @@ describe('reducer contexts', () => {
       },
       noted: (t: any) => t.del.profile(),
     });
-    reducer.reducer(txn, [{ type: 'profile-set', name: 'ann' }], 'inbox.acme.u1', false);
+    reducer.reducer(txn, [{ type: 'profile-set', name: 'ann' }], 'inbox:acme,u1', false);
     expect(seen).toEqual([undefined, 'ANN', { name: 'ANN' }]);
     expect(data.get('profile')).toEqual({ name: 'ANN' });
 
-    reducer.reducer(txn, [noted], 'inbox.acme.u1', false);
+    reducer.reducer(txn, [noted], 'inbox:acme,u1', false);
     expect(data.has('profile')).toBe(false);
 
     // an update of an absent key throws, as any reducer may when its state is not as expected
@@ -499,14 +500,14 @@ describe('reducer contexts', () => {
       M.inboxSliceReducer({
         profileSet: (t: any) => t.update.profile((p: any) => p),
         noted: () => {},
-      }).reducer(txn, [{ type: 'profile-set', name: 'x' }], 'inbox.acme.u1', false),
+      }).reducer(txn, [{ type: 'profile-set', name: 'x' }], 'inbox:acme,u1', false),
     ).toThrow('profile');
   });
 
   it('gives each SliceReducer its family template and its key templates', () => {
     const reducer = M.inboxSliceReducer({ profileSet: () => {}, noted: () => {} });
-    expect(reducer.template).toBe('inbox.{org}.{user}');
-    expect(reducer.keys).toEqual(['note.{note}', 'profile']);
+    expect(reducer.template).toBe('inbox:{org},{user}');
+    expect(reducer.keys).toEqual(['note:{note}', 'profile']);
   });
 
   it('generates a handler table per slice: one reducer handler per event type', () => {
@@ -533,7 +534,7 @@ describe('reducer contexts', () => {
     M.secretSliceReducer({ secretSet: (_t: any, e: any) => secrets.push(e) }).reducer(
       txn,
       [{ type: 'secret-set', password: 'h' }],
-      'secret.u1',
+      'secret:u1',
       false,
     );
     expect(secrets).toEqual([{ type: 'secret-set', password: 'h' }]);
@@ -545,14 +546,14 @@ describe('reducer contexts', () => {
     M.inboxSliceReducer({
       profileSet: (t: any) => params.push(t.params),
       noted: (t: any) => params.push(t.params),
-    }).reducer(txn, [noted], 'inbox.acme.u.1', false);
+    }).reducer(txn, [noted], 'inbox:acme,u.1', false);
     M.catalogSliceReducer({
       itemAdded: () => {},
       itemRemoved: () => {},
       noted: (t: any) => params.push(t.params),
     }).reducer(txn, [noted], 'catalog', false);
 
-    // the final parameter is the rest of the name, dots included
+    // the final parameter may hold dots
     expect(params).toEqual([{ org: 'acme', user: 'u.1' }, {}]);
   });
 });
@@ -591,11 +592,11 @@ describe('global contexts', () => {
     ctx.get.note('acme', 'u1', 'n1');
     ctx.get.secret('u1');
     expect(calls).toEqual([
-      ['get', 'catalog/item.i1', 'Item'],
-      ['get', 'catalog/count', 'catalog/count'],
-      ['get', 'inbox.acme.u1/profile', 'Profile'],
-      ['get', 'inbox.acme.u1/note.n1', 'inbox/note'],
-      ['get', 'secret.u1/secret', 'PasswordHash'],
+      ['get', 'catalog!item:i1', 'Item'],
+      ['get', 'catalog!count', 'catalog/count'],
+      ['get', 'inbox:acme,u1!profile', 'Profile'],
+      ['get', 'inbox:acme,u1!note:n1', 'inbox/note'],
+      ['get', 'secret:u1!secret', 'PasswordHash'],
     ]);
   });
 
@@ -604,11 +605,11 @@ describe('global contexts', () => {
     const ctx = M.appDBTxn(txn);
 
     // a terminal family parameter may hold . and ~, and a terminal key parameter anything
-    ctx.get.note('acme', 'u.1~x', 'a/b.c');
+    ctx.get.note('acme', 'u.1~x', 'a!b,c:d');
     ctx.get.note('acme', 'u1', '');
     expect(calls).toEqual([
-      ['get', 'inbox.acme.u.1~x/note.a/b.c', 'inbox/note'],
-      ['get', 'inbox.acme.u1/note.', 'inbox/note'],
+      ['get', 'inbox:acme,u.1~x!note:a!b,c:d', 'inbox/note'],
+      ['get', 'inbox:acme,u1!note:', 'inbox/note'],
     ]);
 
     // any other parameter is a non-empty run of A-Z a-z 0-9 _ -, and a terminal family one may
@@ -617,10 +618,35 @@ describe('global contexts', () => {
       'profile: org "ac.me" is not a non-empty run of A-Z a-z 0-9 _ -',
     );
     expect(() => ctx.get.profile('', 'u1')).toThrow('profile: org ""');
-    expect(() => ctx.get.profile('acme', 'u/1')).toThrow('profile: user "u/1"');
+    expect(() => ctx.get.profile('acme', 'u!1')).toThrow('profile: user "u!1"');
+    expect(() => ctx.get.profile('ac,me', 'u1')).toThrow('profile: org "ac,me"');
+    expect(() => ctx.get.profile('acme', 'u,1')).toThrow('profile: user "u,1"');
     expect(() => ctx.get.profile('acme', '')).toThrow('profile: user ""');
     expect(() => ctx.get.secret('u*')).toThrow('secret: user "u*"');
     expect(calls).toHaveLength(2);
+  });
+
+  it('builds keys that a walk of their family visits in the order of their parameters', () => {
+    // inbox notes as (org, user, note), in order, each value the one before it followed by '-'
+    const tuples = [
+      ['acme', 'gen', '2026-10'],
+      ['acme', 'gen', '2026-10-06'],
+      ['acme', 'gen-2', '2026-10'],
+      ['acme-2', 'gen', '2026-10'],
+    ];
+    const { txn, calls } = fakeTxn();
+    const ctx = M.appDBTxn(txn);
+    for (const [org, user, note] of tuples) ctx.get.note(org, user, note);
+    const keys = calls.map(([, key]) => key as string);
+    expect(keys[0]).toBe('inbox:acme,gen!note:2026-10');
+
+    // store them in reverse, then walk the family
+    const store = new InMemStore(registry);
+    store.write((w) => {
+      for (const key of [...keys].reverse()) w.set(key, '.json', JS, key);
+    });
+    const walked = store.read((r) => txnScanAll(r, prefixRange('inbox:', 100, false)));
+    expect(walked.map(([key]) => key)).toEqual(keys);
   });
 });
 
@@ -636,8 +662,8 @@ function passthrough() {
     addItem: open((c) => ({ stream: 'catalog', event: { ...c, type: 'item-added' } })),
     removeItem: open((c) => ({ stream: 'catalog', event: { type: 'item-removed', id: c.id } })),
     setProfile: open((c) => [
-      { stream: `inbox.${c.org}.${c.user}`, event: { type: 'profile-set', name: c.name } },
-      { stream: `inbox.${c.org}.${c.user}`, event: { type: 'noted', note: 'p', text: c.name } },
+      { stream: `inbox:${c.org},${c.user}`, event: { type: 'profile-set', name: c.name } },
+      { stream: `inbox:${c.org},${c.user}`, event: { type: 'noted', note: 'p', text: c.name } },
     ]),
     noteMany: open((c) =>
       c.notes.map((note: string) => ({
@@ -647,11 +673,11 @@ function passthrough() {
     ),
     noted: open((c) => ({ stream: 'catalog', event: c })),
     signUp: open((c) => [
-      { stream: `secret.${c.user}`, event: { type: 'secret-set', password: c.password } },
-      { stream: `inbox.${c.org}.${c.user}`, event: { type: 'profile-set', name: c.name } },
+      { stream: `secret:${c.user}`, event: { type: 'secret-set', password: c.password } },
+      { stream: `inbox:${c.org},${c.user}`, event: { type: 'profile-set', name: c.name } },
     ]),
     leave: open(() => [
-      { stream: 'inbox.acme.u1', death: true },
+      { stream: 'inbox:acme,u1', death: true },
       [
         { stream: 'catalog', event: itemRemoved },
         { stream: 'catalog', event: { type: 'item-removed', id: 'i2' } },
@@ -671,7 +697,7 @@ function bundle(precommit: Record<string, unknown> = {}) {
       secret: { secretSet: () => {} },
     },
     precommit: { ...passthrough(), ...precommit },
-    maySee: (_txn: any, principal: any) => [`inbox.acme.${principal.user}/`, 'catalog/'],
+    maySee: (_txn: any, principal: any) => [`inbox:acme,${principal.user}!`, 'catalog!'],
     lookup: (_txn: any, ident: any) =>
       ident.kind === 'password' ? { user: ident.identity, traits: [] } : null,
   });
@@ -706,7 +732,7 @@ describe('precommit', () => {
   });
 
   it('types each handler as (auth, txn, cmd), with cmd the command as precommit sees it', () => {
-    const { txn, calls } = fakeTxn(new Map([['catalog/item.i1', { id: 'i1' }]]));
+    const { txn, calls } = fakeTxn(new Map([['catalog!item:i1', { id: 'i1' }]]));
     const got: unknown[] = [];
     const b = bundle({
       removeItem: (auth: any, ctx: any, cmd: any) => {
@@ -718,7 +744,7 @@ describe('precommit', () => {
     const data = { type: 'remove-item', id: 'i1' };
     b.precommit(txn, { id: 'c1', data }, { user: 'u1', traits: ['admin'] });
     expect(got).toEqual(['u1', ['admin'], { id: 'i1' }, data]);
-    expect(calls).toEqual([['get', 'catalog/item.i1', 'Item']]);
+    expect(calls).toEqual([['get', 'catalog!item:i1', 'Item']]);
   });
 
   it("types each handler's return from its @command output, each event stream-labelled", () => {
@@ -743,7 +769,7 @@ describe('precommit', () => {
     const { txn } = fakeTxn();
     const leave = { type: 'leave', check: { kind: 'password' } };
     expect(b.precommit(txn, { id: 'c1', data: leave }, anyone)).toEqual([
-      { stream: 'inbox.acme.u1', death: true },
+      { stream: 'inbox:acme,u1', death: true },
       { stream: 'catalog', event: itemRemoved },
       { stream: 'catalog', event: { type: 'item-removed', id: 'i2' } },
     ]);
@@ -868,7 +894,7 @@ describe('schema and bundle', () => {
       signal: abort.signal,
       onError: (e: unknown) => errors.push(e),
     });
-    expect(server.conn.wants).toEqual(['catalog', 'inbox.*']);
+    expect(server.conn.wants).toEqual(['catalog', 'inbox:*']);
 
     // live, and the forecast shows through a query on the engine's context
     const rig = { server, engine, data: {}, abort };

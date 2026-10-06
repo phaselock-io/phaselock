@@ -96,7 +96,8 @@ void pldb_prepared_free(pldb_prepared *p);
 /* Reader side: any thread, serialized internally. */
 int pldb_read_log(pldb *db, uint64_t from, uint64_t to, pldb_item **items, size_t *n);
 /* A ref's events with from < position < to, at most limit of them,
-   ascending or descending.  A ref is a stream name, "family.*", or "*". */
+   ascending or descending.  A ref is a stream name, a wildcard such as
+   "chat:*" or "chat:acme,*", or "*". */
 int pldb_read_events(pldb *db, const char *ref, uint64_t from, uint64_t to, int reverse,
                      size_t limit, pldb_item **items, size_t *n);
 void pldb_items_free(pldb_item *items, size_t n);

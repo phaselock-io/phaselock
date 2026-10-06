@@ -138,11 +138,11 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
       .filter((l) => l[0] === 'events')
       .flatMap((l) => l[1] as [number, string, number, unknown][]);
     expect(delivered.map((e) => [e[1], e[2]])).toEqual([
-      ['patron.p1', 1],
-      ['patron.p1', 2],
-      ['patron.p2', 1],
-      ['patron.p2', 2],
-      ['patron.p1', 3],
+      ['patron:p1', 1],
+      ['patron:p1', 2],
+      ['patron:p2', 1],
+      ['patron:p2', 2],
+      ['patron:p1', 3],
     ]);
     expect(delivered.at(-1)![0]).toBe(cursor);
     expect((delivered[0][3] as { $sys: string }).$sys).toBe('birth');
@@ -163,24 +163,24 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
     ctl2.abort();
 
     // a family backfill: header, values, an empty tail (the live cut is at the cursor)
-    const fam = await run(conn, 'patron.*', cursor);
+    const fam = await run(conn, 'patron:*', cursor);
     expect(fam.outcome).toBe('done');
-    expect(fam.header).toEqual({ position: cursor, seqs: { 'patron.p1': 3, 'patron.p2': 2 } });
+    expect(fam.header).toEqual({ position: cursor, seqs: { 'patron:p1': 3, 'patron:p2': 2 } });
     expect(fam.values.map(([k]) => k)).toEqual([
-      'patron.p1/holds',
-      'patron.p1/messages',
-      'patron.p1/patron',
-      'patron.p2/holds',
-      'patron.p2/messages',
-      'patron.p2/patron',
+      'patron:p1!holds',
+      'patron:p1!messages',
+      'patron:p1!patron',
+      'patron:p2!holds',
+      'patron:p2!messages',
+      'patron:p2!patron',
     ]);
     expect((decode(fam.values[2][1]) as { name: string }).name).toBe('Anne');
     expect(fam.tails).toEqual([]);
 
     // an exact ref, and a resume whose position still matches (nothing written since)
-    const p1 = await run(conn, 'patron.p1', cursor);
-    expect(p1.header!.seqs).toEqual({ 'patron.p1': 3 });
-    const back = await run(conn, 'patron.p1', cursor, {
+    const p1 = await run(conn, 'patron:p1', cursor);
+    expect(p1.header!.seqs).toEqual({ 'patron:p1': 3 });
+    const back = await run(conn, 'patron:p1', cursor, {
       position: cursor,
       skipBytes: p1.skips[0],
       fromPosition: cursor,
@@ -195,7 +195,7 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
     await conn.sendCommands([
       { id: 'c5', data: encode({ type: 'rename-patron', id: 'p2', name: 'Rob' }) },
     ]);
-    const stale = await run(conn, 'patron.p1', cursor, {
+    const stale = await run(conn, 'patron:p1', cursor, {
       position: cursor,
       skipBytes: 30,
       fromPosition: cursor,
@@ -213,7 +213,7 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
       onVouch() {},
       onEnd() {},
     });
-    await expect(run(anon, 'patron.p1', cursor)).rejects.toThrow(/403/);
+    await expect(run(anon, 'patron:p1', cursor)).rejects.toThrow(/403/);
     expect((await run(anon, 'book', cursor)).outcome).toBe('done');
 
     ctl.abort();

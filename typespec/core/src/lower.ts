@@ -84,8 +84,10 @@ export interface LoweredProgram {
   sources: Map<PSlice | PCommand | PEngine | PDatabase, Type>;
 }
 
-// a name, then only `.{param}` segments: the shape of a family template and of a key template
-const TEMPLATE_PATTERN = /^[A-Za-z0-9_-]+((\.\{[A-Za-z_][A-Za-z0-9_]*\})*)$/;
+// a name, then optionally `:{param}` and `,{param}` for each further parameter: the shape of a
+// family template and of a key template
+const TEMPLATE_PATTERN =
+  /^[A-Za-z0-9_-]+(:\{[A-Za-z_][A-Za-z0-9_]*\}(,\{[A-Za-z_][A-Za-z0-9_]*\})*)?$/;
 
 /**
  * A template argument may arrive as an IndeterminateEntity (an entity the checker hasn't
@@ -315,7 +317,7 @@ export function lowerProgram(program: Program): LoweredProgram {
     const instance = vocabSource(iface, 'Slice')!;
     const [familyArg, eventsArg, specArg] = (instance.templateMapper?.args ?? []).map(argType);
 
-    // the family template: a name, then only `.{param}` segments
+    // the family template: a name, then its parameters
     if (familyArg?.kind !== 'String') {
       invalidArgs(iface, `Slice 'Family' argument of '${iface.name}' must be a string`);
       return undefined;
@@ -329,7 +331,7 @@ export function lowerProgram(program: Program): LoweredProgram {
       });
       return undefined;
     }
-    const family = tpl.split('.')[0];
+    const family = tpl.split(':')[0];
     const params = [...tpl.matchAll(/\{([^}]*)\}/g)].map((m) => m[1]);
 
     // the events: a named union of named models, or a single named model

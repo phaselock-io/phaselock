@@ -6,20 +6,21 @@ namespace PhaseLock;
 
 /**
  * A Slice is one family of event streams and the state its reducer folds from them.  `Family`
- * names the streams: `"book"` is a single stream, and `"patron.{patron}"` or
- * `"chat.{org}.{channel}"` is one stream per value of each parameter.  `Events` is the named union
+ * names the streams: `"book"` is a single stream, and `"patron:{patron}"` or
+ * `"chat:{org},{channel}"` is one stream per value of each parameter.  `Events` is the named union
  * of the event models the slice folds, and `Spec` lays out its state as key templates:
  *
  * ```typespec
- * interface PatronSlice extends Slice<"patron.{patron}", PatronEvents, {
+ * interface PatronSlice extends Slice<"patron:{patron}", PatronEvents, {
  *   "patron": Patron;
- *   "patron_hold.{hold}": PatronHold;
+ *   "patron_hold:{hold}": PatronHold;
  * }> {}
  * ```
  *
- * Key templates are local to one stream: the machinery owns the `{stream}/` prefix, so a
- * reducer names `patron_hold.{hold}` and never the patron it belongs to.  The part of a template
- * before its first '.' names the item, and must be unique among the slices composed together.
+ * Key templates are local to one stream: the machinery owns the `{stream}!` prefix, so a
+ * reducer names `patron_hold:{hold}` and never the patron it belongs to.  A template is a name,
+ * then optionally ':' and its parameters separated by ','; the name identifies the item, and must
+ * be unique among the slices composed together.
  */
 interface Slice<Family extends string, Events, Spec extends {}> {}
 

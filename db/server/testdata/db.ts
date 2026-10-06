@@ -88,24 +88,24 @@ const precommit: TestDBPrecommit = {
   addPatron: (auth, txn, cmd) => {
     auth.authorize(isAdmin(auth));
     if (txn.get.patron(cmd.id) !== undefined) throw new Reject('patron exists');
-    return { stream: `patron.${cmd.id}`, event: cmd };
+    return { stream: `patron:${cmd.id}`, event: cmd };
   },
   renamePatron: (auth, txn, cmd) => {
     auth.authorize(isAdmin(auth) || isSelf(auth, cmd.id));
     requirePatron(txn, cmd.id);
-    return { stream: `patron.${cmd.id}`, event: cmd };
+    return { stream: `patron:${cmd.id}`, event: cmd };
   },
   removePatron: (auth, txn, cmd) => {
     auth.authorize(isAdmin(auth));
     requirePatron(txn, cmd.id);
-    return { stream: `patron.${cmd.id}`, death: true };
+    return { stream: `patron:${cmd.id}`, death: true };
   },
   tryHold: (auth, txn, cmd) => {
     auth.authorize(isAdmin(auth) || isSelf(auth, cmd.patron));
     const b = txn.get.book(cmd.book);
     if (b === undefined) throw new Reject('no such book');
     requirePatron(txn, cmd.patron);
-    const stream = `patron.${cmd.patron}`;
+    const stream = `patron:${cmd.patron}`;
     if (b.hold) {
       return { stream, event: { type: 'hold-failed', book: cmd.book, reason: 'already held' } };
     }
@@ -119,34 +119,34 @@ const precommit: TestDBPrecommit = {
     if (txn.get.account(cmd.user) !== undefined) throw new Reject('account exists');
     const traits = isAdmin(auth) ? (cmd.traits ?? []) : [];
     return {
-      stream: `account.${cmd.user}`,
+      stream: `account:${cmd.user}`,
       event: { type: 'account-created', user: cmd.user, hash: cmd.password, traits },
     };
   },
   setPassword: (auth, txn, cmd) => {
     auth.authorize(isAdmin(auth) || isSelf(auth, cmd.user));
     requireAccount(txn, cmd.user);
-    return { stream: `account.${cmd.user}`, event: { type: 'password-set', hash: cmd.password } };
+    return { stream: `account:${cmd.user}`, event: { type: 'password-set', hash: cmd.password } };
   },
   revokeSessions: (auth, txn, cmd) => {
     auth.authorize(isAdmin(auth) || isSelf(auth, cmd.user));
     requireAccount(txn, cmd.user);
-    return { stream: `account.${cmd.user}`, event: { type: 'sessions-revoked' } };
+    return { stream: `account:${cmd.user}`, event: { type: 'sessions-revoked' } };
   },
   grantView: (auth, txn, cmd) => {
     auth.authorize(isAdmin(auth));
     requireAccount(txn, cmd.user);
-    return { stream: `account.${cmd.user}`, event: { type: 'view-granted', prefix: cmd.prefix } };
+    return { stream: `account:${cmd.user}`, event: { type: 'view-granted', prefix: cmd.prefix } };
   },
   revokeView: (auth, txn, cmd) => {
     auth.authorize(isAdmin(auth));
     requireAccount(txn, cmd.user);
-    return { stream: `account.${cmd.user}`, event: { type: 'view-revoked', prefix: cmd.prefix } };
+    return { stream: `account:${cmd.user}`, event: { type: 'view-revoked', prefix: cmd.prefix } };
   },
   authenticatedCommand: (auth, txn, cmd) => {
     auth.authorize(isSelf(auth, cmd.user));
     requireAccount(txn, cmd.user);
-    return { stream: `account.${cmd.user}`, event: { type: 'sessions-revoked' } };
+    return { stream: `account:${cmd.user}`, event: { type: 'sessions-revoked' } };
   },
 };
 
@@ -156,9 +156,9 @@ defineTestDB({
   reducers: { book, patron, account },
   precommit,
   maySee: (txn, principal) => {
-    if (principal.user === null) return ['book/'];
+    if (principal.user === null) return ['book!'];
     if (isAdmin(principal)) return ['*'];
-    const out = ['book/', `patron.${principal.user}/`];
+    const out = ['book!', `patron:${principal.user}!`];
     const a = txn.get.account(principal.user);
     if (a !== undefined) out.push(...a.views);
     return out;
@@ -178,6 +178,6 @@ defineTestDB({
     const user = ctx.env('BOOTSTRAP_ADMIN');
     if (user === '') return;
     const hash = ctx.hashPassword(ctx.env('BOOTSTRAP_PASSWORD'));
-    ctx.emit(`account.${user}`, { type: 'account-created', user, hash, traits: [ADMIN] });
+    ctx.emit(`account:${user}`, { type: 'account-created', user, hash, traits: [ADMIN] });
   },
 });

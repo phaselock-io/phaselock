@@ -658,7 +658,7 @@ describe('the reserved identities', () => {
     });
     // a family's parameters do not change its type
     const inbox = encode([
-      [8, 'inbox.acme.u1', 1, 'c2', added],
+      [8, 'inbox:acme,u1', 1, 'c2', added],
       { type: 'noted', note: 'n', text: 't' },
     ]);
     expect((toJs('.event', inbox) as { data: unknown }).data).toEqual({
@@ -699,7 +699,7 @@ describe('the reserved identities', () => {
       () => toJs('.event', encode([[7, 'catalog', 3, 'c1', added], { type: 'bogus' }])),
       'bogus',
     );
-    rejects(() => toJs('.event', encode([[7, 'nowhere.x', 3, 'c1', added], itemAdded])), 'nowhere');
+    rejects(() => toJs('.event', encode([[7, 'nowhere:x', 3, 'c1', added], itemAdded])), 'nowhere');
   });
 });
 

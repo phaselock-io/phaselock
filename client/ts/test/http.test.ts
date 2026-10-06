@@ -114,7 +114,7 @@ describe('the live stream', () => {
     await s.opened;
     s.push(['live', 0]);
     s.push(['events', [[[1, 'book', 1, 'c1', new Date(5)], { $sys: 'birth' }]]]);
-    s.push(['view', 't2', 2, ['book', 'patron.p1']]);
+    s.push(['view', 't2', 2, ['book', 'patron:p1']]);
     s.push(['vouch', 3]);
     s.push(['end', 7, 'done']);
     s.push(['vouch', 4]); // after end: never delivered
@@ -124,7 +124,7 @@ describe('the live stream', () => {
       ['open', 'e3'],
       ['live', 0],
       ['events', [[1, 'book', 1, { $sys: 'birth' }]]],
-      ['view', 't2', 2, ['book', 'patron.p1']],
+      ['view', 't2', 2, ['book', 'patron:p1']],
       ['vouch', 3],
       ['end', 7, 'done'],
     ]);
@@ -141,12 +141,12 @@ describe('the live stream', () => {
     NewHTTPConnector(stub.url)(
       42,
       'stored',
-      ['book', 'patron.*'],
+      ['book', 'patron:*'],
       new AbortController().signal,
       hooks([]),
     );
     await s.opened;
-    expect(seen[0]).toBe('/stream?since=42&view=stored&want=book&want=patron.*');
+    expect(seen[0]).toBe('/stream?since=42&view=stored&want=book&want=patron%3A*');
     expect(stub.requests[0].headers.authorization).toBeUndefined();
   });
 
@@ -155,13 +155,13 @@ describe('the live stream', () => {
     const log: unknown[][] = [];
     NewHTTPConnector(stub.url)(5, 'stale', ['*'], new AbortController().signal, hooks(log));
     await s.opened;
-    s.push(['view', 't9', 7, ['book', 'patron.*']]);
+    s.push(['view', 't9', 7, ['book', 'patron:*']]);
     s.push(['live', 7]);
     s.end();
     await settle();
     expect(log).toEqual([
       ['open', 'e3'],
-      ['view', 't9', 7, ['book', 'patron.*']],
+      ['view', 't9', 7, ['book', 'patron:*']],
       ['live', 7],
       ['end', 0, 'stream closed'],
     ]);
@@ -336,7 +336,7 @@ describe('sendCommands', () => {
             ['ack', 10],
             ['dup', 3],
             ['reject', 'no'],
-            ['conflict', { 'patron.p1': 4 }],
+            ['conflict', { 'patron:p1': 4 }],
           ]),
         ),
       );
@@ -346,7 +346,7 @@ describe('sendCommands', () => {
       { kind: 'ack', position: 10 },
       { kind: 'dup', position: 3 },
       { kind: 'reject', reason: 'no' },
-      { kind: 'conflict', current: { 'patron.p1': 4 } },
+      { kind: 'conflict', current: { 'patron:p1': 4 } },
     ]);
   });
 });
@@ -384,12 +384,12 @@ describe('postCommand', () => {
 describe('backfill', () => {
   const records = Object.fromEntries(
     Array.from({ length: 2500 }, (_, i) => [
-      `patron.p${String(i).padStart(4, '0')}/patron`,
+      `patron:p${String(i).padStart(4, '0')}!patron`,
       { name: 'n'.repeat(200), i },
     ]),
   );
-  const streams = Object.fromEntries(Object.keys(records).map((k) => [k.split('/')[0], 2]));
-  const built = blob({ ref: 'patron.*', position: 40, streams, records });
+  const streams = Object.fromEntries(Object.keys(records).map((k) => [k.split('!')[0], 2]));
+  const built = blob({ ref: 'patron:*', position: 40, streams, records });
 
   type Run = {
     outcome: BackfillOutcome;
@@ -444,7 +444,7 @@ describe('backfill', () => {
 
   // a tail: pages of events for `ref` between after and before, from a fixed log
   const log: [number, string, number][] = [];
-  for (let p = 41; p <= 3500; p++) log.push([p, `patron.p${String(p % 7).padStart(4, '0')}`, p]);
+  for (let p = 41; p <= 3500; p++) log.push([p, `patron:p${String(p % 7).padStart(4, '0')}`, p]);
   function serveTail() {
     stub.routes.set('/events/', (req, _body, res) => {
       const u = new URL(req.url!, stub.url);
@@ -479,7 +479,7 @@ describe('backfill', () => {
   test('header, batched values with record-boundary skips, checksums, and an empty tail', async () => {
     serveBlob();
     serveTail();
-    const r = await run(conn, 'patron.*', 40);
+    const r = await run(conn, 'patron:*', 40);
     expect(r.outcome).toBe('done');
     expect(r.header).toEqual({ position: 40, seqs: streams });
     const keys = r.batches.flatMap((b) => b.keys);
@@ -502,7 +502,7 @@ describe('backfill', () => {
   test('the tail pages forward from the blob position to until and stops on a short page', async () => {
     serveBlob();
     serveTail();
-    const r = await run(conn, 'patron.*', 2600);
+    const r = await run(conn, 'patron:*', 2600);
     const positions = r.tails.flat().map(([p]) => p);
     expect(positions[0]).toBe(41);
     expect(positions.at(-1)).toBe(2599);
@@ -525,7 +525,7 @@ describe('backfill', () => {
       if (req.url!.startsWith('/events/'))
         seenAfter.push(Number(new URL(req.url!, stub.url).searchParams.get('after')));
     });
-    await run(conn, 'patron.*', 200, {
+    await run(conn, 'patron:*', 200, {
       position: 40,
       skipBytes: 0,
       fromPosition: 100,
@@ -534,7 +534,7 @@ describe('backfill', () => {
     });
     expect(seenAfter).toEqual([100]);
     seenAfter.length = 0;
-    await run(conn, 'patron.*', 200, {
+    await run(conn, 'patron:*', 200, {
       position: 10,
       skipBytes: 0,
       fromPosition: 20,
@@ -548,7 +548,7 @@ describe('backfill', () => {
     serveBlob();
     serveTail();
     const skip = built.recordEnds[1000];
-    const r = await run(conn, 'patron.*', 40, {
+    const r = await run(conn, 'patron:*', 40, {
       position: 40,
       skipBytes: skip,
       fromPosition: 40,
@@ -572,7 +572,7 @@ describe('backfill', () => {
       res.end(Buffer.from(built.bytes));
     });
     serveTail();
-    const r = await run(conn, 'patron.*', 40, {
+    const r = await run(conn, 'patron:*', 40, {
       position: 40,
       skipBytes: built.recordEnds[2400],
       fromPosition: 40,
@@ -585,7 +585,7 @@ describe('backfill', () => {
   test('resume: 416 means nothing is left', async () => {
     serveBlob();
     serveTail();
-    const r = await run(conn, 'patron.*', 40, {
+    const r = await run(conn, 'patron:*', 40, {
       position: 40,
       skipBytes: built.bytes.length,
       fromPosition: 40,
@@ -607,7 +607,7 @@ describe('backfill', () => {
       snapshotDone: true,
       tailDone: false,
     };
-    const r = await run(conn, 'patron.*', 100, snapshotDone);
+    const r = await run(conn, 'patron:*', 100, snapshotDone);
     expect(r.outcome).toBe('done');
     expect(r.header).toBeNull();
     expect(r.batches).toEqual([]);
@@ -620,7 +620,7 @@ describe('backfill', () => {
       snapshotDone: false,
       tailDone: true,
     };
-    const r2 = await run(conn, 'patron.*', 100, tailDone);
+    const r2 = await run(conn, 'patron:*', 100, tailDone);
     expect(r2.outcome).toBe('done');
     expect(r2.header!.position).toBe(40);
     expect(r2.tails).toEqual([]);
@@ -631,7 +631,7 @@ describe('backfill', () => {
   test('stale: a resumed position that no longer matches', async () => {
     serveBlob(built.bytes, 41);
     serveTail();
-    const r = await run(conn, 'patron.*', 40, {
+    const r = await run(conn, 'patron:*', 40, {
       position: 40,
       skipBytes: 100,
       fromPosition: 40,
@@ -660,12 +660,12 @@ describe('backfill', () => {
       res.end(Buffer.from(built.bytes));
     });
     serveTail();
-    const r = await run(conn, 'patron.*', 40);
+    const r = await run(conn, 'patron:*', 40);
     expect(r.outcome).toBe('done');
     expect(r.header!.position).toBe(40);
     expect(r.batches.flatMap((b) => b.keys)).toHaveLength(2500);
     gone = true;
-    expect((await run(conn, 'patron.*', 40)).outcome).toBe('stale');
+    expect((await run(conn, 'patron:*', 40)).outcome).toBe('stale');
   });
 
   test('a 403 on the snapshot rejects, and is not mistaken for a pointer', async () => {
@@ -673,7 +673,7 @@ describe('backfill', () => {
       res.writeHead(403, { 'Content-Type': 'text/plain' });
       res.end('ref not visible');
     });
-    await expect(run(conn, 'patron.*', 40)).rejects.toThrow(/403/);
+    await expect(run(conn, 'patron:*', 40)).rejects.toThrow(/403/);
   });
 
   test.each([
@@ -700,13 +700,13 @@ describe('backfill', () => {
     corrupt(bytes);
     serveBlob(bytes);
     serveTail();
-    await expect(run(conn, 'patron.*', 40)).rejects.toThrow(new RegExp(what));
+    await expect(run(conn, 'patron:*', 40)).rejects.toThrow(new RegExp(what));
   });
 
   test('a position in the blob header that disagrees with the origin is an error', async () => {
     serveBlob(built.bytes, 41);
     serveTail();
-    await expect(run(conn, 'patron.*', 41)).rejects.toThrow(/position mismatch/);
+    await expect(run(conn, 'patron:*', 41)).rejects.toThrow(/position mismatch/);
   });
 
   test('a failing tail aborts the blob download', async () => {
@@ -724,7 +724,7 @@ describe('backfill', () => {
       res.writeHead(500);
       res.end('nope');
     });
-    await expect(run(conn, 'patron.*', 100)).rejects.toThrow(/events patron\.\*: 500/);
+    await expect(run(conn, 'patron:*', 100)).rejects.toThrow(/events patron:\*: 500/);
     await settle();
     expect(blobAborted).toBe(true);
   });
@@ -740,7 +740,7 @@ describe('backfill', () => {
     serveTail();
     const ctl = new AbortController();
     const p = conn.backfill({
-      ref: 'patron.*',
+      ref: 'patron:*',
       until: 40,
       resume: null,
       signal: ctl.signal,
@@ -757,7 +757,7 @@ describe('backfill', () => {
     const gate = new Promise<void>((r) => (release = r));
     let calls = 0;
     const p = conn.backfill({
-      ref: 'patron.*',
+      ref: 'patron:*',
       until: 40,
       resume: null,
       signal: new AbortController().signal,

@@ -26,8 +26,8 @@ model Item {
 
 interface TodoStore extends Store<{
   "all_lists": Uuid[]; // array of list ids
-  "list.{list_id}": List;
-  "item.{item_id}": Item;
+  "list:{list_id}": List;
+  "item:{item_id}": Item;
 }> {}
 
 //////////////////

@@ -10,7 +10,7 @@ alias Id = string;
 
 // books //
 
-interface BookSlice extends Slice<"book", BookEvents, { "book.{id}": Book }> {}
+interface BookSlice extends Slice<"book", BookEvents, { "book:{id}": Book }> {}
 
 model Book {
   id: Id;
@@ -42,7 +42,7 @@ model HoldOpened {
 
 interface PatronSlice
   extends Slice<
-    "patron.{patron}",
+    "patron:{patron}",
     PatronEvents,
     {
       "patron": Patron;
@@ -105,7 +105,7 @@ model TryHold {
 
 // accounts //
 
-interface AccountSlice extends Slice<"account.{user}", AccountEvents, { "account": Account }> {}
+interface AccountSlice extends Slice<"account:{user}", AccountEvents, { "account": Account }> {}
 
 model Account {
   user: Id;

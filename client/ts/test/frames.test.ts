@@ -7,21 +7,21 @@ const at = new Date('2026-01-02T03:04:05.678Z');
 describe('parseFrame', () => {
   test('events: envelope decoded, data sliced out undecoded', () => {
     const f = parseFrame(
-      encode(['events', [[[7, 'patron.p1', 3, 'id-1', at], { type: 'x', n: [1, 2] }]]]),
+      encode(['events', [[[7, 'patron:p1', 3, 'id-1', at], { type: 'x', n: [1, 2] }]]]),
     );
     if (f.tag !== 'events') throw new Error(f.tag);
     expect(f.events).toHaveLength(1);
     const e = f.events[0];
     expect([e.position, e.stream, e.seq, e.id, e.servertime]).toEqual([
       7,
-      'patron.p1',
+      'patron:p1',
       3,
       'id-1',
       at,
     ]);
     expect(decode(e.data)).toEqual({ type: 'x', n: [1, 2] });
     // raw is the whole pair, and data is a view into it
-    expect(decode(e.raw)).toEqual([[7, 'patron.p1', 3, 'id-1', at], { type: 'x', n: [1, 2] }]);
+    expect(decode(e.raw)).toEqual([[7, 'patron:p1', 3, 'id-1', at], { type: 'x', n: [1, 2] }]);
     expect(e.data.buffer).toBe(e.raw.buffer);
   });
 
@@ -56,11 +56,11 @@ describe('parseFrame', () => {
   test('the other tags', () => {
     expect(parseFrame(encode(['live', 99]))).toEqual({ tag: 'live', position: 99 });
     expect(parseFrame(encode(['vouch', 100]))).toEqual({ tag: 'vouch', position: 100 });
-    expect(parseFrame(encode(['view', 'tok', 12, ['a', 'b.*']]))).toEqual({
+    expect(parseFrame(encode(['view', 'tok', 12, ['a', 'b:*']]))).toEqual({
       tag: 'view',
       token: 'tok',
       position: 12,
-      refs: ['a', 'b.*'],
+      refs: ['a', 'b:*'],
     });
     expect(parseFrame(encode(['view', 'tok', 0, []]))).toEqual({
       tag: 'view',

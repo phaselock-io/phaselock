@@ -787,8 +787,8 @@ static long mapping_lookup(const schema *sc, const mapping *m, size_t n, const c
 }
 
 long schema_event_type(const schema *sc, const char *stream) {
-    const char *dot = strchr(stream, '.');
-    size_t flen = dot ? (size_t)(dot - stream) : strlen(stream);
+    const char *colon = strchr(stream, ':');
+    size_t flen = colon ? (size_t)(colon - stream) : strlen(stream);
     return mapping_lookup(sc, sc->event_types, sc->nevent_types, stream, flen);
 }
 

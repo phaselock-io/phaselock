@@ -8,7 +8,7 @@ globalThis.__host = (function () {
 
   // a reducer's transaction: its stream's local keys, prefixed here
   function reducerTxn(stream) {
-    const prefix = stream + '/';
+    const prefix = stream + '!';
     return {
       get: (key, type) => __pl_get(prefix + key, type),
       set: (key, type, value) => __pl_set(prefix + key, type, value),

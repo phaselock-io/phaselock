@@ -354,38 +354,38 @@ static void reg_attach(reg *g, uint64_t conn) {
     g->conns[g->nconns++] = conn;
 }
 
-/* A wire ref is a stream name, "family.*" for every stream under
-   "family.", or "*" for every stream.  Wildcards are the prefix they
-   cover, "" for "*". */
+/* A wire ref is a stream name, a wildcard "chat:*" or "chat:acme,*" for
+   every stream whose name begins with its text before the star, or "*"
+   for every stream.  Wildcards are the prefix they cover, "" for "*". */
 static bool is_wildcard(const char *ref) {
     size_t n = strlen(ref);
-    return (n == 1 && ref[0] == '*') || (n > 2 && ref[n - 2] == '.' && ref[n - 1] == '*');
+    if (n == 1) return ref[0] == '*';
+    return n > 2 && ref[n - 1] == '*' && (ref[n - 2] == ':' || ref[n - 2] == ',');
 }
 
 static void ref_prefix(const char *ref, char *out, size_t cap) {
-    size_t n = strlen(ref);
-    if (n == 1) n = 0; /* "*" */
-    else n -= 1;       /* drop the star, keep the dot */
+    size_t n = strlen(ref) - 1; /* drop the star */
     if (n + 1 > cap) n = cap - 1;
     memcpy(out, ref, n);
     out[n] = 0;
 }
 
-/* maySee returns refs with a terminator on every entry: "family.*", "*",
-   or "name/" for an exact stream.  Strips the slash into wire form;
-   false on a malformed entry, one whose name does not fill its family's
-   template, or a wildcard that cuts into a parameter. */
+/* maySee returns refs with a terminator on every entry: a wildcard
+   ("chat:*", "chat:acme,*", "*") or "name!" for an exact stream, so a bare
+   name is never a grant.  Strips the '!' into wire form; false on a
+   malformed entry, one whose name does not fill its family's template, or
+   a wildcard that cuts into a parameter. */
 static bool normalize_bundle_ref(const jsrt *js, char *ref) {
     size_t n = strlen(ref);
     if (strcmp(ref, "*") == 0) return true;
-    if (n > 1 && ref[n - 1] == '/') {
+    if (n > 1 && ref[n - 1] == '!') {
         ref[n - 1] = 0;
         return stream_fills(js, ref);
     }
     if (!is_wildcard(ref)) return false;
-    ref[n - 2] = 0; /* the name before the dot */
+    ref[n - 1] = 0; /* the text before the star */
     bool ok = ref_prefix_fills(js, ref);
-    ref[n - 2] = '.';
+    ref[n - 1] = '*';
     return ok;
 }
 
@@ -541,8 +541,8 @@ static void append_event(pldb *db, batch *b, const char *stream, const char *com
 }
 
 static void family_of(const char *stream, char *out, size_t cap) {
-    const char *dot = strchr(stream, '.');
-    size_t n = dot ? (size_t)(dot - stream) : strlen(stream);
+    const char *colon = strchr(stream, ':');
+    size_t n = colon ? (size_t)(colon - stream) : strlen(stream);
     if (n >= cap) n = cap - 1;
     memcpy(out, stream, n);
     out[n] = 0;
@@ -624,7 +624,7 @@ static char *apply_outputs(pldb *db, batch *b, const char *id, pc_result *pc) {
             append_event(db, b, it->stream, id, DEATH, sizeof DEATH);
             if (store_stream_death(db->w, it->stream, db->position)) die("death: %s", store_err(db->w));
             char prefix[1024];
-            snprintf(prefix, sizeof prefix, "%s/", it->stream);
+            snprintf(prefix, sizeof prefix, "%s!", it->stream);
             if (store_del_prefix(db->w, prefix)) die("del_prefix: %s", store_err(db->w));
             strlist_push(&b->deleted, prefix);
             continue;
@@ -1123,7 +1123,7 @@ static int snap_stream_cb(void *arg, const char *name, uint64_t seq) {
 int pldb_snapshot(pldb *db, const char *ref, uint8_t **out, size_t *len, uint64_t *position) {
     char prefix[1024];
     if (is_wildcard(ref)) ref_prefix(ref, prefix, sizeof prefix);
-    else snprintf(prefix, sizeof prefix, "%s/", ref);
+    else snprintf(prefix, sizeof prefix, "%s!", ref);
 
     snap_ctx sc = {0};
     uint64_t seq = 0, event_bytes = 0, state_bytes = 0;

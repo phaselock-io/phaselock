@@ -27,23 +27,23 @@ type Resume = {
 };
 type Record_ = { until: number; resume: Resume | null; replacing: boolean; children: string[] };
 const record = (r: Rig, ref: string): Record_ | undefined =>
-  r.data()[`/backfill.${ref}`] as Record_ | undefined;
+  r.data()[`!backfill:${ref}`] as Record_ | undefined;
 
 type View = { token: string; position: number; refs: string[] };
-const view = (r: Rig): View | undefined => r.data()['/view'] as View | undefined;
+const view = (r: Rig): View | undefined => r.data()['!view'] as View | undefined;
 
 const patrons: Blob = {
   position: 10,
-  seqs: { 'patron.p1': 2, 'patron.p2': 1 },
+  seqs: { 'patron:p1': 2, 'patron:p2': 1 },
   values: [
-    ['patron.p1/state', { count: 2, fields: {} }],
-    ['patron.p2/state', { count: 1, fields: {} }],
+    ['patron:p1!state', { count: 2, fields: {} }],
+    ['patron:p2!state', { count: 1, fields: {} }],
   ],
 };
 const books: Blob = {
   position: 10,
-  seqs: { 'book.b1': 1 },
-  values: [['book.b1/state', { count: 1, fields: {} }]],
+  seqs: { 'book:b1': 1 },
+  values: [['book:b1!state', { count: 1, fields: {} }]],
 };
 
 /** a deep copy of the store, for comparing two runs */
@@ -70,93 +70,93 @@ describe('crash and resume', () => {
       tailDone: false,
     };
     const server = new FakeServer();
-    server.blobs.set('book.b1', {
+    server.blobs.set('book:b1', {
       position: 10,
-      seqs: { 'book.b1': 3 },
-      values: [['book.b1/state', { count: 3, fields: {} }]],
-      tail: [ev('book.b1', 4, 11)],
+      seqs: { 'book:b1': 3 },
+      values: [['book:b1!state', { count: 3, fields: {} }]],
+      tail: [ev('book:b1', 4, 11)],
     });
     const r = rig({
       server,
       seed: {
-        '/view': { token: 't1', position: 11, refs: ['book.b1'] },
-        '/checkpoint': { epoch: 'e1', position: 12, reduced: 12 },
-        '/backfill.book.b1': { until: 11, resume: { ...resume }, replacing: false, children: [] },
-        '/backfill-seqs.book.b1': { 'book.b1': 3 },
-        '/park.kv.book.b1/book.b1/state': { count: 3, fields: {} },
-        [parkedEvent('book.b1', 5)]: {
+        '!view': { token: 't1', position: 11, refs: ['book:b1'] },
+        '!checkpoint': { epoch: 'e1', position: 12, reduced: 12 },
+        '!backfill:book:b1': { until: 11, resume: { ...resume }, replacing: false, children: [] },
+        '!backfill-seqs:book:b1': { 'book:b1': 3 },
+        '!park-kv:book:b1!book:b1!state': { count: 3, fields: {} },
+        [parkedEvent('book:b1', 5)]: {
           id: 'x',
           data: { id: 'b1', type: 'bump' },
           position: 12,
-          stream: 'book.b1',
+          stream: 'book:b1',
           seq: 5,
           servertime: 0,
         },
-        '/seq.book.b1': 'backfill',
+        '!seq:book:b1': 'backfill',
       },
     });
     await settle();
     expect(server.conn.since).toBe(12);
     expect(server.conn.view).toBe('t1');
-    expect(server.backfills).toEqual([{ ref: 'book.b1', until: 11, resume }]);
+    expect(server.backfills).toEqual([{ ref: 'book:b1', until: 11, resume }]);
     server.open();
     server.live(12);
     await settle();
     // the tail page filled the gap between the cut and the parked live event, and everything chained
-    expect(state(r.data(), 'book.b1')).toEqual({ count: 5, fields: {} });
-    expect(log(r.data(), 'book.b1')).toEqual(['bump', 'bump']);
-    expect(seq(r.data(), 'book.b1')).toBe(5);
-    expect(keys(r.data(), '/backfill')).toEqual([]);
-    expect(keys(r.data(), '/park')).toEqual([]);
+    expect(state(r.data(), 'book:b1')).toEqual({ count: 5, fields: {} });
+    expect(log(r.data(), 'book:b1')).toEqual(['bump', 'bump']);
+    expect(seq(r.data(), 'book:b1')).toBe(5);
+    expect(keys(r.data(), '!backfill')).toEqual([]);
+    expect(keys(r.data(), '!park')).toEqual([]);
   });
 
   test('a crash between the values and the end of the snapshot resumes the download and lands like a clean run', async () => {
     const blobs: Record<string, Blob> = {
-      'patron.*': patrons,
-      'book.*': { ...books, tail: [ev('book.b1', 2, 11)] },
+      'patron:*': patrons,
+      'book:*': { ...books, tail: [ev('book:b1', 2, 11)] },
     };
     const r = rig();
-    await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
-    r.server.blobs.set('book.*', blobs['book.*']);
-    const hold = r.server.hold('book.*');
-    r.server.view('t2', 12, ['patron.*', 'book.*']);
+    await bootstrap(r, ['patron:*'], { 'patron:*': patrons });
+    r.server.blobs.set('book:*', blobs['book:*']);
+    const hold = r.server.hold('book:*');
+    r.server.view('t2', 12, ['patron:*', 'book:*']);
     await settle();
     // release, and stop at the first round that has the values committed; the rest is not
     hold.go();
-    for (let i = 0; i < 10 && (record(r, 'book.*')?.resume?.skipBytes ?? 0) === 0; i++) {
+    for (let i = 0; i < 10 && (record(r, 'book:*')?.resume?.skipBytes ?? 0) === 0; i++) {
       await settle(1);
     }
     // the record is the Engine's own object: what it says now is what the restart must present
-    const mid = { ...record(r, 'book.*')!.resume! };
+    const mid = { ...record(r, 'book:*')!.resume! };
     expect(mid).toMatchObject({ position: 10, snapshotDone: false, tailDone: false });
     expect(mid.skipBytes).toBeGreaterThan(0);
-    expect(keys(r.data(), '/park.kv.book.*/')).toEqual(['/park.kv.book.*/book.b1/state']);
-    expect(state(r.data(), 'book.b1')).toBeUndefined();
+    expect(keys(r.data(), '!park-kv:book:*!')).toEqual(['!park-kv:book:*!book:b1!state']);
+    expect(state(r.data(), 'book:b1')).toBeUndefined();
     const r2 = await restart(r, blobs);
-    expect(r2.server.backfills).toEqual([{ ref: 'book.*', until: 12, resume: mid }]);
+    expect(r2.server.backfills).toEqual([{ ref: 'book:*', until: 12, resume: mid }]);
     r2.server.open();
     r2.server.live(12);
     await settle();
-    expect(state(r2.data(), 'book.b1')).toEqual({ count: 2, fields: {} });
-    expect(log(r2.data(), 'book.b1')).toEqual(['bump']);
-    expect(seq(r2.data(), 'book.b1')).toBe(2);
-    expect(keys(r2.data(), '/backfill')).toEqual([]);
-    expect(keys(r2.data(), '/park')).toEqual([]);
+    expect(state(r2.data(), 'book:b1')).toEqual({ count: 2, fields: {} });
+    expect(log(r2.data(), 'book:b1')).toEqual(['bump']);
+    expect(seq(r2.data(), 'book:b1')).toBe(2);
+    expect(keys(r2.data(), '!backfill')).toEqual([]);
+    expect(keys(r2.data(), '!park')).toEqual([]);
     // the clean run over the same blobs ends in the same store
     const clean = rig();
-    await bootstrap(clean, ['patron.*'], { 'patron.*': patrons });
-    clean.server.blobs.set('book.*', blobs['book.*']);
-    clean.server.view('t2', 12, ['patron.*', 'book.*']);
+    await bootstrap(clean, ['patron:*'], { 'patron:*': patrons });
+    clean.server.blobs.set('book:*', blobs['book:*']);
+    clean.server.view('t2', 12, ['patron:*', 'book:*']);
     clean.server.vouch(12);
     await settle();
     expect(snapshot(r2.data())).toEqual(snapshot(clean.data()));
   });
 
   test('a crash after a land duplicates nothing: the restarted Engine matches the run before it', async () => {
-    const blobs = { 'patron.*': patrons };
+    const blobs = { 'patron:*': patrons };
     const r = rig();
-    await bootstrap(r, ['patron.*'], blobs);
-    r.server.events(ev('patron.p1', 3, 11, { type: 'set', field: 'a', value: 1 }));
+    await bootstrap(r, ['patron:*'], blobs);
+    r.server.events(ev('patron:p1', 3, 11, { type: 'set', field: 'a', value: 1 }));
     await settle();
     const before = snapshot(r.data());
     const r2 = await restart(r, blobs);
@@ -165,37 +165,37 @@ describe('crash and resume', () => {
     expect(r2.server.backfills).toEqual([]);
     r2.server.open();
     // a replay that repeats the last atom is a duplicate and changes nothing
-    r2.server.events(ev('patron.p1', 3, 11, { type: 'set', field: 'a', value: 1 }));
+    r2.server.events(ev('patron:p1', 3, 11, { type: 'set', field: 'a', value: 1 }));
     r2.server.live(11);
     await settle();
-    expect(log(r2.data(), 'patron.p1')).toEqual(['set a=1']);
+    expect(log(r2.data(), 'patron:p1')).toEqual(['set a=1']);
     expect(checkpoint(r2.data())).toEqual({ epoch: 'e1', position: 11, reduced: 11 });
     expect(snapshot(r2.data())).toEqual(before);
   });
 
   test('a crash before a reconciliation commits presents the old token; the frame again yields a clean reconciliation', async () => {
-    const blobs = { 'patron.*': patrons, 'book.*': books };
+    const blobs = { 'patron:*': patrons, 'book:*': books };
     const clean = rig();
-    await bootstrap(clean, ['patron.*'], { 'patron.*': patrons });
-    clean.server.blobs.set('book.*', books);
-    clean.server.view('t2', 12, ['patron.*', 'book.*']);
+    await bootstrap(clean, ['patron:*'], { 'patron:*': patrons });
+    clean.server.blobs.set('book:*', books);
+    clean.server.view('t2', 12, ['patron:*', 'book:*']);
     clean.server.vouch(12);
     await settle();
-    expect(view(clean)).toEqual({ token: 't2', position: 12, refs: ['patron.*', 'book.*'] });
+    expect(view(clean)).toEqual({ token: 't2', position: 12, refs: ['patron:*', 'book:*'] });
     // the same frame is queued when the Engine ends, so it never commits
     const r = rig();
-    await bootstrap(r, ['patron.*'], { 'patron.*': patrons });
-    r.server.view('t2', 12, ['patron.*', 'book.*']);
+    await bootstrap(r, ['patron:*'], { 'patron:*': patrons });
+    r.server.view('t2', 12, ['patron:*', 'book:*']);
     const r2 = await restart(r, blobs);
-    expect(view(r2)).toEqual({ token: 't1', position: 10, refs: ['patron.*'] });
+    expect(view(r2)).toEqual({ token: 't1', position: 10, refs: ['patron:*'] });
     expect(r2.server.conn.view).toBe('t1');
     expect(r2.server.conn.since).toBe(10);
     r2.server.open();
-    r2.server.view('t2', 12, ['patron.*', 'book.*']);
+    r2.server.view('t2', 12, ['patron:*', 'book:*']);
     r2.server.live(12);
     await settle();
-    expect(view(r2)).toEqual({ token: 't2', position: 12, refs: ['patron.*', 'book.*'] });
-    expect(state(r2.data(), 'book.b1')).toEqual({ count: 1, fields: {} });
+    expect(view(r2)).toEqual({ token: 't2', position: 12, refs: ['patron:*', 'book:*'] });
+    expect(state(r2.data(), 'book:b1')).toEqual({ count: 1, fields: {} });
     expect(snapshot(r2.data())).toEqual(snapshot(clean.data()));
   });
 });

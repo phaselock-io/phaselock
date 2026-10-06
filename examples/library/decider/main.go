@@ -24,7 +24,7 @@ var deciderScript string
 
 const (
 	booksStream = "books"
-	patronStreamPrefix = "patron."
+	patronStreamPrefix = "patron:"
 	statusStream = "status"
 	vstatusStream = "vstatus"
 	deciderStateStream = "decider-state"

@@ -88,8 +88,8 @@ connector.  Consequences:
   tokens; the contract never sees either.
 
 `wants` is the engine's compile-time mask: the refs of the shards the
-generated engine declares (`"book"`, `"patron.{id}"` lower to `book`,
-`patron.*`).  The server cuts the view down to them and hashes the
+generated engine declares (`"book"`, `"patron:{id}"` lower to `book`,
+`patron:*`).  The server cuts the view down to them and hashes the
 token from the result, so a build whose wants changed presents a
 stale token and gets the view frame, and the Engine never backfills
 what it cannot fold.  At boot the Engine purges whatever an earlier
@@ -146,11 +146,13 @@ export interface ConnectorHooks {
 
 ## Refs
 
-Refs use the wire grammar from `db/README.md`: a stream name,
-`family.*`, or `*`.  A connector puts a ref into a URL as it is.  Every
-allowed character is URL-safe and `*` is legal unencoded in a path, so
-there is no escaping and no `encodeURIComponent`.  Validation of refs is
-not the client's job.
+Refs use the wire grammar from `db/README.md`: a stream name, a
+wildcard over a family or its leading parameters (`chat:*`,
+`chat:acme,*`), or `*`.  A connector puts a ref into a URL path as it
+is.  Every allowed character, `:` and `,` included, is legal unencoded in
+a path, and `*` too, so there is no escaping and no
+`encodeURIComponent`; a `want` query parameter is form-encoded like any
+other.  Validation of refs is not the client's job.
 
 ## Backfill
 
