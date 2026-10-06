@@ -490,11 +490,11 @@ export function storeTypeOf(reg: Registry, key: string): string | undefined {
   return reg.storeTypes[`${dot(slice)}/${dot(sub)}`]!;
 }
 
-/** A scan walks keys in code-unit order between a lower and an upper bound, either open or
-    closed, one batch at a time.  It is a walk, not a snapshot: a batch is a fresh seek from the
-    resume key, so a key written above the cursor inside the range is visited and one written
-    below is not.  A scan may therefore write anywhere except above its own cursor inside its
-    range.  Its values are all of one type, so a range lies within one key template. */
+/** A scan walks keys in code-point order (compareKeys) between a lower and an upper bound, either
+    open or closed, one batch at a time.  It is a walk, not a snapshot: a batch is a fresh seek
+    from the resume key, so a key written above the cursor inside the range is visited and one
+    written below is not.  A scan may therefore write anywhere except above its own cursor inside
+    its range.  Its values are all of one type, so a range lies within one key template. */
 export type StoreRange = {
   gte?: string;
   gt?: string;
@@ -510,11 +510,56 @@ export type StoreRange = {
     lt when reversed), null when the range is done */
 export type StoreScan = { entries: [string, unknown][]; next: string | null };
 
-/** the exclusive upper bound of the keys sharing prefix; undefined for the empty prefix */
+/** Keys sort in code-point order, which is the order of their UTF-8 bytes, so a store comparing
+    UTF-8 keys bytewise (SQLite, LMDB) walks in the same order as the in-memory layers.  JS's own
+    string comparison is UTF-16 code-unit order, which differs in one place: a surrogate pair,
+    encoding a code point above U+FFFF, sorts below U+E000-U+FFFF.  Keys are well-formed UTF-16,
+    holding no lone surrogate. */
+export function compareKeys(a: string, b: string): number {
+  // find the first code unit that differs
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+  if (i === n) return a.length - b.length;
+
+  // if both units are at or above the surrogates, move the surrogates above U+E000-U+FFFF
+  let x = a.charCodeAt(i);
+  let y = b.charCodeAt(i);
+  if (x >= 0xd800 && y >= 0xd800) {
+    x = x >= 0xe000 ? x - 0x800 : x + 0x2000;
+    y = y >= 0xe000 ? y - 0x800 : y + 0x2000;
+  }
+  return x - y;
+}
+
+// a code unit at or above the surrogates; the two orders agree on keys unless both hold one
+const HIGH_UNIT = /[\uD800-\uFFFF]/;
+
+// code-unit order, exact in code-point order against a key holding no high unit
+const unitCompare = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
+// sort keys in place in code-point order
+function sortKeys(keys: string[]): string[] {
+  // the native sort is already right unless keys hold high units, and leaves them nearly in order
+  keys.sort();
+  if (keys.some((k) => HIGH_UNIT.test(k))) keys.sort(compareKeys);
+  return keys;
+}
+
+/** the exclusive upper bound of the keys sharing prefix, which is prefix with its last code
+    point incremented; undefined when no key lies above them all, as for the empty prefix */
 export function prefixEnd(prefix: string): string | undefined {
-  if (prefix === '') return undefined;
-  const last = prefix.charCodeAt(prefix.length - 1);
-  return prefix.slice(0, -1) + String.fromCharCode(last + 1);
+  // a trailing U+10FFFF has no successor, so the bound comes from the code point before it
+  let end = prefix;
+  while (end.endsWith('\u{10FFFF}')) end = end.slice(0, -2);
+  if (end === '') return undefined;
+
+  // increment the last code point, a surrogate pair or a single unit, stepping over the
+  // surrogates
+  const pair = end.length >= 2 && end.codePointAt(end.length - 2)! > 0xffff;
+  const at = pair ? end.length - 2 : end.length - 1;
+  const cp = end.codePointAt(at)!;
+  return end.slice(0, at) + String.fromCodePoint(cp === 0xd7ff ? 0xe000 : cp + 1);
 }
 
 /** the range covering every key under a prefix */
@@ -607,24 +652,32 @@ function layerOut(reg: Registry, type: string, js: unknown, rep: Rep): unknown {
   return rep === JS ? copyValue(js) : reg.convert(type, js, JS, rep);
 }
 
-function inRange(key: string, r: StoreRange): boolean {
-  if (r.gte !== undefined && key < r.gte) return false;
-  if (r.gt !== undefined && key <= r.gt) return false;
-  if (r.lte !== undefined && key > r.lte) return false;
-  if (r.lt !== undefined && key >= r.lt) return false;
+function inRange(key: string, r: StoreRange, cmp: (a: string, b: string) => number): boolean {
+  if (r.gte !== undefined && cmp(key, r.gte) < 0) return false;
+  if (r.gt !== undefined && cmp(key, r.gt) <= 0) return false;
+  if (r.lte !== undefined && cmp(key, r.lte) > 0) return false;
+  if (r.lt !== undefined && cmp(key, r.lt) >= 0) return false;
   return true;
 }
 
 // the live keys of updates over data, sorted in walk order, restricted to a range
 function layerKeys(data: Layer, updates: Layer, r: StoreRange): string[] {
+  // bounds holding no high unit compare exactly in code-unit order
+  const bounds = [r.gte, r.gt, r.lte, r.lt];
+  const high = bounds.some((b) => b !== undefined && HIGH_UNIT.test(b));
+  const cmp = high ? compareKeys : unitCompare;
+
+  // collect the live keys in range
   const keys: string[] = [];
   for (const k of Object.keys(data)) {
-    if (!(k in updates) && data[k] !== undefined && inRange(k, r)) keys.push(k);
+    if (!(k in updates) && data[k] !== undefined && inRange(k, r, cmp)) keys.push(k);
   }
   for (const k of Object.keys(updates)) {
-    if (updates[k] !== undefined && inRange(k, r)) keys.push(k);
+    if (updates[k] !== undefined && inRange(k, r, cmp)) keys.push(k);
   }
-  keys.sort();
+
+  // order them for the walk
+  sortKeys(keys);
   if (r.reverse) keys.reverse();
   return keys;
 }
@@ -823,7 +876,7 @@ class OverlayTxn implements WTxn {
     }
     const layer = layerKeys(this.#data, this.#updates, prefixRange(prefix, Infinity, false));
     for (const k of layer) all.add(k);
-    return [...all].sort();
+    return sortKeys([...all]);
   }
 
   delPrefix(prefix: string): string[] {
@@ -861,7 +914,7 @@ class OverlayTxn implements WTxn {
     }
 
     // cut the merged keys to one batch
-    const keys = [...merged.keys()].sort();
+    const keys = sortKeys([...merged.keys()]);
     if (range.reverse) keys.reverse();
     const page: StoreScan = {
       entries: keys.slice(0, range.limit).map((k) => [k, merged.get(k)]),
@@ -880,7 +933,8 @@ class OverlayTxn implements WTxn {
 
 /** ExternalStoreTxn is one transaction of an ExternalStore, a WTxn that also commits and aborts.
     The store converts: it persists the representation it keeps and answers in the one asked for,
-    undefined for an absent key. */
+    undefined for an absent key.  It walks keys in code-point order, as a store comparing UTF-8
+    keys bytewise does. */
 export interface ExternalStoreTxn extends WTxn {
   commit(): void;
   /** abort the transaction.  ExternalStore calls it after any failure in the transaction,

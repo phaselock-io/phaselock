@@ -4,12 +4,14 @@
 import { describe, expect, test } from 'vitest';
 
 import {
+  compareKeys,
   deepCopy,
   ExternalStore,
   type ExternalStoreTxn,
   InMemStore,
   JS,
   Overlay,
+  prefixEnd,
   prefixRange,
   resumeRange,
   type Store,
@@ -134,6 +136,74 @@ describe('scan', () => {
       return rest.map(([k]) => k);
     });
     expect(seen).toEqual(['k1a', 'k2', 'k4', 'k5']);
+  });
+});
+
+describe('key order', () => {
+  // in code-point order, which UTF-16 code-unit order gets wrong across U+E000-U+FFFF
+  const ordered = [
+    'A',
+    '\uD7FF',
+    '\uE000',
+    '\uFFFD',
+    '\uFFFF',
+    '\u{10000}',
+    '\u{1F600}',
+    '\u{10FFFF}',
+  ];
+
+  test('compareKeys agrees with UTF-8 byte order', () => {
+    const utf8 = (s: string) => Buffer.from(s, 'utf8');
+    const keys = ordered.flatMap((a) => ordered.map((b) => 'k' + a + b));
+    const byBytes = [...keys].sort((a, b) => Buffer.compare(utf8(a), utf8(b)));
+    expect([...keys].reverse().sort(compareKeys)).toEqual(byBytes);
+  });
+
+  test('a scan walks in code-point order, forward and reversed, through the overlay too', () => {
+    const keys = ordered.map((c) => 'k' + c);
+    const store = seeded({}, ...[...keys].reverse());
+    expect(scanKeys(store, prefixRange('k', 3, false))).toEqual(keys);
+    expect(scanKeys(store, { ...prefixRange('k', 3, false), reverse: true })).toEqual(
+      [...keys].reverse(),
+    );
+    expect(scanKeys(store, { gt: 'k\uFFFF', limit: 3, values: false })).toEqual(keys.slice(5));
+
+    // pending writes on either side of the surrogates merge into the base's walk
+    const overlay = new Overlay(registry);
+    const merged = store.read((b) =>
+      overlay.apply(b, (txn) => {
+        txn.set('k\uE001', T, JS, 'k\uE001');
+        txn.set('k\u{10001}', T, JS, 'k\u{10001}');
+        return txnScanAll(txn, prefixRange('k', 2, false)).map(([k]) => k);
+      }),
+    );
+    expect(merged).toEqual([
+      ...keys.slice(0, 3),
+      'k\uE001',
+      ...keys.slice(3, 6),
+      'k\u{10001}',
+      ...keys.slice(6),
+    ]);
+  });
+
+  test('prefixEnd increments the last code point', () => {
+    expect(prefixEnd('ab')).toBe('ac');
+    expect(prefixEnd('a\uD7FF')).toBe('a\uE000');
+    expect(prefixEnd('a\uFFFF')).toBe('a\u{10000}');
+    expect(prefixEnd('a\u{1F600}')).toBe('a\u{1F601}');
+    expect(prefixEnd('a\u{10FFFF}\u{10FFFF}')).toBe('b');
+    expect(prefixEnd('\u{10FFFF}')).toBeUndefined();
+    expect(prefixEnd('')).toBeUndefined();
+  });
+
+  test('a prefix range holds exactly the keys under its prefix', () => {
+    const prefixes = ['k\uD7FF', 'k\uFFFF', 'k\u{1F600}', 'k\u{10FFFF}'];
+    const keys = ordered.flatMap((a) => ordered.map((b) => 'k' + a + b));
+    const store = seeded({}, ...keys);
+    for (const p of prefixes) {
+      const under = keys.filter((k) => k.startsWith(p)).sort(compareKeys);
+      expect(scanKeys(store, prefixRange(p, 4, false))).toEqual(under);
+    }
   });
 });
 
