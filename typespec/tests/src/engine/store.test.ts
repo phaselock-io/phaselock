@@ -1,6 +1,8 @@
 // TESTS.md: Store primitives (every implementation), against InMemStore, the Overlay, and
 // ExternalStore
 
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, test } from 'vitest';
 
 import {
@@ -10,14 +12,15 @@ import {
   type ExternalStoreTxn,
   InMemStore,
   JS,
+  type KeyPattern,
   Overlay,
+  type ParamMatch,
   prefixEnd,
-  prefixRange,
-  resumeRange,
   type RTxn,
+  scanAll,
+  type ScanRequest,
   type Store,
-  type StoreRange,
-  txnScanAll,
+  type WTxn,
 } from '../../../ts/assets/skeleton.ts';
 
 import { registry } from './harness.ts';
@@ -33,117 +36,185 @@ function seeded(...keys: string[]): InMemStore {
   return store;
 }
 
+// every key
+const EVERY: KeyPattern = { stream: null, name: null, local: [] };
+
 /** every key in a store and its value */
 function contents(store: Store): Record<string, unknown> {
   return store.read((txn) => {
-    return Object.fromEntries(txnScanAll(txn, { limit: 1000, values: { type: T, rep: JS } }));
+    const keys = scanAll(txn, { pattern: EVERY, limit: 1000, values: false }).map(([k]) => k);
+    return Object.fromEntries(keys.map((k) => [k, txn.get(k, T, JS)]));
   });
 }
 
-function scanKeys(store: Store, range: StoreRange): string[] {
-  return store.read((txn) => {
-    return txnScanAll(txn, range).map(([k]) => k);
-  });
+/** the keys of stream s at template k:{id}, by a match on the id */
+const ks = (m: ParamMatch = null, stream = 's'): KeyPattern => ({ stream, name: 'k', local: [m] });
+
+/** the keys a scan walks */
+function scanKeys(txn: RTxn, req: Omit<ScanRequest, 'limit' | 'values'> & { limit?: number }) {
+  return scanAll(txn, { limit: 10, values: false, ...req }).map(([k]) => k);
+}
+
+/** the keys a scan of a store walks */
+function storeKeys(store: Store, req: Omit<ScanRequest, 'limit' | 'values'> & { limit?: number }) {
+  return store.read((txn) => scanKeys(txn, req));
+}
+
+// the batches of a walk, each its keys and its next
+function batchesOf(txn: RTxn, req: ScanRequest): [string[], string | null][] {
+  const out: [string[], string | null][] = [];
+  let after = req.after;
+  for (;;) {
+    const { entries, next } = txn.scan({ ...req, after });
+    out.push([entries.map(([k]) => k), next]);
+    if (next === null) return out;
+    after = next;
+  }
 }
 
 describe('scan', () => {
-  const five = ['k1', 'k2', 'k3', 'k4', 'k5'];
+  const five = ['s!k:1', 's!k:2', 's!k:3', 's!k:4', 's!k:5'];
 
   test('closed and open bounds on each side', () => {
     const store = seeded(...five);
-    expect(scanKeys(store, { gte: 'k2', lt: 'k4', limit: 10, values: false })).toEqual([
-      'k2',
-      'k3',
-    ]);
-    expect(scanKeys(store, { gt: 'k2', lte: 'k4', limit: 10, values: false })).toEqual([
-      'k3',
-      'k4',
-    ]);
-    expect(scanKeys(store, { gte: 'k4', limit: 10, values: false })).toEqual(['k4', 'k5']);
-    expect(scanKeys(store, { lt: 'k3', limit: 10, values: false })).toEqual(['k1', 'k2']);
-    expect(scanKeys(store, { gt: 'k1', lt: 'k2', limit: 10, values: false })).toEqual([]);
+    expect(storeKeys(store, { pattern: ks({ gte: '2', lt: '4' }) })).toEqual(['s!k:2', 's!k:3']);
+    expect(storeKeys(store, { pattern: ks({ gt: '2', lte: '4' }) })).toEqual(['s!k:3', 's!k:4']);
+    expect(storeKeys(store, { pattern: ks({ gte: '4' }) })).toEqual(['s!k:4', 's!k:5']);
+    expect(storeKeys(store, { pattern: ks({ lt: '3' }) })).toEqual(['s!k:1', 's!k:2']);
+    expect(storeKeys(store, { pattern: ks({ gt: '1', lt: '2' }) })).toEqual([]);
+    expect(storeKeys(store, { pattern: ks({ eq: '3' }) })).toEqual(['s!k:3']);
   });
 
-  test('reverse walks descending and resumes with lt', () => {
+  test("reverse walks descending and resumes before the batch's last key", () => {
     const store = seeded(...five);
-    expect(
-      scanKeys(store, { gte: 'k2', lte: 'k4', reverse: true, limit: 10, values: false }),
-    ).toEqual(['k4', 'k3', 'k2']);
+    const pattern = ks({ gte: '2', lte: '4' });
+    expect(storeKeys(store, { pattern, reverse: true })).toEqual(['s!k:4', 's!k:3', 's!k:2']);
     const batches = store.read((txn) => {
-      const out: [string[], string | null][] = [];
-      let range: StoreRange = { reverse: true, limit: 2, values: false };
-      for (;;) {
-        const { entries, next } = txn.scan(range);
-        out.push([entries.map(([k]) => k), next]);
-        if (next === null) return out;
-        range = resumeRange(range, next);
-      }
+      return batchesOf(txn, { pattern: ks(), reverse: true, limit: 2, values: false });
     });
     expect(batches).toEqual([
-      [['k5', 'k4'], 'k4'],
-      [['k3', 'k2'], 'k2'],
-      [['k1'], null],
+      [['s!k:5', 's!k:4'], 's!k:4'],
+      [['s!k:3', 's!k:2'], 's!k:2'],
+      [['s!k:1'], null],
     ]);
   });
 
-  test('limit batching with next', () => {
+  test('batches of the limit, each naming the key to resume after while more follow', () => {
     const store = seeded(...five);
-    const batches = store.read((txn) => {
-      const out: [string[], string | null][] = [];
-      let range: StoreRange = prefixRange('k', 2, false);
-      for (;;) {
-        const { entries, next } = txn.scan(range);
-        out.push([entries.map(([k]) => k), next]);
-        if (next === null) return out;
-        range = resumeRange(range, next);
-      }
-    });
+    const batches = store.read((txn) => batchesOf(txn, { pattern: ks(), limit: 2, values: false }));
     expect(batches).toEqual([
-      [['k1', 'k2'], 'k2'],
-      [['k3', 'k4'], 'k4'],
-      [['k5'], null],
+      [['s!k:1', 's!k:2'], 's!k:2'],
+      [['s!k:3', 's!k:4'], 's!k:4'],
+      [['s!k:5'], null],
     ]);
   });
 
   test('keys only versus values in a representation', () => {
-    const store = seeded('k1', 'k2');
-    const keysOnly = store.read((txn) => {
-      return txnScanAll(txn, prefixRange('k', 10, false));
-    });
+    const store = seeded('s!k:1', 's!k:2');
+    const keysOnly = store.read((txn) => scanAll(txn, { pattern: ks(), limit: 10, values: false }));
     expect(keysOnly).toEqual([
-      ['k1', undefined],
-      ['k2', undefined],
+      ['s!k:1', undefined],
+      ['s!k:2', undefined],
     ]);
     const withValues = store.read((txn) => {
-      return txnScanAll(txn, prefixRange('k', 10, { type: T, rep: JS }));
+      return scanAll(txn, { pattern: ks(), limit: 10, values: { type: T, rep: JS } });
     });
-    expect(withValues.map(([k, v]) => [k, v])).toEqual([
-      ['k1', 'k1'],
-      ['k2', 'k2'],
+    expect(withValues).toEqual([
+      ['s!k:1', 's!k:1'],
+      ['s!k:2', 's!k:2'],
     ]);
   });
 
-  test('an empty range, and a range covering the whole store', () => {
-    const store = seeded(...five);
-    const empty = store.read((txn) => {
-      return txn.scan({ gte: 'z', limit: 10, values: false });
-    });
+  test('an empty walk, and a walk of every key', () => {
+    const store = seeded(...five, 't!k:1');
+    const empty = store.read((txn) =>
+      txn.scan({ pattern: ks({ gte: '6' }), limit: 10, values: false }),
+    );
     expect(empty).toEqual({ entries: [], next: null });
-    expect(scanKeys(store, prefixRange('', 10, false))).toEqual(five);
+    expect(storeKeys(store, { pattern: EVERY })).toEqual([...five, 't!k:1']);
   });
 
-  test('while writing: a key written above the cursor is visited, one below is not, a deleted key ahead is skipped', () => {
+  test('a batch holds at least one entry', () => {
+    const store = seeded(...five);
+    for (const limit of [0, NaN]) {
+      expect(() => store.read((txn) => txn.scan({ pattern: ks(), limit, values: false }))).toThrow(
+        "a scan's limit is at least 1",
+      );
+    }
+  });
+
+  test('a walk of every local key reads keys only', () => {
+    const store = seeded(...five);
+    const every: KeyPattern = { stream: 's', name: null, local: [] };
+    expect(() =>
+      store.read((txn) => txn.scan({ pattern: every, limit: 10, values: { type: T, rep: JS } })),
+    ).toThrow('a scan of every local key reads keys only');
+  });
+
+  test('while writing: a key written ahead of the walk is visited, one behind is not, a key deleted ahead is skipped', () => {
     const store = seeded(...five);
     const seen = store.write((txn) => {
-      const first = txn.scan(prefixRange('k', 1, false));
-      expect(first.entries.map(([k]) => k)).toEqual(['k1']);
-      txn.set('k1a', T, JS, 'k1a');
-      txn.set('k0', T, JS, 'k0');
-      txn.del('k3');
-      const rest = txnScanAll(txn, resumeRange(prefixRange('k', 10, false), first.next!));
-      return rest.map(([k]) => k);
+      const first = txn.scan({ pattern: ks(), limit: 1, values: false });
+      expect(first.entries.map(([k]) => k)).toEqual(['s!k:1']);
+      txn.set('s!k:1a', T, JS, 's!k:1a');
+      txn.set('s!k:0', T, JS, 's!k:0');
+      txn.del('s!k:3');
+      return scanKeys(txn, { pattern: ks(), after: first.next! });
     });
-    expect(seen).toEqual(['k1a', 'k2', 'k4', 'k5']);
+    expect(seen).toEqual(['s!k:1a', 's!k:2', 's!k:4', 's!k:5']);
+  });
+});
+
+describe('the scan conformance cases', () => {
+  type Case = { name: string; pattern: KeyPattern; expect: string[] };
+  const fixture = JSON.parse(
+    readFileSync(new URL('../../fixtures/scan-conformance.json', import.meta.url), 'utf8'),
+  ) as { keys: string[]; cases: Case[] };
+  const { keys } = fixture;
+
+  // every walk of a case, whole and resumed at every batch boundary, forward and reversed
+  function check(txn: RTxn, c: Case): void {
+    const values: ScanRequest['values'] = c.pattern.name === null ? false : { type: T, rep: JS };
+    for (const reverse of [false, true]) {
+      const want = reverse ? [...c.expect].reverse() : c.expect;
+      for (const limit of [1, 2, 3, 1000]) {
+        const got = scanAll(txn, { pattern: c.pattern, reverse, limit, values });
+        expect(got.map(([k]) => k)).toEqual(want);
+        if (values) expect(got.every(([k, v]) => k === v)).toBe(true);
+      }
+    }
+  }
+
+  // the keys at odd places, then the rest
+  const half = (odd: boolean) => keys.filter((_, i) => i % 2 === (odd ? 1 : 0));
+
+  test.each(fixture.cases)('$name', (c) => {
+    expect.hasAssertions();
+
+    // a store holding them all
+    const store = seeded(...[...keys].reverse());
+    store.read((txn) => check(txn, c));
+
+    // half of them pending in a write over the other half, which also deletes two stored keys
+    const part = seeded(...half(false), 'zz!gone:1', 'chat:acme,gen!post:gone');
+    part.write((txn) => {
+      for (const k of half(true)) txn.set(k, T, JS, k);
+      txn.del('zz!gone:1');
+      txn.del('chat:acme,gen!post:gone');
+      check(txn, c);
+    });
+
+    // half of them in the overlay over the other half, which also deletes two base keys
+    const base = seeded(...half(false), 'chat:acme,gen!post:gone', 'chat:ac,gen!meta-gone');
+    const overlay = new Overlay(registry);
+    base.read((b) =>
+      overlay.apply(b, (txn) => {
+        for (const k of half(true)) txn.set(k, T, JS, k);
+        txn.del('chat:acme,gen!post:gone');
+        txn.del('chat:ac,gen!meta-gone');
+      }),
+    );
+    base.read((b) => check(overlay.view(b), c));
   });
 });
 
@@ -168,28 +239,28 @@ describe('key order', () => {
   });
 
   test('a scan walks in code-point order, forward and reversed, through the overlay too', () => {
-    const keys = ordered.map((c) => 'k' + c);
+    const keys = ordered.map((c) => 's!k:' + c);
     const store = seeded(...[...keys].reverse());
-    expect(scanKeys(store, prefixRange('k', 3, false))).toEqual(keys);
-    expect(scanKeys(store, { ...prefixRange('k', 3, false), reverse: true })).toEqual(
+    expect(storeKeys(store, { pattern: ks(), limit: 3 })).toEqual(keys);
+    expect(storeKeys(store, { pattern: ks(), limit: 3, reverse: true })).toEqual(
       [...keys].reverse(),
     );
-    expect(scanKeys(store, { gt: 'k\uFFFF', limit: 3, values: false })).toEqual(keys.slice(5));
+    expect(storeKeys(store, { pattern: ks({ gt: '\uFFFF' }), limit: 3 })).toEqual(keys.slice(5));
 
     // pending writes on either side of the surrogates merge into the base's walk
     const overlay = new Overlay(registry);
     const merged = store.read((b) =>
       overlay.apply(b, (txn) => {
-        txn.set('k\uE001', T, JS, 'k\uE001');
-        txn.set('k\u{10001}', T, JS, 'k\u{10001}');
-        return txnScanAll(txn, prefixRange('k', 2, false)).map(([k]) => k);
+        txn.set('s!k:\uE001', T, JS, 's!k:\uE001');
+        txn.set('s!k:\u{10001}', T, JS, 's!k:\u{10001}');
+        return scanKeys(txn, { pattern: ks(), limit: 2 });
       }),
     );
     expect(merged).toEqual([
       ...keys.slice(0, 3),
-      'k\uE001',
+      's!k:\uE001',
       ...keys.slice(3, 6),
-      'k\u{10001}',
+      's!k:\u{10001}',
       ...keys.slice(6),
     ]);
   });
@@ -218,25 +289,35 @@ describe('key order', () => {
     const store = seeded(...[...keys].reverse());
 
     // the family, one stream, and one stream's thread
-    expect(scanKeys(store, prefixRange('x:', 7, false))).toEqual(keys);
-    expect(scanKeys(store, prefixRange('x:2026-10,gen!', 7, false))).toEqual(
-      keys.filter((k) => k.startsWith('x:2026-10,gen!')),
-    );
-    expect(scanKeys(store, prefixRange('x:2026-10,gen!reply:t1,', 7, false))).toEqual(
-      ids.map((id) => `x:2026-10,gen!reply:t1,${id}`),
+    const family = { family: 'x', params: [null, null] };
+    expect(
+      storeKeys(store, {
+        pattern: { stream: family, name: 'reply', local: [null, null] },
+        limit: 7,
+      }),
+    ).toEqual(keys);
+    const one = 'x:2026-10,gen';
+    expect(
+      storeKeys(store, { pattern: { stream: one, name: 'reply', local: [null, null] }, limit: 7 }),
+    ).toEqual(keys.filter((k) => k.startsWith(`${one}!`)));
+    const thread: KeyPattern = { stream: one, name: 'reply', local: [{ eq: 't1' }, null] };
+    expect(storeKeys(store, { pattern: thread, limit: 7 })).toEqual(
+      ids.map((id) => `${one}!reply:t1,${id}`),
     );
 
     // stream names alone sort the same way
     expect([...streams].reverse().sort(compareKeys)).toEqual(streams);
   });
 
-  test('a prefix range holds exactly the keys under its prefix', () => {
-    const prefixes = ['k\uD7FF', 'k\uFFFF', 'k\u{1F600}', 'k\u{10FFFF}'];
-    const keys = ordered.flatMap((a) => ordered.map((b) => 'k' + a + b));
-    const store = seeded(...keys);
+  test('a prefix match holds exactly the values that start with it', () => {
+    const prefixes = ['\uD7FF', '\uFFFF', '\u{1F600}', '\u{10FFFF}'];
+    const values = ordered.flatMap((a) => ordered.map((b) => a + b));
+    const store = seeded(...values.map((v) => `s!k:${v}`));
     for (const p of prefixes) {
-      const under = keys.filter((k) => k.startsWith(p)).sort(compareKeys);
-      expect(scanKeys(store, prefixRange(p, 4, false))).toEqual(under);
+      const under = values.filter((v) => v.startsWith(p)).map((v) => `s!k:${v}`);
+      expect(storeKeys(store, { pattern: ks({ prefix: p }), limit: 4 })).toEqual(
+        under.sort(compareKeys),
+      );
     }
   });
 });
@@ -276,6 +357,17 @@ describe('delPrefix and move', () => {
     expect(moved).toEqual(['a/1', 'b/1']);
     expect(contents(store)).toEqual({ 'a/1': '!park-kv:x!a/1', 'b/1': '!park-kv:x!b/1' });
   });
+
+  test('both see the keys a transaction wrote and not the ones it deleted', () => {
+    const store = seeded('p/1', 'p/2');
+    const deleted = store.write((txn) => {
+      txn.set('p/0', T, JS, 'p/0');
+      txn.del('p/2');
+      return txn.delPrefix('p/');
+    });
+    expect(deleted).toEqual(['p/0', 'p/1']);
+    expect(contents(store)).toEqual({});
+  });
 });
 
 describe('a store of many keys', () => {
@@ -286,43 +378,50 @@ describe('a store of many keys', () => {
     return Math.floor((seed / 4294967296) * n);
   };
 
-  // a fresh key, now and then holding code points the native order gets wrong
-  const fresh = () => {
+  // a fresh id, now and then holding code points the native order gets wrong
+  const freshId = () => {
     const tail = ['', '', '', '\u{1F600}', '\uFF0C'][rand(5)];
-    return `k/${String(rand(1e9)).padStart(9, '0')}${tail}`;
+    return `${String(rand(1e9)).padStart(9, '0')}${tail}`;
   };
+  const fresh = () => `s!k:${freshId()}`;
 
-  // a random range over the reference's keys, with any mix of bounds on either side
-  function randomRange(keys: string[]): StoreRange {
-    const pick = () => (keys.length > 0 && rand(4) > 0 ? keys[rand(keys.length)] : fresh());
-    const r: StoreRange = { limit: 1 + rand(60), values: false, reverse: rand(2) === 0 };
+  // a random match on the id over the reference's ids, with any mix of bounds on either side
+  function randomMatch(ids: string[]): ParamMatch {
+    const pick = () => (ids.length > 0 && rand(4) > 0 ? ids[rand(ids.length)] : freshId());
+    const m: { gte?: string; gt?: string; lte?: string; lt?: string } = {};
     const lower = rand(4);
-    if (lower & 1) r.gte = pick();
-    if (lower & 2) r.gt = pick();
+    if (lower & 1) m.gte = pick();
+    if (lower & 2) m.gt = pick();
     const upper = rand(4);
-    if (upper & 1) r.lt = pick();
-    if (upper & 2) r.lte = pick();
-    return r;
+    if (upper & 1) m.lt = pick();
+    if (upper & 2) m.lte = pick();
+    return m;
   }
 
-  // the keys of a range, from the reference's keys in walk order
-  function expected(sorted: string[], r: StoreRange): string[] {
-    const inside = sorted.filter(
-      (k) =>
-        (r.gte === undefined || compareKeys(k, r.gte) >= 0) &&
-        (r.gt === undefined || compareKeys(k, r.gt) > 0) &&
-        (r.lt === undefined || compareKeys(k, r.lt) < 0) &&
-        (r.lte === undefined || compareKeys(k, r.lte) <= 0),
-    );
-    return r.reverse ? inside.reverse() : inside;
+  // the keys a match picks out, from the reference's keys in walk order
+  function expected(sorted: string[], m: ParamMatch, reverse: boolean): string[] {
+    const r = m as { gte?: string; gt?: string; lte?: string; lt?: string };
+    const inside = sorted.filter((k) => {
+      const id = k.slice('s!k:'.length);
+      return (
+        (r.gte === undefined || compareKeys(id, r.gte) >= 0) &&
+        (r.gt === undefined || compareKeys(id, r.gt) > 0) &&
+        (r.lt === undefined || compareKeys(id, r.lt) < 0) &&
+        (r.lte === undefined || compareKeys(id, r.lte) <= 0)
+      );
+    });
+    return reverse ? inside.reverse() : inside;
   }
 
-  // check random ranges of txn against the reference
-  function checkRanges(txn: RTxn, keys: Set<string>): void {
+  // check random walks of txn against the reference
+  function checkWalks(txn: RTxn, keys: Set<string>): void {
     const sorted = [...keys].sort(compareKeys);
+    const ids = sorted.map((k) => k.slice('s!k:'.length));
     for (let i = 0; i < 4; i++) {
-      const r = randomRange(sorted);
-      expect(txnScanAll(txn, r).map(([k]) => k)).toEqual(expected(sorted, r));
+      const m = randomMatch(ids);
+      const reverse = rand(2) === 0;
+      const got = scanKeys(txn, { pattern: ks(m), reverse, limit: 1 + rand(60) });
+      expect(got).toEqual(expected(sorted, m, reverse));
     }
   }
 
@@ -336,11 +435,11 @@ describe('a store of many keys', () => {
         for (const k of add) txn.set(k, T, JS, k);
         for (const k of drop) txn.del(k);
         const gone = new Set(drop);
-        checkRanges(txn, new Set([...keys, ...add].filter((k) => !gone.has(k))));
+        checkWalks(txn, new Set([...keys, ...add].filter((k) => !gone.has(k))));
       });
       for (const k of add) keys.add(k);
       for (const k of drop) keys.delete(k);
-      store.read((txn) => checkRanges(txn, keys));
+      store.read((txn) => checkWalks(txn, keys));
     };
     return { store, keys, commit };
   }
@@ -368,7 +467,7 @@ describe('a store of many keys', () => {
 
   test('a short block joining a long neighbour splits the pair again', () => {
     const { keys, commit } = tracked();
-    const name = (i: number) => `m/${String(i).padStart(4, '0')}`;
+    const name = (i: number) => `s!k:${String(i).padStart(4, '0')}`;
 
     // blocks hold about a thousand keys, so a bulk load of two thousand makes two
     commit(
@@ -409,35 +508,70 @@ describe('a store of many keys', () => {
 
 describe('overlay', () => {
   test('refuses to move keys, which no forecast does', () => {
-    const base = seeded('k1');
+    const base = seeded('s!k:1');
     const overlay = new Overlay(registry);
-    expect(() => base.read((b) => overlay.apply(b, (txn) => txn.move('k', 'j')))).toThrow(
+    expect(() => base.read((b) => overlay.apply(b, (txn) => txn.move('s!', 't!')))).toThrow(
       'the overlay does not move keys',
     );
   });
 
+  test('deletes whole streams, from the base and its own layers', () => {
+    const base = seeded('s!k:1', 's!m', 'sx!k:1', 't!k:1');
+    const overlay = new Overlay(registry);
+    const deleted = base.read((b) =>
+      overlay.apply(b, (txn: WTxn) => {
+        txn.set('s!k:2', T, JS, 's!k:2');
+        return txn.delPrefix('s!');
+      }),
+    );
+    expect(deleted).toEqual(['s!k:1', 's!k:2', 's!m']);
+    expect(base.read((b) => scanKeys(overlay.view(b), { pattern: EVERY }))).toEqual([
+      'sx!k:1',
+      't!k:1',
+    ]);
+    expect(() => base.read((b) => overlay.apply(b, (txn) => txn.delPrefix('s!k:')))).toThrow(
+      'the overlay deletes whole streams, not s!k:',
+    );
+  });
+
   test('scan answers with pending writes merged in and pending deletes removed', () => {
-    const base = seeded('k1', 'k2', 'k3');
+    const base = seeded('s!k:1', 's!k:2', 's!k:3');
     const overlay = new Overlay(registry);
     const inside = base.read((b) =>
       overlay.apply(b, (txn) => {
-        txn.set('k4', T, JS, 'k4');
-        txn.del('k2');
-        return txnScanAll(txn, prefixRange('k', 10, { type: T, rep: JS })).map(([k, v]) => [k, v]);
+        txn.set('s!k:4', T, JS, 's!k:4');
+        txn.del('s!k:2');
+        return scanAll(txn, { pattern: ks(), limit: 10, values: { type: T, rep: JS } });
       }),
     );
     expect(inside).toEqual([
-      ['k1', 'k1'],
-      ['k3', 'k3'],
-      ['k4', 'k4'],
+      ['s!k:1', 's!k:1'],
+      ['s!k:3', 's!k:3'],
+      ['s!k:4', 's!k:4'],
     ]);
-    const after = base.read((b) =>
-      txnScanAll(overlay.view(b), prefixRange('k', 10, false)).map(([k]) => k),
-    );
-    expect(after).toEqual(['k1', 'k3', 'k4']);
-    expect(scanKeys(base, prefixRange('k', 10, false))).toEqual(['k1', 'k2', 'k3']);
-    const gone = base.read((b) => overlay.view(b).get('k2', T, JS));
+    const after = base.read((b) => scanKeys(overlay.view(b), { pattern: ks() }));
+    expect(after).toEqual(['s!k:1', 's!k:3', 's!k:4']);
+    expect(storeKeys(base, { pattern: ks() })).toEqual(['s!k:1', 's!k:2', 's!k:3']);
+    const gone = base.read((b) => overlay.view(b).get('s!k:2', T, JS));
     expect(gone).toBeUndefined();
+  });
+
+  test('a base batch the overlay deletes entirely still resumes the walk past it', () => {
+    const base = seeded('s!k:1', 's!k:2', 's!k:3', 's!k:4');
+    const overlay = new Overlay(registry);
+    base.read((b) =>
+      overlay.apply(b, (txn) => {
+        txn.del('s!k:1');
+        txn.del('s!k:2');
+      }),
+    );
+    const batches = base.read((b) => {
+      return batchesOf(overlay.view(b), { pattern: ks(), limit: 2, values: false });
+    });
+    expect(batches).toEqual([
+      [[], 's!k:2'],
+      [['s!k:3', 's!k:4'], null],
+    ]);
   });
 });
 
@@ -485,37 +619,37 @@ describe('ownership', () => {
   test('scan values are copies', () => {
     const store = new InMemStore(registry);
     store.write((txn) => {
-      txn.set('k1', T, JS, { n: 1 });
+      txn.set('s!k:1', T, JS, { n: 1 });
     });
     const entries = store.read((txn) => {
-      return txnScanAll(txn, prefixRange('k', 10, { type: T, rep: JS }));
+      return scanAll(txn, { pattern: ks(), limit: 10, values: { type: T, rep: JS } });
     });
     (entries[0][1] as { n: number }).n = 2;
-    expect(contents(store)['k1']).toEqual({ n: 1 });
+    expect(contents(store)['s!k:1']).toEqual({ n: 1 });
   });
 
   test('the overlay copies its layer both ways, in gets and in scans', () => {
-    const base = seeded('k1');
+    const base = seeded('s!k:1');
     const overlay = new Overlay(registry);
     const obj = { n: 1 };
     base.read((b) =>
       overlay.apply(b, (txn) => {
-        txn.set('k2', T, JS, obj);
+        txn.set('s!k:2', T, JS, obj);
       }),
     );
     obj.n = 2;
     const read = () =>
       base.read((b) => {
         const txn = overlay.view(b);
-        const got = txn.get('k2', T, JS) as { n: number };
-        const all = txnScanAll(txn, prefixRange('k', 10, { type: T, rep: JS }));
+        const got = txn.get('s!k:2', T, JS) as { n: number };
+        const all = scanAll(txn, { pattern: ks(), limit: 10, values: { type: T, rep: JS } });
         return { got, scanned: all[1][1] as { n: number }, base: all[0][1] };
       });
     const first = read();
-    expect(first).toEqual({ got: { n: 1 }, scanned: { n: 1 }, base: 'k1' });
+    expect(first).toEqual({ got: { n: 1 }, scanned: { n: 1 }, base: 's!k:1' });
     first.got.n = 3;
     first.scanned.n = 4;
-    expect(read()).toEqual({ got: { n: 1 }, scanned: { n: 1 }, base: 'k1' });
+    expect(read()).toEqual({ got: { n: 1 }, scanned: { n: 1 }, base: 's!k:1' });
   });
 });
 

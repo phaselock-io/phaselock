@@ -7,9 +7,12 @@ struct store {
     sqlite3 *db;
     char err[512];
     sqlite3_stmt *get, *set, *del, *scan, *scan_all, *del_prefix, *append, *read_log,
+        *seek_ge, *seek_gt, *seek_le, *seek_lt, *seek_first, *seek_last,
         *max_pos, *cmd_pos, *cmd_ins, *stream_live, *stream_birth, *stream_death, *stream_seq,
         *live_streams, *live_streams_all, *live_stream, *kv_len, *stream_state, *stream_state_zero, *stream_stats,
         *read_stream_asc, *read_stream_desc, *read_prefix_asc, *read_prefix_desc;
+    // the kv cursor's statement, positioned at its key, or NULL past the end of its walk
+    sqlite3_stmt *cursor;
 };
 
 static const char *SCHEMA =
@@ -60,6 +63,12 @@ int store_open(const char *path, bool writer, store **out, char *err, size_t err
                   "SELECT key, value FROM kv WHERE key >= ?1 AND key < ?2 ORDER BY key") ||
              prep(s, &s->scan_all, "SELECT key, value FROM kv ORDER BY key") ||
              prep(s, &s->del_prefix, "DELETE FROM kv WHERE key >= ?1 AND key < ?2") ||
+             prep(s, &s->seek_ge, "SELECT key, value FROM kv WHERE key >= ?1 ORDER BY key") ||
+             prep(s, &s->seek_gt, "SELECT key, value FROM kv WHERE key > ?1 ORDER BY key") ||
+             prep(s, &s->seek_le, "SELECT key, value FROM kv WHERE key <= ?1 ORDER BY key DESC") ||
+             prep(s, &s->seek_lt, "SELECT key, value FROM kv WHERE key < ?1 ORDER BY key DESC") ||
+             prep(s, &s->seek_first, "SELECT key, value FROM kv ORDER BY key") ||
+             prep(s, &s->seek_last, "SELECT key, value FROM kv ORDER BY key DESC") ||
              prep(s, &s->append,
                   "INSERT INTO log (position, stream, seq, commandid, servertime, data)"
                   " VALUES (?1, ?2, ?3, ?4, ?5, ?6)") ||
@@ -120,6 +129,8 @@ int store_open(const char *path, bool writer, store **out, char *err, size_t err
 void store_close(store *s) {
     if (!s) return;
     sqlite3_stmt *stmts[] = {s->get, s->set, s->del, s->scan, s->scan_all, s->del_prefix,
+                             s->seek_ge, s->seek_gt, s->seek_le, s->seek_lt, s->seek_first,
+                             s->seek_last,
                              s->append, s->read_log, s->max_pos, s->cmd_pos, s->cmd_ins,
                              s->stream_live, s->stream_birth, s->stream_death,
                              s->stream_seq, s->live_streams, s->live_streams_all, s->live_stream,
@@ -247,6 +258,58 @@ int store_scan(store *s, const char *prefix, store_kv_fn fn, void *arg) {
     sqlite3_reset(st);
     sqlite3_clear_bindings(st);
     return out;
+}
+
+/* move the cursor onto the row its statement steps to; 1 at a key, 0 past the end, -1 on error */
+static int cursor_land(store *s) {
+    int rc = sqlite3_step(s->cursor);
+    if (rc == SQLITE_ROW) return 1;
+    sqlite3_stmt *st = s->cursor;
+    s->cursor = NULL;
+    sqlite3_reset(st);
+    sqlite3_clear_bindings(st);
+    return rc == SQLITE_DONE ? 0 : fail(s, "cursor");
+}
+
+int store_cursor_seek(store *s, bool reverse, const char *target, size_t n, bool strict) {
+    store_cursor_end(s);
+
+    // a statement per direction and bound, re-bound per seek
+    if (!target) {
+        s->cursor = reverse ? s->seek_last : s->seek_first;
+    } else {
+        if (reverse) {
+            s->cursor = strict ? s->seek_lt : s->seek_le;
+        } else {
+            s->cursor = strict ? s->seek_gt : s->seek_ge;
+        }
+        sqlite3_bind_text(s->cursor, 1, target, (int)n, SQLITE_TRANSIENT);
+    }
+    return cursor_land(s);
+}
+
+int store_cursor_step(store *s) {
+    if (!s->cursor) return 0;
+    return cursor_land(s);
+}
+
+const char *store_cursor_key(store *s, size_t *n) {
+    const char *key = (const char *)sqlite3_column_text(s->cursor, 0);
+    *n = (size_t)sqlite3_column_bytes(s->cursor, 0);
+    return key;
+}
+
+const uint8_t *store_cursor_value(store *s, size_t *n) {
+    const uint8_t *val = sqlite3_column_blob(s->cursor, 1);
+    *n = (size_t)sqlite3_column_bytes(s->cursor, 1);
+    return val;
+}
+
+void store_cursor_end(store *s) {
+    if (!s->cursor) return;
+    sqlite3_reset(s->cursor);
+    sqlite3_clear_bindings(s->cursor);
+    s->cursor = NULL;
 }
 
 int store_del_prefix(store *s, const char *prefix) {

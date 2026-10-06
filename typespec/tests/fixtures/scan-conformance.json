@@ -1,0 +1,1164 @@
+{
+  "about": "Pattern walks every store implements identically.  Each case walks keys with its pattern; expect is the keys it visits, in code-point order, and reversed when the walk is reversed, whatever the batch size.",
+  "keys": [
+    "!backfill-seqs:chat:*",
+    "!backfill:chat:*",
+    "!backfill:chat:acme,*",
+    "!checkpoint",
+    "!command:00000000000000000001",
+    "!command:00000000000000000002",
+    "!park-ev:chat:ac,gen!00000000000000000001",
+    "!park-ev:chat:acme,gen!00000000000000000001",
+    "!park-ev:chat:acme,gen!00000000000000000002",
+    "!park-ev:chat:acme,gen-2!00000000000000000001",
+    "!park-ev:login!00000000000000000003",
+    "!park-kv:chat:acme,*!chat:acme,gen!meta",
+    "!seq:chat:acme,gen",
+    "!seq:login",
+    "!view",
+    "chat:ac,gen!ack:1",
+    "chat:ac,gen!meta",
+    "chat:ac,gen!post:2026-10",
+    "chat:ac,gen!post:2026-10-06",
+    "chat:ac,gen!post:m1",
+    "chat:ac,gen!reply:t1,a",
+    "chat:ac,gen!reply:t1,b",
+    "chat:ac,gen!reply:t1-2,a",
+    "chat:ac,gen!reply:t2,a",
+    "chat:ac,gen-2!ack:1",
+    "chat:ac,gen-2!meta",
+    "chat:ac,gen-2!post:2026-10",
+    "chat:ac,gen-2!post:2026-10-06",
+    "chat:ac,gen-2!post:m1",
+    "chat:ac,gen-2!reply:t1,a",
+    "chat:ac,gen-2!reply:t1,b",
+    "chat:ac,gen-2!reply:t1-2,a",
+    "chat:ac,gen-2!reply:t2,a",
+    "chat:ac,gen.x!ack:1",
+    "chat:ac,gen.x!meta",
+    "chat:ac,gen.x!post:2026-10",
+    "chat:ac,gen.x!post:2026-10-06",
+    "chat:ac,gen.x!post:m1",
+    "chat:ac,gen.x!reply:t1,a",
+    "chat:ac,gen.x!reply:t1,b",
+    "chat:ac,gen.x!reply:t1-2,a",
+    "chat:ac,gen.x!reply:t2,a",
+    "chat:ac,gen_3!ack:1",
+    "chat:ac,gen_3!meta",
+    "chat:ac,gen_3!post:2026-10",
+    "chat:ac,gen_3!post:2026-10-06",
+    "chat:ac,gen_3!post:m1",
+    "chat:ac,gen_3!reply:t1,a",
+    "chat:ac,gen_3!reply:t1,b",
+    "chat:ac,gen_3!reply:t1-2,a",
+    "chat:ac,gen_3!reply:t2,a",
+    "chat:ac,genx!ack:1",
+    "chat:ac,genx!meta",
+    "chat:ac,genx!post:2026-10",
+    "chat:ac,genx!post:2026-10-06",
+    "chat:ac,genx!post:m1",
+    "chat:ac,genx!reply:t1,a",
+    "chat:ac,genx!reply:t1,b",
+    "chat:ac,genx!reply:t1-2,a",
+    "chat:ac,genx!reply:t2,a",
+    "chat:acme,gen!ack:1",
+    "chat:acme,gen!meta",
+    "chat:acme,gen!metadata",
+    "chat:acme,gen!post-ish:1",
+    "chat:acme,gen!post:",
+    "chat:acme,gen!post:2026-10",
+    "chat:acme,gen!post:2026-10-06",
+    "chat:acme,gen!post:a,b",
+    "chat:acme,gen!post:k:v",
+    "chat:acme,gen!post:m1",
+    "chat:acme,gen!post:x!y",
+    "chat:acme,gen!post:\ufffd",
+    "chat:acme,gen!post:\ud83d\ude00",
+    "chat:acme,gen!postx",
+    "chat:acme,gen!reply:t1,a",
+    "chat:acme,gen!reply:t1,b",
+    "chat:acme,gen!reply:t1-2,a",
+    "chat:acme,gen!reply:t2,a",
+    "chat:acme,gen-2!ack:1",
+    "chat:acme,gen-2!meta",
+    "chat:acme,gen-2!post:2026-10",
+    "chat:acme,gen-2!post:2026-10-06",
+    "chat:acme,gen-2!post:m1",
+    "chat:acme,gen-2!reply:t1,a",
+    "chat:acme,gen-2!reply:t1,b",
+    "chat:acme,gen-2!reply:t1-2,a",
+    "chat:acme,gen-2!reply:t2,a",
+    "chat:acme,gen.x!ack:1",
+    "chat:acme,gen.x!meta",
+    "chat:acme,gen.x!post:2026-10",
+    "chat:acme,gen.x!post:2026-10-06",
+    "chat:acme,gen.x!post:m1",
+    "chat:acme,gen.x!reply:t1,a",
+    "chat:acme,gen.x!reply:t1,b",
+    "chat:acme,gen.x!reply:t1-2,a",
+    "chat:acme,gen.x!reply:t2,a",
+    "chat:acme,gen_3!ack:1",
+    "chat:acme,gen_3!meta",
+    "chat:acme,gen_3!post:2026-10",
+    "chat:acme,gen_3!post:2026-10-06",
+    "chat:acme,gen_3!post:m1",
+    "chat:acme,gen_3!reply:t1,a",
+    "chat:acme,gen_3!reply:t1,b",
+    "chat:acme,gen_3!reply:t1-2,a",
+    "chat:acme,gen_3!reply:t2,a",
+    "chat:acme,genx!ack:1",
+    "chat:acme,genx!meta",
+    "chat:acme,genx!post:2026-10",
+    "chat:acme,genx!post:2026-10-06",
+    "chat:acme,genx!post:m1",
+    "chat:acme,genx!reply:t1,a",
+    "chat:acme,genx!reply:t1,b",
+    "chat:acme,genx!reply:t1-2,a",
+    "chat:acme,genx!reply:t2,a",
+    "chat:acme-2,gen!ack:1",
+    "chat:acme-2,gen!meta",
+    "chat:acme-2,gen!post:2026-10",
+    "chat:acme-2,gen!post:2026-10-06",
+    "chat:acme-2,gen!post:m1",
+    "chat:acme-2,gen!reply:t1,a",
+    "chat:acme-2,gen!reply:t1,b",
+    "chat:acme-2,gen!reply:t1-2,a",
+    "chat:acme-2,gen!reply:t2,a",
+    "chat:acme-2,gen-2!ack:1",
+    "chat:acme-2,gen-2!meta",
+    "chat:acme-2,gen-2!post:2026-10",
+    "chat:acme-2,gen-2!post:2026-10-06",
+    "chat:acme-2,gen-2!post:m1",
+    "chat:acme-2,gen-2!reply:t1,a",
+    "chat:acme-2,gen-2!reply:t1,b",
+    "chat:acme-2,gen-2!reply:t1-2,a",
+    "chat:acme-2,gen-2!reply:t2,a",
+    "chat:acme-2,gen.x!ack:1",
+    "chat:acme-2,gen.x!meta",
+    "chat:acme-2,gen.x!post:2026-10",
+    "chat:acme-2,gen.x!post:2026-10-06",
+    "chat:acme-2,gen.x!post:m1",
+    "chat:acme-2,gen.x!reply:t1,a",
+    "chat:acme-2,gen.x!reply:t1,b",
+    "chat:acme-2,gen.x!reply:t1-2,a",
+    "chat:acme-2,gen.x!reply:t2,a",
+    "chat:acme-2,gen_3!ack:1",
+    "chat:acme-2,gen_3!meta",
+    "chat:acme-2,gen_3!post:2026-10",
+    "chat:acme-2,gen_3!post:2026-10-06",
+    "chat:acme-2,gen_3!post:m1",
+    "chat:acme-2,gen_3!reply:t1,a",
+    "chat:acme-2,gen_3!reply:t1,b",
+    "chat:acme-2,gen_3!reply:t1-2,a",
+    "chat:acme-2,gen_3!reply:t2,a",
+    "chat:acme-2,genx!ack:1",
+    "chat:acme-2,genx!meta",
+    "chat:acme-2,genx!post:2026-10",
+    "chat:acme-2,genx!post:2026-10-06",
+    "chat:acme-2,genx!post:m1",
+    "chat:acme-2,genx!reply:t1,a",
+    "chat:acme-2,genx!reply:t1,b",
+    "chat:acme-2,genx!reply:t1-2,a",
+    "chat:acme-2,genx!reply:t2,a",
+    "chat:acme_3,gen!ack:1",
+    "chat:acme_3,gen!meta",
+    "chat:acme_3,gen!post:2026-10",
+    "chat:acme_3,gen!post:2026-10-06",
+    "chat:acme_3,gen!post:m1",
+    "chat:acme_3,gen!reply:t1,a",
+    "chat:acme_3,gen!reply:t1,b",
+    "chat:acme_3,gen!reply:t1-2,a",
+    "chat:acme_3,gen!reply:t2,a",
+    "chat:acme_3,gen-2!ack:1",
+    "chat:acme_3,gen-2!meta",
+    "chat:acme_3,gen-2!post:2026-10",
+    "chat:acme_3,gen-2!post:2026-10-06",
+    "chat:acme_3,gen-2!post:m1",
+    "chat:acme_3,gen-2!reply:t1,a",
+    "chat:acme_3,gen-2!reply:t1,b",
+    "chat:acme_3,gen-2!reply:t1-2,a",
+    "chat:acme_3,gen-2!reply:t2,a",
+    "chat:acme_3,gen.x!ack:1",
+    "chat:acme_3,gen.x!meta",
+    "chat:acme_3,gen.x!post:2026-10",
+    "chat:acme_3,gen.x!post:2026-10-06",
+    "chat:acme_3,gen.x!post:m1",
+    "chat:acme_3,gen.x!reply:t1,a",
+    "chat:acme_3,gen.x!reply:t1,b",
+    "chat:acme_3,gen.x!reply:t1-2,a",
+    "chat:acme_3,gen.x!reply:t2,a",
+    "chat:acme_3,gen_3!ack:1",
+    "chat:acme_3,gen_3!meta",
+    "chat:acme_3,gen_3!post:2026-10",
+    "chat:acme_3,gen_3!post:2026-10-06",
+    "chat:acme_3,gen_3!post:m1",
+    "chat:acme_3,gen_3!reply:t1,a",
+    "chat:acme_3,gen_3!reply:t1,b",
+    "chat:acme_3,gen_3!reply:t1-2,a",
+    "chat:acme_3,gen_3!reply:t2,a",
+    "chat:acme_3,genx!ack:1",
+    "chat:acme_3,genx!meta",
+    "chat:acme_3,genx!post:2026-10",
+    "chat:acme_3,genx!post:2026-10-06",
+    "chat:acme_3,genx!post:m1",
+    "chat:acme_3,genx!reply:t1,a",
+    "chat:acme_3,genx!reply:t1,b",
+    "chat:acme_3,genx!reply:t1-2,a",
+    "chat:acme_3,genx!reply:t2,a",
+    "chatx:acme!post:1",
+    "chatx:b!meta",
+    "login!session:1",
+    "login!user:ann",
+    "login!user:bob",
+    "loginx!user:z"
+  ],
+  "cases": [
+    {
+      "name": "every post of a family",
+      "pattern": {
+        "stream": {
+          "family": "chat",
+          "params": [
+            null,
+            null
+          ]
+        },
+        "name": "post",
+        "local": [
+          null
+        ]
+      },
+      "expect": [
+        "chat:ac,gen!post:2026-10",
+        "chat:ac,gen!post:2026-10-06",
+        "chat:ac,gen!post:m1",
+        "chat:ac,gen-2!post:2026-10",
+        "chat:ac,gen-2!post:2026-10-06",
+        "chat:ac,gen-2!post:m1",
+        "chat:ac,gen.x!post:2026-10",
+        "chat:ac,gen.x!post:2026-10-06",
+        "chat:ac,gen.x!post:m1",
+        "chat:ac,gen_3!post:2026-10",
+        "chat:ac,gen_3!post:2026-10-06",
+        "chat:ac,gen_3!post:m1",
+        "chat:ac,genx!post:2026-10",
+        "chat:ac,genx!post:2026-10-06",
+        "chat:ac,genx!post:m1",
+        "chat:acme,gen!post:",
+        "chat:acme,gen!post:2026-10",
+        "chat:acme,gen!post:2026-10-06",
+        "chat:acme,gen!post:a,b",
+        "chat:acme,gen!post:k:v",
+        "chat:acme,gen!post:m1",
+        "chat:acme,gen!post:x!y",
+        "chat:acme,gen!post:\ufffd",
+        "chat:acme,gen!post:\ud83d\ude00",
+        "chat:acme,gen-2!post:2026-10",
+        "chat:acme,gen-2!post:2026-10-06",
+        "chat:acme,gen-2!post:m1",
+        "chat:acme,gen.x!post:2026-10",
+        "chat:acme,gen.x!post:2026-10-06",
+        "chat:acme,gen.x!post:m1",
+        "chat:acme,gen_3!post:2026-10",
+        "chat:acme,gen_3!post:2026-10-06",
+        "chat:acme,gen_3!post:m1",
+        "chat:acme,genx!post:2026-10",
+        "chat:acme,genx!post:2026-10-06",
+        "chat:acme,genx!post:m1",
+        "chat:acme-2,gen!post:2026-10",
+        "chat:acme-2,gen!post:2026-10-06",
+        "chat:acme-2,gen!post:m1",
+        "chat:acme-2,gen-2!post:2026-10",
+        "chat:acme-2,gen-2!post:2026-10-06",
+        "chat:acme-2,gen-2!post:m1",
+        "chat:acme-2,gen.x!post:2026-10",
+        "chat:acme-2,gen.x!post:2026-10-06",
+        "chat:acme-2,gen.x!post:m1",
+        "chat:acme-2,gen_3!post:2026-10",
+        "chat:acme-2,gen_3!post:2026-10-06",
+        "chat:acme-2,gen_3!post:m1",
+        "chat:acme-2,genx!post:2026-10",
+        "chat:acme-2,genx!post:2026-10-06",
+        "chat:acme-2,genx!post:m1",
+        "chat:acme_3,gen!post:2026-10",
+        "chat:acme_3,gen!post:2026-10-06",
+        "chat:acme_3,gen!post:m1",
+        "chat:acme_3,gen-2!post:2026-10",
+        "chat:acme_3,gen-2!post:2026-10-06",
+        "chat:acme_3,gen-2!post:m1",
+        "chat:acme_3,gen.x!post:2026-10",
+        "chat:acme_3,gen.x!post:2026-10-06",
+        "chat:acme_3,gen.x!post:m1",
+        "chat:acme_3,gen_3!post:2026-10",
+        "chat:acme_3,gen_3!post:2026-10-06",
+        "chat:acme_3,gen_3!post:m1",
+        "chat:acme_3,genx!post:2026-10",
+        "chat:acme_3,genx!post:2026-10-06",
+        "chat:acme_3,genx!post:m1"
+      ]
+    },
+    {
+      "name": "one org, any channel, posts from a bound",
+      "pattern": {
+        "stream": {
+          "family": "chat",
+          "params": [
+            {
+              "eq": "acme"
+            },
+            null
+          ]
+        },
+        "name": "post",
+        "local": [
+          {
+            "gte": "2026-10"
+          }
+        ]
+      },
+      "expect": [
+        "chat:acme,gen!post:2026-10",
+        "chat:acme,gen!post:2026-10-06",
+        "chat:acme,gen!post:a,b",
+        "chat:acme,gen!post:k:v",
+        "chat:acme,gen!post:m1",
+        "chat:acme,gen!post:x!y",
+        "chat:acme,gen!post:\ufffd",
+        "chat:acme,gen!post:\ud83d\ude00",
+        "chat:acme,gen-2!post:2026-10",
+        "chat:acme,gen-2!post:2026-10-06",
+        "chat:acme,gen-2!post:m1",
+        "chat:acme,gen.x!post:2026-10",
+        "chat:acme,gen.x!post:2026-10-06",
+        "chat:acme,gen.x!post:m1",
+        "chat:acme,gen_3!post:2026-10",
+        "chat:acme,gen_3!post:2026-10-06",
+        "chat:acme,gen_3!post:m1",
+        "chat:acme,genx!post:2026-10",
+        "chat:acme,genx!post:2026-10-06",
+        "chat:acme,genx!post:m1"
+      ]
+    },
+    {
+      "name": "channels by prefix in every org",
+      "pattern": {
+        "stream": {
+          "family": "chat",
+          "params": [
+            null,
+            {
+              "prefix": "gen"
+            }
+          ]
+        },
+        "name": "meta",
+        "local": []
+      },
+      "expect": [
+        "chat:ac,gen!meta",
+        "chat:ac,gen-2!meta",
+        "chat:ac,gen.x!meta",
+        "chat:ac,gen_3!meta",
+        "chat:ac,genx!meta",
+        "chat:acme,gen!meta",
+        "chat:acme,gen-2!meta",
+        "chat:acme,gen.x!meta",
+        "chat:acme,gen_3!meta",
+        "chat:acme,genx!meta",
+        "chat:acme-2,gen!meta",
+        "chat:acme-2,gen-2!meta",
+        "chat:acme-2,gen.x!meta",
+        "chat:acme-2,gen_3!meta",
+        "chat:acme-2,genx!meta",
+        "chat:acme_3,gen!meta",
+        "chat:acme_3,gen-2!meta",
+        "chat:acme_3,gen.x!meta",
+        "chat:acme_3,gen_3!meta",
+        "chat:acme_3,genx!meta"
+      ]
+    },
+    {
+      "name": "an open lower bound on a stream parameter skips the value and keeps its extensions",
+      "pattern": {
+        "stream": {
+          "family": "chat",
+          "params": [
+            null,
+            {
+              "gt": "gen"
+            }
+          ]
+        },
+        "name": "ack",
+        "local": [
+          null
+        ]
+      },
+      "expect": [
+        "chat:ac,gen-2!ack:1",
+        "chat:ac,gen.x!ack:1",
+        "chat:ac,gen_3!ack:1",
+        "chat:ac,genx!ack:1",
+        "chat:acme,gen-2!ack:1",
+        "chat:acme,gen.x!ack:1",
+        "chat:acme,gen_3!ack:1",
+        "chat:acme,genx!ack:1",
+        "chat:acme-2,gen-2!ack:1",
+        "chat:acme-2,gen.x!ack:1",
+        "chat:acme-2,gen_3!ack:1",
+        "chat:acme-2,genx!ack:1",
+        "chat:acme_3,gen-2!ack:1",
+        "chat:acme_3,gen.x!ack:1",
+        "chat:acme_3,gen_3!ack:1",
+        "chat:acme_3,genx!ack:1"
+      ]
+    },
+    {
+      "name": "an upper bound on the first parameter",
+      "pattern": {
+        "stream": {
+          "family": "chat",
+          "params": [
+            {
+              "lt": "acme"
+            },
+            {
+              "eq": "gen"
+            }
+          ]
+        },
+        "name": "meta",
+        "local": []
+      },
+      "expect": [
+        "chat:ac,gen!meta"
+      ]
+    },
+    {
+      "name": "a closed upper bound on the first parameter",
+      "pattern": {
+        "stream": {
+          "family": "chat",
+          "params": [
+            {
+              "lte": "acme"
+            },
+            {
+              "eq": "gen"
+            }
+          ]
+        },
+        "name": "meta",
+        "local": []
+      },
+      "expect": [
+        "chat:ac,gen!meta",
+        "chat:acme,gen!meta"
+      ]
+    },
+    {
+      "name": "one thread of a two-parameter template",
+      "pattern": {
+        "stream": {
+          "family": "chat",
+          "params": [
+            {
+              "eq": "acme"
+            },
+            {
+              "eq": "gen"
+            }
+          ]
+        },
+        "name": "reply",
+        "local": [
+          {
+            "eq": "t1"
+          },
+          null
+        ]
+      },
+      "expect": [
+        "chat:acme,gen!reply:t1,a",
+        "chat:acme,gen!reply:t1,b"
+      ]
+    },
+    {
+      "name": "a range on a local parameter that is not last",
+      "pattern": {
+        "stream": {
+          "family": "chat",
+          "params": [
+            null,
+            null
+          ]
+        },
+        "name": "reply",
+        "local": [
+          {
+            "gte": "t1",
+            "lt": "t2"
+          },
+          {
+            "eq": "a"
+          }
+        ]
+      },
+      "expect": [
+        "chat:ac,gen!reply:t1,a",
+        "chat:ac,gen!reply:t1-2,a",
+        "chat:ac,gen-2!reply:t1,a",
+        "chat:ac,gen-2!reply:t1-2,a",
+        "chat:ac,gen.x!reply:t1,a",
+        "chat:ac,gen.x!reply:t1-2,a",
+        "chat:ac,gen_3!reply:t1,a",
+        "chat:ac,gen_3!reply:t1-2,a",
+        "chat:ac,genx!reply:t1,a",
+        "chat:ac,genx!reply:t1-2,a",
+        "chat:acme,gen!reply:t1,a",
+        "chat:acme,gen!reply:t1-2,a",
+        "chat:acme,gen-2!reply:t1,a",
+        "chat:acme,gen-2!reply:t1-2,a",
+        "chat:acme,gen.x!reply:t1,a",
+        "chat:acme,gen.x!reply:t1-2,a",
+        "chat:acme,gen_3!reply:t1,a",
+        "chat:acme,gen_3!reply:t1-2,a",
+        "chat:acme,genx!reply:t1,a",
+        "chat:acme,genx!reply:t1-2,a",
+        "chat:acme-2,gen!reply:t1,a",
+        "chat:acme-2,gen!reply:t1-2,a",
+        "chat:acme-2,gen-2!reply:t1,a",
+        "chat:acme-2,gen-2!reply:t1-2,a",
+        "chat:acme-2,gen.x!reply:t1,a",
+        "chat:acme-2,gen.x!reply:t1-2,a",
+        "chat:acme-2,gen_3!reply:t1,a",
+        "chat:acme-2,gen_3!reply:t1-2,a",
+        "chat:acme-2,genx!reply:t1,a",
+        "chat:acme-2,genx!reply:t1-2,a",
+        "chat:acme_3,gen!reply:t1,a",
+        "chat:acme_3,gen!reply:t1-2,a",
+        "chat:acme_3,gen-2!reply:t1,a",
+        "chat:acme_3,gen-2!reply:t1-2,a",
+        "chat:acme_3,gen.x!reply:t1,a",
+        "chat:acme_3,gen.x!reply:t1-2,a",
+        "chat:acme_3,gen_3!reply:t1,a",
+        "chat:acme_3,gen_3!reply:t1-2,a",
+        "chat:acme_3,genx!reply:t1,a",
+        "chat:acme_3,genx!reply:t1-2,a"
+      ]
+    },
+    {
+      "name": "a range on the last local parameter",
+      "pattern": {
+        "stream": {
+          "family": "chat",
+          "params": [
+            {
+              "eq": "acme"
+            },
+            {
+              "eq": "gen"
+            }
+          ]
+        },
+        "name": "reply",
+        "local": [
+          null,
+          {
+            "gt": "a",
+            "lte": "b"
+          }
+        ]
+      },
+      "expect": [
+        "chat:acme,gen!reply:t1,b"
+      ]
+    },
+    {
+      "name": "a template with no parameters across a family",
+      "pattern": {
+        "stream": {
+          "family": "chat",
+          "params": [
+            null,
+            null
+          ]
+        },
+        "name": "meta",
+        "local": []
+      },
+      "expect": [
+        "chat:ac,gen!meta",
+        "chat:ac,gen-2!meta",
+        "chat:ac,gen.x!meta",
+        "chat:ac,gen_3!meta",
+        "chat:ac,genx!meta",
+        "chat:acme,gen!meta",
+        "chat:acme,gen-2!meta",
+        "chat:acme,gen.x!meta",
+        "chat:acme,gen_3!meta",
+        "chat:acme,genx!meta",
+        "chat:acme-2,gen!meta",
+        "chat:acme-2,gen-2!meta",
+        "chat:acme-2,gen.x!meta",
+        "chat:acme-2,gen_3!meta",
+        "chat:acme-2,genx!meta",
+        "chat:acme_3,gen!meta",
+        "chat:acme_3,gen-2!meta",
+        "chat:acme_3,gen.x!meta",
+        "chat:acme_3,gen_3!meta",
+        "chat:acme_3,genx!meta"
+      ]
+    },
+    {
+      "name": "the tighter of two lower bounds and of two upper bounds",
+      "pattern": {
+        "stream": {
+          "family": "chat",
+          "params": [
+            {
+              "gte": "a",
+              "gt": "ac"
+            },
+            {
+              "lte": "genx",
+              "lt": "gen_3"
+            }
+          ]
+        },
+        "name": "meta",
+        "local": []
+      },
+      "expect": [
+        "chat:acme,gen!meta",
+        "chat:acme,gen-2!meta",
+        "chat:acme,gen.x!meta",
+        "chat:acme-2,gen!meta",
+        "chat:acme-2,gen-2!meta",
+        "chat:acme-2,gen.x!meta",
+        "chat:acme_3,gen!meta",
+        "chat:acme_3,gen-2!meta",
+        "chat:acme_3,gen.x!meta"
+      ]
+    },
+    {
+      "name": "last values holding separators, empty, and above U+FFFF",
+      "pattern": {
+        "stream": "chat:acme,gen",
+        "name": "post",
+        "local": [
+          null
+        ]
+      },
+      "expect": [
+        "chat:acme,gen!post:",
+        "chat:acme,gen!post:2026-10",
+        "chat:acme,gen!post:2026-10-06",
+        "chat:acme,gen!post:a,b",
+        "chat:acme,gen!post:k:v",
+        "chat:acme,gen!post:m1",
+        "chat:acme,gen!post:x!y",
+        "chat:acme,gen!post:\ufffd",
+        "chat:acme,gen!post:\ud83d\ude00"
+      ]
+    },
+    {
+      "name": "a prefix on the last local parameter",
+      "pattern": {
+        "stream": "chat:acme,gen",
+        "name": "post",
+        "local": [
+          {
+            "prefix": "2026-10"
+          }
+        ]
+      },
+      "expect": [
+        "chat:acme,gen!post:2026-10",
+        "chat:acme,gen!post:2026-10-06"
+      ]
+    },
+    {
+      "name": "every local key of one stream",
+      "pattern": {
+        "stream": "chat:acme,gen",
+        "name": null,
+        "local": []
+      },
+      "expect": [
+        "chat:acme,gen!ack:1",
+        "chat:acme,gen!meta",
+        "chat:acme,gen!metadata",
+        "chat:acme,gen!post-ish:1",
+        "chat:acme,gen!post:",
+        "chat:acme,gen!post:2026-10",
+        "chat:acme,gen!post:2026-10-06",
+        "chat:acme,gen!post:a,b",
+        "chat:acme,gen!post:k:v",
+        "chat:acme,gen!post:m1",
+        "chat:acme,gen!post:x!y",
+        "chat:acme,gen!post:\ufffd",
+        "chat:acme,gen!post:\ud83d\ude00",
+        "chat:acme,gen!postx",
+        "chat:acme,gen!reply:t1,a",
+        "chat:acme,gen!reply:t1,b",
+        "chat:acme,gen!reply:t1-2,a",
+        "chat:acme,gen!reply:t2,a"
+      ]
+    },
+    {
+      "name": "every stream of a family, every local key",
+      "pattern": {
+        "stream": {
+          "family": "chat",
+          "params": [
+            {
+              "eq": "acme-2"
+            },
+            null
+          ]
+        },
+        "name": null,
+        "local": []
+      },
+      "expect": [
+        "chat:acme-2,gen!ack:1",
+        "chat:acme-2,gen!meta",
+        "chat:acme-2,gen!post:2026-10",
+        "chat:acme-2,gen!post:2026-10-06",
+        "chat:acme-2,gen!post:m1",
+        "chat:acme-2,gen!reply:t1,a",
+        "chat:acme-2,gen!reply:t1,b",
+        "chat:acme-2,gen!reply:t1-2,a",
+        "chat:acme-2,gen!reply:t2,a",
+        "chat:acme-2,gen-2!ack:1",
+        "chat:acme-2,gen-2!meta",
+        "chat:acme-2,gen-2!post:2026-10",
+        "chat:acme-2,gen-2!post:2026-10-06",
+        "chat:acme-2,gen-2!post:m1",
+        "chat:acme-2,gen-2!reply:t1,a",
+        "chat:acme-2,gen-2!reply:t1,b",
+        "chat:acme-2,gen-2!reply:t1-2,a",
+        "chat:acme-2,gen-2!reply:t2,a",
+        "chat:acme-2,gen.x!ack:1",
+        "chat:acme-2,gen.x!meta",
+        "chat:acme-2,gen.x!post:2026-10",
+        "chat:acme-2,gen.x!post:2026-10-06",
+        "chat:acme-2,gen.x!post:m1",
+        "chat:acme-2,gen.x!reply:t1,a",
+        "chat:acme-2,gen.x!reply:t1,b",
+        "chat:acme-2,gen.x!reply:t1-2,a",
+        "chat:acme-2,gen.x!reply:t2,a",
+        "chat:acme-2,gen_3!ack:1",
+        "chat:acme-2,gen_3!meta",
+        "chat:acme-2,gen_3!post:2026-10",
+        "chat:acme-2,gen_3!post:2026-10-06",
+        "chat:acme-2,gen_3!post:m1",
+        "chat:acme-2,gen_3!reply:t1,a",
+        "chat:acme-2,gen_3!reply:t1,b",
+        "chat:acme-2,gen_3!reply:t1-2,a",
+        "chat:acme-2,gen_3!reply:t2,a",
+        "chat:acme-2,genx!ack:1",
+        "chat:acme-2,genx!meta",
+        "chat:acme-2,genx!post:2026-10",
+        "chat:acme-2,genx!post:2026-10-06",
+        "chat:acme-2,genx!post:m1",
+        "chat:acme-2,genx!reply:t1,a",
+        "chat:acme-2,genx!reply:t1,b",
+        "chat:acme-2,genx!reply:t1-2,a",
+        "chat:acme-2,genx!reply:t2,a"
+      ]
+    },
+    {
+      "name": "a family whose name another extends",
+      "pattern": {
+        "stream": {
+          "family": "chatx",
+          "params": [
+            null
+          ]
+        },
+        "name": "post",
+        "local": [
+          null
+        ]
+      },
+      "expect": [
+        "chatx:acme!post:1"
+      ]
+    },
+    {
+      "name": "a singleton family",
+      "pattern": {
+        "stream": {
+          "family": "login",
+          "params": []
+        },
+        "name": "user",
+        "local": [
+          null
+        ]
+      },
+      "expect": [
+        "login!user:ann",
+        "login!user:bob"
+      ]
+    },
+    {
+      "name": "a name another name extends with a lower character",
+      "pattern": {
+        "stream": "",
+        "name": "backfill",
+        "local": [
+          null
+        ]
+      },
+      "expect": [
+        "!backfill:chat:*",
+        "!backfill:chat:acme,*"
+      ]
+    },
+    {
+      "name": "parked events under a ref prefix",
+      "pattern": {
+        "stream": "",
+        "name": "park-ev",
+        "local": [
+          {
+            "prefix": "chat:acme,"
+          }
+        ]
+      },
+      "expect": [
+        "!park-ev:chat:acme,gen!00000000000000000001",
+        "!park-ev:chat:acme,gen!00000000000000000002",
+        "!park-ev:chat:acme,gen-2!00000000000000000001"
+      ]
+    },
+    {
+      "name": "every parked event",
+      "pattern": {
+        "stream": "",
+        "name": "park-ev",
+        "local": [
+          null
+        ]
+      },
+      "expect": [
+        "!park-ev:chat:ac,gen!00000000000000000001",
+        "!park-ev:chat:acme,gen!00000000000000000001",
+        "!park-ev:chat:acme,gen!00000000000000000002",
+        "!park-ev:chat:acme,gen-2!00000000000000000001",
+        "!park-ev:login!00000000000000000003"
+      ]
+    },
+    {
+      "name": "the outbox",
+      "pattern": {
+        "stream": "",
+        "name": "command",
+        "local": [
+          null
+        ]
+      },
+      "expect": [
+        "!command:00000000000000000001",
+        "!command:00000000000000000002"
+      ]
+    },
+    {
+      "name": "a whole system key",
+      "pattern": {
+        "stream": "",
+        "name": "view",
+        "local": []
+      },
+      "expect": [
+        "!view"
+      ]
+    },
+    {
+      "name": "nothing matches",
+      "pattern": {
+        "stream": {
+          "family": "chat",
+          "params": [
+            {
+              "eq": "nope"
+            },
+            null
+          ]
+        },
+        "name": "post",
+        "local": [
+          null
+        ]
+      },
+      "expect": []
+    },
+    {
+      "name": "a bound below every value and one above",
+      "pattern": {
+        "stream": {
+          "family": "chat",
+          "params": [
+            {
+              "gt": ""
+            },
+            {
+              "lt": "~"
+            }
+          ]
+        },
+        "name": "ack",
+        "local": [
+          {
+            "gte": ""
+          }
+        ]
+      },
+      "expect": [
+        "chat:ac,gen!ack:1",
+        "chat:ac,gen-2!ack:1",
+        "chat:ac,gen.x!ack:1",
+        "chat:ac,gen_3!ack:1",
+        "chat:ac,genx!ack:1",
+        "chat:acme,gen!ack:1",
+        "chat:acme,gen-2!ack:1",
+        "chat:acme,gen.x!ack:1",
+        "chat:acme,gen_3!ack:1",
+        "chat:acme,genx!ack:1",
+        "chat:acme-2,gen!ack:1",
+        "chat:acme-2,gen-2!ack:1",
+        "chat:acme-2,gen.x!ack:1",
+        "chat:acme-2,gen_3!ack:1",
+        "chat:acme-2,genx!ack:1",
+        "chat:acme_3,gen!ack:1",
+        "chat:acme_3,gen-2!ack:1",
+        "chat:acme_3,gen.x!ack:1",
+        "chat:acme_3,gen_3!ack:1",
+        "chat:acme_3,genx!ack:1"
+      ]
+    },
+    {
+      "name": "every key",
+      "pattern": {
+        "stream": null,
+        "name": null,
+        "local": []
+      },
+      "expect": [
+        "!backfill-seqs:chat:*",
+        "!backfill:chat:*",
+        "!backfill:chat:acme,*",
+        "!checkpoint",
+        "!command:00000000000000000001",
+        "!command:00000000000000000002",
+        "!park-ev:chat:ac,gen!00000000000000000001",
+        "!park-ev:chat:acme,gen!00000000000000000001",
+        "!park-ev:chat:acme,gen!00000000000000000002",
+        "!park-ev:chat:acme,gen-2!00000000000000000001",
+        "!park-ev:login!00000000000000000003",
+        "!park-kv:chat:acme,*!chat:acme,gen!meta",
+        "!seq:chat:acme,gen",
+        "!seq:login",
+        "!view",
+        "chat:ac,gen!ack:1",
+        "chat:ac,gen!meta",
+        "chat:ac,gen!post:2026-10",
+        "chat:ac,gen!post:2026-10-06",
+        "chat:ac,gen!post:m1",
+        "chat:ac,gen!reply:t1,a",
+        "chat:ac,gen!reply:t1,b",
+        "chat:ac,gen!reply:t1-2,a",
+        "chat:ac,gen!reply:t2,a",
+        "chat:ac,gen-2!ack:1",
+        "chat:ac,gen-2!meta",
+        "chat:ac,gen-2!post:2026-10",
+        "chat:ac,gen-2!post:2026-10-06",
+        "chat:ac,gen-2!post:m1",
+        "chat:ac,gen-2!reply:t1,a",
+        "chat:ac,gen-2!reply:t1,b",
+        "chat:ac,gen-2!reply:t1-2,a",
+        "chat:ac,gen-2!reply:t2,a",
+        "chat:ac,gen.x!ack:1",
+        "chat:ac,gen.x!meta",
+        "chat:ac,gen.x!post:2026-10",
+        "chat:ac,gen.x!post:2026-10-06",
+        "chat:ac,gen.x!post:m1",
+        "chat:ac,gen.x!reply:t1,a",
+        "chat:ac,gen.x!reply:t1,b",
+        "chat:ac,gen.x!reply:t1-2,a",
+        "chat:ac,gen.x!reply:t2,a",
+        "chat:ac,gen_3!ack:1",
+        "chat:ac,gen_3!meta",
+        "chat:ac,gen_3!post:2026-10",
+        "chat:ac,gen_3!post:2026-10-06",
+        "chat:ac,gen_3!post:m1",
+        "chat:ac,gen_3!reply:t1,a",
+        "chat:ac,gen_3!reply:t1,b",
+        "chat:ac,gen_3!reply:t1-2,a",
+        "chat:ac,gen_3!reply:t2,a",
+        "chat:ac,genx!ack:1",
+        "chat:ac,genx!meta",
+        "chat:ac,genx!post:2026-10",
+        "chat:ac,genx!post:2026-10-06",
+        "chat:ac,genx!post:m1",
+        "chat:ac,genx!reply:t1,a",
+        "chat:ac,genx!reply:t1,b",
+        "chat:ac,genx!reply:t1-2,a",
+        "chat:ac,genx!reply:t2,a",
+        "chat:acme,gen!ack:1",
+        "chat:acme,gen!meta",
+        "chat:acme,gen!metadata",
+        "chat:acme,gen!post-ish:1",
+        "chat:acme,gen!post:",
+        "chat:acme,gen!post:2026-10",
+        "chat:acme,gen!post:2026-10-06",
+        "chat:acme,gen!post:a,b",
+        "chat:acme,gen!post:k:v",
+        "chat:acme,gen!post:m1",
+        "chat:acme,gen!post:x!y",
+        "chat:acme,gen!post:\ufffd",
+        "chat:acme,gen!post:\ud83d\ude00",
+        "chat:acme,gen!postx",
+        "chat:acme,gen!reply:t1,a",
+        "chat:acme,gen!reply:t1,b",
+        "chat:acme,gen!reply:t1-2,a",
+        "chat:acme,gen!reply:t2,a",
+        "chat:acme,gen-2!ack:1",
+        "chat:acme,gen-2!meta",
+        "chat:acme,gen-2!post:2026-10",
+        "chat:acme,gen-2!post:2026-10-06",
+        "chat:acme,gen-2!post:m1",
+        "chat:acme,gen-2!reply:t1,a",
+        "chat:acme,gen-2!reply:t1,b",
+        "chat:acme,gen-2!reply:t1-2,a",
+        "chat:acme,gen-2!reply:t2,a",
+        "chat:acme,gen.x!ack:1",
+        "chat:acme,gen.x!meta",
+        "chat:acme,gen.x!post:2026-10",
+        "chat:acme,gen.x!post:2026-10-06",
+        "chat:acme,gen.x!post:m1",
+        "chat:acme,gen.x!reply:t1,a",
+        "chat:acme,gen.x!reply:t1,b",
+        "chat:acme,gen.x!reply:t1-2,a",
+        "chat:acme,gen.x!reply:t2,a",
+        "chat:acme,gen_3!ack:1",
+        "chat:acme,gen_3!meta",
+        "chat:acme,gen_3!post:2026-10",
+        "chat:acme,gen_3!post:2026-10-06",
+        "chat:acme,gen_3!post:m1",
+        "chat:acme,gen_3!reply:t1,a",
+        "chat:acme,gen_3!reply:t1,b",
+        "chat:acme,gen_3!reply:t1-2,a",
+        "chat:acme,gen_3!reply:t2,a",
+        "chat:acme,genx!ack:1",
+        "chat:acme,genx!meta",
+        "chat:acme,genx!post:2026-10",
+        "chat:acme,genx!post:2026-10-06",
+        "chat:acme,genx!post:m1",
+        "chat:acme,genx!reply:t1,a",
+        "chat:acme,genx!reply:t1,b",
+        "chat:acme,genx!reply:t1-2,a",
+        "chat:acme,genx!reply:t2,a",
+        "chat:acme-2,gen!ack:1",
+        "chat:acme-2,gen!meta",
+        "chat:acme-2,gen!post:2026-10",
+        "chat:acme-2,gen!post:2026-10-06",
+        "chat:acme-2,gen!post:m1",
+        "chat:acme-2,gen!reply:t1,a",
+        "chat:acme-2,gen!reply:t1,b",
+        "chat:acme-2,gen!reply:t1-2,a",
+        "chat:acme-2,gen!reply:t2,a",
+        "chat:acme-2,gen-2!ack:1",
+        "chat:acme-2,gen-2!meta",
+        "chat:acme-2,gen-2!post:2026-10",
+        "chat:acme-2,gen-2!post:2026-10-06",
+        "chat:acme-2,gen-2!post:m1",
+        "chat:acme-2,gen-2!reply:t1,a",
+        "chat:acme-2,gen-2!reply:t1,b",
+        "chat:acme-2,gen-2!reply:t1-2,a",
+        "chat:acme-2,gen-2!reply:t2,a",
+        "chat:acme-2,gen.x!ack:1",
+        "chat:acme-2,gen.x!meta",
+        "chat:acme-2,gen.x!post:2026-10",
+        "chat:acme-2,gen.x!post:2026-10-06",
+        "chat:acme-2,gen.x!post:m1",
+        "chat:acme-2,gen.x!reply:t1,a",
+        "chat:acme-2,gen.x!reply:t1,b",
+        "chat:acme-2,gen.x!reply:t1-2,a",
+        "chat:acme-2,gen.x!reply:t2,a",
+        "chat:acme-2,gen_3!ack:1",
+        "chat:acme-2,gen_3!meta",
+        "chat:acme-2,gen_3!post:2026-10",
+        "chat:acme-2,gen_3!post:2026-10-06",
+        "chat:acme-2,gen_3!post:m1",
+        "chat:acme-2,gen_3!reply:t1,a",
+        "chat:acme-2,gen_3!reply:t1,b",
+        "chat:acme-2,gen_3!reply:t1-2,a",
+        "chat:acme-2,gen_3!reply:t2,a",
+        "chat:acme-2,genx!ack:1",
+        "chat:acme-2,genx!meta",
+        "chat:acme-2,genx!post:2026-10",
+        "chat:acme-2,genx!post:2026-10-06",
+        "chat:acme-2,genx!post:m1",
+        "chat:acme-2,genx!reply:t1,a",
+        "chat:acme-2,genx!reply:t1,b",
+        "chat:acme-2,genx!reply:t1-2,a",
+        "chat:acme-2,genx!reply:t2,a",
+        "chat:acme_3,gen!ack:1",
+        "chat:acme_3,gen!meta",
+        "chat:acme_3,gen!post:2026-10",
+        "chat:acme_3,gen!post:2026-10-06",
+        "chat:acme_3,gen!post:m1",
+        "chat:acme_3,gen!reply:t1,a",
+        "chat:acme_3,gen!reply:t1,b",
+        "chat:acme_3,gen!reply:t1-2,a",
+        "chat:acme_3,gen!reply:t2,a",
+        "chat:acme_3,gen-2!ack:1",
+        "chat:acme_3,gen-2!meta",
+        "chat:acme_3,gen-2!post:2026-10",
+        "chat:acme_3,gen-2!post:2026-10-06",
+        "chat:acme_3,gen-2!post:m1",
+        "chat:acme_3,gen-2!reply:t1,a",
+        "chat:acme_3,gen-2!reply:t1,b",
+        "chat:acme_3,gen-2!reply:t1-2,a",
+        "chat:acme_3,gen-2!reply:t2,a",
+        "chat:acme_3,gen.x!ack:1",
+        "chat:acme_3,gen.x!meta",
+        "chat:acme_3,gen.x!post:2026-10",
+        "chat:acme_3,gen.x!post:2026-10-06",
+        "chat:acme_3,gen.x!post:m1",
+        "chat:acme_3,gen.x!reply:t1,a",
+        "chat:acme_3,gen.x!reply:t1,b",
+        "chat:acme_3,gen.x!reply:t1-2,a",
+        "chat:acme_3,gen.x!reply:t2,a",
+        "chat:acme_3,gen_3!ack:1",
+        "chat:acme_3,gen_3!meta",
+        "chat:acme_3,gen_3!post:2026-10",
+        "chat:acme_3,gen_3!post:2026-10-06",
+        "chat:acme_3,gen_3!post:m1",
+        "chat:acme_3,gen_3!reply:t1,a",
+        "chat:acme_3,gen_3!reply:t1,b",
+        "chat:acme_3,gen_3!reply:t1-2,a",
+        "chat:acme_3,gen_3!reply:t2,a",
+        "chat:acme_3,genx!ack:1",
+        "chat:acme_3,genx!meta",
+        "chat:acme_3,genx!post:2026-10",
+        "chat:acme_3,genx!post:2026-10-06",
+        "chat:acme_3,genx!post:m1",
+        "chat:acme_3,genx!reply:t1,a",
+        "chat:acme_3,genx!reply:t1,b",
+        "chat:acme_3,genx!reply:t1-2,a",
+        "chat:acme_3,genx!reply:t2,a",
+        "chatx:acme!post:1",
+        "chatx:b!meta",
+        "login!session:1",
+        "login!user:ann",
+        "login!user:bob",
+        "loginx!user:z"
+      ]
+    }
+  ]
+}

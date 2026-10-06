@@ -1,6 +1,7 @@
 // The model the server tests run against: a small library domain with a singleton book stream,
-// per-patron streams, and per-account streams holding credentials, which maySee never grants
-// to a client.  Librarians carry the admin trait in their principal.
+// per-patron streams, per-branch shelves that the scan tests walk, and per-account streams
+// holding credentials, which maySee never grants to a client.  Librarians carry the admin trait
+// in their principal.
 
 import "@phaselock/typespec-core";
 
@@ -103,6 +104,58 @@ model TryHold {
   patron: Id;
 }
 
+// shelves //
+
+// a branch's copies of books, the patrons it lends to, and its copies as its reducer's scan saw
+// them
+interface ShelfSlice
+  extends Slice<
+    "shelf:{branch}",
+    ShelfEvents,
+    {
+      "copy:{book}": Copy;
+      "lend:{patron}": Id;
+      "shelved": string[];
+    }
+  > {}
+
+model Copy {
+  book: Id;
+  title: string;
+}
+
+union ShelfEvents {
+  Shelved,
+  Lend,
+}
+
+// the shelf learns the book's title from the catalogue
+@command(Shelved)
+model Shelve {
+  type: "shelve";
+  branch: Id;
+  book: Id;
+}
+
+model Shelved {
+  type: "shelved";
+  book: Id;
+  title: string;
+}
+
+@command(Lend)
+model Lend {
+  type: "lend";
+  branch: Id;
+  patron: Id;
+}
+
+@command(Death)
+model CloseShelf {
+  type: "close-shelf";
+  branch: Id;
+}
+
 // accounts //
 
 interface AccountSlice extends Slice<"account:{user}", AccountEvents, { "account": Account }> {}
@@ -203,12 +256,15 @@ union TestCommands {
   RenamePatron,
   RemovePatron,
   TryHold,
+  Shelve,
+  Lend,
+  CloseShelf,
   RevokeSessions,
   GrantView,
   RevokeView,
 }
 
-interface TestEngine extends Engine<[BookSlice, PatronSlice], TestCommands> {}
+interface TestEngine extends Engine<[BookSlice, PatronSlice, ShelfSlice], TestCommands> {}
 
 union DbCommands {
   CreateAccount,

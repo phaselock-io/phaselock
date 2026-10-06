@@ -22,6 +22,14 @@ layout, build commands, and the test suite.
   streams and a template's keys in the order of their parameters (`gen` before `gen-2`).  Wire
   refs are a stream name, `chat:*` or `chat:acme,*` (whole leading parameters only), or `*`;
   maySee returns them with an exact stream terminated, `name!`, so a bare name is malformed.
+- **Scans are typed per key template.**  Every context with `get` also has `scan.X` for each key
+  template with a parameter that varies there: in a global context the family's and the
+  template's, in a reducer's the template's own.  `scan.X(match?, { reverse?, keys? })` takes a
+  match by parameter name (an exact value, checked as `get` checks it; a range; a prefix; or, left
+  out, any value), walks in parameter order, and yields `[params, value]` with every varying
+  parameter named, or the parameters alone with `keys: true`.  Beneath it is the one store scan,
+  a `KeyPattern` each store walks natively as a skip scan, in batches resumed past a key; a
+  query's read set holds each walk's pattern and the stretch of keys it covered.
 - **Queries are interfaces too**: `interface AdminQueries extends Queries { allPatrons(): AdminPatronInfo[]; }`
   declares a typed query contract — a message contract only, binding no store (which store backs
   an implementation is the implementation's business).  Lowering collects them as `PQueries`

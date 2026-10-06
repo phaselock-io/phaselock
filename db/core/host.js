@@ -1,10 +1,14 @@
 // The JS side of the QuickJS host.  Hands the bundle's slots transactions over the natives
-// (__pl_get, __pl_set, __pl_del), which convert every value through the bundle's registry under
-// the type the call names, and exposes one entry point per slot on globalThis.__host.
+// (__pl_get, __pl_scan, __pl_set, __pl_del), which convert every value through the bundle's
+// registry under the type the call names, and exposes one entry point per slot on
+// globalThis.__host.
 
 globalThis.__host = (function () {
   // the read transaction over global keys that precommit, maySee, and lookup read through
-  const rx = { get: (key, type) => __pl_get(key, type) };
+  const rx = {
+    get: (key, type) => __pl_get(key, type),
+    scan: (req) => __pl_scan(req),
+  };
 
   // a reducer's transaction: its stream's local keys, prefixed here
   function reducerTxn(stream) {
@@ -13,6 +17,16 @@ globalThis.__host = (function () {
       get: (key, type) => __pl_get(prefix + key, type),
       set: (key, type, value) => __pl_set(prefix + key, type, value),
       del: (key) => __pl_del(prefix + key),
+      // a pattern over the stream's own keys, resumed and answered with local keys
+      scan(req) {
+        const pattern = { stream, name: req.name, local: req.local };
+        const after = req.after === undefined ? undefined : prefix + req.after;
+        const { entries, next } = __pl_scan({ ...req, pattern, after });
+        return {
+          entries: entries.map(([k, v]) => [k.slice(prefix.length), v]),
+          next: next === null ? null : next.slice(prefix.length),
+        };
+      },
     };
   }
 

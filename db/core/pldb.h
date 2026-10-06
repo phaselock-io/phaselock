@@ -104,4 +104,17 @@ void pldb_items_free(pldb_item *items, size_t n);
 int pldb_snapshot(pldb *db, const char *ref, uint8_t **out, size_t *len, uint64_t *position);
 void pldb_free(void *p);
 
+/* Test only: the scan conformance test's hold on the pattern walk (scantest.c).  It opens the
+   bundle's JS host over a store at path, its scans stepping through budget keys before a seek,
+   or the core's own number for a negative budget; stores keys with string values converted under a
+   type and no template check, and answers a scan request given as JSON with its batch as
+   JSON, or with the message of what it threw and *failed set.  The caller frees the answer. */
+typedef struct pldb_scantest pldb_scantest;
+pldb_scantest *pldb_scantest_open(const char *bundle, const char *path, int budget, char *err,
+                                  size_t errlen);
+void pldb_scantest_close(pldb_scantest *t);
+int pldb_scantest_put(pldb_scantest *t, const char *key, const char *type, const char *value,
+                      char *err, size_t errlen);
+char *pldb_scantest_scan(pldb_scantest *t, const char *req, int *failed);
+
 #endif

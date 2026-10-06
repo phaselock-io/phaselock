@@ -192,56 +192,146 @@ static JSValue native_del(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     return JS_UNDEFINED;
 }
 
-/* a scan's range lies within one key template, so one type covers every entry */
-typedef struct scan_ctx {
+/* one scan batch as it is collected: the entries the walk visits up to the batch's limit, and
+   whether one more follows */
+typedef struct batch_ctx {
     JSContext *ctx;
     jsrt *js;
-    long type;
-    JSValue arr;
-    uint32_t n;
-    bool failed;
-} scan_ctx;
+    long type; // the values' type, or -1 for keys only
+    size_t limit;
+    JSValue entries;
+    size_t n;
+    bool more;
+    char *last; // the batch's last key
+    size_t last_n;
+} batch_ctx;
 
-static int scan_cb(void *arg, const char *key, const uint8_t *val, size_t len) {
-    scan_ctx *sc = arg;
-    JSValue v = decode_stored(sc->ctx, sc->js, key, sc->type, val, len);
-    if (JS_IsException(v)) {
-        sc->failed = true;
-        return -1;
+/* take a key into the batch with its value, or note that more follow a full batch */
+static int batch_visit(void *arg, const char *key, size_t n) {
+    batch_ctx *b = arg;
+    if (b->n == b->limit) {
+        b->more = true;
+        return 0;
     }
-    JSValue pair = JS_NewArray(sc->ctx);
-    JS_DefinePropertyValueUint32(sc->ctx, pair, 0, JS_NewString(sc->ctx, key), JS_PROP_C_W_E);
-    JS_DefinePropertyValueUint32(sc->ctx, pair, 1, v, JS_PROP_C_W_E);
-    JS_DefinePropertyValueUint32(sc->ctx, sc->arr, sc->n++, pair, JS_PROP_C_W_E);
-    return 0;
+
+    // the key's value, decoded under the batch's type
+    JSValue v = JS_UNDEFINED;
+    if (b->type >= 0) {
+        size_t len;
+        const uint8_t *val = store_cursor_value(b->js->st, &len);
+        v = decode_stored(b->ctx, b->js, key, b->type, val, len);
+        if (JS_IsException(v)) return -1;
+    }
+
+    // the entry, and the key the batch would end with
+    JSValue pair = JS_NewArray(b->ctx);
+    JS_DefinePropertyValueUint32(b->ctx, pair, 0, JS_NewStringLen(b->ctx, key, n), JS_PROP_C_W_E);
+    JS_DefinePropertyValueUint32(b->ctx, pair, 1, v, JS_PROP_C_W_E);
+    JS_DefinePropertyValueUint32(b->ctx, b->entries, (uint32_t)b->n++, pair, JS_PROP_C_W_E);
+    free(b->last);
+    b->last = xmalloc(n + 1);
+    memcpy(b->last, key, n);
+    b->last[n] = 0;
+    b->last_n = n;
+    return 1;
 }
 
+/* the text of a request's after, its length in *n, or NULL for none; *failed says it threw */
+static char *after_arg(JSContext *ctx, JSValueConst req, size_t *n, bool *failed) {
+    JSValue v = JS_GetPropertyStr(ctx, req, "after");
+    *failed = JS_IsException(v);
+    if (*failed || JS_IsUndefined(v) || JS_IsNull(v)) return NULL;
+    const char *s = JS_ToCStringLen(ctx, n, v);
+    JS_FreeValue(ctx, v);
+    if (!s) {
+        *failed = true;
+        return NULL;
+    }
+    char *out = xmalloc(*n + 1);
+    memcpy(out, s, *n + 1);
+    JS_FreeCString(ctx, s);
+    return out;
+}
+
+/* One batch of a walk of the keys a pattern picks out, the skeleton's ReadScan answered with
+   {entries, next}: the keys from just past after, with their values decoded under the type the
+   request names, or keys only for a type of false.  It reads one key past the batch to tell
+   whether more follow.  While maySee runs, the batch's span is its read-set. */
 static JSValue native_scan(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     jsrt *js = rt_of(ctx);
-    bool nul;
-    char *prefix = name_arg(ctx, argv[0], &nul);
-    if (!prefix) return JS_EXCEPTION;
+    JSValueConst req = argv[0];
+    if (!JS_IsObject(req)) return JS_ThrowTypeError(ctx, "a scan's request is an object");
 
-    // no stored key holds U+0000, so a prefix that does covers none
-    if (nul) {
-        free(prefix);
-        return JS_NewArray(ctx);
+    // the pattern, compiled
+    JSValue pv = JS_GetPropertyStr(ctx, req, "pattern");
+    pattern *p = JS_IsException(pv) ? NULL : pattern_from_js(ctx, pv);
+    JS_FreeValue(ctx, pv);
+    if (!p) return JS_EXCEPTION;
+
+    // keys only, or values of the type it names, which one local template's keys share
+    batch_ctx b = {ctx, js, -1, 0, JS_UNDEFINED, 0, false, NULL, 0};
+    JSValue tv = JS_GetPropertyStr(ctx, req, "type");
+    bool values = !(JS_IsBool(tv) && !JS_ToBool(ctx, tv));
+    if (values && !pattern_named(p)) {
+        JSValue e = JS_NewError(ctx);
+        const char *msg = "a scan of every local key reads keys only";
+        JS_SetPropertyStr(ctx, e, "message", JS_NewString(ctx, msg));
+        JS_Throw(ctx, e);
+    } else if (values) {
+        b.type = type_arg(ctx, js, tv);
     }
-    long type = type_arg(ctx, js, argv[1]);
-    if (type < 0) {
-        free(prefix);
+    JS_FreeValue(ctx, tv);
+    if (values && b.type < 0) {
+        pattern_free(p);
         return JS_EXCEPTION;
     }
-    if (js->track_rprefixes) strlist_push(js->track_rprefixes, prefix);
-    scan_ctx sc = {ctx, js, type, JS_NewArray(ctx), 0, false};
-    int rc = store_scan(js->st, prefix, scan_cb, &sc);
-    if (rc && !sc.failed) JS_ThrowInternalError(ctx, "store scan %s: %s", prefix, store_err(js->st));
-    free(prefix);
-    if (rc) {
-        JS_FreeValue(ctx, sc.arr);
+
+    // its direction, where it resumes, and the batch's size
+    JSValue rv = JS_GetPropertyStr(ctx, req, "reverse");
+    bool reverse = JS_IsBool(rv) && JS_ToBool(ctx, rv);
+    JS_FreeValue(ctx, rv);
+    size_t after_n = 0;
+    bool failed;
+    char *after = after_arg(ctx, req, &after_n, &failed);
+    JSValue lv = JS_GetPropertyStr(ctx, req, "limit");
+    double limit = 0;
+    if (!failed && JS_ToFloat64(ctx, &limit, lv)) failed = true;
+    JS_FreeValue(ctx, lv);
+    if (!failed && !(limit >= 1)) {
+        JS_ThrowRangeError(ctx, "a scan's limit is at least 1");
+        failed = true;
+    }
+    if (failed) {
+        free(after);
+        pattern_free(p);
         return JS_EXCEPTION;
     }
-    return sc.arr;
+    b.limit = limit >= (double)SIZE_MAX ? SIZE_MAX : (size_t)limit;
+
+    // walk one key past the batch, to tell whether more follow
+    b.entries = JS_NewArray(ctx);
+    if (pattern_walk(js->st, p, reverse, after, after_n, js->scan_budget, batch_visit, &b)) {
+        if (!JS_HasException(ctx)) JS_ThrowInternalError(ctx, "store scan: %s", store_err(js->st));
+        JS_FreeValue(ctx, b.entries);
+        free(b.last);
+        free(after);
+        pattern_free(p);
+        return JS_EXCEPTION;
+    }
+
+    // the batch, and what it walked for maySee's read-set
+    JSValue out = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, out, "entries", b.entries);
+    JS_SetPropertyStr(ctx, out, "next", b.more ? JS_NewStringLen(ctx, b.last, b.last_n) : JS_NULL);
+    if (js->track_spans) {
+        const char *to = b.more ? b.last : NULL;
+        span_list_push(js->track_spans, p, reverse, after, after_n, to, b.last_n);
+    } else {
+        pattern_free(p);
+    }
+    free(b.last);
+    free(after);
+    return out;
 }
 
 /* bootstrap's hashPassword: the hash intake would make */
@@ -451,6 +541,7 @@ static const char ENV_SHIM[] =
 int js_open(jsrt *js, const char *bundle_path, store *st, char *err, size_t errlen) {
     memset(js, 0, sizeof *js);
     js->st = st;
+    js->scan_budget = SCAN_STEP_BUDGET;
     js->source_map = JS_UNDEFINED;
     js->map_stack = JS_UNDEFINED;
     js->bundle_file = xstrdup(bundle_path);
@@ -461,7 +552,7 @@ int js_open(jsrt *js, const char *bundle_path, store *st, char *err, size_t errl
     JS_SetPropertyStr(js->ctx, global, "__pl_get", JS_NewCFunction(js->ctx, native_get, "__pl_get", 2));
     JS_SetPropertyStr(js->ctx, global, "__pl_set", JS_NewCFunction(js->ctx, native_set, "__pl_set", 3));
     JS_SetPropertyStr(js->ctx, global, "__pl_del", JS_NewCFunction(js->ctx, native_del, "__pl_del", 1));
-    JS_SetPropertyStr(js->ctx, global, "__pl_scan", JS_NewCFunction(js->ctx, native_scan, "__pl_scan", 2));
+    JS_SetPropertyStr(js->ctx, global, "__pl_scan", JS_NewCFunction(js->ctx, native_scan, "__pl_scan", 1));
     JS_SetPropertyStr(js->ctx, global, "__pl_hash", JS_NewCFunction(js->ctx, native_hash, "__pl_hash", 1));
     JS_SetPropertyStr(js->ctx, global, "__pl_env", JS_NewCFunction(js->ctx, native_env, "__pl_env", 1));
     JSValue console = JS_NewObject(js->ctx);

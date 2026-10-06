@@ -43,7 +43,8 @@ typedef struct reg {
     strlist traits;
     strlist prefixes;
     char hash[17]; /* of prefixes, so a change to the set is one comparison */
-    strlist rkeys, rprefixes;
+    strlist rkeys;   /* the keys maySee got */
+    span_list spans; /* what each of maySee's scan batches walked */
     uint64_t *conns;
     size_t nconns, capconns;
     char *failure; /* what its connections are answered with when maySee failed, or NULL */
@@ -302,12 +303,12 @@ static int reg_evaluate(pldb *db, reg *g) {
     JSValue principal = js_principal(&db->js, g->user, (const char *const *)g->traits.v, (int)g->traits.n);
     strlist_clear(&g->prefixes);
     strlist_clear(&g->rkeys);
-    strlist_clear(&g->rprefixes);
+    span_list_clear(&g->spans);
     db->js.track_rkeys = &g->rkeys;
-    db->js.track_rprefixes = &g->rprefixes;
+    db->js.track_spans = &g->spans;
     int rc = js_maysee(&db->js, principal, &g->prefixes);
     db->js.track_rkeys = NULL;
-    db->js.track_rprefixes = NULL;
+    db->js.track_spans = NULL;
     JS_FreeValue(db->js.ctx, principal);
 
     // every ref in wire form, or the first failure
@@ -339,7 +340,7 @@ static void reg_free(reg *g) {
     strlist_free(&g->traits);
     strlist_free(&g->prefixes);
     strlist_free(&g->rkeys);
-    strlist_free(&g->rprefixes);
+    span_list_free(&g->spans);
     free(g->conns);
     free(g->failure);
     free(g);
@@ -479,27 +480,42 @@ static bool has_prefix(const char *s, const char *prefix) {
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
+/* Whether a batch's writes touched what a registration's maySee read: a written key it got or
+   one inside a stretch a scan batch walked, or a deleted prefix holding a key it got or one that
+   could lie inside such a stretch.  A spurious re-run costs only time, so a deleted prefix
+   dirties whenever it may. */
+static bool reads_touched(const reg *g, const strlist *written, const strlist *deleted) {
+    // the written keys
+    for (size_t i = 0; i < written->n; i++) {
+        const char *k = written->v[i];
+        if (strlist_has(&g->rkeys, k)) return true;
+        size_t n = strlen(k);
+        for (size_t j = 0; j < g->spans.n; j++) {
+            if (span_covers(&g->spans.v[j], k, n)) return true;
+        }
+    }
+
+    // the deleted prefixes
+    for (size_t i = 0; i < deleted->n; i++) {
+        const char *p = deleted->v[i];
+        for (size_t j = 0; j < g->rkeys.n; j++) {
+            if (has_prefix(g->rkeys.v[j], p)) return true;
+        }
+        size_t n = strlen(p);
+        for (size_t j = 0; j < g->spans.n; j++) {
+            if (span_may_hold(&g->spans.v[j], p, n)) return true;
+        }
+    }
+    return false;
+}
+
 /* after a batch's writes: re-run every maySee whose read-set was touched,
    and emit a view result to every connection of a registration whose
    prefixes changed */
 static void invalidate_views(pldb *db, const strlist *written, const strlist *deleted,
                              pldb_result **head, pldb_result **tail) {
     for (reg *g = db->regs; g; g = g->next) {
-        bool dirty = false;
-        for (size_t i = 0; i < written->n && !dirty; i++) {
-            const char *k = written->v[i];
-            if (strlist_has(&g->rkeys, k)) dirty = true;
-            for (size_t j = 0; j < g->rprefixes.n && !dirty; j++)
-                if (has_prefix(k, g->rprefixes.v[j])) dirty = true;
-        }
-        for (size_t i = 0; i < deleted->n && !dirty; i++) {
-            const char *p = deleted->v[i];
-            for (size_t j = 0; j < g->rkeys.n && !dirty; j++)
-                if (has_prefix(g->rkeys.v[j], p)) dirty = true;
-            for (size_t j = 0; j < g->rprefixes.n && !dirty; j++)
-                if (has_prefix(g->rprefixes.v[j], p) || has_prefix(p, g->rprefixes.v[j])) dirty = true;
-        }
-        if (!dirty) continue;
+        if (!reads_touched(g, written, deleted)) continue;
         char old_hash[17];
         memcpy(old_hash, g->hash, sizeof old_hash);
         reg_evaluate(db, g);

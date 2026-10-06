@@ -56,6 +56,17 @@ int store_del(store *s, const char *key);
 typedef int (*store_kv_fn)(void *arg, const char *key, const uint8_t *val, size_t len);
 int store_scan(store *s, const char *prefix, store_kv_fn fn, void *arg);
 int store_del_prefix(store *s, const char *prefix);
+/* The kv cursor walks the kv table's keys one way, one walk at a time per connection.  A seek
+   forward moves to the first key at or after target, strictly after it when strict, and one in
+   reverse to the last key at or before it; a NULL target moves to the first or last key of all.
+   A step moves one key on in the seek's direction.  Each answers 1 at a key, 0 past the end of
+   the walk, and -1 on an error.  The key and value at the cursor hold until it moves, and
+   store_cursor_end lets go of the walk. */
+int store_cursor_seek(store *s, bool reverse, const char *target, size_t n, bool strict);
+int store_cursor_step(store *s);
+const char *store_cursor_key(store *s, size_t *n);
+const uint8_t *store_cursor_value(store *s, size_t *n);
+void store_cursor_end(store *s);
 int store_append(store *s, uint64_t position, const char *stream, uint64_t seq,
                  const char *commandid, int64_t servertime, const uint8_t *data, size_t len);
 typedef int (*store_log_fn)(void *arg, uint64_t position, const char *stream, uint64_t seq,
@@ -80,6 +91,48 @@ int store_live_streams(store *s, const char *prefix, store_name_fn fn, void *arg
 /* 1 and the stream's seq if it is live, 0 if unborn or dead */
 int store_live_stream(store *s, const char *name, uint64_t *seq);
 
+/* scan.c: key patterns, the skeleton's KeyPattern compiled, and the walk of the keys one picks
+   out.  Text carries its length, since a pattern given by the bundle may hold U+0000. */
+typedef struct pattern pattern;
+/* the skeleton's compilePattern of a KeyPattern; NULL with a JS exception for a malformed one */
+pattern *pattern_from_js(JSContext *ctx, JSValueConst v);
+void pattern_free(pattern *p);
+/* whether the pattern names a local template, so that its keys share one type */
+bool pattern_named(const pattern *p);
+/* the keys a walk steps through before it seeks: a SQLite seek costs about as much as 16 steps
+   (2.5 us against 0.16 us a row) */
+#define SCAN_STEP_BUDGET 16
+/* Walk the keys the pattern picks out, as the skeleton's walkPattern does over the kv cursor,
+   from just past after when it is not NULL, stepping up to budget keys before a seek.  visit
+   sees each key with the cursor on it and answers 1 to go on, 0 to stop, or -1 to fail the
+   walk.  Answers 0, or -1 when visit failed or the store did, which store_err tells. */
+typedef int (*pattern_visit_fn)(void *arg, const char *key, size_t n);
+int pattern_walk(store *s, const pattern *p, bool reverse, const char *after, size_t after_n,
+                 size_t budget, pattern_visit_fn visit, void *arg);
+
+/* What one scan batch walked, the skeleton's ScanSpan: its pattern, and the stretch of keys from
+   just past from, or the walk's start when it is NULL, to to, or the walk's end. */
+typedef struct scan_span {
+    pattern *pattern;
+    bool reverse;
+    char *from, *to;
+    size_t from_n, to_n;
+} scan_span;
+typedef struct span_list {
+    scan_span *v;
+    size_t n, cap;
+} span_list;
+/* add a span, taking pattern and copying from and to; the next batch of the last span's walk,
+   resuming where it ends under the same pattern, extends that span instead */
+void span_list_push(span_list *l, pattern *pattern, bool reverse, const char *from, size_t from_n,
+                    const char *to, size_t to_n);
+void span_list_clear(span_list *l);
+void span_list_free(span_list *l);
+/* whether a key written lies inside what a scan batch read */
+bool span_covers(const scan_span *s, const char *key, size_t n);
+/* whether a key under prefix could lie inside what a scan batch read; true when in doubt */
+bool span_may_hold(const scan_span *s, const char *prefix, size_t n);
+
 /* mpjs.c: msgpack <-> plain JS values */
 JSValue mpjs_decode(JSContext *ctx, const uint8_t *data, size_t len);
 JSValue mpjs_decode_node(JSContext *ctx, mpack_node_t node);
@@ -103,7 +156,8 @@ typedef struct jsrt {
     strlist env_names;    /* the variables bootstrap's env may read */
     jsenv env;
     strlist *track_rkeys;
-    strlist *track_rprefixes;
+    span_list *track_spans;
+    size_t scan_budget; /* the keys a scan steps through before it seeks */
     strlist *track_wkeys;
     slice_names *slices; /* every reducer's templates */
     size_t nslices;

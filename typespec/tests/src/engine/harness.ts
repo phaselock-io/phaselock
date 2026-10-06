@@ -22,10 +22,10 @@ import {
   type ReducerTxn,
   type Registry,
   type Rep,
+  scanAll,
   type SliceReducer,
   type Store,
   storeTypeOf,
-  txnScanAll,
   type WireEvent,
 } from '../../../ts/assets/skeleton.ts';
 
@@ -78,6 +78,8 @@ export const registry: Registry = {
     'book/log': 'log',
     // reduce.test's reducer writes a marker into patron streams
     'patron/marker': 'state',
+    // scan.test's reducer walks items in patron streams
+    'patron/item': 'state',
   },
 };
 
@@ -438,7 +440,8 @@ function seeded(seed: Record<string, unknown>): InMemStore {
 function contents(store: Store): Record<string, unknown> {
   return store.read((txn) => {
     const out: Record<string, unknown> = {};
-    for (const [key] of txnScanAll(txn, { limit: 1000, values: false })) {
+    const pattern = { stream: null, name: null, local: [] };
+    for (const [key] of scanAll(txn, { pattern, limit: 1000, values: false })) {
       out[key] = txn.get(key, typeOf(key), JS);
     }
     return out;

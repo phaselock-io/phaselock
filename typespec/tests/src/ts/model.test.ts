@@ -8,7 +8,16 @@
 
 import { beforeAll, describe, expect, it } from 'vitest';
 
-import { InMemStore, JS, prefixRange, txnScanAll } from '../../../ts/assets/skeleton.ts';
+import {
+  InMemStore,
+  JS,
+  type ReadTxn,
+  type ReducerTxn,
+  type RTxn,
+  scanAll,
+  type ScanRequest,
+  type WTxn,
+} from '../../../ts/assets/skeleton.ts';
 import { bootstrap, FakeServer, registry, settle } from '../engine/harness.ts';
 
 import { emit, outDir, typecheck } from './emit-harness.ts';
@@ -130,6 +139,15 @@ const SNIPPETS: Record<string, string> = {
         // @ts-expect-error the stream binds the family's parameters
         txn.get.note('acme', 'u1', e.note);
         txn.del.note(e.note);
+
+        // a reducer scans its own stream by the template's own parameters
+        for (const [{ note }, text] of txn.scan.note({ note: { prefix: 'n' } })) {
+          txn.set.note(note, text.trim());
+        }
+        // @ts-expect-error the stream binds the family's parameters
+        txn.scan.note({ org: 'acme' });
+        // @ts-expect-error a template with no parameter of its own names one key of the stream
+        void txn.scan.profile;
       },
     };
   `,
@@ -147,6 +165,7 @@ const SNIPPETS: Record<string, string> = {
     declare const reader: ReaderEngineTxn;
     declare const writer: WriterEngineTxn;
     declare const db: AppDBTxn;
+    declare function export_(s: string): void;
 
     export const item: Item | undefined = reader.get.item('i1');
     export const count: number | undefined = reader.get.count();
@@ -157,6 +176,23 @@ const SNIPPETS: Record<string, string> = {
     export const secret: PasswordHash | undefined = db.get.secret('u1');
     // @ts-expect-error a global context is read-only
     void db.set;
+
+    // scans: a match by name on any of the varying parameters, each yielded by name
+    for (const [{ org, user, note }, text] of writer.scan.note({ org: 'acme', note: { gte: 'a' } })) {
+      export_(org + user + note + text);
+    }
+    for (const [{ org, user }, p] of db.scan.profile({}, { reverse: true })) {
+      export_(org + user + p.name);
+    }
+    for (const { item } of reader.scan.item(undefined, { keys: true })) export_(item);
+    // @ts-expect-error keys only yields the parameters alone
+    for (const [{ item }] of reader.scan.item({}, { keys: true })) export_(item);
+    // @ts-expect-error a misspelled parameter
+    writer.scan.note({ orgg: 'acme' });
+    // @ts-expect-error a match is a value, a range, or a prefix
+    writer.scan.note({ org: 1 });
+    // @ts-expect-error a template whose family and key have no parameters names one key
+    void reader.scan.count;
 
     // the database's context passes wherever one of its engines' contexts is wanted
     export const asWriter: WriterEngineTxn = db;
@@ -568,7 +604,7 @@ describe('global contexts', () => {
       'note',
       'profile',
     ]);
-    expect(Object.keys(M.writerEngineTxn(txn)).sort()).toEqual(['get']);
+    expect(Object.keys(M.writerEngineTxn(txn)).sort()).toEqual(['get', 'scan']);
     compiles('contexts');
   });
 
@@ -645,8 +681,131 @@ describe('global contexts', () => {
     store.write((w) => {
       for (const key of [...keys].reverse()) w.set(key, '.json', JS, key);
     });
-    const walked = store.read((r) => txnScanAll(r, prefixRange('inbox:', 100, false)));
+    const pattern = {
+      stream: { family: 'inbox', params: [null, null] },
+      name: 'note',
+      local: [null],
+    };
+    const walked = store.read((r) => scanAll(r, { pattern, limit: 100, values: false }));
     expect(walked.map(([key]) => key)).toEqual(keys);
+  });
+});
+
+describe('scan accessors', () => {
+  /** a store holding these inbox notes, each the text of its own key */
+  function notes(...keys: string[]): InMemStore {
+    const store = new InMemStore(registry);
+    store.write((w) => {
+      for (const key of keys) w.set(key, 'inbox/note', JS, key);
+    });
+    return store;
+  }
+
+  /** a ReadTxn over a store transaction, as the Engine hands a query one */
+  const readOf = (txn: RTxn): ReadTxn => ({
+    get: (key, type) => txn.get(key, type, JS),
+    scan: (req) =>
+      txn.scan({ ...req, values: req.type === false ? false : { type: req.type, rep: JS } }),
+  });
+
+  /** a ReducerTxn over a store transaction for one stream's keys, as the Engine hands a reducer one */
+  const reducerOf = (txn: WTxn, stream: string): ReducerTxn => {
+    const at = `${stream}!`;
+    return {
+      get: (key, type) => txn.get(at + key, type, JS),
+      set: (key, type, value) => txn.set(at + key, type, JS, value),
+      del: (key) => txn.del(at + key),
+      scan: (req) => {
+        const values: ScanRequest['values'] =
+          req.type === false ? false : { type: req.type, rep: JS };
+        const after = req.after === undefined ? undefined : at + req.after;
+        const pattern = { stream, name: req.name, local: req.local };
+        const { entries, next } = txn.scan({ ...req, pattern, values, after });
+        return {
+          entries: entries.map(([k, v]) => [k.slice(at.length), v]),
+          next: next === null ? null : next.slice(at.length),
+        };
+      },
+    };
+  };
+
+  const keys = [
+    'inbox:acme,gen!note:2026-10',
+    'inbox:acme,gen!note:2026-10-06',
+    'inbox:acme,gen-2!note:a',
+    'inbox:acme-2,gen!note:b',
+    'inbox:acme,gen!profile',
+  ];
+
+  it('generates a scan accessor for each template with a parameter that varies in its context', () => {
+    const { txn } = fakeTxn();
+    expect(Object.keys(M.writerEngineTxn(txn).scan).sort()).toEqual(['item', 'note', 'profile']);
+    expect(Object.keys(M.appDBTxn(txn).scan).sort()).toEqual(['item', 'note', 'profile', 'secret']);
+    compiles('contexts');
+  });
+
+  it('walks a match by parameter name, yielding every parameter by name with the value', () => {
+    const store = notes(...keys);
+    const got = store.read((r) => {
+      const ctx = M.appDBTxn(readOf(r));
+      return {
+        org: [...ctx.scan.note({ org: 'acme', note: { gte: '2026-10' } })],
+        reversed: [...ctx.scan.note({ user: { prefix: 'gen' } }, { reverse: true })],
+        keys: [...ctx.scan.note({ org: 'acme-2' }, { keys: true })],
+      };
+    });
+    expect(got.org).toEqual([
+      [{ org: 'acme', user: 'gen', note: '2026-10' }, 'inbox:acme,gen!note:2026-10'],
+      [{ org: 'acme', user: 'gen', note: '2026-10-06' }, 'inbox:acme,gen!note:2026-10-06'],
+      [{ org: 'acme', user: 'gen-2', note: 'a' }, 'inbox:acme,gen-2!note:a'],
+    ]);
+    expect(got.reversed.map(([p]: [{ note: string }]) => p.note)).toEqual([
+      'b',
+      'a',
+      '2026-10-06',
+      '2026-10',
+    ]);
+    expect(got.keys).toEqual([{ org: 'acme-2', user: 'gen', note: 'b' }]);
+  });
+
+  it("walks a reducer's own stream by the template's own parameters", () => {
+    const store = notes(...keys);
+    const seen: unknown[] = [];
+    const reducer = M.inboxSliceReducer({
+      profileSet: () => {},
+      noted: (t: any) => seen.push(...t.scan.note({ note: { lt: 'b' } })),
+    });
+    store.write((w) =>
+      reducer.reducer(reducerOf(w, 'inbox:acme,gen'), [noted], 'inbox:acme,gen', false),
+    );
+    expect(seen).toEqual([
+      [{ note: '2026-10' }, 'inbox:acme,gen!note:2026-10'],
+      [{ note: '2026-10-06' }, 'inbox:acme,gen!note:2026-10-06'],
+    ]);
+  });
+
+  it('checks an exact value as get checks the parameter, and every value for lone surrogates', () => {
+    const store = notes(...keys);
+    store.read((r) => {
+      const ctx = M.appDBTxn(readOf(r));
+      expect(() => [...ctx.scan.note({ org: 'ac,me' })]).toThrow(
+        'note: org "ac,me" is not a non-empty run of A-Z a-z 0-9 _ -',
+      );
+      expect(() => [...ctx.scan.note({ user: 'u!1' })]).toThrow('note: user "u!1"');
+
+      // a range or a prefix need not be a whole value, and a key's last parameter may hold anything
+      expect([...ctx.scan.note({ org: { gte: 'acme,' }, note: 'a!b' })]).toEqual([]);
+      // a surrogate pair is well-formed, and a surrogate alone or out of order is not
+      const [hi, lo] = [String.fromCharCode(0xd83d), String.fromCharCode(0xde00)];
+      expect([...ctx.scan.note({ note: { prefix: `a${hi}${lo}` } })]).toEqual([]);
+      for (const bad of [lo, `a${lo}`, `${lo}${hi}`, `${hi}${hi}${lo}`, `${hi}${lo}${lo}`]) {
+        expect(() => [...ctx.scan.note({ note: { gte: bad } })]).toThrow('holds a lone surrogate');
+      }
+      const lone = String.fromCharCode(0xd800);
+      expect(() => [...ctx.scan.note({ note: { gte: lone } })]).toThrow(
+        'note: note "\\ud800" holds a lone surrogate',
+      );
+    });
   });
 });
 

@@ -491,28 +491,55 @@ app's slots:
   skeleton's and every host shares it.
 - Every slot is a plain synchronous function over rich JS values.
   `txn` reads the store: `get(key, type)` answers the value or
-  undefined.  A reducer's `txn` also has `set(key, type, value)` and
+  undefined, and `scan(req)` answers one batch of a walk of the keys a
+  pattern picks out, `{entries, next}`, as the skeleton's `ReadTxn`
+  does.  A reducer's `txn` also has `set(key, type, value)` and
   `del(key)`.  The core converts each value under the type the call
   names, a registry identity, so a value that does not fit its type
-  fails the call.  A scan names one type too, so its range lies within
-  one key template.
+  fails the call.  A scan names one type too, or `false` for keys
+  only, so a scan with values picks out one key template's keys.
+- A scan walks the kv table in C (`core/scan.c`) the way the
+  skeleton's `walkPattern` does: a skip scan that places each key
+  against the pattern's fields and seeks past the keys that cannot
+  match, after stepping up to 16 keys toward the target, since a
+  SQLite seek costs about as much as 16 steps.  It reads one key past
+  the batch to tell whether more follow, and decodes only the batch's
+  values.  The skeleton's conformance fixture
+  (`typespec/tests/fixtures/scan-conformance.json`) runs against it in
+  `server/scan_test.go`.
 - A reducer's keys are local: the core prefixes `<stream>!`.  Its
   `template` is the family template and `keys` the key templates, as
-  declared in the model.
+  declared in the model.  Its scan is the skeleton's `LocalScan`: the
+  pattern's stream is its own, and `after` and the keys it answers are
+  local.  It reads the command's own transaction, so it sees the
+  reducer's writes.
   precommit, maySee, and lookup see global keys.
 - maySee is registered per distinct `principal` and re-run when a
-  commit writes a key it read.
+  commit touches what it read: the keys it got, and for each scan
+  batch, the stretch of keys the walk covered, the skeleton's
+  `ScanSpan` (its pattern, its direction, from just past the batch's
+  `after` to its `next` or the walk's end).  A written key touches a
+  key it got or one a span covers, as `spanCovers` decides.  A
+  deleted prefix, a dead stream's `<stream>!`, touches a key it got
+  under the prefix, or a span whenever the prefix could hold a key the
+  span covers: the prefix and the pattern's head agree, one starting
+  with the other, and the prefix's keys overlap the span's stretch.
+  A spurious re-run costs only time, so that test errs toward
+  re-running.
 
 ### Layout and build
 
     db/core/      the C core (libpldb.a): pldb.c txn loop, queues, and
-                  the command check, store.c SQLite, walk.c the
-                  conversion kernel, names.c stream names and keys
-                  against their templates, mpjs.c untyped msgpack<->JS, js.c
-                  QuickJS host, host.js the JS glue, vendor/mpack
+                  the command check, store.c SQLite, scan.c key
+                  patterns and their walk, walk.c the conversion
+                  kernel, names.c stream names and keys against their
+                  templates, mpjs.c untyped msgpack<->JS, js.c QuickJS
+                  host, host.js the JS glue, scantest.c the scan
+                  conformance test's hold on the walk, vendor/mpack
     db/server/    the Go layer: core.go cgo binding, server.go HTTP,
                   auth.go tokens and passwords, mp.go msgpack codec,
-                  server_test.go feature tests
+                  server_test.go feature tests, scan_test.go the
+                  scans, scantest.go their test-only binding
     db/server/testdata/
                   the test bundle: model.tsp and db.ts, generated into
                   bundle.js (dev, with an inline source map) and

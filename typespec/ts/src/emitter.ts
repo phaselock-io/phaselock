@@ -631,11 +631,55 @@ function printGets(d: Denter, list: Accessor[]): void {
   }
 }
 
+/** a scan accessor: its name, the parameters that vary in its context, its value's annotation, and
+    its template as the skeleton's ScanTemplate, in source */
+type Scanner = { name: string; params: readonly string[]; anno: string; template: string };
+
+/** the scan accessors over a slice's keys, local for its reducer, or global for any other context:
+    one per key template with a parameter that varies there, since any other names one key */
+function scanners(annos: Annos, slice: PSlice, global: boolean): Scanner[] {
+  return slice.store.items.flatMap((item) => {
+    const params = global ? [...slice.params, ...item.params] : item.params;
+    if (params.length === 0) return [];
+    const template = {
+      accessor: item.name,
+      family: slice.family,
+      stream: global ? slice.params : [],
+      name: item.name,
+      local: item.params,
+      type: storeTypeName(slice, item),
+    };
+    return [
+      { name: item.name, params, anno: annos.get(item.type)!, template: JSON.stringify(template) },
+    ];
+  });
+}
+
+/** a scan accessor's type arguments: the parameters that vary, as a union, and its value */
+function scanTypeArgs(s: Scanner): string {
+  return `${s.params.map((p) => JSON.stringify(p)).join(' | ')}, ${s.anno}`;
+}
+
+/** the members of a context's scan accessors, as a type */
+function printScanTypes(d: Denter, list: Scanner[]): void {
+  for (const s of list) d.print(`${prop(s.name)}: ScanAccessor<${scanTypeArgs(s)}>;\n`);
+}
+
+/** the members of a context's scan accessors, walking through $txn with the skeleton's global or
+    local scan */
+function printScans(d: Denter, list: Scanner[], global: boolean): void {
+  const make = global ? 'globalScan' : 'localScan';
+  for (const s of list) {
+    d.print(`${prop(s.name)}: ${make}<${scanTypeArgs(s)}>($txn, ${s.template}),\n`);
+  }
+}
+
 /** a slice's reducer context type and factory, its handler table type, and its SliceReducer */
 function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: PSlice): void {
   const base = slice.name;
   const txnType = `${base}Txn`;
   const local = accessors(annos, slice, false);
+  const localScans = scanners(annos, slice, false);
   const updatable = local.filter((a) => a.updatable);
   const params = slice.params.map((p) => `${p}: string`).join('; ');
 
@@ -648,6 +692,10 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   d.print('get: {\n');
   d.indent('  ');
   printGetTypes(d, local);
+  d.dedent();
+  d.print('};\nscan: {\n');
+  d.indent('  ');
+  printScanTypes(d, localScans);
   d.dedent();
   d.print('};\nset: {\n');
   d.indent('  ');
@@ -687,6 +735,10 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   d.print('params,\nget: {\n');
   d.indent('  ');
   printGets(d, local);
+  d.dedent();
+  d.print('},\nscan: {\n');
+  d.indent('  ');
+  printScans(d, localScans, false);
   d.dedent();
   d.print('},\nset: {\n');
   d.indent('  ');
@@ -787,6 +839,15 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   d.print('};\n');
   d.dedent();
   d.print('}\n');
+  d.print(`\nfunction ${lowerFirst(base)}Scan($txn: ReadTxn) {\n`);
+  d.indent('  ');
+  d.print('return {\n');
+  d.indent('  ');
+  printScans(d, scanners(annos, slice, true), true);
+  d.dedent();
+  d.print('};\n');
+  d.dedent();
+  d.print('}\n');
 }
 
 /** a global context's type and its factory over a read transaction */
@@ -804,13 +865,18 @@ function generateGlobalContext(
   d.indent('  ');
   for (const slice of slices) printGetTypes(d, accessors(annos, slice, true));
   d.dedent();
+  d.print('};\nscan: {\n');
+  d.indent('  ');
+  for (const slice of slices) printScanTypes(d, scanners(annos, slice, true));
+  d.dedent();
   d.print('};\n');
   d.dedent();
   d.print('};\n');
 
   const gets = slices.map((s) => `...${lowerFirst(s.name)}Get($txn)`).join(', ');
+  const scans = slices.map((s) => `...${lowerFirst(s.name)}Scan($txn)`).join(', ');
   d.print(`\nexport function ${lowerFirst(name)}Txn($txn: ReadTxn): ${name}Txn {\n`);
-  d.print(`  return { get: { ${gets} } };\n`);
+  d.print(`  return { get: { ${gets} }, scan: { ${scans} } };\n`);
   d.print('}\n');
 }
 

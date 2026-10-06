@@ -6,7 +6,9 @@ import {
   defineTestDB,
   type PatronSliceReducers,
   type Principal,
+  type ReadTxn,
   Reject,
+  type ShelfSliceReducers,
   type TestDBPrecommit,
   type TestDBTxn,
 } from './model.gen.ts';
@@ -14,9 +16,40 @@ import {
 const ADMIN = 'admin';
 const isAdmin = (p: Principal): boolean => p.traits.includes(ADMIN);
 
+// a principal whose every maySee run changes its view, so a test sees each run as a view frame
+const AUDITED = 'audited';
+
 // the users the tests sign in as without creating an account first, with their traits
-const TEST_USERS: Record<string, string[]> = { root: [ADMIN], p1: [] };
+const TEST_USERS: Record<string, string[]> = { root: [ADMIN], p1: [], r1: [AUDITED] };
 const isSelf = (p: Principal, user: string): boolean => p.user !== null && p.user === user;
+
+// scans //
+
+/* Precommit and the reducers scan through their typed contexts.  maySee scans through the raw
+   ReadTxn the database hands it, which the wrapper at the end of this file holds while it runs,
+   one entry per batch: every batch after the first resumes from the key the last one ended
+   with, so maySee's read-set spans many batches of one walk. */
+let readTxn: ReadTxn | undefined;
+
+// the keys of every shelf that lends to a patron, fetched a batch of one at a time
+function lendsTo(patron: string): string[] {
+  const keys: string[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const { entries, next } = readTxn!.scan({
+      pattern: { stream: { family: 'shelf', params: [null] }, name: 'lend', local: [{ eq: patron }] },
+      type: false,
+      after,
+      limit: 1,
+    });
+    for (const [key] of entries) keys.push(key);
+    if (next === null) return keys;
+    after = next;
+  }
+}
+
+// the count of maySee's runs for audited principals
+let auditedRuns = 0;
 
 // reducers //
 
@@ -46,6 +79,15 @@ const patron: PatronSliceReducers = {
     txn.update.messages((messages) => {
       messages.push(e.reason);
     }),
+};
+
+const shelf: ShelfSliceReducers = {
+  shelved: (txn, e) => {
+    txn.set.copy(e.book, { book: e.book, title: e.title });
+    // the copies as the reducer's own scan sees them, the one set just above included
+    txn.set.shelved([...txn.scan.copy({}, { keys: true })].map(({ book }) => `copy:${book}`));
+  },
+  lend: (txn, e) => txn.set.lend(e.patron, e.patron),
 };
 
 const account: AccountSliceReducers = {
@@ -114,6 +156,25 @@ const precommit: TestDBPrecommit = {
       { stream, event: { type: 'patron-hold', book: cmd.book } },
     ];
   },
+  shelve: (auth, txn, cmd) => {
+    auth.authorize(isAdmin(auth));
+    const b = txn.get.book(cmd.book);
+    if (b === undefined) throw new Reject('no such book');
+    const copies = txn.scan.copy({ branch: cmd.branch });
+    if ([...copies].some(([, c]) => c.title === b.title)) throw new Reject('title on shelf');
+    return {
+      stream: `shelf:${cmd.branch}`,
+      event: { type: 'shelved', book: cmd.book, title: b.title },
+    };
+  },
+  lend: (auth, txn, cmd) => {
+    auth.authorize(isAdmin(auth));
+    return { stream: `shelf:${cmd.branch}`, event: cmd };
+  },
+  closeShelf: (auth, txn, cmd) => {
+    auth.authorize(isAdmin(auth));
+    return { stream: `shelf:${cmd.branch}`, death: true };
+  },
   createAccount: (auth, txn, cmd) => {
     auth.authorizeAnyone();
     if (txn.get.account(cmd.user) !== undefined) throw new Reject('account exists');
@@ -152,8 +213,8 @@ const precommit: TestDBPrecommit = {
 
 // the bundle //
 
-defineTestDB({
-  reducers: { book, patron, account },
+const bundle = defineTestDB({
+  reducers: { book, patron, shelf, account },
   precommit,
   maySee: (txn, principal) => {
     if (principal.user === null) return ['book!'];
@@ -161,6 +222,9 @@ defineTestDB({
     const out = ['book!', `patron:${principal.user}!`];
     const a = txn.get.account(principal.user);
     if (a !== undefined) out.push(...a.views);
+    // the shelves that lend to the user
+    for (const key of lendsTo(principal.user)) out.push(key.slice(0, key.indexOf('!') + 1));
+    if (principal.traits.includes(AUDITED)) out.push(`shelf:run-${++auditedRuns}!`);
     return out;
   },
   lookup: (txn, ident) => {
@@ -181,3 +245,14 @@ defineTestDB({
     ctx.emit(`account:${user}`, { type: 'account-created', user, hash, traits: [ADMIN] });
   },
 });
+
+// maySee, holding its transaction while it runs
+const { maySee: maySeeSlot } = bundle;
+bundle.maySee = (txn, principal) => {
+  readTxn = txn;
+  try {
+    return maySeeSlot(txn, principal);
+  } finally {
+    readTxn = undefined;
+  }
+};

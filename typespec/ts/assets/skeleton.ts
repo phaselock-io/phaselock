@@ -490,26 +490,6 @@ export function storeTypeOf(reg: Registry, key: string): string | undefined {
   return reg.storeTypes[`${name(stream)}/${name(local)}`]!;
 }
 
-/** A scan walks keys in code-point order (compareKeys) between a lower and an upper bound, either
-    open or closed, one batch at a time.  It is a walk, not a snapshot: a batch is a fresh seek
-    from the resume key, so a key written above the cursor inside the range is visited and one
-    written below is not.  A scan may therefore write anywhere except above its own cursor inside
-    its range.  Its values are all of one type, so a range lies within one key template. */
-export type StoreRange = {
-  gte?: string;
-  gt?: string;
-  lt?: string;
-  lte?: string;
-  reverse?: boolean;
-  // entries per batch
-  limit: number;
-  // keys only, or values of this type in this representation
-  values: false | { type: string; rep: Rep };
-};
-/** one batch; a keys-only scan carries undefined values; next is the key to resume from (gt, or
-    lt when reversed), null when the range is done */
-export type StoreScan = { entries: [string, unknown][]; next: string | null };
-
 /** Keys sort in code-point order, which is the order of their UTF-8 bytes, so a store comparing
     UTF-8 keys bytewise (SQLite, LMDB) walks in the same order as the in-memory layers.  JS's own
     string comparison is UTF-16 code-unit order, which differs in one place: a surrogate pair,
@@ -562,22 +542,11 @@ export function prefixEnd(prefix: string): string | undefined {
   return end.slice(0, at) + String.fromCodePoint(cp === 0xd7ff ? 0xe000 : cp + 1);
 }
 
-/** the range covering every key under a prefix */
-export function prefixRange(
-  prefix: string,
-  limit: number,
-  values: StoreRange['values'],
-): StoreRange {
-  const end = prefixEnd(prefix);
-  if (end === undefined) return { gte: prefix, limit, values };
-  return { gte: prefix, lt: end, limit, values };
-}
-
 export interface RTxn {
   /** the value at key in a representation, converted by the store; undefined when the key is
       absent */
   get(key: string, type: string, rep: Rep): unknown;
-  scan(range: StoreRange): StoreScan;
+  scan(req: ScanRequest): StoreScan;
 }
 
 export interface WTxn extends RTxn {
@@ -602,29 +571,341 @@ export interface Store {
   read<T>(fn: (txn: RTxn) => T): T;
 }
 
-/** every entry of a range, batch by batch */
-export function txnScanAll(txn: RTxn, range: StoreRange): [string, unknown][] {
+// key patterns ///////////////////////////////////////////////////////////////
+
+/** A match on one template parameter: exactly one value, a range of values, the values starting
+    with a prefix, or null for any value.  Values compare in code-point order, as keys do. */
+export type ParamMatch =
+  | null
+  | { eq: string }
+  | { prefix: string }
+  | { gte?: string; gt?: string; lte?: string; lt?: string };
+
+/** A KeyPattern picks out keys of one key template by a match on each of its parameters.
+    `stream` is one stream by name, the empty name being the Engine's own stream; or a family and a
+    match per family parameter; or null for every stream.  `name` is the local template's name, with
+    a match per local parameter in `local`, or null for every local key of the streams matched,
+    which a scan reads keys only, since the values of different templates differ in type.  Each
+    separator in a key sorts below every character the parameter before it may hold, so the keys a
+    pattern picks out come in the order of their parameters, stream ones first. */
+export type KeyPattern = {
+  stream: string | { family: string; params: ParamMatch[] } | null;
+  name: string | null;
+  local: ParamMatch[];
+};
+
+/** A scan walks the keys a pattern picks out in code-point order, or reversed, one batch at a
+    time, from the start or from just past the key `after`.  It is a walk, not a snapshot: a batch
+    is a fresh seek from where the last one ended, so a key written ahead of the walk is visited
+    and one written behind it is not. */
+export type ScanRequest = {
+  pattern: KeyPattern;
+  reverse?: boolean;
+  after?: string;
+  // entries per batch, at least 1
+  limit: number;
+  // keys only, or values of this type in this representation
+  values: false | { type: string; rep: Rep };
+};
+
+/** one batch; a keys-only scan carries undefined values; next is the batch's last key when more
+    follow, to pass as `after`, and null when the walk is done */
+export type StoreScan = { entries: [string, unknown][]; next: string | null };
+
+/** every entry a scan picks out, batch by batch */
+export function scanAll(txn: RTxn, req: ScanRequest): [string, unknown][] {
   const all: [string, unknown][] = [];
-  let r = range;
+  let after = req.after;
   for (;;) {
-    const { entries, next } = txn.scan(r);
-    all.push(...entries);
+    const { entries, next } = txn.scan({ ...req, after });
+    for (const e of entries) all.push(e);
     if (next === null) return all;
-    r = resumeRange(r, next);
+    after = next;
   }
 }
 
-/** the range to resume a scan from after a batch */
-export function resumeRange(range: StoreRange, next: string): StoreRange {
-  const r = { ...range };
-  if (range.reverse) {
-    delete r.lte;
-    r.lt = next;
+/* A pattern compiles to the text every key it picks out starts with, then its fields in key order:
+   a value field per parameter, with its bounds and the separator that follows it ('' after the
+   last one of a key), and between the stream's fields and the local ones a literal, the local
+   template's name with the ':' that follows it when it has parameters.  The literal matches as
+   text, not as an ordered value, since a name may hold characters that sort below ':'. */
+type ValueField = {
+  literal: false;
+  lo: string | undefined;
+  loOpen: boolean;
+  hi: string | undefined;
+  hiOpen: boolean;
+  // a comparison exact against the bounds
+  cmp: (a: string, b: string) => number;
+  // whether the field admits one value only
+  single: boolean;
+  sep: string;
+};
+type LiteralField = { literal: true; text: string; whole: boolean };
+type CompiledPattern = { head: string; fields: (ValueField | LiteralField)[] };
+
+// a value field matching m, followed by sep
+function valueField(m: ParamMatch, sep: string): ValueField {
+  const f: ValueField = {
+    literal: false,
+    lo: undefined,
+    loOpen: false,
+    hi: undefined,
+    hiOpen: false,
+    cmp: unitCompare,
+    single: false,
+    sep,
+  };
+
+  // the bounds of each kind of match; a range keeps the tighter of each pair it gives
+  if (m === null) return f;
+  if ('eq' in m) {
+    f.lo = f.hi = m.eq;
+    f.single = true;
+  } else if ('prefix' in m) {
+    if (m.prefix === '') return f;
+    f.lo = m.prefix;
+    f.hi = prefixEnd(m.prefix);
+    f.hiOpen = true;
   } else {
-    delete r.gte;
-    r.gt = next;
+    f.lo = m.gte;
+    if (m.gt !== undefined && (f.lo === undefined || compareKeys(m.gt, f.lo) >= 0)) {
+      f.lo = m.gt;
+      f.loOpen = true;
+    }
+    f.hi = m.lte;
+    if (m.lt !== undefined && (f.hi === undefined || compareKeys(m.lt, f.hi) <= 0)) {
+      f.hi = m.lt;
+      f.hiOpen = true;
+    }
   }
-  return r;
+  f.cmp = exactFor([f.lo, f.hi]);
+  return f;
+}
+
+function compilePattern(p: KeyPattern): CompiledPattern {
+  const fields: CompiledPattern['fields'] = [];
+  const s = p.stream;
+
+  // every key
+  if (s === null) {
+    if (p.name !== null || p.local.length > 0) {
+      throw new Error('a pattern over every stream picks out every local key');
+    }
+    return { head: '', fields };
+  }
+
+  // the streams: one by name, or a family's with a field per parameter
+  let head: string;
+  if (typeof s === 'string') {
+    head = `${s}!`;
+  } else if (s.params.length === 0) {
+    head = `${s.family}!`;
+  } else {
+    head = `${s.family}:`;
+    const n = s.params.length;
+    s.params.forEach((m, i) => fields.push(valueField(m, i < n - 1 ? ',' : '!')));
+  }
+
+  // every local key of the streams, or one template's, its name a literal
+  if (p.name === null) {
+    if (p.local.length > 0) throw new Error('a pattern over every local key matches no parameter');
+    return { head, fields };
+  }
+  const n = p.local.length;
+  fields.push({ literal: true, text: n > 0 ? `${p.name}:` : p.name, whole: n === 0 });
+  p.local.forEach((m, i) => fields.push(valueField(m, i < n - 1 ? ',' : '')));
+  return { head, fields };
+}
+
+/** where a key stands against a pattern, for a walk one way: a match, a key to step past, the end
+    of the walk, or the target of a seek to the next key that may match */
+type Placement =
+  { kind: 'match' | 'step' | 'done' } | { kind: 'seek'; target: string; strict: boolean };
+
+const MATCH: Placement = { kind: 'match' };
+const STEP: Placement = { kind: 'step' };
+const DONE: Placement = { kind: 'done' };
+const seekTo = (target: string, strict: boolean): Placement => ({ kind: 'seek', target, strict });
+
+// the character just above a separator, so text ending in it sorts after every key that
+// continues past the separator
+const above = (sep: string) => String.fromCharCode(sep.charCodeAt(0) + 1);
+
+/* Place a key the way a skip scan does.  The first field outside its match decides: a field short
+   of its match seeks to where the match begins, and a field past it seeks past every key holding
+   the value of the nearest field before it that admits more than one, or ends the walk when no
+   such field does.  Seek targets are in walk order: a seek forward lands on the first key at or
+   past its target, and one in reverse on the last key at or before it. */
+function placeKey(c: CompiledPattern, key: string, reverse: boolean): Placement {
+  if (!key.startsWith(c.head)) return DONE;
+
+  // the end of each value field's text so far, by field
+  const ends: number[] = [];
+
+  // past every key holding the value of the nearest varying field before field i
+  const skipBack = (i: number): Placement => {
+    for (let j = i - 1; j >= 0; j--) {
+      const f = c.fields[j];
+      if (f.literal || f.single) continue;
+      if (reverse) return seekTo(key.slice(0, ends[j] + 1), true);
+      return seekTo(key.slice(0, ends[j]) + above(f.sep), false);
+    }
+    return DONE;
+  };
+
+  let pos = c.head.length;
+  for (let i = 0; i < c.fields.length; i++) {
+    const f = c.fields[i];
+
+    // a literal: the template's keys start with it, or are it when it is a whole local key
+    if (f.literal) {
+      const has = key.startsWith(f.text, pos) && (!f.whole || key.length === pos + f.text.length);
+      if (has) {
+        pos += f.text.length;
+        continue;
+      }
+      const at = key.slice(0, pos);
+      if (unitCompare(key.slice(pos), f.text) < 0) {
+        return reverse ? skipBack(i) : seekTo(at + f.text, false);
+      }
+      if (!reverse) return skipBack(i);
+      return f.whole ? seekTo(at + f.text, false) : seekTo(at + prefixEnd(f.text)!, true);
+    }
+
+    // a value field: its text runs to its separator, or to the end for the last field
+    let end = key.length;
+    let short = false;
+    if (f.sep !== '') {
+      end = key.indexOf(f.sep, pos);
+      if (end < 0) {
+        end = key.length;
+        short = true;
+      }
+    }
+    const v = key.slice(pos, end);
+
+    // is the value short of its match?
+    if (f.lo !== undefined) {
+      const d = f.cmp(v, f.lo);
+      if (d < 0 || (d === 0 && f.loOpen)) {
+        if (reverse) return skipBack(i);
+        const at = key.slice(0, pos) + f.lo;
+        if (!f.loOpen) return seekTo(at, false);
+        return f.sep === '' ? seekTo(at, true) : seekTo(at + above(f.sep), false);
+      }
+    }
+
+    // is it past its match?
+    if (f.hi !== undefined) {
+      const d = f.cmp(v, f.hi);
+      if (d > 0 || (d === 0 && f.hiOpen)) {
+        if (!reverse) return skipBack(i);
+        const at = key.slice(0, pos) + f.hi;
+        if (f.hiOpen) return seekTo(at, true);
+        return f.sep === '' ? seekTo(at, false) : seekTo(at + above(f.sep), true);
+      }
+    }
+
+    // inside its match, but a key that ends here holds none of the fields after it
+    if (short) return STEP;
+    ends[i] = end;
+    pos = end + f.sep.length;
+  }
+  return MATCH;
+}
+
+function matchesPattern(c: CompiledPattern, key: string): boolean {
+  return placeKey(c, key, false).kind === 'match';
+}
+
+/** A KeyCursor walks a store's keys one way.  A seek forward moves to the first key at or after
+    its target, strictly after it when strict, or to the first key of all for a null target; a seek
+    in reverse moves to the last key at or before it, or to the last key of all. */
+interface KeyCursor {
+  /** the key at the cursor, undefined past the end of the walk */
+  key(): string | undefined;
+  seek(target: string | null, strict: boolean): void;
+  step(): void;
+}
+
+/* Walk the keys a pattern picks out, calling visit with each until it answers false.  Before a
+   seek the walk steps up to budget keys toward the target, since a store whose seek costs more
+   than a few steps does better stepping over the short gaps between matches. */
+function walkPattern(
+  c: CompiledPattern,
+  cursor: KeyCursor,
+  req: { reverse?: boolean; after?: string },
+  budget: number,
+  visit: (key: string) => boolean,
+): void {
+  const reverse = req.reverse === true;
+
+  // start just past after, or at the pattern's first key in walk order
+  if (req.after !== undefined) {
+    cursor.seek(req.after, true);
+  } else if (!reverse) {
+    cursor.seek(c.head, false);
+  } else {
+    const end = prefixEnd(c.head);
+    cursor.seek(end ?? null, end !== undefined);
+  }
+
+  for (;;) {
+    const key = cursor.key();
+    if (key === undefined) return;
+    const p = placeKey(c, key, reverse);
+    if (p.kind === 'done') return;
+    if (p.kind === 'match' && !visit(key)) return;
+    if (p.kind !== 'seek') {
+      cursor.step();
+      continue;
+    }
+
+    /* A target behind the key comes from a bound holding characters its parameter cannot, which
+       orders differently against the separators; stepping is always safe. */
+    const cmp = exactFor([p.target]);
+    const past = (k: string) => {
+      const d = reverse ? cmp(p.target, k) : cmp(k, p.target);
+      return d > 0 || (d === 0 && !p.strict);
+    };
+    if (past(key)) {
+      cursor.step();
+      continue;
+    }
+
+    // step toward the target, then seek if it is still ahead
+    let s = 0;
+    for (; s < budget; s++) {
+      cursor.step();
+      const k = cursor.key();
+      if (k === undefined) return;
+      if (past(k)) break;
+    }
+    if (s === budget) cursor.seek(p.target, p.strict);
+  }
+}
+
+/** what one scan batch read, for a query's dependencies: its pattern, and the stretch of keys its
+    walk covered, from just past `from` or the walk's start to `to` or the walk's end */
+type ScanSpan = {
+  pattern: CompiledPattern;
+  reverse: boolean;
+  from: string | undefined;
+  to: string | undefined;
+};
+
+// whether a key written lies inside what a scan batch read
+function spanCovers(s: ScanSpan, key: string): boolean {
+  if (s.from !== undefined) {
+    const d = compareKeys(key, s.from);
+    if (s.reverse ? d >= 0 : d <= 0) return false;
+  }
+  if (s.to !== undefined) {
+    const d = compareKeys(key, s.to);
+    if (s.reverse ? d < 0 : d > 0) return false;
+  }
+  return matchesPattern(s.pattern, key);
 }
 
 /** the read half of a transaction object, what a read transaction hands out */
@@ -638,7 +919,7 @@ function readHalf(txn: RTxn): WTxn {
    way in and out.  Each keeps a base map, and each transaction keeps a map of pending updates over
    it, in which undefined marks a deletion.  The store also keeps its keys in a KeyList, so a scan
    seeks to its first key and walks from there; the overlay holds only the few keys forecasts
-   write, and sorts them for each range operation. */
+   write, and sorts them for each scan. */
 
 type Layer = Map<string, unknown>;
 
@@ -659,57 +940,23 @@ function exactFor(keys: (string | undefined)[]): (a: string, b: string) => numbe
   return keys.some((k) => k !== undefined && HIGH_UNIT.test(k)) ? compareKeys : unitCompare;
 }
 
-// a comparison exact against a range's bounds
-const boundsCompare = (r: StoreRange) => exactFor([r.gte, r.gt, r.lte, r.lt]);
-
-function inRange(key: string, r: StoreRange, cmp: (a: string, b: string) => number): boolean {
-  if (r.gte !== undefined && cmp(key, r.gte) < 0) return false;
-  if (r.gt !== undefined && cmp(key, r.gt) <= 0) return false;
-  if (r.lte !== undefined && cmp(key, r.lte) > 0) return false;
-  if (r.lt !== undefined && cmp(key, r.lt) >= 0) return false;
-  return true;
-}
-
-// the live keys of layers inside a range, sorted in walk order; the last layer holding a key
-// decides whether it is live
-function layerKeys(layers: Layer[], r: StoreRange): string[] {
-  // collect the live keys in range, each from the last layer holding it
-  const cmp = boundsCompare(r);
+// the live keys of layers that keep answers true for, sorted; the last layer holding a key decides
+// whether it is live
+function layerKeys(layers: Layer[], keep: (key: string) => boolean): string[] {
   const seen = new Set<string>();
   const keys: string[] = [];
   for (let i = layers.length - 1; i >= 0; i--) {
     for (const [k, v] of layers[i]) {
       if (seen.has(k)) continue;
       seen.add(k);
-      if (v !== undefined && inRange(k, r, cmp)) keys.push(k);
+      if (v !== undefined && keep(k)) keys.push(k);
     }
   }
-
-  // order them for the walk
-  sortKeys(keys);
-  if (r.reverse) keys.reverse();
-  return keys;
+  return sortKeys(keys);
 }
 
 function layerGet(data: Layer, updates: Layer, key: string): unknown {
   return updates.has(key) ? updates.get(key) : data.get(key);
-}
-
-// one batch over sorted keys: cut to the limit, and name the resume key when more remain
-function batch(
-  reg: Registry,
-  keys: string[],
-  r: StoreRange,
-  get: (key: string) => unknown,
-): StoreScan {
-  const page = keys.slice(0, r.limit);
-  const v = r.values;
-  const entries: [string, unknown][] = page.map((k) => [
-    k,
-    v ? layerOut(reg, v.type, get(k), v.rep) : undefined,
-  ]);
-  const next = keys.length > r.limit ? page[page.length - 1] : null;
-  return { entries, next };
 }
 
 // the first index below n where before answers false, or n; before answers true, then false
@@ -727,16 +974,82 @@ function bisect(n: number, before: (i: number) => boolean): number {
   return lo;
 }
 
-// the later and the earlier of two positions in a KeyList
-const later = (p: [number, number], q: [number, number]) =>
-  p[0] > q[0] || (p[0] === q[0] && p[1] > q[1]) ? p : q;
-const earlier = (p: [number, number], q: [number, number]) => (later(p, q) === p ? q : p);
+// a cursor over keys sorted in code-point order
+function arrayCursor(keys: string[], reverse: boolean): KeyCursor {
+  let j = 0;
+  return {
+    key: () => keys[j],
+    seek(target, strict) {
+      if (target === null) {
+        j = reverse ? keys.length - 1 : 0;
+        return;
+      }
+
+      // forward, the first key at or past target; reversed, the one before the first key past it
+      const cmp = exactFor([target]);
+      const before = (k: string) => {
+        const d = cmp(k, target);
+        return d < 0 || (d === 0 && strict !== reverse);
+      };
+      j = bisect(keys.length, (i) => before(keys[i])) - (reverse ? 1 : 0);
+    },
+    step() {
+      j += reverse ? -1 : 1;
+    },
+  };
+}
+
+// a cursor that passes over the keys hide answers true for
+function filterCursor(inner: KeyCursor, hide: (key: string) => boolean): KeyCursor {
+  const skip = () => {
+    for (let k = inner.key(); k !== undefined && hide(k); k = inner.key()) inner.step();
+  };
+  return {
+    key: () => inner.key(),
+    seek(target, strict) {
+      inner.seek(target, strict);
+      skip();
+    },
+    step() {
+      inner.step();
+      skip();
+    },
+  };
+}
+
+// a cursor over two cursors that hold no key in common, in walk order
+function mergeCursors(a: KeyCursor, b: KeyCursor, reverse: boolean): KeyCursor {
+  const key = () => {
+    const ka = a.key();
+    const kb = b.key();
+    if (ka === undefined || kb === undefined) return ka ?? kb;
+    const d = compareKeys(ka, kb);
+    return (reverse ? d > 0 : d < 0) ? ka : kb;
+  };
+  return {
+    key,
+    seek(target, strict) {
+      a.seek(target, strict);
+      b.seek(target, strict);
+    },
+    step() {
+      if (a.key() === key()) {
+        a.step();
+      } else {
+        b.step();
+      }
+    },
+  };
+}
 
 /* KeyList is a sorted list of distinct keys, cut into blocks that put end to end are the whole
    list.  A block holds at most 2 * BLOCK keys and, unless it is the only one, at least BLOCK / 4,
    so an insert or a removal splices one short array, and finding a position is a binary search over
    the blocks' last keys and then one inside a block.  A block is never empty. */
 const BLOCK = 1024;
+
+// the keys a scan of the in-memory store steps through before it seeks, which costs a search
+const STEP_BUDGET = 8;
 
 class KeyList {
   #blocks: string[][] = [];
@@ -797,45 +1110,42 @@ class KeyList {
     }
   }
 
-  /** call visit with each key inside r in walk order, until it answers false */
-  walk(r: StoreRange, visit: (key: string) => boolean): void {
+  /** a cursor walking the list one way; the list holds still while it is in use */
+  cursor(reverse: boolean): KeyCursor {
     const blocks = this.#blocks;
-    const cmp = boundsCompare(r);
 
-    if (!r.reverse) {
-      // from the first key inside the lower bounds up, until a key passes an upper bound
-      let [b, i] = [0, 0];
-      if (r.gte !== undefined) [b, i] = later([b, i], this.#seek(r.gte, false, cmp));
-      if (r.gt !== undefined) [b, i] = later([b, i], this.#seek(r.gt, true, cmp));
-      for (; b < blocks.length; b++, i = 0) {
-        const block = blocks[b];
-        for (; i < block.length; i++) {
-          const k = block[i];
-          if (r.lt !== undefined && cmp(k, r.lt) >= 0) return;
-          if (r.lte !== undefined && cmp(k, r.lte) > 0) return;
-          if (!visit(k)) return;
+    // the cursor's position, a block and an index into it, the block off either end when the
+    // walk is over
+    let b = 0;
+    let i = 0;
+    const back = () => {
+      if (i > 0) {
+        i--;
+        return;
+      }
+      b--;
+      i = b >= 0 ? blocks[b].length - 1 : 0;
+    };
+    return {
+      key: () => (b >= 0 && b < blocks.length ? blocks[b][i] : undefined),
+      seek: (target, strict) => {
+        // forward, the first key at or past target; reversed, the one before the first key past it
+        if (target === null) {
+          [b, i] = reverse ? [blocks.length, 0] : [0, 0];
+        } else {
+          [b, i] = this.#seek(target, strict !== reverse, exactFor([target]));
         }
-      }
-      return;
-    }
-
-    // reversed, from the last key inside the upper bounds down, until a key passes a lower bound
-    let [b, i] = [blocks.length, 0];
-    if (r.lte !== undefined) [b, i] = earlier([b, i], this.#seek(r.lte, true, cmp));
-    if (r.lt !== undefined) [b, i] = earlier([b, i], this.#seek(r.lt, false, cmp));
-    for (;;) {
-      // step back to the key before the position
-      if (i === 0) {
-        if (b === 0) return;
-        b--;
-        i = blocks[b].length;
-      }
-      i--;
-      const k = blocks[b][i];
-      if (r.gt !== undefined && cmp(k, r.gt) <= 0) return;
-      if (r.gte !== undefined && cmp(k, r.gte) < 0) return;
-      if (!visit(k)) return;
-    }
+        if (reverse) back();
+      },
+      step: () => {
+        if (reverse) {
+          back();
+        } else if (++i === blocks[b].length) {
+          b++;
+          i = 0;
+        }
+      },
+    };
   }
 
   // the position of the first key at or above key, or above it when strict, as a block and an
@@ -851,15 +1161,6 @@ class KeyList {
     const block = blocks[b];
     return [b, bisect(block.length, (j) => before(block[j]))];
   }
-}
-
-// two lists of distinct keys, each in walk order, merged by order
-function mergeKeys(a: string[], b: string[], order: (a: string, b: string) => number): string[] {
-  const out: string[] = [];
-  let i = 0;
-  let j = 0;
-  while (i < a.length && j < b.length) out.push(order(a[i], b[j]) < 0 ? a[i++] : b[j++]);
-  return out.concat(a.slice(i), b.slice(j));
 }
 
 /** InMemStore keeps values in their JS form in memory, with its keys in a sorted list, so a scan
@@ -942,13 +1243,13 @@ class InMemTxn implements WTxn {
   }
 
   delPrefix(prefix: string): string[] {
-    const keys = this.#walk(prefixRange(prefix, Infinity, false));
+    const keys = this.#keysUnder(prefix);
     for (const k of keys) this.#updates.set(k, undefined);
     return keys;
   }
 
   move(src: string, dst: string): string[] {
-    const keys = this.#walk(prefixRange(src, Infinity, false));
+    const keys = this.#keysUnder(src);
     const moved: string[] = [];
     for (const k of keys) {
       const to = dst + k.slice(src.length);
@@ -959,26 +1260,50 @@ class InMemTxn implements WTxn {
     return moved;
   }
 
-  scan(range: StoreRange): StoreScan {
-    const keys = this.#walk(range);
-    return batch(this.#reg, keys, range, (k) => layerGet(this.#values, this.#updates, k));
+  scan(req: ScanRequest): StoreScan {
+    const c = compilePattern(req.pattern);
+    const v = req.values;
+    if (v && req.pattern.name === null) {
+      throw new Error('a scan of every local key reads keys only');
+    }
+    if (!(req.limit >= 1)) throw new RangeError("a scan's limit is at least 1");
+
+    // walk one key past a batch, to tell whether more follow
+    const keys: string[] = [];
+    const cursor = this.#cursor(c.head, req.reverse === true);
+    walkPattern(c, cursor, req, STEP_BUDGET, (k) => keys.push(k) <= req.limit);
+
+    // the batch, its values copied or converted out
+    const page = keys.slice(0, req.limit);
+    const entries: [string, unknown][] = page.map((k) => {
+      if (!v) return [k, undefined];
+      return [k, layerOut(this.#reg, v.type, layerGet(this.#values, this.#updates, k), v.rep)];
+    });
+    return { entries, next: keys.length > req.limit ? page[page.length - 1] : null };
   }
 
-  // the live keys inside r in walk order, enough of them to fill a batch and tell whether more
-  // remain: the stored keys no update shadows, merged with the updates' live keys
-  #walk(r: StoreRange): string[] {
-    // the stored keys, up to one more than a batch; any past those sort after the batch
-    const stored: string[] = [];
-    this.#keys.walk(r, (k) => {
-      if (!this.#updates.has(k)) stored.push(k);
-      return stored.length <= r.limit;
-    });
+  // a cursor over the live keys: the stored ones no update shadows, merged with the updates' live
+  // keys under prefix
+  #cursor(prefix: string, reverse: boolean): KeyCursor {
+    const updates = this.#updates;
+    const stored = this.#keys.cursor(reverse);
+    if (updates.size === 0) return stored;
+    const shown = filterCursor(stored, (k) => updates.has(k));
+    const pending = layerKeys([updates], (k) => k.startsWith(prefix));
+    if (pending.length === 0) return shown;
+    return mergeCursors(shown, arrayCursor(pending, reverse), reverse);
+  }
 
-    // the updates' live keys inside the range, merged in
-    const pending = layerKeys([this.#updates], r);
-    if (pending.length === 0) return stored;
-    const cmp = exactFor(pending);
-    return mergeKeys(stored, pending, r.reverse ? (a, b) => cmp(b, a) : cmp);
+  // every live key under prefix, in order
+  #keysUnder(prefix: string): string[] {
+    const keys: string[] = [];
+    const cursor = this.#cursor(prefix, false);
+    cursor.seek(prefix, false);
+    for (let k = cursor.key(); k?.startsWith(prefix); k = cursor.key()) {
+      keys.push(k);
+      cursor.step();
+    }
+    return keys;
   }
 }
 
@@ -1051,14 +1376,19 @@ class OverlayTxn implements WTxn {
     this.#updates.set(key, undefined);
   }
 
-  // every key under prefix, from the base and the layers, in walk order
+  // every key of the stream a prefix `{stream}!` names, from the base and the layers, in order;
+  // forecasts end whole streams, so the overlay deletes nothing narrower
   #keysUnder(prefix: string): string[] {
+    if (prefix.indexOf('!') !== prefix.length - 1) {
+      throw new Error(`the overlay deletes whole streams, not ${prefix}`);
+    }
     const all = new Set<string>();
-    for (const [k] of txnScanAll(this.#base, prefixRange(prefix, 1000, false))) {
+    const pattern: KeyPattern = { stream: prefix.slice(0, -1), name: null, local: [] };
+    for (const [k] of scanAll(this.#base, { pattern, limit: 1000, values: false })) {
       if (!this.#has(k)) all.add(k);
     }
     const layers = [this.#data, this.#updates];
-    for (const k of layerKeys(layers, prefixRange(prefix, Infinity, false))) all.add(k);
+    for (const k of layerKeys(layers, (k) => k.startsWith(prefix))) all.add(k);
     return sortKeys([...all]);
   }
 
@@ -1073,41 +1403,37 @@ class OverlayTxn implements WTxn {
     throw new Error('the overlay does not move keys');
   }
 
-  scan(range: StoreRange): StoreScan {
-    const result = this.#base.scan(range);
+  scan(req: ScanRequest): StoreScan {
+    const result = this.#base.scan(req);
 
-    // the span this batch covers is up to its last key when more follow, else the whole range
-    const span: StoreRange = { ...range, limit: Infinity };
-    if (result.next !== null) {
-      if (range.reverse) {
-        span.gte = result.next;
-      } else {
-        span.lte = result.next;
-      }
-    }
+    // the stretch this batch covers: up to its last key when more follow, else to the walk's end
+    const span: ScanSpan = {
+      pattern: compilePattern(req.pattern),
+      reverse: req.reverse === true,
+      from: req.after,
+      to: result.next ?? undefined,
+    };
 
     // merge the layers' keys in the span over the base's; the base's answers are already the
     // caller's in the asked-for representation, and layer entries are copied and converted here
     const merged = new Map<string, unknown>();
     for (const [k, v] of result.entries) if (!this.#has(k)) merged.set(k, v);
-    const v = range.values;
-    for (const k of layerKeys([this.#data, this.#updates], span)) {
+    const v = req.values;
+    for (const k of layerKeys([this.#data, this.#updates], (k) => spanCovers(span, k))) {
       const js = layerGet(this.#data, this.#updates, k);
       merged.set(k, v ? layerOut(this.#reg, v.type, js, v.rep) : undefined);
     }
 
     // cut the merged keys to one batch
     const keys = sortKeys([...merged.keys()]);
-    if (range.reverse) keys.reverse();
+    if (req.reverse) keys.reverse();
     const page: StoreScan = {
-      entries: keys.slice(0, range.limit).map((k) => [k, merged.get(k)]),
-      next: keys.length > range.limit ? keys[range.limit - 1] : null,
+      entries: keys.slice(0, req.limit).map((k) => [k, merged.get(k)]),
+      next: keys.length > req.limit ? keys[req.limit - 1] : null,
     };
 
-    // the base has more batches behind this span, so the walk resumes even if the merge fit
-    if (page.next === null && result.next !== null) {
-      page.next = page.entries[page.entries.length - 1][0];
-    }
+    // the base has more batches behind this span, so the walk resumes past it even if the merge fit
+    if (page.next === null && result.next !== null) page.next = result.next;
     return page;
   }
 }
@@ -1159,18 +1485,219 @@ export class ExternalStore implements Store {
 // reducers /////////////////////////////////////////////////////////////////
 
 /** ReadTxn is what a query, a forecast, or precommit reads through: rich JS values by key and type,
-    undefined for an absent key. */
+    undefined for an absent key, and scans by pattern. */
 export interface ReadTxn {
   get(key: string, type: string): unknown;
+  scan(req: ReadScan): StoreScan;
 }
+
+/** a scan through a ReadTxn: its values are rich JS values of `type`, or keys only for false */
+export type ReadScan = {
+  pattern: KeyPattern;
+  type: string | false;
+  reverse?: boolean;
+  after?: string;
+  limit: number;
+};
 
 /** ReducerTxn is what a slice reducer reads and writes through, inside the Engine's transaction.
     Its keys are local to one stream: the Engine prefixes `{stream}!`, so a reducer cannot name a
     key outside its own stream.  A reducer owns what it gets, and what it sets is the store's from
     that call on. */
-export interface ReducerTxn extends ReadTxn {
+export interface ReducerTxn {
+  get(key: string, type: string): unknown;
   set(key: string, type: string, value: unknown): void;
   del(key: string): void;
+  /** One batch of the stream's keys of a local template, by a match per parameter, keyed
+      locally, `after` included.  A scan sees the reducer's own writes, but it is a walk taken a
+      batch at a time: a key written or deleted ahead of an unfinished scan, among the keys it
+      picks out, is seen or not depending on whether its batch was already fetched, so the Engine
+      and the database could fold such a reducer differently.  Write only behind a scan, or after
+      it ends. */
+  scan(req: LocalScan): StoreScan;
+}
+
+/** a scan through a ReducerTxn: a local template, or null for every local key, keys only */
+export type LocalScan = Omit<ReadScan, 'pattern'> & { name: string | null; local: ParamMatch[] };
+
+// the transactions a query or forecast read through that have returned, so a scan carried out of
+// one throws rather than reading on
+const closedTxns = new WeakSet<object>();
+
+/** every entry a scan picks out, as the key's template parameters in order, stream ones first,
+    and its value; batches are fetched as the walk goes, from 16 entries growing to 256 */
+export function scanEach(
+  txn: ReadTxn,
+  req: Omit<ReadScan, 'after' | 'limit'>,
+): IterableIterator<[string[], unknown]> {
+  const p = req.pattern;
+  const parse = (key: string) => {
+    if (p.stream === null) return [key];
+    const bang = key.indexOf('!');
+    const stream =
+      typeof p.stream === 'string' || p.stream.params.length === 0
+        ? []
+        : key.slice(p.stream.family.length + 1, bang).split(',');
+    return [...stream, ...localParams(key.slice(bang + 1), p.name, p.local.length)];
+  };
+  return batches(txn, (after, limit) => txn.scan({ ...req, after, limit }), parse);
+}
+
+/** every entry a reducer's scan picks out, as scanEach yields them, of its own stream */
+export function scanEachLocal(
+  txn: ReducerTxn,
+  req: Omit<LocalScan, 'after' | 'limit'>,
+): IterableIterator<[string[], unknown]> {
+  const parse = (key: string) => localParams(key, req.name, req.local.length);
+  return batches(txn, (after, limit) => txn.scan({ ...req, after, limit }), parse);
+}
+
+// the parameters of a local key of the named template with n of them, or the key itself for
+// every local key (a null name)
+function localParams(local: string, name: string | null, n: number): string[] {
+  if (name === null) return [local];
+  if (n === 0) return [];
+  const parts = local.slice(name.length + 1).split(',');
+  return [...parts.slice(0, n - 1), parts.slice(n - 1).join(',')];
+}
+
+// the entries of a walk, fetched in batches of growing size
+function* batches(
+  txn: object,
+  fetch: (after: string | undefined, limit: number) => StoreScan,
+  parse: (key: string) => string[],
+): IterableIterator<[string[], unknown]> {
+  let after: string | undefined;
+  let limit = 16;
+  for (;;) {
+    if (closedTxns.has(txn)) {
+      throw new Error('a scan was used after its query or forecast returned');
+    }
+    const { entries, next } = fetch(after, limit);
+    for (const [key, value] of entries) {
+      yield [parse(key), value];
+      if (closedTxns.has(txn)) {
+        throw new Error('a scan was used after its query or forecast returned');
+      }
+    }
+    if (next === null) return;
+    after = next;
+    limit = Math.min(limit * 2, 256);
+  }
+}
+
+// typed scans ///////////////////////////////////////////////////////////////
+
+/** a match on one parameter, as a generated scan accessor takes it: an exact value, a range, or a
+    prefix; a parameter left out matches any value */
+export type ScanMatch =
+  string | { gte?: string; gt?: string; lte?: string; lt?: string } | { prefix: string };
+
+/** A generated scan accessor over one key template.  P names the template's parameters that vary
+    in its context, its family's then its own, and V is its value.  It walks the keys a match on
+    those parameters picks out, in the order of the parameters, fetching as it goes, and yields
+    each key's parameters by name with its value, or only the parameters with `keys: true`. */
+export type ScanAccessor<P extends string, V> = {
+  (
+    match?: { [K in P]?: ScanMatch },
+    options?: { reverse?: boolean; keys?: false },
+  ): IterableIterator<[{ [K in P]: string }, V]>;
+  (
+    match: { [K in P]?: ScanMatch } | undefined,
+    options: { reverse?: boolean; keys: true },
+  ): IterableIterator<{ [K in P]: string }>;
+};
+
+/** what a generated scan accessor knows of its template: its own name for errors, its family and
+    the family's parameters (none for a reducer's, whose stream is its own), the local template's
+    name and parameters, and the type its values travel under */
+export type ScanTemplate = {
+  accessor: string;
+  family: string;
+  stream: string[];
+  name: string;
+  local: string[];
+  type: string;
+};
+
+type ScanOptions = { reverse?: boolean; keys?: boolean };
+type NamedMatch = Partial<Record<string, ScanMatch>>;
+
+/** a scan accessor over a global context's read transaction */
+export function globalScan<P extends string, V>(txn: ReadTxn, t: ScanTemplate): ScanAccessor<P, V> {
+  const scan = (match: NamedMatch = {}, options: ScanOptions = {}) => {
+    const n = t.stream.length;
+    const params = t.stream.map((p, i) => {
+      return paramMatch(t.accessor, p, match[p], i < n - 1 ? asSegment : asStreamRest);
+    });
+    const pattern: KeyPattern = {
+      stream: { family: t.family, params },
+      name: t.name,
+      local: localMatches(t, match),
+    };
+    const type = options.keys === true ? false : t.type;
+    const walk = scanEach(txn, { pattern, type, reverse: options.reverse });
+    return named(walk, [...t.stream, ...t.local], options.keys === true);
+  };
+  return scan as ScanAccessor<P, V>;
+}
+
+/** a scan accessor over a reducer's transaction, of its own stream */
+export function localScan<P extends string, V>(
+  txn: ReducerTxn,
+  t: ScanTemplate,
+): ScanAccessor<P, V> {
+  const scan = (match: NamedMatch = {}, options: ScanOptions = {}) => {
+    const local = localMatches(t, match);
+    const type = options.keys === true ? false : t.type;
+    const walk = scanEachLocal(txn, { name: t.name, local, type, reverse: options.reverse });
+    return named(walk, t.local, options.keys === true);
+  };
+  return scan as ScanAccessor<P, V>;
+}
+
+// a template's local parameters' matches; the last one may hold anything a key may
+function localMatches(t: ScanTemplate, match: NamedMatch): ParamMatch[] {
+  const n = t.local.length;
+  return t.local.map((p, i) => paramMatch(t.accessor, p, match[p], i < n - 1 ? asSegment : null));
+}
+
+// a parameter's match as a pattern takes it: an exact value checked as its place in its template
+// requires, unless check is null, and every value well-formed, since a lone surrogate orders
+// differently in different stores
+function paramMatch(
+  accessor: string,
+  param: string,
+  m: ScanMatch | undefined,
+  check: ((value: string, accessor: string, param: string) => string) | null,
+): ParamMatch {
+  const wellFormed = (v: string | undefined) => {
+    if (v === undefined || !LONE_SURROGATE.test(v)) return;
+    throw new Error(`${accessor}: ${param} ${JSON.stringify(v)} holds a lone surrogate`);
+  };
+  if (m === undefined) return null;
+  if (typeof m === 'string') {
+    wellFormed(m);
+    return { eq: check === null ? m : check(m, accessor, param) };
+  }
+  for (const v of Object.values(m)) wellFormed(v);
+  return m;
+}
+
+// a low surrogate at the start or after anything but a high one, or a high one before anything
+// but a low one; no lookbehind, which not every engine a host embeds supports
+const LONE_SURROGATE = /(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])/;
+
+// a walk's entries with their parameters by name, or the parameters alone
+function* named(
+  walk: IterableIterator<[string[], unknown]>,
+  names: string[],
+  keysOnly: boolean,
+): IterableIterator<unknown> {
+  for (const [values, value] of walk) {
+    const params = Object.fromEntries(names.map((name, i) => [name, values[i]]));
+    yield keysOnly ? params : [params, value];
+  }
 }
 
 // stream names and keys ////////////////////////////////////////////////////
@@ -1239,6 +1766,17 @@ function reducerTxn(txn: WTxn, stream: string, updates: Record<string, true>): R
     del(key) {
       txn.del(prefix + key);
       updates[prefix + key] = true;
+    },
+    scan(req) {
+      const pattern: KeyPattern = { stream, name: req.name, local: req.local };
+      const values: ScanRequest['values'] =
+        req.type === false ? false : { type: req.type, rep: JS };
+      const after = req.after === undefined ? undefined : prefix + req.after;
+      const { entries, next } = txn.scan({ ...req, pattern, values, after });
+      return {
+        entries: entries.map(([k, v]) => [k.slice(prefix.length), v]),
+        next: next === null ? null : next.slice(prefix.length),
+      };
     },
   };
 }
@@ -1511,17 +2049,54 @@ export interface Query<T> {
     keys changes. */
 export type QueryFunction<QX, T> = (qx: QX) => T;
 
-// A ReadTxn over a store transaction, adding every key it reads to keys when given.  In dev mode
+/** what a query's run read: the keys it got, {key: true}, and what each walk of its scans
+    covered, with the pattern of the last one as text to know the walk's next batch */
+type ReadDeps = { keys: Record<string, true>; spans: ScanSpan[]; last: string | null };
+
+// A ReadTxn over a store transaction, recording what it reads in deps when given.  In dev mode
 // what it hands out is a read-only proxy, so a mutation of a result throws where it happens,
 // naming the key; the JS representation is the one the app touches.
-function readTxn(txn: RTxn, keys?: Record<string, true>): ReadTxn {
+function readTxn(txn: RTxn, deps?: ReadDeps): ReadTxn {
   return {
     get(key, type) {
-      if (keys !== undefined) keys[key] = true;
+      if (deps !== undefined) deps.keys[key] = true;
       const value = txn.get(key, type, JS);
       return DEV ? readOnly(value, key) : value;
     },
+    scan(req) {
+      const values: ScanRequest['values'] =
+        req.type === false ? false : { type: req.type, rep: JS };
+      const result = txn.scan({ ...req, values });
+      if (deps !== undefined) record(deps, req, result.next);
+      if (!DEV) return result;
+      const entries: [string, unknown][] = result.entries.map(([k, v]) => [k, readOnly(v, k)]);
+      return { entries, next: result.next };
+    },
   };
+}
+
+// record what a scan batch walked; a batch resuming where the last span ends, under the same
+// pattern, is the next batch of that walk and extends the span
+function record(deps: ReadDeps, req: ReadScan, next: string | null): void {
+  const reverse = req.reverse === true;
+  const to = next ?? undefined;
+  const text = JSON.stringify(req.pattern);
+
+  // the next batch of the last span's walk extends it
+  const last = deps.spans[deps.spans.length - 1];
+  if (
+    last?.to !== undefined &&
+    last.to === req.after &&
+    last.reverse === reverse &&
+    deps.last === text
+  ) {
+    last.to = to;
+    return;
+  }
+
+  // any other batch starts a span of its own
+  deps.spans.push({ pattern: compilePattern(req.pattern), reverse, from: req.after, to });
+  deps.last = text;
 }
 
 class QueryImpl<QX, T> {
@@ -1530,8 +2105,8 @@ class QueryImpl<QX, T> {
 
   #subs: ((val: T) => void)[] = [];
   #fn: QueryFunction<QX, T>;
-  // the keys the last run read: {key: true}
-  #keyDeps: Record<string, true> = {};
+  // what the last run read
+  #deps: ReadDeps = { keys: {}, spans: [], last: null };
   #runs: number = 0;
   #result: T | undefined = undefined;
 
@@ -1554,19 +2129,33 @@ class QueryImpl<QX, T> {
     this.closed = true;
   }
 
-  /** run against txn, unless it has run before and read no key in dirty; answers whether its
-      result changed */
+  /** run against txn, unless it has run before and read nothing dirty changed; answers whether
+      its result changed */
   run(txn: RTxn, context: (txn: ReadTxn) => QX, dirty: Record<string, true>): boolean {
     // a query that read nothing which changed keeps its result
-    if (this.#runs > 0 && !Object.keys(this.#keyDeps).some((k) => k in dirty)) return false;
+    if (this.#runs > 0 && !this.#reads(dirty)) return false;
 
-    // run it, recording the keys it reads
-    const keys: Record<string, true> = {};
+    // run it, recording what it reads; its transaction closes when it returns
+    const deps: ReadDeps = { keys: {}, spans: [], last: null };
+    const rtx = readTxn(txn, deps);
     const old = this.#result;
-    this.#result = this.#fn(context(readTxn(txn, keys)));
-    this.#keyDeps = keys;
+    try {
+      this.#result = this.#fn(context(rtx));
+    } finally {
+      closedTxns.add(rtx);
+    }
+    this.#deps = deps;
     this.#runs++;
     return this.#runs === 1 || this.#result !== old;
+  }
+
+  // whether the last run read a key in dirty, by getting it or by walking past where it lies
+  #reads(dirty: Record<string, true>): boolean {
+    const { keys, spans } = this.#deps;
+    for (const k in dirty) {
+      if (k in keys || spans.some((s) => spanCovers(s, k))) return true;
+    }
+    return false;
   }
 
   // call subscribers with the latest result
@@ -2005,6 +2594,11 @@ export function commandKey(ordinal: number): string {
   return `!command:${String(ordinal).padStart(20, '0')}`;
 }
 
+/** the pattern of the Engine's own keys of one template, by a match on its one parameter */
+function engineKeys(name: string, match: ParamMatch = null): KeyPattern {
+  return { stream: '', name, local: [match] };
+}
+
 /** the stream and seq a parked event key names */
 export function parsePark(key: string): { stream: string; seq: number } {
   const at = '!park-ev:'.length;
@@ -2229,16 +2823,18 @@ export class Engine<QX, C, N = never> {
       this.#view = (txn.get('!view', '.json', JS) as ViewRecord | undefined) ?? null;
 
       // the streams table: seq per held stream, or the marker for a stream under a backfill
-      const seqRows = txnScanAll(txn, prefixRange('!seq:', 1000, { type: '.json', rep: JS }));
+      const json = { type: '.json', rep: JS } as const;
+      const seqRows = scanAll(txn, { pattern: engineKeys('seq'), limit: 1000, values: json });
       for (const [key, value] of seqRows) {
         this.#streams.set(key.slice('!seq:'.length), value as number | 'backfill');
       }
 
       // the outbox in ordinal order; the next ordinal continues from the last key
-      const commandRows = txnScanAll(
-        txn,
-        prefixRange('!command:', 1000, { type: '.command', rep: JS }),
-      );
+      const commandRows = scanAll(txn, {
+        pattern: engineKeys('command'),
+        limit: 1000,
+        values: { type: '.command', rep: JS },
+      });
       for (const [key, value] of commandRows) {
         const ordinal = Number(key.slice('!command:'.length));
         this.#outbox.set((value as Command<Uint8Array>).id, ordinal);
@@ -2246,10 +2842,11 @@ export class Engine<QX, C, N = never> {
       }
 
       // the backfills in flight, each with a fresh controller
-      const backfillRows = txnScanAll(
-        txn,
-        prefixRange('!backfill:', 1000, { type: '.json', rep: JS }),
-      );
+      const backfillRows = scanAll(txn, {
+        pattern: engineKeys('backfill'),
+        limit: 1000,
+        values: json,
+      });
       for (const [key, value] of backfillRows) {
         const record = value as BackfillRecord;
         this.#backfills.set(key.slice('!backfill:'.length), {
@@ -2775,8 +3372,9 @@ export class Engine<QX, C, N = never> {
   }
 
   // the parked event range of a ref, or of every stream for the frozen events (null)
-  #parkRange(ref: string | null, values: StoreRange['values']): StoreRange {
-    return prefixRange(`!park-ev:${ref === null ? '' : refPrefix(ref)}`, 1000, values);
+  #parkRange(ref: string | null, values: ScanRequest['values']): ScanRequest {
+    const match = ref === null ? null : { prefix: refPrefix(ref) };
+    return { pattern: engineKeys('park-ev', match), limit: 1000, values };
   }
 
   // a ref's blob header: the seq of every stream in its blob at the cut
@@ -2829,7 +3427,7 @@ export class Engine<QX, C, N = never> {
         last = park.seq;
       }
       if (next === null) return broken;
-      range = resumeRange(range, next);
+      range = { ...range, after: next };
     }
   }
 
@@ -2962,7 +3560,7 @@ export class Engine<QX, C, N = never> {
         run.push(ev);
       }
       if (next === null) break;
-      range = resumeRange(range, next);
+      range = { ...range, after: next };
     }
     if (run.length > 0) this.#reduceStreamIn(txn, stream, run, dirty);
 
@@ -3454,10 +4052,11 @@ export class Engine<QX, C, N = never> {
       // forecast each outbox command, each seeing what the ones before it left
       const forecaster = this.#forecaster;
       if (forecaster !== null && this.#outbox.size > 0) {
-        const rows = txnScanAll(
-          base,
-          prefixRange('!command:', 1000, { type: '.command', rep: JS }),
-        );
+        const rows = scanAll(base, {
+          pattern: engineKeys('command'),
+          limit: 1000,
+          values: { type: '.command', rep: JS },
+        });
         for (const [, value] of rows) {
           const command = value as Command<Uint8Array>;
 
@@ -3513,7 +4112,16 @@ export class Engine<QX, C, N = never> {
       run = [];
     };
 
-    for (const out of forecaster(this.#context(readTxn(txn)), command)) {
+    // forecast over the overlay; the transaction closes when the forecaster returns
+    const rtx = readTxn(txn);
+    let outs: ForecastOutput[];
+    try {
+      outs = forecaster(this.#context(rtx), command);
+    } finally {
+      closedTxns.add(rtx);
+    }
+
+    for (const out of outs) {
       // the label fills its slice's family template, or has the shape of a stream name when this
       // Engine holds no slice of its family; an invalid one throws, forecasting nothing
       const pattern = this.#streamPatterns[out.stream.split(':')[0]] ?? ANY_STREAM_RE;
