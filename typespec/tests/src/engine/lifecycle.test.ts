@@ -63,7 +63,7 @@ describe('connector lifecycle', () => {
     await settle();
     r.server.events(ev('patron.p1', 1, 5));
     await expect(settle()).rejects.toThrow(/no epoch/);
-    expect(checkpoint(r.data)).toBeUndefined();
+    expect(checkpoint(r.data())).toBeUndefined();
   });
 
   test('the epoch is forgotten on end: the next connection must open again', async () => {
@@ -134,7 +134,7 @@ describe('connector lifecycle', () => {
     r.server.open();
     r.server.events(ev('patron.p1', 3, 11));
     await settle();
-    expect(seq(r.data, 'patron.p1')).toBe(3);
+    expect(seq(r.data(), 'patron.p1')).toBe(3);
   });
 
   test('a new connection starts every backfill still downloading, except one in backoff', async () => {
@@ -182,8 +182,8 @@ describe('connector lifecycle', () => {
     await settle();
     expect(r.server.backfills.map((b) => b.ref)).toEqual(['patron.*', 'patron.p9', 'patron.p9']);
     expect(r.server.backfills[2].resume).toBeNull();
-    expect(seq(r.data, 'patron.p9')).toBe(7);
-    expect(keys(r.data, '/backfill')).toEqual([]);
+    expect(seq(r.data(), 'patron.p9')).toBe(7);
+    expect(keys(r.data(), '/backfill')).toEqual([]);
   });
 
   test('a hook from a replaced connector is dropped', async () => {
@@ -197,10 +197,10 @@ describe('connector lifecycle', () => {
     old.hooks.onView('t9', 12, ['book.*']);
     old.hooks.onVouch(50);
     await settle();
-    expect(seq(r.data, 'patron.p1')).toBe(2);
-    expect(log(r.data, 'patron.p1')).toEqual([]);
-    expect(checkpoint(r.data)?.position).toBe(10);
-    expect(r.data['/view']).toEqual({ token: 't1', position: 10, refs: ['patron.*'] });
+    expect(seq(r.data(), 'patron.p1')).toBe(2);
+    expect(log(r.data(), 'patron.p1')).toEqual([]);
+    expect(checkpoint(r.data())?.position).toBe(10);
+    expect(r.data()['/view']).toEqual({ token: 't1', position: 10, refs: ['patron.*'] });
     expect(r.server.backfills.map((b) => b.ref)).toEqual(['patron.*']);
   });
 
@@ -213,7 +213,7 @@ describe('connector lifecycle', () => {
     r.server.events(ev('patron.p1', 3, 11));
     r.server.live(11);
     await settle();
-    expect(seq(r.data, 'patron.p1')).toBe(3);
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 11, reduced: 11 });
+    expect(seq(r.data(), 'patron.p1')).toBe(3);
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 11, reduced: 11 });
   });
 });

@@ -21,7 +21,7 @@ import {
 
 type Record_ = { until: number; replacing: boolean; children: string[] };
 const record = (r: Rig, ref: string): Record_ | undefined =>
-  r.data[`/backfill.${ref}`] as Record_ | undefined;
+  r.data()[`/backfill.${ref}`] as Record_ | undefined;
 
 const patrons: Blob = {
   position: 10,
@@ -62,7 +62,7 @@ async function freeze(r: Rig, position = 11): Promise<{ release: () => void }> {
   const hold = r.server.hold('patron.p2');
   r.server.events(ev('patron.p2', 9, position));
   await settle();
-  expect(seq(r.data, 'patron.p2')).toBe('backfill');
+  expect(seq(r.data(), 'patron.p2')).toBe('backfill');
   return {
     release: () => {
       r.server.blobs.set('patron.p2', {
@@ -82,23 +82,23 @@ describe('freeze and group land', () => {
     expect(record(r, 'patron.p2')).toMatchObject({ replacing: true, until: 11 });
     r.server.events(ev('patron.p1', 3, 12), ev('book.b1', 2, 13));
     await settle();
-    expect(log(r.data, 'patron.p1')).toEqual([]);
-    expect(seq(r.data, 'patron.p1')).toBe(2);
-    expect(seq(r.data, 'book.b1')).toBe(1);
-    expect(keys(r.data, '/park.ev.')).toEqual([
+    expect(log(r.data(), 'patron.p1')).toEqual([]);
+    expect(seq(r.data(), 'patron.p1')).toBe(2);
+    expect(seq(r.data(), 'book.b1')).toBe(1);
+    expect(keys(r.data(), '/park.ev.')).toEqual([
       parkedEvent('book.b1', 2),
       parkedEvent('patron.p1', 3),
       parkedEvent('patron.p2', 9),
     ]);
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 13, reduced: 10 });
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 13, reduced: 10 });
     release();
     await settle();
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 3, fields: {} });
-    expect(state(r.data, 'book.b1')).toEqual({ count: 2, fields: {} });
-    expect(state(r.data, 'patron.p2')).toEqual({ count: 9, fields: {} });
-    expect(keys(r.data, '/park')).toEqual([]);
-    expect(keys(r.data, '/backfill')).toEqual([]);
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 13, reduced: 13 });
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 3, fields: {} });
+    expect(state(r.data(), 'book.b1')).toEqual({ count: 2, fields: {} });
+    expect(state(r.data(), 'patron.p2')).toEqual({ count: 9, fields: {} });
+    expect(keys(r.data(), '/park')).toEqual([]);
+    expect(keys(r.data(), '/backfill')).toEqual([]);
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 13, reduced: 13 });
   });
 
   test('an additive backfill completing during a freeze lands only with the group', async () => {
@@ -113,16 +113,16 @@ describe('freeze and group land', () => {
     await settle();
     // downloaded and ready, but the base is frozen
     expect(record(r, 'book.b2')).toMatchObject({ replacing: false, until: 12 });
-    expect(state(r.data, 'book.b2')).toBeUndefined();
-    expect(seq(r.data, 'book.b2')).toBe('backfill');
-    expect(keys(r.data, '/park.kv.book.b2/')).toEqual(['/park.kv.book.b2/book.b2/state']);
+    expect(state(r.data(), 'book.b2')).toBeUndefined();
+    expect(seq(r.data(), 'book.b2')).toBe('backfill');
+    expect(keys(r.data(), '/park.kv.book.b2/')).toEqual(['/park.kv.book.b2/book.b2/state']);
     release();
     await settle();
-    expect(state(r.data, 'book.b2')).toEqual({ count: 1, fields: {} });
-    expect(seq(r.data, 'book.b2')).toBe(1);
-    expect(state(r.data, 'patron.p2')).toEqual({ count: 9, fields: {} });
-    expect(keys(r.data, '/backfill')).toEqual([]);
-    expect(keys(r.data, '/park')).toEqual([]);
+    expect(state(r.data(), 'book.b2')).toEqual({ count: 1, fields: {} });
+    expect(seq(r.data(), 'book.b2')).toBe(1);
+    expect(state(r.data(), 'patron.p2')).toEqual({ count: 9, fields: {} });
+    expect(keys(r.data(), '/backfill')).toEqual([]);
+    expect(keys(r.data(), '/park')).toEqual([]);
   });
 
   test('a replacing child under a still-downloading additive parent holds the freeze until the subtree lands', async () => {
@@ -139,7 +139,7 @@ describe('freeze and group land', () => {
     expect(record(r, 'patron.*')?.children).toEqual(['patron.p1']);
     r.server.events(ev('book.b1', 2, 13));
     await settle();
-    expect(keys(r.data, '/park.ev.book.b1/')).toEqual([parkedEvent('book.b1', 2)]);
+    expect(keys(r.data(), '/park.ev.book.b1/')).toEqual([parkedEvent('book.b1', 2)]);
     // the child completes; its parent is still downloading, so nothing lands
     r.server.blobs.set('patron.p1', {
       position: 12,
@@ -149,8 +149,8 @@ describe('freeze and group land', () => {
     child.go();
     await settle();
     expect(record(r, 'patron.p1')).toBeDefined();
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 2, fields: {} });
-    expect(state(r.data, 'book.b1')).toEqual({ count: 1, fields: {} });
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 2, fields: {} });
+    expect(state(r.data(), 'book.b1')).toEqual({ count: 1, fields: {} });
     // the parent completes: the subtree lands as one, and the frozen events with it
     r.server.blobs.set('patron.*', {
       position: 11,
@@ -162,13 +162,13 @@ describe('freeze and group land', () => {
     });
     fam.go();
     await settle();
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 7, fields: {} });
-    expect(seq(r.data, 'patron.p1')).toBe(7);
-    expect(state(r.data, 'patron.p2')).toEqual({ count: 1, fields: {} });
-    expect(state(r.data, 'book.b1')).toEqual({ count: 2, fields: {} });
-    expect(keys(r.data, '/backfill')).toEqual([]);
-    expect(keys(r.data, '/park')).toEqual([]);
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 13, reduced: 13 });
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 7, fields: {} });
+    expect(seq(r.data(), 'patron.p1')).toBe(7);
+    expect(state(r.data(), 'patron.p2')).toEqual({ count: 1, fields: {} });
+    expect(state(r.data(), 'book.b1')).toEqual({ count: 2, fields: {} });
+    expect(keys(r.data(), '/backfill')).toEqual([]);
+    expect(keys(r.data(), '/park')).toEqual([]);
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 13, reduced: 13 });
   });
 
   test('a revoke that drops the last replacing ref lands the frozen events in the same transaction', async () => {
@@ -176,16 +176,16 @@ describe('freeze and group land', () => {
     await freeze(r);
     r.server.events(ev('book.b1', 2, 12), ev('patron.p1', 3, 12));
     await settle();
-    expect(state(r.data, 'book.b1')).toEqual({ count: 1, fields: {} });
+    expect(state(r.data(), 'book.b1')).toEqual({ count: 1, fields: {} });
     r.server.view('t2', 13, ['book.b1']);
     await settle();
     expect(record(r, 'patron.p2')).toBeUndefined();
-    expect(seq(r.data, 'patron.p1')).toBeUndefined();
-    expect(seq(r.data, 'patron.p2')).toBeUndefined();
-    expect(keys(r.data, '/park')).toEqual([]);
-    expect(state(r.data, 'book.b1')).toEqual({ count: 2, fields: {} });
-    expect(seq(r.data, 'book.b1')).toBe(2);
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 12, reduced: 12 });
+    expect(seq(r.data(), 'patron.p1')).toBeUndefined();
+    expect(seq(r.data(), 'patron.p2')).toBeUndefined();
+    expect(keys(r.data(), '/park')).toEqual([]);
+    expect(state(r.data(), 'book.b1')).toEqual({ count: 2, fields: {} });
+    expect(seq(r.data(), 'book.b1')).toBe(2);
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 12, reduced: 12 });
   });
 
   test('a widening grant over the last replacing ref adopts it, and the freeze holds until the subtree lands', async () => {
@@ -202,8 +202,8 @@ describe('freeze and group land', () => {
     await settle();
     expect(record(r, 'patron.p1')).toMatchObject({ replacing: true, until: 11 });
     expect(record(r, 'patron.*')?.children).toEqual(['patron.p1']);
-    expect(keys(r.data, '/park.ev.book.b1/')).toEqual([parkedEvent('book.b1', 2)]);
-    expect(state(r.data, 'book.b1')).toEqual({ count: 1, fields: {} });
+    expect(keys(r.data(), '/park.ev.book.b1/')).toEqual([parkedEvent('book.b1', 2)]);
+    expect(state(r.data(), 'book.b1')).toEqual({ count: 1, fields: {} });
     r.server.blobs.set('patron.p1', {
       position: 11,
       seqs: { 'patron.p1': 7 },
@@ -219,13 +219,13 @@ describe('freeze and group land', () => {
     });
     child.go();
     await settle();
-    expect(state(r.data, 'book.b1')).toEqual({ count: 1, fields: {} });
+    expect(state(r.data(), 'book.b1')).toEqual({ count: 1, fields: {} });
     fam.go();
     await settle();
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 7, fields: {} });
-    expect(state(r.data, 'patron.p2')).toEqual({ count: 1, fields: {} });
-    expect(state(r.data, 'book.b1')).toEqual({ count: 2, fields: {} });
-    expect(keys(r.data, '/backfill')).toEqual([]);
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 7, fields: {} });
+    expect(state(r.data(), 'patron.p2')).toEqual({ count: 1, fields: {} });
+    expect(state(r.data(), 'book.b1')).toEqual({ count: 2, fields: {} });
+    expect(keys(r.data(), '/backfill')).toEqual([]);
   });
 
   test('frozen events on a stream a landing ref covers land once, through the ref', async () => {
@@ -235,11 +235,11 @@ describe('freeze and group land', () => {
     await settle();
     release();
     await settle();
-    expect(log(r.data, 'patron.p2')).toEqual(['bump']);
-    expect(state(r.data, 'patron.p2')).toEqual({ count: 10, fields: {} });
-    expect(seq(r.data, 'patron.p2')).toBe(10);
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 3, fields: {} });
-    expect(keys(r.data, '/park')).toEqual([]);
+    expect(log(r.data(), 'patron.p2')).toEqual(['bump']);
+    expect(state(r.data(), 'patron.p2')).toEqual({ count: 10, fields: {} });
+    expect(seq(r.data(), 'patron.p2')).toBe(10);
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 3, fields: {} });
+    expect(keys(r.data(), '/park')).toEqual([]);
   });
 
   test('a frozen event on a stream under an in-flight additive backfill stays parked through the group land', async () => {
@@ -252,10 +252,10 @@ describe('freeze and group land', () => {
     await settle();
     release();
     await settle();
-    expect(state(r.data, 'book.b1')).toEqual({ count: 2, fields: {} });
+    expect(state(r.data(), 'book.b1')).toEqual({ count: 2, fields: {} });
     expect(record(r, 'patron.p2')).toBeUndefined();
-    expect(seq(r.data, 'book.b2')).toBe('backfill');
-    expect(keys(r.data, '/park.ev.')).toEqual([parkedEvent('book.b2', 5)]);
+    expect(seq(r.data(), 'book.b2')).toBe('backfill');
+    expect(keys(r.data(), '/park.ev.')).toEqual([parkedEvent('book.b2', 5)]);
     expect(record(r, 'book.b2')).toBeDefined();
     r.server.blobs.set('book.b2', {
       position: 12,
@@ -264,9 +264,9 @@ describe('freeze and group land', () => {
     });
     b2.go();
     await settle();
-    expect(state(r.data, 'book.b2')).toEqual({ count: 5, fields: {} });
-    expect(seq(r.data, 'book.b2')).toBe(5);
-    expect(keys(r.data, '/park')).toEqual([]);
+    expect(state(r.data(), 'book.b2')).toEqual({ count: 5, fields: {} });
+    expect(seq(r.data(), 'book.b2')).toBe(5);
+    expect(keys(r.data(), '/park')).toEqual([]);
   });
 
   test.todo(
@@ -286,7 +286,7 @@ describe('freeze and group land', () => {
       { count: 2, fields: { x: 1 } },
     ]);
     // the base under it is untouched
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 2, fields: {} });
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 2, fields: {} });
     release();
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { x: 1 } });
@@ -320,14 +320,14 @@ describe('freeze and group land', () => {
     // book.b1 is revoked while patron.p2's replacing backfill is still in flight
     r.server.view('t2', 12, ['patron.*']);
     await settle();
-    expect(seq(r.data, 'patron.p2')).toBe('backfill');
-    expect(state(r.data, 'book.b1')).toBeUndefined();
+    expect(seq(r.data(), 'patron.p2')).toBe('backfill');
+    expect(state(r.data(), 'book.b1')).toBeUndefined();
     expect(w.values).toEqual([{ count: 1, fields: {} }, undefined]);
 
     // the unfreeze delivers nothing more for it
     release();
     await settle();
-    expect(seq(r.data, 'patron.p2')).toBe(9);
+    expect(seq(r.data(), 'patron.p2')).toBe(9);
     expect(w.values).toEqual([{ count: 1, fields: {} }, undefined]);
   });
 
@@ -344,16 +344,16 @@ describe('freeze and group land', () => {
     r.server.view('t2', 12, ['patron.*', 'book.b1', 'book.b2']);
     await settle();
     expect(record(r, 'book.b2')).toBeDefined();
-    expect(state(r.data, 'book.b2')).toBeUndefined();
+    expect(state(r.data(), 'book.b2')).toBeUndefined();
 
     // revoking the patrons drops the replacing backfill on patron.p2, and that unfreezes; the
     // frame that unfroze lands book.b2 without waiting for any outcome
     r.server.view('t3', 13, ['book.b1', 'book.b2']);
     await settle();
-    expect(seq(r.data, 'patron.p2')).toBeUndefined();
+    expect(seq(r.data(), 'patron.p2')).toBeUndefined();
     expect(record(r, 'book.b2')).toBeUndefined();
-    expect(state(r.data, 'book.b2')).toEqual({ count: 1, fields: {} });
-    expect(seq(r.data, 'book.b2')).toBe(1);
+    expect(state(r.data(), 'book.b2')).toEqual({ count: 1, fields: {} });
+    expect(seq(r.data(), 'book.b2')).toBe(1);
   });
 
   test.todo('a status-only query runs while frozen: no status key yet');

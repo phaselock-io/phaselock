@@ -26,6 +26,6 @@ describe('an event that fails its schema', () => {
     expect(message).toMatch(/12/);
     expect(message).toMatch(/\$\.type: invalid/);
     // the transaction rolled back: the valid event is not in the base either
-    expect(state(r.data, 'patron.p1')).toBeUndefined();
+    expect(state(r.data(), 'patron.p1')).toBeUndefined();
   });
 });

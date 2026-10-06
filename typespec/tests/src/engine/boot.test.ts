@@ -32,7 +32,7 @@ function persisted(): Record<string, unknown> {
 
 describe('boot', () => {
   test('the factory is called with the stored checkpoint and view token', async () => {
-    const r = rig({ data: persisted() });
+    const r = rig({ seed: persisted() });
     await settle();
     expect(r.server.conns.length).toBe(1);
     expect(r.server.conn.since).toBe(42);
@@ -48,7 +48,7 @@ describe('boot', () => {
   });
 
   test('the streams table is rebuilt from /seq.: a held stream reduces, a marked one parks', async () => {
-    const r = rig({ data: persisted() });
+    const r = rig({ seed: persisted() });
     await settle();
     r.server.open();
     r.server.events(
@@ -56,11 +56,11 @@ describe('boot', () => {
       ev('book.b1', 9, 43),
     );
     await settle();
-    expect(log(r.data, 'patron.p1')).toEqual(['bump', 'bump', 'set a=1']);
-    expect(seq(r.data, 'patron.p1')).toBe(3);
-    expect(state(r.data, 'book.b1')).toBeUndefined();
-    expect(keys(r.data, '/park.ev.')).toEqual([parkedEvent('book.b1', 9)]);
-    expect(seq(r.data, 'book.b1')).toBe('backfill');
+    expect(log(r.data(), 'patron.p1')).toEqual(['bump', 'bump', 'set a=1']);
+    expect(seq(r.data(), 'patron.p1')).toBe(3);
+    expect(state(r.data(), 'book.b1')).toBeUndefined();
+    expect(keys(r.data(), '/park.ev.')).toEqual([parkedEvent('book.b1', 9)]);
+    expect(seq(r.data(), 'book.b1')).toBe('backfill');
   });
 
   test('in-flight backfills are rebuilt from /backfill. and resumed from their resume', async () => {
@@ -77,13 +77,13 @@ describe('boot', () => {
       '/backfill-seqs.book.*': { 'book.b1': 5 },
       '/park.kv.book.*/book.b1/state': { count: 5, fields: {} },
     };
-    const r = rig({ data });
+    const r = rig({ seed: data });
     r.server.hold('book.*');
     await settle();
     expect(r.server.backfills).toEqual([{ ref: 'book.*', until: 40, resume }]);
     // nothing parked was touched by the boot
-    expect(r.data['/park.kv.book.*/book.b1/state']).toEqual({ count: 5, fields: {} });
-    expect(r.data['/backfill-seqs.book.*']).toEqual({ 'book.b1': 5 });
+    expect(r.data()['/park.kv.book.*/book.b1/state']).toEqual({ count: 5, fields: {} });
+    expect(r.data()['/backfill-seqs.book.*']).toEqual({ 'book.b1': 5 });
   });
 
   test('a finished download boots ready and lands at boot, before any connection', async () => {
@@ -100,13 +100,13 @@ describe('boot', () => {
       '/backfill-seqs.book.*': { 'book.b1': 5 },
       '/park.kv.book.*/book.b1/state': { count: 5, fields: {} },
     };
-    const r = rig({ data });
+    const r = rig({ seed: data });
     await settle();
     expect(r.server.backfills).toEqual([]);
-    expect(seq(r.data, 'book.b1')).toBe(5);
-    expect(state(r.data, 'book.b1')).toEqual({ count: 5, fields: {} });
-    expect(keys(r.data, '/backfill')).toEqual([]);
-    expect(keys(r.data, '/park.kv.')).toEqual([]);
+    expect(seq(r.data(), 'book.b1')).toBe(5);
+    expect(state(r.data(), 'book.b1')).toEqual({ count: 5, fields: {} });
+    expect(keys(r.data(), '/backfill')).toEqual([]);
+    expect(keys(r.data(), '/park.kv.')).toEqual([]);
   });
 
   test('a stream outside the wants is purged at boot, and its view ref with it', async () => {
@@ -124,16 +124,16 @@ describe('boot', () => {
         servertime: 0,
       },
     };
-    const r = rig({ data, wants: ['patron.*'] });
+    const r = rig({ seed: data, wants: ['patron.*'] });
     await settle();
-    expect(keys(r.data, 'book.')).toEqual([]);
-    expect(seq(r.data, 'book.b1')).toBeUndefined();
-    expect(seq(r.data, 'book.b2')).toBeUndefined();
-    expect(keys(r.data, '/park.ev.')).toEqual([]);
-    expect(r.data['/view']).toEqual({ token: 't7', position: 40, refs: ['patron.*'] });
+    expect(keys(r.data(), 'book.')).toEqual([]);
+    expect(seq(r.data(), 'book.b1')).toBeUndefined();
+    expect(seq(r.data(), 'book.b2')).toBeUndefined();
+    expect(keys(r.data(), '/park.ev.')).toEqual([]);
+    expect(r.data()['/view']).toEqual({ token: 't7', position: 40, refs: ['patron.*'] });
     // the wanted stream is untouched, and the connection presents the stored token
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 2, fields: {} });
-    expect(seq(r.data, 'patron.p1')).toBe(2);
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 2, fields: {} });
+    expect(seq(r.data(), 'patron.p1')).toBe(2);
     expect(r.server.conn.view).toBe('t7');
     expect(r.server.conn.wants).toEqual(['patron.*']);
   });
@@ -152,12 +152,12 @@ describe('boot', () => {
       '/backfill-seqs.book.*': { 'book.b1': 5 },
       '/park.kv.book.*/book.b1/state': { count: 5, fields: {} },
     };
-    const r = rig({ data, wants: ['patron.*'] });
+    const r = rig({ seed: data, wants: ['patron.*'] });
     await settle();
     expect(r.server.backfills).toEqual([]);
-    expect(keys(r.data, '/backfill')).toEqual([]);
-    expect(keys(r.data, '/park.kv.')).toEqual([]);
-    expect(seq(r.data, 'book.b1')).toBeUndefined();
+    expect(keys(r.data(), '/backfill')).toEqual([]);
+    expect(keys(r.data(), '/park.kv.')).toEqual([]);
+    expect(seq(r.data(), 'book.b1')).toBeUndefined();
   });
 
   test('a backfill of * stays under wants of *, and goes under narrower wants', async () => {
@@ -178,17 +178,17 @@ describe('boot', () => {
       },
       '/backfill-seqs.*': {},
     });
-    const kept = rig({ data: data() });
+    const kept = rig({ seed: data() });
     await settle();
     expect(kept.server.backfills.map((b) => b.ref)).toEqual(['*']);
     kept.abort.abort();
     await settle();
 
-    const purged = rig({ data: data(), wants: ['patron.*', 'book.*'] });
+    const purged = rig({ seed: data(), wants: ['patron.*', 'book.*'] });
     await settle();
     expect(purged.server.backfills).toEqual([]);
-    expect(keys(purged.data, '/backfill')).toEqual([]);
-    expect(purged.data['/view']).toEqual({ token: 't7', position: 40, refs: [] });
+    expect(keys(purged.data(), '/backfill')).toEqual([]);
+    expect(purged.data()['/view']).toEqual({ token: 't7', position: 40, refs: [] });
   });
 
   test('purging the last replacing backfill unfreezes and lands the frozen events', async () => {
@@ -218,13 +218,13 @@ describe('boot', () => {
         servertime: 0,
       },
     };
-    const r = rig({ data, wants: ['patron.*'] });
+    const r = rig({ seed: data, wants: ['patron.*'] });
     await settle();
-    expect(keys(r.data, '/backfill')).toEqual([]);
-    expect(log(r.data, 'patron.p1')).toEqual(['bump', 'bump', 'set a=1']);
-    expect(seq(r.data, 'patron.p1')).toBe(3);
-    expect(keys(r.data, '/park.ev.')).toEqual([]);
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 43, reduced: 43 });
+    expect(keys(r.data(), '/backfill')).toEqual([]);
+    expect(log(r.data(), 'patron.p1')).toEqual(['bump', 'bump', 'set a=1']);
+    expect(seq(r.data(), 'patron.p1')).toBe(3);
+    expect(keys(r.data(), '/park.ev.')).toEqual([]);
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 43, reduced: 43 });
   });
 
   test('the outbox is rebuilt in ordinal order, flushed on connect, and the next ordinal continues', async () => {
@@ -234,19 +234,19 @@ describe('boot', () => {
       [commandKey(5)]: { id: 'c5', data: bytes({ type: 'bump', id: 'p1' }) },
       [commandKey(10)]: { id: 'c10', data: bytes({ type: 'bump', id: 'p1' }) },
     };
-    const r = rig({ data });
+    const r = rig({ seed: data });
     await settle();
     expect(r.server.sends.length).toBe(1);
     expect(r.server.sends[0].map((c) => c.id)).toEqual(['c3', 'c5', 'c10']);
     r.engine.sendCommand({ type: 'bump', id: 'p2' });
     await settle();
-    expect(keys(r.data, '/command.')).toEqual([
+    expect(keys(r.data(), '/command.')).toEqual([
       commandKey(3),
       commandKey(5),
       commandKey(10),
       commandKey(11),
     ]);
-    expect(parse((r.data[commandKey(11)] as { data: Uint8Array }).data)).toEqual({
+    expect(parse((r.data()[commandKey(11)] as { data: Uint8Array }).data)).toEqual({
       type: 'bump',
       id: 'p2',
     });
@@ -256,7 +256,7 @@ describe('boot', () => {
 
   test('/checkpoint loads: the reduced position is restored and gates ack releases', async () => {
     const data = { ...persisted(), '/checkpoint': { epoch: 'e1', position: 42, reduced: 30 } };
-    const r = rig({ data });
+    const r = rig({ seed: data });
     await settle();
     r.server.open();
     // an ack above the restored reduced position waits
@@ -264,18 +264,18 @@ describe('boot', () => {
       Promise.resolve(cmds.map(() => ({ kind: 'ack' as const, position: 35 })));
     r.engine.sendCommand({ type: 'bump', id: 'p1' });
     await settle();
-    expect(keys(r.data, '/command.').length).toBe(1);
+    expect(keys(r.data(), '/command.').length).toBe(1);
     // one at it releases at once
     r.server.onSend = (cmds) =>
       Promise.resolve(cmds.map(() => ({ kind: 'ack' as const, position: 30 })));
     r.engine.sendCommand({ type: 'noop', id: 'p1' });
     await settle();
     expect(r.server.sends.length).toBe(2);
-    expect(keys(r.data, '/command.').length).toBe(1);
+    expect(keys(r.data(), '/command.').length).toBe(1);
   });
 
   test('a connection from another epoch ends the Engine', async () => {
-    const r = rig({ data: persisted() });
+    const r = rig({ seed: persisted() });
     await settle();
     r.server.open('e2');
     await expect(settle()).rejects.toThrow(/epoch e2, checkpoint from e1/);

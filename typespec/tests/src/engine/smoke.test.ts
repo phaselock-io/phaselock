@@ -24,18 +24,18 @@ describe('smoke', () => {
       },
     });
     expect(r.server.backfills.map((b) => [b.ref, b.until])).toEqual([['patron.*', 10]]);
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 2, fields: {} });
-    expect(seq(r.data, 'patron.p1')).toBe(2);
-    expect(seq(r.data, 'patron.p2')).toBe(1);
-    expect(keys(r.data, '/backfill')).toEqual([]);
-    expect(keys(r.data, '/park')).toEqual([]);
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 10, reduced: 10 });
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 2, fields: {} });
+    expect(seq(r.data(), 'patron.p1')).toBe(2);
+    expect(seq(r.data(), 'patron.p2')).toBe(1);
+    expect(keys(r.data(), '/backfill')).toEqual([]);
+    expect(keys(r.data(), '/park')).toEqual([]);
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 10, reduced: 10 });
 
     r.server.events(ev('patron.p1', 3, 11, { type: 'set', field: 'name', value: 'Ann' }));
     await settle();
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 2, fields: { name: 'Ann' } });
-    expect(log(r.data, 'patron.p1')).toEqual(['set name=Ann']);
-    expect(seq(r.data, 'patron.p1')).toBe(3);
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 11, reduced: 11 });
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 2, fields: { name: 'Ann' } });
+    expect(log(r.data(), 'patron.p1')).toEqual(['set name=Ann']);
+    expect(seq(r.data(), 'patron.p1')).toBe(3);
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 11, reduced: 11 });
   });
 });

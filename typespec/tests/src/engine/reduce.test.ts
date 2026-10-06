@@ -37,8 +37,8 @@ describe('the reducer protocol', () => {
     r.server.events(ev('patron.p1', 3, 11));
     await settle();
     expect(calls).toEqual([{ stream: 'patron.p1', pending: false }]);
-    expect(r.data['patron.p1/marker']).toEqual({ count: 1, fields: {} });
-    expect(r.data['marker']).toBeUndefined();
+    expect(r.data()['patron.p1/marker']).toEqual({ count: 1, fields: {} });
+    expect(r.data()['marker']).toBeUndefined();
   });
 
   test("a forecast's events reach the reducer with pending true, and stay off the base", async () => {
@@ -55,7 +55,7 @@ describe('the reducer protocol', () => {
     await settle();
     expect(calls).toContainEqual({ stream: 'patron.p2', pending: true });
     expect(calls).not.toContainEqual({ stream: 'patron.p2', pending: false });
-    expect(r.data['patron.p2/marker']).toBeUndefined();
+    expect(r.data()['patron.p2/marker']).toBeUndefined();
   });
 });
 
@@ -104,7 +104,7 @@ describe('forecasts', () => {
     r.engine.sendCommand({ emit: [{ stream: 'patron.p1', death: true }] });
     await settle();
     expect(p1.values.at(-1)).toBeUndefined();
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 2, fields: {} });
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 2, fields: {} });
   });
 });
 

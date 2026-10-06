@@ -100,7 +100,7 @@ async function freeze(r: Rig, position = 11): Promise<() => void> {
   const hold = r.server.hold('patron.p2');
   r.server.events(ev('patron.p2', 9, position));
   await settle();
-  expect(seq(r.data, 'patron.p2')).toBe('backfill');
+  expect(seq(r.data(), 'patron.p2')).toBe('backfill');
   return () => {
     r.server.blobs.set('patron.p2', {
       position,
@@ -117,7 +117,7 @@ describe('outbox rows and sends', () => {
     r.engine.sendCommand({ field: 'a', value: 1 });
     r.engine.sendCommand({ field: 'b', value: 2 });
     await settle();
-    const rows = outbox(r.data);
+    const rows = outbox(r.data());
     expect(rows.map((x) => x.key)).toEqual([
       '/command.00000000000000000000',
       '/command.00000000000000000001',
@@ -146,14 +146,14 @@ describe('outbox rows and sends', () => {
     await settle();
     calls[0].resolve([ack(15), dup(16), reject, conflict]);
     await settle();
-    const rows = outbox(r.data);
+    const rows = outbox(r.data());
     expect(rows.map((x) => x.data)).toEqual([{ field: 'a' }, { field: 'b' }]);
     r.server.vouch(15);
     await settle();
-    expect(outbox(r.data).map((x) => x.data)).toEqual([{ field: 'b' }]);
+    expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'b' }]);
     r.server.vouch(16);
     await settle();
-    expect(outbox(r.data)).toEqual([]);
+    expect(outbox(r.data())).toEqual([]);
   });
 
   test('an event carrying the command id releases it when reduced, before the ack', async () => {
@@ -161,16 +161,16 @@ describe('outbox rows and sends', () => {
     const calls = sendControl(r.server);
     r.engine.sendCommand({ field: 'a' });
     await settle();
-    const id = outbox(r.data)[0].id;
+    const id = outbox(r.data())[0].id;
     r.server.events(ev('patron.p1', 3, 11, { type: 'set', field: 'a', value: 1 }, id));
     await settle();
-    expect(outbox(r.data)).toEqual([]);
-    expect(log(r.data, 'patron.p1')).toEqual(['set a=1']);
+    expect(outbox(r.data())).toEqual([]);
+    expect(log(r.data(), 'patron.p1')).toEqual(['set a=1']);
     // the late ack finds nothing to release and changes nothing
     calls[0].resolve([ack(11)]);
     await settle();
-    expect(outbox(r.data)).toEqual([]);
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 2, fields: { a: 1 } });
+    expect(outbox(r.data())).toEqual([]);
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 2, fields: { a: 1 } });
   });
 
   test("a failed call's commands wait for the connection's end; the next connection resends them in order in one call", async () => {
@@ -181,7 +181,7 @@ describe('outbox rows and sends', () => {
     await settle();
     calls[0].reject(new Error('500'));
     await settle();
-    expect(outbox(r.data).length).toBe(2);
+    expect(outbox(r.data()).length).toBe(2);
     // the connection has not ended yet, so a new command goes alone
     r.engine.sendCommand({ field: 'c' });
     await settle();
@@ -209,7 +209,7 @@ describe('outbox rows and sends', () => {
     const r = rig({
       forecaster,
       server,
-      data: {
+      seed: {
         '/view': { token: 't1', position: 10, refs: ['patron.*'] },
         '/checkpoint': { epoch: 'e1', position: 10, reduced: 10 },
         '/seq.patron.p1': 2,
@@ -231,7 +231,7 @@ describe('outbox rows and sends', () => {
     // acked like any other command
     calls[0].resolve([ack(10)]);
     await settle();
-    expect(keys(r.data, '/command.')).toEqual([]);
+    expect(keys(r.data(), '/command.')).toEqual([]);
   });
 
   test('a new connection flushes every command not acked, in ordinal order, in one call', async () => {
@@ -251,7 +251,7 @@ describe('outbox rows and sends', () => {
     await settle();
     expect(r.server.sends.length).toBe(3);
     expect(r.server.sends[2].map((c) => parse(c.data))).toEqual([{ field: 'b' }, { field: 'c' }]);
-    expect(outbox(r.data).length).toBe(3);
+    expect(outbox(r.data()).length).toBe(3);
   });
 
   test('commands survive a restart in order and are flushed on connect; the next ordinal continues', async () => {
@@ -265,14 +265,14 @@ describe('outbox rows and sends', () => {
     const server = new FakeServer();
     server.blobs.set('patron.*', patrons);
     const calls = sendControl(server);
-    const r2 = rig({ data: r.data, server, forecaster });
+    const r2 = rig({ store: r.store, server, forecaster });
     await settle();
     expect(server.sends.length).toBe(1);
     expect(server.sends[0].map((c) => parse(c.data))).toEqual([{ field: 'a' }, { field: 'b' }]);
     expect(calls.length).toBe(1);
     r2.engine.sendCommand({ field: 'c' });
     await settle();
-    expect(outbox(r2.data).map((x) => x.key)).toEqual([
+    expect(outbox(r2.data()).map((x) => x.key)).toEqual([
       '/command.00000000000000000000',
       '/command.00000000000000000001',
       '/command.00000000000000000002',
@@ -286,23 +286,23 @@ describe('outbox rows and sends', () => {
     await settle();
     calls[0].resolve([ack(15)]);
     await settle();
-    expect(outbox(r.data).length).toBe(1);
+    expect(outbox(r.data()).length).toBe(1);
     r.abort.abort();
     await settle();
     const server = new FakeServer();
     server.blobs.set('patron.*', patrons);
     const calls2 = sendControl(server);
-    rig({ data: r.data, server, forecaster });
+    rig({ store: r.store, server, forecaster });
     await settle();
     expect(server.sends.length).toBe(1);
     expect(server.sends[0].map((c) => parse(c.data))).toEqual([{ field: 'a' }]);
     calls2[0].resolve([dup(15)]);
     await settle();
-    expect(outbox(r.data).length).toBe(1);
+    expect(outbox(r.data()).length).toBe(1);
     server.open();
     server.vouch(15);
     await settle();
-    expect(outbox(r.data)).toEqual([]);
+    expect(outbox(r.data())).toEqual([]);
   });
 });
 
@@ -320,7 +320,7 @@ describe('forecasts', () => {
     r.server.events(ev('patron.p1', 3, 11));
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 3, fields: { a: 1 } });
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 3, fields: {} });
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 3, fields: {} });
   });
 
   test('forecasts run in outbox order, each reading the overlay the earlier ones left', async () => {
@@ -340,9 +340,9 @@ describe('forecasts', () => {
     r.engine.sendCommand({ reason: true });
     r.engine.sendCommand({ ghost: true });
     await settle();
-    expect(outbox(r.data).length).toBe(2);
+    expect(outbox(r.data()).length).toBe(2);
     expect(w.values.at(-1)).toEqual({ count: 2, fields: {} });
-    expect(keys(r.data, 'ghost')).toEqual([]);
+    expect(keys(r.data(), 'ghost')).toEqual([]);
   });
 
   test('a dropped command rebuilds the overlay and runs the graph even while frozen', async () => {
@@ -355,8 +355,8 @@ describe('forecasts', () => {
     await freeze(r);
     calls[0].resolve([reject]);
     await settle();
-    expect(seq(r.data, 'patron.p2')).toBe('backfill');
-    expect(outbox(r.data)).toEqual([]);
+    expect(seq(r.data(), 'patron.p2')).toBe('backfill');
+    expect(outbox(r.data())).toEqual([]);
     expect(w.values.at(-1)).toEqual({ count: 2, fields: {} });
   });
 });
@@ -374,26 +374,26 @@ describe('the reduced position', () => {
     const hold = r.server.hold('patron.p2');
     r.server.events(ev('patron.p1', 3, 11), ev('patron.p2', 9, 12));
     await settle();
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 12, reduced: 11 });
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 12, reduced: 11 });
     // frozen: the base change reaches no query
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1, b: 2 } });
     calls[0].resolve([ack(11), ack(12)]);
     await settle();
-    expect(outbox(r.data).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
+    expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
     // the release rebuilds the overlay over the reduced base, b's forecast still on it
     expect(w.values.at(-1)).toEqual({ count: 3, fields: { b: 2 } });
     // a vouch moves the cursor but not the reduced position while frozen
     r.server.vouch(20);
     await settle();
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 20, reduced: 11 });
-    expect(outbox(r.data).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 20, reduced: 11 });
+    expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
     // an ack at a position already reduced past releases at once, frozen or not
     r.engine.sendCommand({ field: 'c', value: 3 });
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 3, fields: { b: 2, c: 3 } });
     calls[1].resolve([ack(5)]);
     await settle();
-    expect(outbox(r.data).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
+    expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
     // b's forecast never left the overlay through the freeze
     for (const v of w.values.slice(1)) expect(v?.fields.b).toBe(2);
     // the unfreeze moves the reduced position to the checkpoint and releases b
@@ -404,8 +404,8 @@ describe('the reduced position', () => {
     });
     hold.go();
     await settle();
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 20, reduced: 20 });
-    expect(outbox(r.data)).toEqual([]);
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 20, reduced: 20 });
+    expect(outbox(r.data())).toEqual([]);
     expect(w.values.at(-1)).toEqual({ count: 3, fields: {} });
   });
 
@@ -415,7 +415,7 @@ describe('the reduced position', () => {
     r.server.events(ev('patron.p1', 3, 11), ev('patron.p2', 9, 12));
     r.server.vouch(20);
     await settle();
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 20, reduced: 11 });
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 20, reduced: 11 });
     void hold;
     r.abort.abort();
     await settle();
@@ -423,7 +423,7 @@ describe('the reduced position', () => {
     server.blobs.set('patron.*', patrons);
     server.hold('patron.p2');
     const calls = sendControl(server);
-    const r2 = rig({ data: r.data, server, forecaster });
+    const r2 = rig({ store: r.store, server, forecaster });
     await settle();
     expect(server.conn.since).toBe(20);
     r2.engine.sendCommand({ field: 'a' });
@@ -431,7 +431,7 @@ describe('the reduced position', () => {
     await settle();
     calls[0].resolve([ack(11), ack(12)]);
     await settle();
-    expect(outbox(r2.data).map((x) => x.data)).toEqual([{ field: 'b' }]);
+    expect(outbox(r2.data()).map((x) => x.data)).toEqual([{ field: 'b' }]);
   });
 
   test('the round trip is observed in a landed backfill tail', async () => {
@@ -442,7 +442,7 @@ describe('the reduced position', () => {
     sendControl(server);
     r.engine.sendCommand({ field: 'a' });
     await settle();
-    const id = outbox(r.data)[0].id;
+    const id = outbox(r.data())[0].id;
     server.blobs.set('patron.*', {
       position: 8,
       seqs: { 'patron.p1': 2 },
@@ -451,8 +451,8 @@ describe('the reduced position', () => {
     });
     hold.go();
     await settle();
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 2, fields: { a: 1 } });
-    expect(outbox(r.data)).toEqual([]);
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 2, fields: { a: 1 } });
+    expect(outbox(r.data())).toEqual([]);
   });
 
   test('the round trip is observed in the frozen walk', async () => {
@@ -460,16 +460,16 @@ describe('the reduced position', () => {
     sendControl(r.server);
     r.engine.sendCommand({ field: 'a' });
     await settle();
-    const id = outbox(r.data)[0].id;
+    const id = outbox(r.data())[0].id;
     const unfreeze = await freeze(r);
     r.server.events(ev('patron.p1', 3, 12, { type: 'set', field: 'a', value: 1 }, id));
     await settle();
-    expect(outbox(r.data).length).toBe(1);
-    expect(log(r.data, 'patron.p1')).toEqual([]);
+    expect(outbox(r.data()).length).toBe(1);
+    expect(log(r.data(), 'patron.p1')).toEqual([]);
     unfreeze();
     await settle();
-    expect(log(r.data, 'patron.p1')).toEqual(['set a=1']);
-    expect(outbox(r.data)).toEqual([]);
+    expect(log(r.data(), 'patron.p1')).toEqual(['set a=1']);
+    expect(outbox(r.data())).toEqual([]);
   });
 
   test('a no-op command acked during a freeze is released at the unfreeze', async () => {
@@ -481,12 +481,12 @@ describe('the reduced position', () => {
     calls[0].resolve([ack(15)]);
     r.server.vouch(15);
     await settle();
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 15, reduced: 10 });
-    expect(outbox(r.data).length).toBe(1);
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, reduced: 10 });
+    expect(outbox(r.data()).length).toBe(1);
     unfreeze();
     await settle();
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 15, reduced: 15 });
-    expect(outbox(r.data)).toEqual([]);
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, reduced: 15 });
+    expect(outbox(r.data())).toEqual([]);
   });
 });
 
@@ -515,7 +515,7 @@ describe('@online commands', () => {
       [{ field: 'b' }],
     ]);
     // never persisted, never forecast
-    expect(outbox(r.data).map((x) => x.data)).toEqual([{ field: 'a' }, { field: 'b' }]);
+    expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'a' }, { field: 'b' }]);
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1, b: 1 } });
   });
 
@@ -620,7 +620,7 @@ describe('@online commands', () => {
     const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
     await settle();
     expect((t.error as Error).message).toBe('no connection');
-    expect(outbox(r.data).map((x) => x.data)).toEqual([{ field: 'a' }]);
+    expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'a' }]);
     r.engine.reconnectNow();
     await settle();
     expect(r.server.sends.map((call) => call.map((c) => parse(c.data)))).toEqual([

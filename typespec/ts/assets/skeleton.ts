@@ -634,11 +634,13 @@ function readHalf(txn: RTxn): WTxn {
 
 // in-memory layers /////////////////////////////////////////////////////////
 
-/* The in-memory and overlay stores keep rich js values, converting through the Registry on the
-   way in and out, in a base map plus a map of pending updates (undefined marks a deletion), and
-   answer range operations by sorting keys. */
+/* The in-memory store and the overlay keep rich js values, converting through the Registry on the
+   way in and out.  Each keeps a base map, and each transaction keeps a map of pending updates over
+   it, in which undefined marks a deletion.  The store also keeps its keys in a KeyList, so a scan
+   seeks to its first key and walks from there; the overlay holds only the few keys forecasts
+   write, and sorts them for each range operation. */
 
-type Layer = Record<string, unknown>;
+type Layer = Map<string, unknown>;
 
 /* The in-memory layers hand values across their boundary by copy.  On the way in, a JS value the
    caller supplied is copied, and a conversion from another representation is already fresh; on
@@ -652,6 +654,14 @@ function layerOut(reg: Registry, type: string, js: unknown, rep: Rep): unknown {
   return rep === JS ? copyValue(js) : reg.convert(type, js, JS, rep);
 }
 
+// a comparison exact in code-point order whenever one side is one of keys
+function exactFor(keys: (string | undefined)[]): (a: string, b: string) => number {
+  return keys.some((k) => k !== undefined && HIGH_UNIT.test(k)) ? compareKeys : unitCompare;
+}
+
+// a comparison exact against a range's bounds
+const boundsCompare = (r: StoreRange) => exactFor([r.gte, r.gt, r.lte, r.lt]);
+
 function inRange(key: string, r: StoreRange, cmp: (a: string, b: string) => number): boolean {
   if (r.gte !== undefined && cmp(key, r.gte) < 0) return false;
   if (r.gt !== undefined && cmp(key, r.gt) <= 0) return false;
@@ -660,20 +670,19 @@ function inRange(key: string, r: StoreRange, cmp: (a: string, b: string) => numb
   return true;
 }
 
-// the live keys of updates over data, sorted in walk order, restricted to a range
-function layerKeys(data: Layer, updates: Layer, r: StoreRange): string[] {
-  // bounds holding no high unit compare exactly in code-unit order
-  const bounds = [r.gte, r.gt, r.lte, r.lt];
-  const high = bounds.some((b) => b !== undefined && HIGH_UNIT.test(b));
-  const cmp = high ? compareKeys : unitCompare;
-
-  // collect the live keys in range
+// the live keys of layers inside a range, sorted in walk order; the last layer holding a key
+// decides whether it is live
+function layerKeys(layers: Layer[], r: StoreRange): string[] {
+  // collect the live keys in range, each from the last layer holding it
+  const cmp = boundsCompare(r);
+  const seen = new Set<string>();
   const keys: string[] = [];
-  for (const k of Object.keys(data)) {
-    if (!(k in updates) && data[k] !== undefined && inRange(k, r, cmp)) keys.push(k);
-  }
-  for (const k of Object.keys(updates)) {
-    if (updates[k] !== undefined && inRange(k, r, cmp)) keys.push(k);
+  for (let i = layers.length - 1; i >= 0; i--) {
+    for (const [k, v] of layers[i]) {
+      if (seen.has(k)) continue;
+      seen.add(k);
+      if (v !== undefined && inRange(k, r, cmp)) keys.push(k);
+    }
   }
 
   // order them for the walk
@@ -683,7 +692,7 @@ function layerKeys(data: Layer, updates: Layer, r: StoreRange): string[] {
 }
 
 function layerGet(data: Layer, updates: Layer, key: string): unknown {
-  return key in updates ? updates[key] : data[key];
+  return updates.has(key) ? updates.get(key) : data.get(key);
 }
 
 // one batch over sorted keys: cut to the limit, and name the resume key when more remain
@@ -703,52 +712,198 @@ function batch(
   return { entries, next };
 }
 
-function layerDelPrefix(data: Layer, updates: Layer, prefix: string): string[] {
-  const keys = layerKeys(data, updates, prefixRange(prefix, Infinity, false));
-  for (const k of keys) updates[k] = undefined;
-  return keys;
-}
-
-function layerMove(data: Layer, updates: Layer, src: string, dst: string): string[] {
-  const keys = layerKeys(data, updates, prefixRange(src, Infinity, false));
-  const moved: string[] = [];
-  for (const k of keys) {
-    const to = dst + k.slice(src.length);
-    updates[to] = layerGet(data, updates, k);
-    updates[k] = undefined;
-    moved.push(to);
+// the first index below n where before answers false, or n; before answers true, then false
+function bisect(n: number, before: (i: number) => boolean): number {
+  let lo = 0;
+  let hi = n;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (before(mid)) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
   }
-  return moved;
+  return lo;
 }
 
-/** InMemStore keeps values in their JS form in one object, the one given to the constructor if
-    any, so a test can seed the store and read it back through that object.  Values cross the
-    transaction boundary by copy; the constructor's object is the store's memory itself. */
+// the later and the earlier of two positions in a KeyList
+const later = (p: [number, number], q: [number, number]) =>
+  p[0] > q[0] || (p[0] === q[0] && p[1] > q[1]) ? p : q;
+const earlier = (p: [number, number], q: [number, number]) => (later(p, q) === p ? q : p);
+
+/* KeyList is a sorted list of distinct keys, cut into blocks that put end to end are the whole
+   list.  A block holds at most 2 * BLOCK keys and, unless it is the only one, at least BLOCK / 4,
+   so an insert or a removal splices one short array, and finding a position is a binary search over
+   the blocks' last keys and then one inside a block.  A block is never empty. */
+const BLOCK = 1024;
+
+class KeyList {
+  #blocks: string[][] = [];
+
+  /** a list over keys that are already sorted and distinct, in blocks of even size */
+  static of(sorted: string[]): KeyList {
+    const list = new KeyList();
+    if (sorted.length === 0) return list;
+    const size = Math.ceil(sorted.length / Math.ceil(sorted.length / BLOCK));
+    for (let i = 0; i < sorted.length; i += size) list.#blocks.push(sorted.slice(i, i + size));
+    return list;
+  }
+
+  /** insert a key the list does not hold */
+  add(key: string): void {
+    const blocks = this.#blocks;
+    if (blocks.length === 0) {
+      blocks.push([key]);
+      return;
+    }
+
+    // find its place; a key above every block's last key goes at the end of the last block
+    let [b, i] = this.#seek(key, false, exactFor([key]));
+    if (b === blocks.length) {
+      b--;
+      i = blocks[b].length;
+    }
+    const block = blocks[b];
+    block.splice(i, 0, key);
+
+    // a block grown too long splits in two
+    if (block.length > 2 * BLOCK) blocks.splice(b + 1, 0, block.splice(block.length >> 1));
+  }
+
+  /** remove a key the list holds */
+  remove(key: string): void {
+    const blocks = this.#blocks;
+    const [b, i] = this.#seek(key, false, exactFor([key]));
+    if (blocks[b]?.[i] !== key) throw new Error(`KeyList holds no ${JSON.stringify(key)}`);
+    const block = blocks[b];
+    block.splice(i, 1);
+    if (block.length >= BLOCK / 4) return;
+
+    // the only block stays until it is empty
+    if (blocks.length === 1) {
+      if (block.length === 0) blocks.pop();
+      return;
+    }
+
+    // otherwise a block grown too short joins a neighbour, splitting again if the pair is too long
+    const x = b + 1 < blocks.length ? b : b - 1;
+    const joined = blocks[x].concat(blocks[x + 1]);
+    if (joined.length > 2 * BLOCK) {
+      const half = joined.length >> 1;
+      blocks.splice(x, 2, joined.slice(0, half), joined.slice(half));
+    } else {
+      blocks.splice(x, 2, joined);
+    }
+  }
+
+  /** call visit with each key inside r in walk order, until it answers false */
+  walk(r: StoreRange, visit: (key: string) => boolean): void {
+    const blocks = this.#blocks;
+    const cmp = boundsCompare(r);
+
+    if (!r.reverse) {
+      // from the first key inside the lower bounds up, until a key passes an upper bound
+      let [b, i] = [0, 0];
+      if (r.gte !== undefined) [b, i] = later([b, i], this.#seek(r.gte, false, cmp));
+      if (r.gt !== undefined) [b, i] = later([b, i], this.#seek(r.gt, true, cmp));
+      for (; b < blocks.length; b++, i = 0) {
+        const block = blocks[b];
+        for (; i < block.length; i++) {
+          const k = block[i];
+          if (r.lt !== undefined && cmp(k, r.lt) >= 0) return;
+          if (r.lte !== undefined && cmp(k, r.lte) > 0) return;
+          if (!visit(k)) return;
+        }
+      }
+      return;
+    }
+
+    // reversed, from the last key inside the upper bounds down, until a key passes a lower bound
+    let [b, i] = [blocks.length, 0];
+    if (r.lte !== undefined) [b, i] = earlier([b, i], this.#seek(r.lte, true, cmp));
+    if (r.lt !== undefined) [b, i] = earlier([b, i], this.#seek(r.lt, false, cmp));
+    for (;;) {
+      // step back to the key before the position
+      if (i === 0) {
+        if (b === 0) return;
+        b--;
+        i = blocks[b].length;
+      }
+      i--;
+      const k = blocks[b][i];
+      if (r.gt !== undefined && cmp(k, r.gt) <= 0) return;
+      if (r.gte !== undefined && cmp(k, r.gte) < 0) return;
+      if (!visit(k)) return;
+    }
+  }
+
+  // the position of the first key at or above key, or above it when strict, as a block and an
+  // index into it; the block count when no key is
+  #seek(key: string, strict: boolean, cmp: (a: string, b: string) => number): [number, number] {
+    const before = (k: string) => {
+      const c = cmp(k, key);
+      return c < 0 || (strict && c === 0);
+    };
+    const blocks = this.#blocks;
+    const b = bisect(blocks.length, (j) => before(blocks[j][blocks[j].length - 1]));
+    if (b === blocks.length) return [b, 0];
+    const block = blocks[b];
+    return [b, bisect(block.length, (j) => before(block[j]))];
+  }
+}
+
+// two lists of distinct keys, each in walk order, merged by order
+function mergeKeys(a: string[], b: string[], order: (a: string, b: string) => number): string[] {
+  const out: string[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) out.push(order(a[i], b[j]) < 0 ? a[i++] : b[j++]);
+  return out.concat(a.slice(i), b.slice(j));
+}
+
+/** InMemStore keeps values in their JS form in memory, with its keys in a sorted list, so a scan
+    seeks to its first key rather than sorting.  Values cross the transaction boundary by copy. */
 export class InMemStore implements Store {
   #reg: Registry;
-  #data: Layer;
+  #values: Layer = new Map();
+  #keys = new KeyList();
 
-  constructor(reg: Registry, data?: Record<string, unknown>) {
+  constructor(reg: Registry) {
     this.#reg = reg;
-    this.#data = data !== undefined ? data : {};
   }
 
   #withTxn<T>(writable: boolean, fn: (txn: WTxn) => T): T {
-    const updates: Layer = {};
-    const txn = new InMemTxn(this.#reg, this.#data, updates);
+    const updates: Layer = new Map();
+    const txn = new InMemTxn(this.#reg, this.#values, this.#keys, updates);
 
     // a throw leaves the updates uncommitted, which is the rollback
     const result = fn(writable ? txn : readHalf(txn));
+    this.#commit(updates);
+    return result;
+  }
 
-    // commit the updates
-    for (const [key, val] of Object.entries(updates)) {
+  // apply a transaction's updates to the values, and to the key list the keys that appear or go
+  #commit(updates: Layer): void {
+    // apply the values, noting each key that appears or goes
+    const added: string[] = [];
+    const removed: string[] = [];
+    for (const [key, val] of updates) {
       if (val === undefined) {
-        delete this.#data[key];
+        if (this.#values.delete(key)) removed.push(key);
       } else {
-        this.#data[key] = val;
+        if (!this.#values.has(key)) added.push(key);
+        this.#values.set(key, val);
       }
     }
-    return result;
+
+    // place the keys one by one, unless one sort of them all costs less
+    if (added.length + removed.length > this.#values.size / 8) {
+      this.#keys = KeyList.of(sortKeys([...this.#values.keys()]));
+      return;
+    }
+    for (const key of removed) this.#keys.remove(key);
+    for (const key of added) this.#keys.add(key);
   }
 
   write<T>(fn: (txn: WTxn) => T): T {
@@ -762,40 +917,68 @@ export class InMemStore implements Store {
 
 class InMemTxn implements WTxn {
   #reg: Registry;
-  #data: Layer;
+  #values: Layer;
+  #keys: KeyList;
   #updates: Layer;
 
-  constructor(reg: Registry, data: Layer, updates: Layer) {
+  constructor(reg: Registry, values: Layer, keys: KeyList, updates: Layer) {
     this.#reg = reg;
-    this.#data = data;
+    this.#values = values;
+    this.#keys = keys;
     this.#updates = updates;
   }
 
   get(key: string, type: string, rep: Rep): unknown {
-    const js = layerGet(this.#data, this.#updates, key);
+    const js = layerGet(this.#values, this.#updates, key);
     return js === undefined ? undefined : layerOut(this.#reg, type, js, rep);
   }
 
   set(key: string, type: string, rep: Rep, value: unknown): void {
-    this.#updates[key] = layerIn(this.#reg, type, rep, value);
+    this.#updates.set(key, layerIn(this.#reg, type, rep, value));
   }
 
   del(key: string): void {
-    this.#updates[key] = undefined;
+    this.#updates.set(key, undefined);
   }
 
   delPrefix(prefix: string): string[] {
-    return layerDelPrefix(this.#data, this.#updates, prefix);
+    const keys = this.#walk(prefixRange(prefix, Infinity, false));
+    for (const k of keys) this.#updates.set(k, undefined);
+    return keys;
   }
 
   move(src: string, dst: string): string[] {
-    return layerMove(this.#data, this.#updates, src, dst);
+    const keys = this.#walk(prefixRange(src, Infinity, false));
+    const moved: string[] = [];
+    for (const k of keys) {
+      const to = dst + k.slice(src.length);
+      this.#updates.set(to, layerGet(this.#values, this.#updates, k));
+      this.#updates.set(k, undefined);
+      moved.push(to);
+    }
+    return moved;
   }
 
   scan(range: StoreRange): StoreScan {
-    const keys = layerKeys(this.#data, this.#updates, range);
-    const get = (k: string) => copyValue(layerGet(this.#data, this.#updates, k));
-    return batch(this.#reg, keys, range, get);
+    const keys = this.#walk(range);
+    return batch(this.#reg, keys, range, (k) => layerGet(this.#values, this.#updates, k));
+  }
+
+  // the live keys inside r in walk order, enough of them to fill a batch and tell whether more
+  // remain: the stored keys no update shadows, merged with the updates' live keys
+  #walk(r: StoreRange): string[] {
+    // the stored keys, up to one more than a batch; any past those sort after the batch
+    const stored: string[] = [];
+    this.#keys.walk(r, (k) => {
+      if (!this.#updates.has(k)) stored.push(k);
+      return stored.length <= r.limit;
+    });
+
+    // the updates' live keys inside the range, merged in
+    const pending = layerKeys([this.#updates], r);
+    if (pending.length === 0) return stored;
+    const cmp = exactFor(pending);
+    return mergeKeys(stored, pending, r.reverse ? (a, b) => cmp(b, a) : cmp);
   }
 }
 
@@ -804,33 +987,33 @@ class InMemTxn implements WTxn {
     forecasts and the graph run after them, reads one snapshot of the base. */
 export class Overlay {
   #reg: Registry;
-  #data: Layer = {};
+  #data: Layer = new Map();
 
   constructor(reg: Registry) {
     this.#reg = reg;
   }
 
   keys(): string[] {
-    return Object.keys(this.#data);
+    return [...this.#data.keys()];
   }
 
   /** run fn over a scratch layer on top of the overlay and base, keeping its writes when fn
       returns; a throw drops them */
   apply<T>(base: RTxn, fn: (txn: WTxn) => T): T {
-    const updates: Layer = {};
+    const updates: Layer = new Map();
     const result = fn(new OverlayTxn(this.#reg, base, this.#data, updates));
 
     // keep the scratch layer's writes in the overlay's own layer
-    for (const [key, val] of Object.entries(updates)) {
+    for (const [key, val] of updates) {
       // note: we must keep undefined values rather than propagate deletions to base
-      this.#data[key] = val;
+      this.#data.set(key, val);
     }
     return result;
   }
 
   /** the overlay over base, read-only */
   view(base: RTxn): RTxn {
-    return readHalf(new OverlayTxn(this.#reg, base, this.#data, {}));
+    return readHalf(new OverlayTxn(this.#reg, base, this.#data, new Map()));
   }
 }
 
@@ -851,7 +1034,7 @@ class OverlayTxn implements WTxn {
   }
 
   #has(key: string): boolean {
-    return key in this.#updates || key in this.#data;
+    return this.#updates.has(key) || this.#data.has(key);
   }
 
   get(key: string, type: string, rep: Rep): unknown {
@@ -861,11 +1044,11 @@ class OverlayTxn implements WTxn {
   }
 
   set(key: string, type: string, rep: Rep, value: unknown): void {
-    this.#updates[key] = layerIn(this.#reg, type, rep, value);
+    this.#updates.set(key, layerIn(this.#reg, type, rep, value));
   }
 
   del(key: string): void {
-    this.#updates[key] = undefined;
+    this.#updates.set(key, undefined);
   }
 
   // every key under prefix, from the base and the layers, in walk order
@@ -874,14 +1057,14 @@ class OverlayTxn implements WTxn {
     for (const [k] of txnScanAll(this.#base, prefixRange(prefix, 1000, false))) {
       if (!this.#has(k)) all.add(k);
     }
-    const layer = layerKeys(this.#data, this.#updates, prefixRange(prefix, Infinity, false));
-    for (const k of layer) all.add(k);
+    const layers = [this.#data, this.#updates];
+    for (const k of layerKeys(layers, prefixRange(prefix, Infinity, false))) all.add(k);
     return sortKeys([...all]);
   }
 
   delPrefix(prefix: string): string[] {
     const keys = this.#keysUnder(prefix);
-    for (const k of keys) this.#updates[k] = undefined;
+    for (const k of keys) this.#updates.set(k, undefined);
     return keys;
   }
 
@@ -908,7 +1091,7 @@ class OverlayTxn implements WTxn {
     const merged = new Map<string, unknown>();
     for (const [k, v] of result.entries) if (!this.#has(k)) merged.set(k, v);
     const v = range.values;
-    for (const k of layerKeys(this.#data, this.#updates, span)) {
+    for (const k of layerKeys([this.#data, this.#updates], span)) {
       const js = layerGet(this.#data, this.#updates, k);
       merged.set(k, v ? layerOut(this.#reg, v.type, js, v.rep) : undefined);
     }

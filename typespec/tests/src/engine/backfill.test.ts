@@ -27,7 +27,7 @@ type Record_ = {
 };
 
 const record = (r: Rig, ref: string): Record_ | undefined =>
-  r.data[`/backfill.${ref}`] as Record_ | undefined;
+  r.data()[`/backfill.${ref}`] as Record_ | undefined;
 
 /** a held family with two members at position 10 */
 const patrons: Blob = {
@@ -64,7 +64,7 @@ describe('backfill lifecycle', () => {
     r.server.hold('book.*');
     r.server.view('t2', 11, ['patron.*', 'book.*']);
     await settle();
-    expect(r.data['/view']).toEqual({ token: 't2', position: 11, refs: ['patron.*', 'book.*'] });
+    expect(r.data()['/view']).toEqual({ token: 't2', position: 11, refs: ['patron.*', 'book.*'] });
     expect(record(r, 'book.*')).toEqual({
       until: 11,
       resume: null,
@@ -85,12 +85,12 @@ describe('backfill lifecycle', () => {
     r.server.vouch(15);
     await settle();
     expect(record(r, 'patron.*')?.replacing).toBe(true);
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 15, reduced: -1 });
-    expect(state(r.data, 'patron.p1')).toBeUndefined();
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, reduced: -1 });
+    expect(state(r.data(), 'patron.p1')).toBeUndefined();
     hold.go();
     await settle();
-    expect(checkpoint(r.data)).toEqual({ epoch: 'e1', position: 15, reduced: 15 });
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 2, fields: {} });
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, reduced: 15 });
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 2, fields: {} });
     r.server.hold('book.*');
     r.server.view('t2', 16, ['patron.*', 'book.*']);
     await settle();
@@ -103,13 +103,13 @@ describe('backfill lifecycle', () => {
     r.server.hold('patron.p1');
     r.server.events(ev('patron.p1', 5, 11));
     await settle();
-    expect(seq(r.data, 'patron.p1')).toBe('backfill');
-    expect(seq(r.data, 'patron.p2')).toBe(1);
+    expect(seq(r.data(), 'patron.p1')).toBe('backfill');
+    expect(seq(r.data(), 'patron.p2')).toBe(1);
 
     // a first view over held state (no /view stored): the family grant is replacing and marks
     // every member before its download starts
     const r2 = rig({
-      data: {
+      seed: {
         '/seq.patron.p1': 2,
         '/seq.patron.p2': 1,
         'patron.p1/state': { count: 2, fields: {} },
@@ -122,9 +122,9 @@ describe('backfill lifecycle', () => {
     r2.server.view('t1', 10, ['patron.*']);
     await settle();
     expect(record(r2, 'patron.*')?.replacing).toBe(true);
-    expect(seq(r2.data, 'patron.p1')).toBe('backfill');
-    expect(seq(r2.data, 'patron.p2')).toBe('backfill');
-    expect(state(r2.data, 'patron.p1')).toEqual({ count: 2, fields: {} });
+    expect(seq(r2.data(), 'patron.p1')).toBe('backfill');
+    expect(seq(r2.data(), 'patron.p2')).toBe('backfill');
+    expect(state(r2.data(), 'patron.p1')).toEqual({ count: 2, fields: {} });
   });
 
   test('the header writes /backfill-seqs and resume.position; values write /park.kv.{ref}/ and skipBytes; events write parked events and fromPosition', async () => {
@@ -144,7 +144,7 @@ describe('backfill lifecycle', () => {
     });
     r.server.view('t2', 12, ['patron.*', 'book.*']);
     await settle();
-    expect(r.data['/backfill-seqs.book.*']).toEqual({ 'book.b1': 3, 'book.b7': 2 });
+    expect(r.data()['/backfill-seqs.book.*']).toEqual({ 'book.b1': 3, 'book.b7': 2 });
     expect(record(r, 'book.*')?.resume).toEqual({
       position: 10,
       skipBytes: 3,
@@ -153,15 +153,15 @@ describe('backfill lifecycle', () => {
       tailDone: true,
     });
     // a key no slice declares is dropped
-    expect(keys(r.data, '/park.kv.book.*/')).toEqual([
+    expect(keys(r.data(), '/park.kv.book.*/')).toEqual([
       '/park.kv.book.*/book.b1/state',
       '/park.kv.book.*/book.b7/state',
     ]);
-    expect(keys(r.data, '/park.ev.book.')).toEqual([
+    expect(keys(r.data(), '/park.ev.book.')).toEqual([
       parkedEvent('book.b1', 4),
       parkedEvent('book.b7', 4),
     ]);
-    expect(seq(r.data, 'book.b1')).toBe('backfill');
+    expect(seq(r.data(), 'book.b1')).toBe('backfill');
     expect(record(r, 'book.*')?.children).toEqual(['book.b7']);
   });
 
@@ -185,7 +185,7 @@ describe('backfill lifecycle', () => {
     });
     const r = rig({
       server,
-      data: {
+      seed: {
         '/view': { token: 't1', position: 11, refs: ['book.b1'] },
         '/checkpoint': { epoch: 'e1', position: 11, reduced: 11 },
         '/backfill.book.b1': { until: 11, resume: { ...resume }, replacing: false, children: [] },
@@ -204,9 +204,9 @@ describe('backfill lifecycle', () => {
     await settle();
     expect(r.server.backfills.length).toBe(2);
     expect(r.server.backfills[1]).toEqual({ ref: 'book.b1', until: 11, resume });
-    expect(state(r.data, 'book.b1')).toEqual({ count: 4, fields: {} });
-    expect(log(r.data, 'book.b1')).toEqual(['bump']);
-    expect(seq(r.data, 'book.b1')).toBe(4);
+    expect(state(r.data(), 'book.b1')).toEqual({ count: 4, fields: {} });
+    expect(log(r.data(), 'book.b1')).toEqual(['bump']);
+    expect(seq(r.data(), 'book.b1')).toBe(4);
   });
 
   test("'stale' clears the ref's values, keeps its parked events, and retries from the start of the blob", async () => {
@@ -226,7 +226,7 @@ describe('backfill lifecycle', () => {
     });
     const r = rig({
       server,
-      data: {
+      seed: {
         '/view': { token: 't1', position: 11, refs: ['book.b1'] },
         '/checkpoint': { epoch: 'e1', position: 11, reduced: 11 },
         '/backfill.book.b1': { until: 11, resume, replacing: false, children: [] },
@@ -252,10 +252,10 @@ describe('backfill lifecycle', () => {
       { position: 10, skipBytes: 0, fromPosition: 10, snapshotDone: false, tailDone: false },
     ]);
     // the fresh blob landed and the kept parked event reduced over it
-    expect(state(r.data, 'book.b1')).toEqual({ count: 5, fields: {} });
-    expect(log(r.data, 'book.b1')).toEqual(['bump']);
-    expect(seq(r.data, 'book.b1')).toBe(5);
-    expect(keys(r.data, '/park.kv.')).toEqual([]);
+    expect(state(r.data(), 'book.b1')).toEqual({ count: 5, fields: {} });
+    expect(log(r.data(), 'book.b1')).toEqual(['bump']);
+    expect(seq(r.data(), 'book.b1')).toBe(5);
+    expect(keys(r.data(), '/park.kv.')).toEqual([]);
   });
 
   test('a revoke of an in-flight ref aborts it and drops its values, record, and uncovered streams', async () => {
@@ -270,20 +270,20 @@ describe('backfill lifecycle', () => {
     await settle();
     r.server.events(ev('book.b1', 4, 12));
     await settle();
-    expect(seq(r.data, 'book.b1')).toBe('backfill');
-    expect(keys(r.data, '/park.ev.book.')).toEqual([parkedEvent('book.b1', 4)]);
+    expect(seq(r.data(), 'book.b1')).toBe('backfill');
+    expect(keys(r.data(), '/park.ev.book.')).toEqual([parkedEvent('book.b1', 4)]);
     const signal = r.server.conn.signal;
     expect(signal.aborted).toBe(false);
     r.server.view('t3', 13, ['patron.*']);
     await settle();
     expect(record(r, 'book.*')).toBeUndefined();
-    expect(keys(r.data, '/backfill')).toEqual([]);
-    expect(keys(r.data, '/park.')).toEqual([]);
-    expect(seq(r.data, 'book.b1')).toBeUndefined();
-    expect(keys(r.data, 'book.')).toEqual([]);
+    expect(keys(r.data(), '/backfill')).toEqual([]);
+    expect(keys(r.data(), '/park.')).toEqual([]);
+    expect(seq(r.data(), 'book.b1')).toBeUndefined();
+    expect(keys(r.data(), 'book.')).toEqual([]);
     // the connection itself is untouched, the held stream too
     expect(signal.aborted).toBe(false);
-    expect(state(r.data, 'patron.p1')).toEqual({ count: 2, fields: {} });
+    expect(state(r.data(), 'patron.p1')).toEqual({ count: 2, fields: {} });
     // the held download was aborted through its own signal: releasing it starts nothing
     r.server.holds.get('book.*');
     await settle();
@@ -296,7 +296,7 @@ describe('backfill lifecycle', () => {
     r.server.view('t2', 11, ['patron.*', 'book.*', 'book.b1', 'patron.p1']);
     await settle();
     expect(r.server.backfills.map((b) => b.ref)).toEqual(['patron.*', 'book.*']);
-    expect(keys(r.data, '/backfill.')).toEqual(['/backfill.book.*']);
+    expect(keys(r.data(), '/backfill.')).toEqual(['/backfill.book.*']);
   });
 
   test('a stream born under an in-flight ref parks; born under no ref it is held at seq 1', async () => {
@@ -306,10 +306,10 @@ describe('backfill lifecycle', () => {
     await settle();
     r.server.events(birth('book.b2', 1, 12), birth('patron.p3', 1, 12));
     await settle();
-    expect(seq(r.data, 'book.b2')).toBe('backfill');
-    expect(keys(r.data, '/park.ev.book.b2/')).toEqual([parkedEvent('book.b2', 1)]);
-    expect(seq(r.data, 'patron.p3')).toBe(1);
-    expect(keys(r.data, '/park.ev.patron.')).toEqual([]);
+    expect(seq(r.data(), 'book.b2')).toBe('backfill');
+    expect(keys(r.data(), '/park.ev.book.b2/')).toEqual([parkedEvent('book.b2', 1)]);
+    expect(seq(r.data(), 'patron.p3')).toBe(1);
+    expect(keys(r.data(), '/park.ev.patron.')).toEqual([]);
     await untilCalls(r, 'book.*', 1);
   });
 });

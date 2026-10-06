@@ -23,6 +23,9 @@ import {
   type Registry,
   type Rep,
   type SliceReducer,
+  type Store,
+  storeTypeOf,
+  txnScanAll,
   type WireEvent,
 } from '../../../ts/assets/skeleton.ts';
 
@@ -73,6 +76,8 @@ export const registry: Registry = {
     'patron/log': 'log',
     'book/state': 'state',
     'book/log': 'log',
+    // reduce.test's reducer writes a marker into patron streams
+    'patron/marker': 'state',
   },
 };
 
@@ -367,15 +372,19 @@ export type Forecaster = EngineForecaster<ReadTxn, unknown>;
 
 export type Rig = {
   server: FakeServer;
-  data: Record<string, unknown>;
+  store: InMemStore;
   engine: Engine<ReadTxn, unknown, unknown>;
   abort: AbortController;
+  /** every key in the store and its value, as of the call */
+  data: () => Record<string, unknown>;
 };
 
-/** an Engine over an in-memory store, whose keys the test can read straight out of `data` */
+/** an Engine over an in-memory store: a fresh one holding seed, or store as an earlier Engine
+    left it */
 export function rig(
   opts: {
-    data?: Record<string, unknown>;
+    seed?: Record<string, unknown>;
+    store?: InMemStore;
     forecaster?: Forecaster;
     reducers?: Record<string, SliceReducer>;
     wants?: string[];
@@ -384,11 +393,11 @@ export function rig(
 ): Rig {
   errors.length = 0;
   const server = opts.server ?? new FakeServer();
-  const data = opts.data ?? {};
+  const store = opts.store ?? seeded(opts.seed ?? {});
   const abort = new AbortController();
   const engine = new Engine<ReadTxn, unknown, unknown>(
     (txn) => txn,
-    new InMemStore(registry, data),
+    store,
     registry,
     server.factory,
     {
@@ -399,7 +408,40 @@ export function rig(
       onError: (e) => errors.push(e),
     },
   );
-  return { server, data, engine, abort };
+  return { server, store, engine, abort, data: () => contents(store) };
+}
+
+// the store type of a key the Engine writes
+function typeOf(key: string): string {
+  if (key.startsWith('/command.')) return '.command';
+  if (key.startsWith('/park.ev.')) return '.event';
+
+  // a parked value has the type of the key it parks
+  const local = key.startsWith('/park.kv.') ? key.slice(key.indexOf('/', 1) + 1) : key;
+  if (local.startsWith('/')) return '.json';
+  const type = storeTypeOf(registry, local);
+  if (type === undefined) throw new Error(`no store type for ${key}`);
+  return type;
+}
+
+// a fresh store holding seed
+function seeded(seed: Record<string, unknown>): InMemStore {
+  const store = new InMemStore(registry);
+  store.write((txn) => {
+    for (const [key, value] of Object.entries(seed)) txn.set(key, typeOf(key), JS, value);
+  });
+  return store;
+}
+
+// every key in a store and its value
+function contents(store: Store): Record<string, unknown> {
+  return store.read((txn) => {
+    const out: Record<string, unknown> = {};
+    for (const [key] of txnScanAll(txn, { limit: 1000, values: false })) {
+      out[key] = txn.get(key, typeOf(key), JS);
+    }
+    return out;
+  });
 }
 
 /** let the advancer run everything it can: scheduled wakeups, promise chains, hook pushes */
