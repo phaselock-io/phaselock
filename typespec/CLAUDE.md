@@ -29,7 +29,8 @@ layout, build commands, and the test suite.
   out, any value), walks in parameter order, and yields `[params, value]` with every varying
   parameter named, or the parameters alone with `keys: true`.  Beneath it is the one store scan,
   a `KeyPattern` each store walks natively as a skip scan, in batches resumed past a key; a
-  query's read set holds each walk's pattern and the stretch of keys it covered.
+  query's read set holds each walk's pattern and the stretch of keys it covered, up to the last
+  entry the query took.
 - **Queries are interfaces too**: `interface AdminQueries extends Queries { allPatrons(): AdminPatronInfo[]; }`
   declares a typed query contract — a message contract only, binding no store (which store backs
   an implementation is the implementation's business).  Lowering collects them as `PQueries`

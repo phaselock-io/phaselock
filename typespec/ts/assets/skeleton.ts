@@ -1604,26 +1604,41 @@ function localParams(local: string, name: string | null, n: number): string[] {
   return [...parts.slice(0, n - 1), parts.slice(n - 1).join(',')];
 }
 
-// the entries of a walk, fetched in batches of growing size
+/* The entries of a walk, fetched in batches of growing size.  Over a query's transaction, the
+   span its batch recorded is cut back to the last entry handed out, since the query has seen
+   nothing past it, and runs to the walk's end only once the query has asked past the last entry
+   there is.  A query that stops early then depends on what it took, not on what was fetched. */
 function* batches(
   txn: object,
   fetch: (after: string | undefined, limit: number) => StoreScan,
   parse: (key: string) => string[],
 ): IterableIterator<[string[], unknown]> {
+  const deps = queryDeps.get(txn);
   let after: string | undefined;
   let limit = 16;
   for (;;) {
     if (closedTxns.has(txn)) {
       throw new Error('a scan was used after its query or forecast returned');
     }
+
+    // a batch, whose span the fetch just recorded or extended
     const { entries, next } = fetch(after, limit);
+    const span = deps?.spans[deps.spans.length - 1];
+
+    // each entry, the span reaching it as it is handed out
     for (const [key, value] of entries) {
+      if (span !== undefined) span.to = key;
       yield [parse(key), value];
       if (closedTxns.has(txn)) {
         throw new Error('a scan was used after its query or forecast returned');
       }
     }
-    if (next === null) return;
+
+    // asked past the last entry there is, the query has seen the walk to its end
+    if (next === null) {
+      if (span !== undefined) span.to = undefined;
+      return;
+    }
     after = next;
     limit = Math.min(limit * 2, 256);
   }
@@ -2100,7 +2115,7 @@ type ReadDeps = { keys: Record<string, true>; spans: ScanSpan[]; last: string | 
 // what it hands out is a read-only proxy, so a mutation of a result throws where it happens,
 // naming the key; the JS representation is the one the app touches.
 function readTxn(txn: RTxn, deps?: ReadDeps): ReadTxn {
-  return {
+  const rtx: ReadTxn = {
     get(key, type) {
       if (deps !== undefined) deps.keys[key] = true;
       const value = txn.get(key, type, JS);
@@ -2116,7 +2131,12 @@ function readTxn(txn: RTxn, deps?: ReadDeps): ReadTxn {
       return { entries, next: result.next };
     },
   };
+  if (deps !== undefined) queryDeps.set(rtx, deps);
+  return rtx;
 }
+
+// what each query transaction records its reads in, for its scans' walks to narrow
+const queryDeps = new WeakMap<object, ReadDeps>();
 
 // record what a scan batch walked; a batch resuming where the last span ends, under the same
 // pattern, is the next batch of that walk and extends the span

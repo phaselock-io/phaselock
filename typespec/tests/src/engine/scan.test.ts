@@ -95,22 +95,53 @@ describe("a query's scans", () => {
     expect(query.latest).toEqual(['acme gen 1', 'acme gen-2 1', 'zeta a 1']);
   });
 
-  test('a query that stopped early depends only on the batches it fetched', () => {
+  test('a query that stopped early depends only on the entries it took', () => {
     // more posts than the first batch of 16 holds
     const ids = Array.from({ length: 40 }, (_, i) => String(i).padStart(2, '0'));
     const store = seeded(...ids.map((id) => `chat:acme,gen!post:${id}`));
     const { graph, run, write } = graphOver(store);
-    const { query, counter } = counted(graph, posts('acme'), 1);
+    const { query, counter } = counted(graph, posts('acme'), 2);
     run();
-    expect(query.latest).toEqual(['acme gen 00']);
+    expect(query.latest).toEqual(['acme gen 00', 'acme gen 01']);
 
-    // past the first batch, nothing it read changed
-    write(['chat:acme,gen!post:30a']);
+    // past the second entry, inside the batch fetched and beyond it, nothing it took changed
+    write(['chat:acme,gen!post:01a', 'chat:acme,gen!post:05a', 'chat:acme,gen!post:30a']);
     expect(counter.runs).toBe(1);
 
-    // inside it, the query runs again
-    write(['chat:acme,gen!post:05a']);
+    // a post among the two, or a change to one of them, runs it again
+    write(['chat:acme,gen!post:00a']);
     expect(counter.runs).toBe(2);
+    expect(query.latest).toEqual(['acme gen 00', 'acme gen 00a']);
+    write(['chat:acme,gen!post:00']);
+    expect(counter.runs).toBe(3);
+  });
+
+  test('a walk that found nothing depends on the whole of what its pattern picks out', () => {
+    const store = seeded('chat:acme,gen!meta', 'chat:beta,gen!post:1');
+    const { graph, run, write } = graphOver(store);
+    const { query, counter } = counted(graph, posts('acme'));
+    run();
+    expect(query.latest).toEqual([]);
+
+    // outside the pattern nothing changes; a first post anywhere in it, in a new stream too, does
+    write(['chat:beta,gen!post:2', 'chat:acme,gen!meta-x']);
+    expect(counter.runs).toBe(1);
+    write(['chat:acme,zz!post:9']);
+    expect(query.latest).toEqual(['acme zz 9']);
+  });
+
+  test('a query that took every entry depends on the walk to its end only once it asked past the last', () => {
+    const store = seeded('chat:acme,gen!post:1', 'chat:acme,gen!post:2');
+
+    // taking exactly the two there are, it never learns there are no more
+    const { graph, run, write } = graphOver(store);
+    const exact = counted(graph, posts('acme'), 2);
+    const drained = counted(graph, posts('acme'));
+    run();
+    write(['chat:acme,gen!post:3']);
+    expect(exact.counter.runs).toBe(1);
+    expect(drained.counter.runs).toBe(2);
+    expect(drained.query.latest).toEqual(['acme gen 1', 'acme gen 2', 'acme gen 3']);
   });
 
   test('a walk over several batches depends on all of them, as one stretch', () => {
