@@ -28,7 +28,6 @@ type core struct {
 type principal struct {
 	anonymous bool
 	user      string
-	traits    []string
 	gen       int64 // -1 skips the generation check
 }
 
@@ -109,15 +108,13 @@ func freeStrings(arr **C.char, n int) {
 	C.free(unsafe.Pointer(arr))
 }
 
-func withPrincipal(p principal, fn func(user *C.char, traits **C.char, n C.int, gen C.int64_t)) {
+func withPrincipal(p principal, fn func(user *C.char, gen C.int64_t)) {
 	var user *C.char
 	if !p.anonymous {
 		user = C.CString(p.user)
 		defer C.free(unsafe.Pointer(user))
 	}
-	traits := cstrings(p.traits)
-	defer freeStrings(traits, len(p.traits))
-	fn(user, traits, C.int(len(p.traits)), C.int64_t(p.gen))
+	fn(user, C.int64_t(p.gen))
 }
 
 func cbytes(b []byte) (*C.uint8_t, C.size_t) {
@@ -128,15 +125,15 @@ func cbytes(b []byte) (*C.uint8_t, C.size_t) {
 }
 
 func (c *core) submit(reqid uint64, p principal, body []byte) {
-	withPrincipal(p, func(user *C.char, traits **C.char, n C.int, gen C.int64_t) {
+	withPrincipal(p, func(user *C.char, gen C.int64_t) {
 		ptr, l := cbytes(body)
-		C.pldb_submit(c.db, C.uint64_t(reqid), user, traits, n, gen, ptr, l)
+		C.pldb_submit(c.db, C.uint64_t(reqid), user, gen, ptr, l)
 	})
 }
 
 func (c *core) register(reqid, conn uint64, p principal) {
-	withPrincipal(p, func(user *C.char, traits **C.char, n C.int, gen C.int64_t) {
-		C.pldb_register(c.db, C.uint64_t(reqid), C.uint64_t(conn), user, traits, n, gen)
+	withPrincipal(p, func(user *C.char, gen C.int64_t) {
+		C.pldb_register(c.db, C.uint64_t(reqid), C.uint64_t(conn), user, gen)
 	})
 }
 

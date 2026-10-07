@@ -28,7 +28,6 @@ typedef struct req {
     int kind;
     uint64_t reqid, conn;
     char *user;
-    strlist traits;
     int64_t gen;
     uint8_t *body;
     size_t len;
@@ -40,7 +39,6 @@ typedef struct req {
 typedef struct reg {
     char *canon;
     char *user;
-    strlist traits;
     strlist prefixes;
     char hash[17]; /* of prefixes, so a change to the set is one comparison */
     strlist rkeys;   /* the keys maySee got */
@@ -200,21 +198,18 @@ static char **strings_copy(const strlist *l) {
 
 // requests /////////////////////////////////////////////////////////////////
 
-static req *req_new(int kind, uint64_t reqid, const char *user, const char *const *traits,
-                    int ntraits, int64_t gen) {
+static req *req_new(int kind, uint64_t reqid, const char *user, int64_t gen) {
     req *q = xmalloc(sizeof *q);
     memset(q, 0, sizeof *q);
     q->kind = kind;
     q->reqid = reqid;
     q->user = user ? xstrdup(user) : NULL;
-    for (int i = 0; i < ntraits; i++) strlist_push(&q->traits, traits[i]);
     q->gen = gen;
     return q;
 }
 
 static void req_free(req *q) {
     free(q->user);
-    strlist_free(&q->traits);
     free(q->body);
     free(q);
 }
@@ -229,9 +224,9 @@ static void enqueue(pldb *db, req *q) {
     pthread_mutex_unlock(&db->qmu);
 }
 
-int pldb_submit(pldb *db, uint64_t reqid, const char *user, const char *const *traits,
-                int ntraits, int64_t gen, const uint8_t *body, size_t len) {
-    req *q = req_new(REQ_SUBMIT, reqid, user, traits, ntraits, gen);
+int pldb_submit(pldb *db, uint64_t reqid, const char *user, int64_t gen, const uint8_t *body,
+                size_t len) {
+    req *q = req_new(REQ_SUBMIT, reqid, user, gen);
     q->body = xmalloc(len);
     memcpy(q->body, body, len);
     q->len = len;
@@ -239,23 +234,22 @@ int pldb_submit(pldb *db, uint64_t reqid, const char *user, const char *const *t
     return 0;
 }
 
-int pldb_register(pldb *db, uint64_t reqid, uint64_t conn, const char *user,
-                  const char *const *traits, int ntraits, int64_t gen) {
-    req *q = req_new(REQ_REGISTER, reqid, user, traits, ntraits, gen);
+int pldb_register(pldb *db, uint64_t reqid, uint64_t conn, const char *user, int64_t gen) {
+    req *q = req_new(REQ_REGISTER, reqid, user, gen);
     q->conn = conn;
     enqueue(db, q);
     return 0;
 }
 
 int pldb_unregister(pldb *db, uint64_t conn) {
-    req *q = req_new(REQ_UNREGISTER, 0, NULL, NULL, 0, -1);
+    req *q = req_new(REQ_UNREGISTER, 0, NULL, -1);
     q->conn = conn;
     enqueue(db, q);
     return 0;
 }
 
 int pldb_lookup(pldb *db, uint64_t reqid, const uint8_t *ident, size_t len) {
-    req *q = req_new(REQ_LOOKUP, reqid, NULL, NULL, 0, -1);
+    req *q = req_new(REQ_LOOKUP, reqid, NULL, -1);
     q->body = xmalloc(len);
     memcpy(q->body, ident, len);
     q->len = len;
@@ -265,20 +259,8 @@ int pldb_lookup(pldb *db, uint64_t reqid, const uint8_t *ident, size_t len) {
 
 // maySee registrations /////////////////////////////////////////////////////
 
-static char *canon_principal(const char *user, const strlist *traits) {
-    strlist sorted = {0};
-    for (size_t i = 0; i < traits->n; i++) strlist_push(&sorted, traits->v[i]);
-    strlist_sort(&sorted);
-    buf b = {0};
-    buf_append(&b, user ? "u:" : "anon", user ? 2 : 4);
-    if (user) buf_append(&b, user, strlen(user));
-    for (size_t i = 0; i < sorted.n; i++) {
-        buf_append(&b, "\x1f", 1);
-        buf_append(&b, sorted.v[i], strlen(sorted.v[i]));
-    }
-    buf_append(&b, "", 1);
-    strlist_free(&sorted);
-    return (char *)b.p;
+static char *canon_principal(const char *user) {
+    return user ? strf("u:%s", user) : xstrdup("anon");
 }
 
 static void view_hash(const strlist *prefixes, char out[17]) {
@@ -300,7 +282,7 @@ static bool normalize_bundle_ref(const jsrt *js, char *ref);
    returns a malformed ref is a bug, and the registration fails closed: it grants nothing, and
    every connection of it is answered with the failure. */
 static int reg_evaluate(pldb *db, reg *g) {
-    JSValue principal = js_principal(&db->js, g->user, (const char *const *)g->traits.v, (int)g->traits.n);
+    JSValue principal = js_principal(&db->js, g->user);
     strlist_clear(&g->prefixes);
     strlist_clear(&g->rkeys);
     span_list_clear(&g->spans);
@@ -337,7 +319,6 @@ static reg *reg_find(pldb *db, const char *canon) {
 static void reg_free(reg *g) {
     free(g->canon);
     free(g->user);
-    strlist_free(&g->traits);
     strlist_free(&g->prefixes);
     strlist_free(&g->rkeys);
     span_list_free(&g->spans);
@@ -411,9 +392,9 @@ static pldb_result *view_result(const reg *g, uint64_t conn, uint64_t position) 
 }
 
 /* the stale-token check: -1 stale, 0 ok */
-static int check_generation(pldb *db, const char *user, const strlist *traits, int64_t gen) {
+static int check_generation(pldb *db, const char *user, int64_t gen) {
     if (!user || gen < 0) return 0;
-    JSValue principal = js_principal(&db->js, user, (const char *const *)traits->v, (int)traits->n);
+    JSValue principal = js_principal(&db->js, user);
     int64_t g = js_generation(&db->js, principal);
     JS_FreeValue(db->js.ctx, principal);
     if (g == -2) {
@@ -427,7 +408,7 @@ static int check_generation(pldb *db, const char *user, const strlist *traits, i
 
 static void handle_register(pldb *db, req *q, pldb_result **after_tail) {
     pldb_result *r;
-    if (check_generation(db, q->user, &q->traits, q->gen)) {
+    if (check_generation(db, q->user, q->gen)) {
         r = result_new(PLDB_R_VIEW);
         r->status = 401;
         r->conn = q->conn;
@@ -436,14 +417,13 @@ static void handle_register(pldb *db, req *q, pldb_result **after_tail) {
         *after_tail = r;
         return;
     }
-    char *canon = canon_principal(q->user, &q->traits);
+    char *canon = canon_principal(q->user);
     reg *g = reg_find(db, canon);
     if (!g) {
         g = xmalloc(sizeof *g);
         memset(g, 0, sizeof *g);
         g->canon = canon;
         g->user = q->user ? xstrdup(q->user) : NULL;
-        for (size_t i = 0; i < q->traits.n; i++) strlist_push(&g->traits, q->traits.v[i]);
         reg_evaluate(db, g);
         g->next = db->regs;
         db->regs = g;
@@ -752,12 +732,12 @@ static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) 
     r->reqid = q->reqid;
     (*after_tail)->next = r;
     *after_tail = r;
-    if (check_generation(db, q->user, &q->traits, q->gen)) {
+    if (check_generation(db, q->user, q->gen)) {
         r->status = 401;
         return;
     }
     JSContext *ctx = db->js.ctx;
-    JSValue principal = js_principal(&db->js, q->user, (const char *const *)q->traits.v, (int)q->traits.n);
+    JSValue principal = js_principal(&db->js, q->user);
 
     char *data = NULL;
     size_t size = 0;

@@ -1,7 +1,7 @@
 // The model the server tests run against: a small library domain with a singleton book stream,
 // per-patron streams, per-branch shelves that the scan tests walk, and per-account streams
-// holding credentials, which maySee never grants to a client.  Librarians carry the admin trait
-// in their principal.
+// holding credentials, which maySee never grants to a client.  A librarian's account is flagged
+// admin.
 
 import "@phaselock/typespec-core";
 
@@ -163,7 +163,7 @@ interface AccountSlice extends Slice<"account:{user}", AccountEvents, { "account
 model Account {
   user: Id;
   hash: PasswordHash;
-  traits: string[];
+  admin: boolean;
   generation: int32;
   views: string[];
 }
@@ -180,7 +180,7 @@ model AccountCreated {
   type: "account-created";
   user: Id;
   hash: PasswordHash;
-  traits: string[];
+  admin: boolean;
 }
 
 model PasswordSet {
@@ -208,7 +208,7 @@ model CreateAccount {
   type: "create-account";
   user: Id;
   password: NewPassword;
-  traits?: string[];
+  admin?: boolean;
 }
 
 @online

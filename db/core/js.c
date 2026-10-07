@@ -624,14 +624,10 @@ static JSValue call_host(jsrt *js, const char *name, int argc, JSValueConst *arg
     return r;
 }
 
-JSValue js_principal(jsrt *js, const char *user, const char *const *traits, int n) {
+JSValue js_principal(jsrt *js, const char *user) {
     JSContext *ctx = js->ctx;
     JSValue p = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, p, "user", user ? JS_NewString(ctx, user) : JS_NULL);
-    JSValue arr = JS_NewArray(ctx);
-    for (int i = 0; i < n; i++)
-        JS_DefinePropertyValueUint32(ctx, arr, (uint32_t)i, JS_NewString(ctx, traits[i]), JS_PROP_C_W_E);
-    JS_SetPropertyStr(ctx, p, "traits", arr);
     return p;
 }
 

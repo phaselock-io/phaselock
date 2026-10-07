@@ -64,10 +64,9 @@ const char *pldb_epoch(pldb *db);
 
 /* Requests; answered through pldb_pop.  user NULL is anonymous; gen < 0 skips
    the generation check. */
-int pldb_submit(pldb *db, uint64_t reqid, const char *user, const char *const *traits,
-                int ntraits, int64_t gen, const uint8_t *body, size_t len);
-int pldb_register(pldb *db, uint64_t reqid, uint64_t conn, const char *user,
-                  const char *const *traits, int ntraits, int64_t gen);
+int pldb_submit(pldb *db, uint64_t reqid, const char *user, int64_t gen, const uint8_t *body,
+                size_t len);
+int pldb_register(pldb *db, uint64_t reqid, uint64_t conn, const char *user, int64_t gen);
 int pldb_unregister(pldb *db, uint64_t conn);
 int pldb_lookup(pldb *db, uint64_t reqid, const uint8_t *ident, size_t len);
 

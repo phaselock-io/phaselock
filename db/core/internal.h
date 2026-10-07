@@ -187,7 +187,7 @@ typedef struct pc_result {
 
 int js_open(jsrt *js, const char *bundle_path, store *st, char *err, size_t errlen);
 void js_close(jsrt *js);
-JSValue js_principal(jsrt *js, const char *user, const char *const *traits, int n);
+JSValue js_principal(jsrt *js, const char *user);
 /* run the bundle's bootstrap, if it has one, collecting what it emits */
 int js_bootstrap(jsrt *js, pc_result *out);
 int js_precommit(jsrt *js, const char *id, JSValueConst data, JSValueConst principal,

@@ -103,7 +103,6 @@ func (h *harness) do(method, path, token string, body []byte) (int, http.Header,
 	return resp.StatusCode, resp.Header, out
 }
 
-// token mints a dev token for user with the given traits.
 // token signs in as an existing account with no credential, through dev auth; the test bundle's
 // standing users, root (an admin) and p1, need no account in the log.
 func (h *harness) token(identity string) string {
@@ -1045,19 +1044,16 @@ func TestPasswordAuth(t *testing.T) {
 	tok3 := mpDecodeOne(t, out).(map[string]any)["token"].(string)
 	h.ack(tok3, cmd("c8", "rename-patron", "id", "ann", "name", "Ann"))
 
-	// traits ride the account: an admin-created account with the admin trait
-	h.ack(admin, cmd("c9", "create-account", "user", "boss", "password", "pw", "traits", []any{"admin"}))
+	// an account an admin creates as an admin is one
+	h.ack(admin, cmd("c9", "create-account", "user", "boss", "password", "pw", "admin", true))
 	status, _, out = h.do("POST", "/auth/token", "", mpEncode(map[string]any{
 		"kind": "password", "identity": "boss", "password": "pw",
 	}))
 	if status != 200 {
 		t.Fatalf("boss login: %d", status)
 	}
-	boss := mpDecodeOne(t, out).(map[string]any)
-	if strs(boss["traits"])[0] != "admin" {
-		t.Fatalf("boss traits: %v", boss)
-	}
-	h.ack(boss["token"].(string), cmd("c10", "add-book", "id", "b1", "title", "Dune"))
+	boss := mpDecodeOne(t, out).(map[string]any)["token"].(string)
+	h.ack(boss, cmd("c10", "add-book", "id", "b1", "title", "Dune"))
 }
 
 func TestDevAuthCanBeDisabled(t *testing.T) {
@@ -1854,20 +1850,15 @@ func TestDevSignInIsAnExistingAccount(t *testing.T) {
 		t.Fatalf("dev sign-in with no account: %d", status)
 	}
 
-	// the traits are the account's, whatever the request says
-	_, reply := devSignIn(h, map[string]any{"identity": "p1", "traits": []any{"admin"}})
-	if traits := reply["traits"].([]any); len(traits) != 0 {
-		t.Fatalf("dev sign-in took its traits from the request: %v", traits)
-	}
-	_, reply = devSignIn(h, map[string]any{"identity": "root"})
-	if strs(reply["traits"])[0] != "admin" {
-		t.Fatalf("root's traits: %v", reply["traits"])
+	// a name with an account signs in as it
+	if status, reply := devSignIn(h, map[string]any{"identity": "p1"}); status != 200 || reply["user"] != "p1" {
+		t.Fatalf("dev sign-in as p1: %d %v", status, reply)
 	}
 }
 
 func TestATokenForNoAccountIsRefusedEverywhere(t *testing.T) {
 	h := start(t)
-	ghost, _ := h.srv.mint("ghost", []string{"admin"}, 0)
+	ghost, _ := h.srv.mint("ghost", 0)
 
 	if status, _ := h.commandsStatus(ghost, cmd("c1", "add-book", "id", "b1", "title", "Dune")); status != 401 {
 		t.Fatalf("commands: %d", status)
@@ -1909,18 +1900,19 @@ func TestBootstrapSeedsAnEmptyLog(t *testing.T) {
 		t.Fatalf("bootstrap's hash: %q", hash)
 	}
 
-	// the seeded admin signs in with the password, and its traits ride the account
+	// the seeded admin signs in with the password
 	status, _, out := h.do("POST", "/auth/token", "", mpEncode(map[string]any{
 		"kind": "password", "identity": "boss", "password": "pw",
 	}))
-	if status != 200 || strs(mpDecodeOne(t, out).(map[string]any)["traits"])[0] != "admin" {
+	if status != 200 {
 		t.Fatalf("seeded admin sign-in: %d %s", status, out)
 	}
+	boss := mpDecodeOne(t, out).(map[string]any)["token"].(string)
 
-	// a log that is not empty is not seeded again
+	// a log that is not empty is not seeded again, and the seeded account acts as an admin
 	h.stop()
 	h = startWith(t, t.Context(), Options{DataDir: dir, BootstrapEnv: env})
-	if next := h.ack(h.admin(), cmd("c1", "add-book", "id", "b1", "title", "Dune")); next != 4 {
+	if next := h.ack(boss, cmd("c1", "add-book", "id", "b1", "title", "Dune")); next != 4 {
 		t.Fatalf("after a restart, the next atom lands at %d, want 4: bootstrap ran again", next)
 	}
 }

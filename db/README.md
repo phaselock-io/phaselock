@@ -380,13 +380,13 @@ fields are the stream row's counters and appear only for an exact ref.
 ### Auth
 
 - `POST /auth/token`, msgpack body, msgpack reply `{token, user,
-  traits, exp}`.  Kinds: `{kind: "password", identity, password}`;
+  exp}`.  Kinds: `{kind: "password", identity, password}`;
   `{kind: "refresh"}` with a bearer token; `{kind: "dev", identity}`
   accepted only when the server runs with `--dev-auth`, signing in as
   an existing account with no credential.  No Authorization header is
   the anonymous principal.
 - Tokens are HS256 JWTs signed with a per-database secret, claims
-  `sub`, `traits`, `gen`, `iat`, `exp`.  Refresh is re-issue.  The
+  `sub`, `gen`, `iat`, `exp`, `jti`.  Refresh is re-issue.  The
   token's `gen` is compared to the account's generation on stream open
   and on every command; a mismatch is rejected, so a generation bump
   logs out everywhere.
@@ -396,8 +396,8 @@ fields are the stream row's counters and appear only for an exact ref.
   argon2id hash at the current parameters, so it answers no faster
   than a wrong password.  Go never reads the
   store.  The generation check calls `lookup` with `{kind: "token",
-  user, traits}`; refresh calls it
-  with `{kind: "refresh", user, traits}`; a null result means no
+  user}`; refresh calls it
+  with `{kind: "refresh", user}`; a null result means no
   account and fails like a moved generation, since a token speaks only
   for an existing account (AUTH.md), dev tokens included.
 - A command's `NewPassword` fields, which the registry marks, are
@@ -470,14 +470,14 @@ app's slots:
       reducers: { family: { reducer(txn, events, stream, pending),
                             template, keys } },
       maySee(txn, principal) → [ref...],
-      lookup(txn, ident) → null | { user, traits, generation, secret },
+      lookup(txn, ident) → null | { user, generation, secret },
       bootstrap(ctx),           // optional; see Bootstrap
       dev,                      // the skeleton's DEV
       mapStack(stack, file, map) → stack,
     }
 
-- `cmd` is `{id, data}`; `principal` is `{user, traits}` with `user`
-  null for anonymous; `ident` is `{kind: "password", identity}` at
+- `cmd` is `{id, data}`; `principal` is `{user}` with `user` null
+  for anonymous; `ident` is `{kind: "password", identity}` at
   login and the `token`/`refresh` shapes above otherwise.
 - The core defines `process.env.NODE_ENV` as `production` before
   evaluating the bundle, for a bundle built without a define; a build

@@ -11,7 +11,12 @@ Two kinds of work happen here; orient first:
   follow the `phaselock` skill at `agents/skills/phaselock/SKILL.md` and
   its reference files. That skill is the product documentation for
   agents; it also ships to end users, so keep it repo-agnostic when
-  editing it.
+  editing it. The skill still describes the KurrentDB-shaped API. The
+  PhaseLockDB-shaped API was more than half a rewrite and assumes
+  synchronous stores, which rules out IndexedDB and implies OPFS with
+  SQLite or a custom KV store in the browser; the Engine rewrite is not
+  finished, so the skill is not being updated yet. The current contract
+  is the skeleton (`typespec/ts/assets/skeleton.ts`) and `client/ts`.
 - **Changing PhaseLock itself** (`typespec/` — the TypeSpec vocabulary,
   emitters, and runtime skeletons): read `typespec/CLAUDE.md` for settled
   design decisions before touching anything there.

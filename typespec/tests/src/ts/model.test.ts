@@ -222,7 +222,7 @@ const SNIPPETS: Record<string, string> = {
 
     // a helper typed by the generated names
     function sweep(auth: Auth, txn: AppDBTxn, cmd: Sweep): SweepOutput {
-      auth.authorize(auth.traits.includes('admin'), 'admins only');
+      auth.authorize(auth.user === 'root', 'root only');
       if (txn.get.item(cmd.id) === undefined) throw new Reject('no such item');
       return { stream: 'catalog', event: { type: 'item-removed', id: cmd.id } };
     }
@@ -858,11 +858,11 @@ function bundle(precommit: Record<string, unknown> = {}) {
     precommit: { ...passthrough(), ...precommit },
     maySee: (_txn: any, principal: any) => [`inbox:acme,${principal.user}!`, 'catalog!'],
     lookup: (_txn: any, ident: any) =>
-      ident.kind === 'password' ? { user: ident.identity, traits: [] } : null,
+      ident.kind === 'password' ? { user: ident.identity } : null,
   });
 }
 
-const anyone = { user: null, traits: [] };
+const anyone = { user: null };
 
 describe('precommit', () => {
   it('generates a precommit interface with one handler per @command model', () => {
@@ -896,13 +896,13 @@ describe('precommit', () => {
     const b = bundle({
       removeItem: (auth: any, ctx: any, cmd: any) => {
         auth.authorize(auth.user === 'u1');
-        got.push(auth.user, auth.traits, ctx.get.item(cmd.id), cmd);
+        got.push(auth.user, ctx.get.item(cmd.id), cmd);
         return { stream: 'catalog', event: itemRemoved };
       },
     });
     const data = { type: 'remove-item', id: 'i1' };
-    b.precommit(txn, { id: 'c1', data }, { user: 'u1', traits: ['admin'] });
-    expect(got).toEqual(['u1', ['admin'], { id: 'i1' }, data]);
+    b.precommit(txn, { id: 'c1', data }, { user: 'u1' });
+    expect(got).toEqual(['u1', { id: 'i1' }, data]);
     expect(calls).toEqual([['get', 'catalog!item:i1', 'Item']]);
   });
 
@@ -952,9 +952,9 @@ describe('precommit', () => {
 
     // a failed authorization and a Reject are rejections, answered with their reasons
     const denied = bundle({
-      sweep: (auth: any) => auth.authorize(auth.traits.includes('admin'), 'admins only'),
+      sweep: (auth: any) => auth.authorize(auth.user !== null, 'signed-in users only'),
     });
-    expect(denied.precommit(txn, sweep, anyone)).toBe('admins only');
+    expect(denied.precommit(txn, sweep, anyone)).toBe('signed-in users only');
     const rejected = bundle({
       sweep: (auth: any) => {
         auth.authorizeAnyone();

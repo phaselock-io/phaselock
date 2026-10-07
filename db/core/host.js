@@ -66,7 +66,7 @@ globalThis.__host = (function () {
       return r == null ? null : r;
     },
     generation(principal) {
-      const r = bundle().lookup(rx, { kind: 'token', user: principal.user, traits: principal.traits });
+      const r = bundle().lookup(rx, { kind: 'token', user: principal.user });
       return r == null ? -1 : (r.generation ?? 0);
     },
   };

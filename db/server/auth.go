@@ -35,24 +35,20 @@ const (
 var phc64 = base64.RawStdEncoding
 
 type claims struct {
-	Sub    string   `json:"sub"`
-	Traits []string `json:"traits"`
-	Gen    int64    `json:"gen"`
-	Iat    int64    `json:"iat"`
-	Exp    int64    `json:"exp"`
-	Jti    string   `json:"jti"`
+	Sub string `json:"sub"`
+	Gen int64  `json:"gen"`
+	Iat int64  `json:"iat"`
+	Exp int64  `json:"exp"`
+	Jti string `json:"jti"`
 }
 
 var b64 = base64.RawURLEncoding
 
-func (s *Server) mint(user string, traits []string, gen int64) (string, int64) {
-	if traits == nil {
-		traits = []string{}
-	}
+func (s *Server) mint(user string, gen int64) (string, int64) {
 	now := time.Now()
 	jti := make([]byte, 8)
 	rand.Read(jti)
-	c := claims{Sub: user, Traits: traits, Gen: gen, Iat: now.Unix(), Exp: now.Add(tokenLifetime).Unix(), Jti: fmt.Sprintf("%x", jti)}
+	c := claims{Sub: user, Gen: gen, Iat: now.Unix(), Exp: now.Add(tokenLifetime).Unix(), Jti: fmt.Sprintf("%x", jti)}
 	header := b64.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	payload, _ := json.Marshal(c)
 	signing := header + "." + b64.EncodeToString(payload)
@@ -100,7 +96,7 @@ func (s *Server) principalOf(r *http.Request) (principal, error) {
 	if err != nil {
 		return principal{}, err
 	}
-	return principal{user: c.Sub, traits: c.Traits, gen: c.Gen}, nil
+	return principal{user: c.Sub, gen: c.Gen}, nil
 }
 
 func hashPassword(pw string) string {
@@ -171,7 +167,6 @@ func hashFailed(w http.ResponseWriter, err error) {
 // the bundle's lookup result
 type account struct {
 	user       string
-	traits     []string
 	generation int64
 	secret     string
 }
@@ -197,13 +192,6 @@ func (s *Server) lookup(ident map[string]any) (*account, error) {
 	a.secret, _ = m["secret"].(string)
 	if g, ok := m["generation"]; ok && g != nil {
 		a.generation = asInt64(g)
-	}
-	if ts, ok := m["traits"].([]any); ok {
-		for _, t := range ts {
-			if str, ok := t.(string); ok {
-				a.traits = append(a.traits, str)
-			}
-		}
 	}
 	return a, nil
 }
@@ -238,7 +226,6 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	kind, _ := req["kind"].(string)
 	var user string
-	var traits []string
 	var gen int64
 	switch kind {
 	case "dev":
@@ -246,8 +233,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "dev auth is disabled", http.StatusForbidden)
 			return
 		}
-		// password sign-in without the password: the account, its traits, and its generation
-		// come from lookup
+		// password sign-in without the password: the account and its generation come from lookup
 		identity, _ := req["identity"].(string)
 		a, err := s.lookup(map[string]any{"kind": "password", "identity": identity})
 		if err != nil {
@@ -258,7 +244,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "no such account", http.StatusUnauthorized)
 			return
 		}
-		user, traits, gen = a.user, a.traits, a.generation
+		user, gen = a.user, a.generation
 	case "password":
 		identity, _ := req["identity"].(string)
 		password, _ := req["password"].(string)
@@ -282,14 +268,14 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid credentials", http.StatusUnauthorized)
 			return
 		}
-		user, traits, gen = a.user, a.traits, a.generation
+		user, gen = a.user, a.generation
 	case "refresh":
 		p, err := s.principalOf(r)
 		if err != nil || p.anonymous {
 			http.Error(w, "refresh needs a bearer token", http.StatusUnauthorized)
 			return
 		}
-		a, err := s.lookup(map[string]any{"kind": "refresh", "user": p.user, "traits": p.traits})
+		a, err := s.lookup(map[string]any{"kind": "refresh", "user": p.user})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -299,16 +285,12 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "token revoked", http.StatusUnauthorized)
 			return
 		}
-		user, traits, gen = p.user, a.traits, p.gen
+		user, gen = p.user, p.gen
 	default:
 		http.Error(w, "unknown kind", http.StatusBadRequest)
 		return
 	}
-	token, exp := s.mint(user, traits, gen)
-	tr := make([]any, 0, len(traits))
-	for _, t := range traits {
-		tr = append(tr, t)
-	}
+	token, exp := s.mint(user, gen)
 	w.Header().Set("Content-Type", "application/msgpack")
-	w.Write(mpEncode(map[string]any{"token": token, "user": user, "traits": tr, "exp": exp}))
+	w.Write(mpEncode(map[string]any{"token": token, "user": user, "exp": exp}))
 }

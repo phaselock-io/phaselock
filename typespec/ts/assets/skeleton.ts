@@ -1871,7 +1871,7 @@ export class Reject extends Error {
 }
 
 /** who sent a command, as their token proves it; user is null for the anonymous principal */
-export type Principal = { user: string | null; traits: string[] };
+export type Principal = { user: string | null };
 
 /** Auth is what a precommit handler authorizes through.  Each call gets a fresh one, and the
     caller rejects a handler that returns without an authorization decision, so authorization
@@ -1879,12 +1879,10 @@ export type Principal = { user: string | null; traits: string[] };
     wanted. */
 export class Auth implements Principal {
   readonly user: string | null;
-  readonly traits: string[];
   #authorized: boolean = false;
 
   constructor(principal: Principal) {
     this.user = principal.user;
-    this.traits = principal.traits;
   }
 
   /** whether the call has been authorized so far */
@@ -1939,14 +1937,13 @@ export function runPrecommit(
     and on every check of its account's generation */
 export type LookupIdent =
   | { kind: 'password'; identity: string }
-  | { kind: 'refresh'; user: string; traits: string[] }
-  | { kind: 'token'; user: string; traits: string[] };
+  | { kind: 'refresh'; user: string }
+  | { kind: 'token'; user: string };
 
-/** an existing account: its principal, the generation every token of it must carry, and the
-    stored password hash a sign-in verifies against */
+/** an existing account: its user, the generation every token of it must carry, and the stored
+    password hash a sign-in verifies against */
 export type LookupResult = {
   user: string;
-  traits: string[];
   generation?: number;
   secret?: string;
 };

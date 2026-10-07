@@ -13,14 +13,15 @@ import {
   type TestDBTxn,
 } from './model.gen.ts';
 
-const ADMIN = 'admin';
-const isAdmin = (p: Principal): boolean => p.traits.includes(ADMIN);
+/* The users the tests sign in as without creating an account first.  root is an admin, and r1 is
+   audited: its every maySee run changes its view, so a test sees each run as a view frame. */
+const TEST_USERS = ['root', 'p1', 'r1'];
+const ROOT = 'root';
+const AUDITED = 'r1';
 
-// a principal whose every maySee run changes its view, so a test sees each run as a view frame
-const AUDITED = 'audited';
-
-// the users the tests sign in as without creating an account first, with their traits
-const TEST_USERS: Record<string, string[]> = { root: [ADMIN], p1: [], r1: [AUDITED] };
+// whether the principal is root or an account flagged admin
+const isAdmin = (txn: TestDBTxn, p: Principal): boolean =>
+  p.user === ROOT || (p.user !== null && txn.get.account(p.user)?.admin === true);
 const isSelf = (p: Principal, user: string): boolean => p.user !== null && p.user === user;
 
 // scans //
@@ -92,7 +93,7 @@ const shelf: ShelfSliceReducers = {
 
 const account: AccountSliceReducers = {
   accountCreated: (txn, e) =>
-    txn.set.account({ user: e.user, hash: e.hash, traits: e.traits, generation: 0, views: [] }),
+    txn.set.account({ user: e.user, hash: e.hash, admin: e.admin, generation: 0, views: [] }),
   passwordSet: (txn, e) =>
     txn.update.account((a) => {
       a.hash = e.hash;
@@ -123,27 +124,27 @@ function requireAccount(txn: TestDBTxn, user: string): void {
 
 const precommit: TestDBPrecommit = {
   addBook: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(auth));
+    auth.authorize(isAdmin(txn, auth));
     if (txn.get.book(cmd.id) !== undefined) throw new Reject('book exists');
     return { stream: 'book', event: cmd };
   },
   addPatron: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(auth));
+    auth.authorize(isAdmin(txn, auth));
     if (txn.get.patron(cmd.id) !== undefined) throw new Reject('patron exists');
     return { stream: `patron:${cmd.id}`, event: cmd };
   },
   renamePatron: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(auth) || isSelf(auth, cmd.id));
+    auth.authorize(isAdmin(txn, auth) || isSelf(auth, cmd.id));
     requirePatron(txn, cmd.id);
     return { stream: `patron:${cmd.id}`, event: cmd };
   },
   removePatron: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(auth));
+    auth.authorize(isAdmin(txn, auth));
     requirePatron(txn, cmd.id);
     return { stream: `patron:${cmd.id}`, death: true };
   },
   tryHold: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(auth) || isSelf(auth, cmd.patron));
+    auth.authorize(isAdmin(txn, auth) || isSelf(auth, cmd.patron));
     const b = txn.get.book(cmd.book);
     if (b === undefined) throw new Reject('no such book');
     requirePatron(txn, cmd.patron);
@@ -157,7 +158,7 @@ const precommit: TestDBPrecommit = {
     ];
   },
   shelve: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(auth));
+    auth.authorize(isAdmin(txn, auth));
     const b = txn.get.book(cmd.book);
     if (b === undefined) throw new Reject('no such book');
     const copies = txn.scan.copy({ branch: cmd.branch });
@@ -168,39 +169,40 @@ const precommit: TestDBPrecommit = {
     };
   },
   lend: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(auth));
+    auth.authorize(isAdmin(txn, auth));
     return { stream: `shelf:${cmd.branch}`, event: cmd };
   },
   closeShelf: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(auth));
+    auth.authorize(isAdmin(txn, auth));
     return { stream: `shelf:${cmd.branch}`, death: true };
   },
   createAccount: (auth, txn, cmd) => {
     auth.authorizeAnyone();
     if (txn.get.account(cmd.user) !== undefined) throw new Reject('account exists');
-    const traits = isAdmin(auth) ? (cmd.traits ?? []) : [];
+    // only an admin creates an admin
+    const admin = isAdmin(txn, auth) && cmd.admin === true;
     return {
       stream: `account:${cmd.user}`,
-      event: { type: 'account-created', user: cmd.user, hash: cmd.password, traits },
+      event: { type: 'account-created', user: cmd.user, hash: cmd.password, admin },
     };
   },
   setPassword: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(auth) || isSelf(auth, cmd.user));
+    auth.authorize(isAdmin(txn, auth) || isSelf(auth, cmd.user));
     requireAccount(txn, cmd.user);
     return { stream: `account:${cmd.user}`, event: { type: 'password-set', hash: cmd.password } };
   },
   revokeSessions: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(auth) || isSelf(auth, cmd.user));
+    auth.authorize(isAdmin(txn, auth) || isSelf(auth, cmd.user));
     requireAccount(txn, cmd.user);
     return { stream: `account:${cmd.user}`, event: { type: 'sessions-revoked' } };
   },
   grantView: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(auth));
+    auth.authorize(isAdmin(txn, auth));
     requireAccount(txn, cmd.user);
     return { stream: `account:${cmd.user}`, event: { type: 'view-granted', prefix: cmd.prefix } };
   },
   revokeView: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(auth));
+    auth.authorize(isAdmin(txn, auth));
     requireAccount(txn, cmd.user);
     return { stream: `account:${cmd.user}`, event: { type: 'view-revoked', prefix: cmd.prefix } };
   },
@@ -218,31 +220,30 @@ const bundle = defineTestDB({
   precommit,
   maySee: (txn, principal) => {
     if (principal.user === null) return ['book!'];
-    if (isAdmin(principal)) return ['*'];
+    if (isAdmin(txn, principal)) return ['*'];
     const out = ['book!', `patron:${principal.user}!`];
     const a = txn.get.account(principal.user);
     if (a !== undefined) out.push(...a.views);
     // the shelves that lend to the user
     for (const key of lendsTo(principal.user)) out.push(key.slice(0, key.indexOf('!') + 1));
-    if (principal.traits.includes(AUDITED)) out.push(`shelf:run-${++auditedRuns}!`);
+    if (principal.user === AUDITED) out.push(`shelf:run-${++auditedRuns}!`);
     return out;
   },
   lookup: (txn, ident) => {
     const user = ident.kind === 'password' ? ident.identity : ident.user;
     const a = txn.get.account(user);
     if (a !== undefined) {
-      return { user: a.user, traits: a.traits, generation: a.generation, secret: a.hash };
+      return { user: a.user, generation: a.generation, secret: a.hash };
     }
     // the tests' standing users, who need no account in the log
-    const traits = TEST_USERS[user];
-    return traits === undefined ? null : { user, traits, generation: 0 };
+    return TEST_USERS.includes(user) ? { user, generation: 0 } : null;
   },
   // an admin account, when the operator names its user and password
   bootstrap: (ctx) => {
     const user = ctx.env('BOOTSTRAP_ADMIN');
     if (user === '') return;
     const hash = ctx.hashPassword(ctx.env('BOOTSTRAP_PASSWORD'));
-    ctx.emit(`account:${user}`, { type: 'account-created', user, hash, traits: [ADMIN] });
+    ctx.emit(`account:${user}`, { type: 'account-created', user, hash, admin: true });
   },
 });
 

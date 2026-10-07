@@ -14,20 +14,19 @@ describe('Reject', () => {
 
 describe('Auth', () => {
   test('carries the principal and starts with no authorization decision', () => {
-    const auth = new Auth({ user: 'u1', traits: ['admin'] });
+    const auth = new Auth({ user: 'u1' });
     expect(auth.user).toBe('u1');
-    expect(auth.traits).toEqual(['admin']);
     expect(auth.authorized).toBe(false);
   });
 
   test('authorize marks the call on a true condition', () => {
-    const auth = new Auth({ user: 'u1', traits: [] });
+    const auth = new Auth({ user: 'u1' });
     auth.authorize(true);
     expect(auth.authorized).toBe(true);
   });
 
   test('authorize rejects on a false condition, with the reason or a default', () => {
-    const auth = new Auth({ user: 'u1', traits: [] });
+    const auth = new Auth({ user: 'u1' });
     expect(() => auth.authorize(false, 'librarians only')).toThrow(Reject);
     expect(() => auth.authorize(false, 'librarians only')).toThrow('librarians only');
     expect(() => auth.authorize(false)).toThrow('unauthorized');
@@ -35,7 +34,7 @@ describe('Auth', () => {
   });
 
   test('authorizeAnyone marks the call unconditionally, anonymous included', () => {
-    const auth = new Auth({ user: null, traits: [] });
+    const auth = new Auth({ user: null });
     auth.authorizeAnyone();
     expect(auth.authorized).toBe(true);
   });
