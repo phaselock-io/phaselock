@@ -1139,15 +1139,13 @@ int pldb_snapshot(pldb *db, const char *ref, uint8_t **out, size_t *len, uint64_
         if (!rc && (live = store_live_stream(db->r, ref, &seq)) < 0) rc = -1;
     }
     if (!rc) {
-        mpack_start_map(&w, have_stats > 0 ? 7 : 5);
+        mpack_start_map(&w, have_stats > 0 ? 6 : 4);
         mpack_write_cstr(&w, "ref");
         mpack_write_cstr(&w, ref);
         mpack_write_cstr(&w, "position");
         mpack_write_u64(&w, *position);
         mpack_write_cstr(&w, "fold");
         mpack_write_cstr(&w, db->epoch);
-        mpack_write_cstr(&w, "count");
-        mpack_write_u32(&w, sc.count);
         mpack_write_cstr(&w, "streams");
         if (is_wildcard(ref)) {
             mpack_build_map(&w);

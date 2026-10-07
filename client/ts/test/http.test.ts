@@ -86,7 +86,7 @@ class Stub {
 
 function hooks(log: unknown[][]): ConnectorHooks {
   return {
-    onOpen: (epoch) => log.push(['open', epoch]),
+    onOpen: (epoch, head) => log.push(['open', epoch, head]),
     onView: (token, position, refs) => log.push(['view', token, position, refs]),
     onEvents: (events) =>
       log.push(['events', events.map((e) => [e.position, e.stream, e.seq, decode(e.data)])]),
@@ -121,7 +121,7 @@ describe('the live stream', () => {
     s.end();
     await settle();
     expect(log).toEqual([
-      ['open', 'e3'],
+      ['open', 'e3', 3],
       ['live', 0],
       ['events', [[1, 'book', 1, { $sys: 'birth' }]]],
       ['view', 't2', 2, ['book', 'patron:p1']],
@@ -160,7 +160,7 @@ describe('the live stream', () => {
     s.end();
     await settle();
     expect(log).toEqual([
-      ['open', 'e3'],
+      ['open', 'e3', 7],
       ['view', 't9', 7, ['book', 'patron:*']],
       ['live', 7],
       ['end', 0, 'stream closed'],
@@ -176,7 +176,7 @@ describe('the live stream', () => {
     s.end();
     await settle();
     expect(log).toEqual([
-      ['open', 'e3'],
+      ['open', 'e3', 3],
       ['live', 9],
       ['end', 0, 'stream closed'],
     ]);
@@ -191,6 +191,17 @@ describe('the live stream', () => {
     NewHTTPConnector(stub.url)(-1, null, ['*'], new AbortController().signal, hooks(log));
     await settle();
     expect(log).toEqual([['end', 200, 'stream: no epoch']]);
+  });
+
+  test('a stream without a position header ends before any frame', async () => {
+    stub.routes.set('/stream', (_r, _b, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/msgpack', 'PhaseLock-Epoch': 'e3' });
+      res.end();
+    });
+    const log: unknown[][] = [];
+    NewHTTPConnector(stub.url)(-1, null, ['*'], new AbortController().signal, hooks(log));
+    await settle();
+    expect(log).toEqual([['end', 200, 'stream: no position']]);
   });
 
   test('a refused handshake ends with the HTTP status', async () => {
@@ -396,6 +407,8 @@ describe('backfill', () => {
     header: { position: number; seqs: Record<string, number> } | null;
     batches: { keys: string[]; skip: number }[];
     tails: [number, string, number][][];
+    scanned: number[];
+    lengths: number[];
     done: ('values' | 'events')[];
   };
 
@@ -405,20 +418,30 @@ describe('backfill', () => {
     until: number,
     resume: Backfill['resume'] = null,
   ): Promise<Run> {
-    const got: Run = { outcome: 'done', header: null, batches: [], tails: [], done: [] };
+    const got: Run = {
+      outcome: 'done',
+      header: null,
+      batches: [],
+      tails: [],
+      scanned: [],
+      lengths: [],
+      done: [],
+    };
     got.outcome = await conn.backfill({
       ref,
       until,
       resume,
       signal: new AbortController().signal,
       push: async (item) => {
-        if ('header' in item) got.header = item.header;
+        if ('length' in item) got.lengths.push(item.length);
+        else if ('header' in item) got.header = item.header;
         else if ('values' in item)
           got.batches.push({ keys: item.values.map(([k]) => k), skip: item.skip });
         else if ('valuesDone' in item) got.done.push('values');
-        else if ('events' in item)
+        else if ('events' in item) {
           got.tails.push(item.events.map((e) => [e.position, e.stream, e.seq]));
-        else got.done.push('events');
+          got.scanned.push(item.scanned);
+        } else got.done.push('events');
       },
     });
     return got;
@@ -434,9 +457,14 @@ describe('backfill', () => {
         res.end();
         return;
       }
+      const length =
+        skip > 0
+          ? { 'Content-Range': `bytes ${skip}-${bytes.length - 1}/${bytes.length}` }
+          : { 'Content-Length': String(bytes.length) };
       res.writeHead(skip > 0 ? 206 : 200, {
         'Content-Type': 'application/octet-stream',
         'PhaseLock-Position': String(position),
+        ...length,
       });
       res.end(Buffer.from(bytes.subarray(skip)));
     });
@@ -481,6 +509,7 @@ describe('backfill', () => {
     serveTail();
     const r = await run(conn, 'patron:*', 40);
     expect(r.outcome).toBe('done');
+    expect(r.lengths).toEqual([built.bytes.length]);
     expect(r.header).toEqual({ position: 40, seqs: streams });
     const keys = r.batches.flatMap((b) => b.keys);
     expect(keys).toEqual(Object.keys(records).sort());
@@ -508,6 +537,8 @@ describe('backfill', () => {
     expect(positions.at(-1)).toBe(2599);
     expect(positions).toHaveLength(2559);
     expect(r.tails).toHaveLength(3);
+    // each page reports how far its scan reached: a full page its last event, a short one until
+    expect(r.scanned).toEqual([1040, 2040, 2600]);
     expect(r.done.filter((d) => d === 'events')).toEqual(['events']);
     const pages = stub.requests.filter((q) => q.path.startsWith('/events/')).map((q) => q.path);
     expect(pages).toHaveLength(3);
@@ -557,6 +588,7 @@ describe('backfill', () => {
     });
     expect(r.outcome).toBe('done');
     expect(r.header).toBeNull();
+    expect(r.lengths).toEqual([built.bytes.length]);
     expect(r.batches.flatMap((b) => b.keys)).toEqual(Object.keys(records).sort().slice(1001));
     expect(stub.requests.find((q) => q.path.startsWith('/snapshot/'))!.headers.range).toBe(
       `bytes=${skip}-`,

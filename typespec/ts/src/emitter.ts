@@ -850,16 +850,18 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   d.print('}\n');
 }
 
-/** a global context's type and its factory over a read transaction */
+/** a global context's type and its factory over a read transaction, with the Engine's status
+    when the context is a query's */
 function generateGlobalContext(
   d: Denter,
   annos: Annos,
-  name: string,
+  type: string,
   doc: string,
   slices: readonly PSlice[],
+  status = false,
 ): void {
   d.print(`\n/** ${doc} */\n`);
-  d.print(`export type ${name}Txn = {\n`);
+  d.print(`export type ${type} = {\n`);
   d.indent('  ');
   d.print('get: {\n');
   d.indent('  ');
@@ -870,13 +872,16 @@ function generateGlobalContext(
   for (const slice of slices) printScanTypes(d, scanners(annos, slice, true));
   d.dedent();
   d.print('};\n');
+  if (status) d.print('status: EngineStatus;\n');
   d.dedent();
   d.print('};\n');
 
   const gets = slices.map((s) => `...${lowerFirst(s.name)}Get($txn)`).join(', ');
   const scans = slices.map((s) => `...${lowerFirst(s.name)}Scan($txn)`).join(', ');
-  d.print(`\nexport function ${lowerFirst(name)}Txn($txn: ReadTxn): ${name}Txn {\n`);
-  d.print(`  return { get: { ${gets} }, scan: { ${scans} } };\n`);
+  const members = [`get: { ${gets} }`, `scan: { ${scans} }`];
+  if (status) members.push('status: engineStatus($txn)');
+  d.print(`\nexport function ${lowerFirst(type)}($txn: ReadTxn): ${type} {\n`);
+  d.print(`  return { ${members.join(', ')} };\n`);
   d.print('}\n');
 }
 
@@ -898,14 +903,19 @@ function reducersValue(slices: readonly PSlice[], tables: string): string {
 /** an engine's read context, its forecaster table and its wrapper, and its Engine subclass */
 function generateEngine(d: Denter, annos: Annos, registry: PTypeRegistry, e: PEngine): void {
   const txnType = `${e.name}Txn`;
+  const queryTxnType = `${e.name}QueryTxn`;
   const tableType = `${e.name}Forecasters`;
   const offline = e.commands.filter((c) => !c.online);
   const online = e.commands.filter((c) => c.online);
   const anno = (c: PCommand) => annos.get(c.type)!;
 
-  // the read context of its queries and forecasts
-  const doc = `${e.name}'s read context: what its queries and forecasts read, over its slices`;
-  generateGlobalContext(d, annos, e.name, doc, e.slices);
+  // the read context of its forecasts, and of its queries, which also read the Engine's status
+  const doc = `${e.name}'s read context: what its forecasts read, over its slices`;
+  generateGlobalContext(d, annos, txnType, doc, e.slices);
+  const queryDoc =
+    `${e.name}'s query context: what its queries read, over its slices, ` +
+    "and the Engine's status";
+  generateGlobalContext(d, annos, queryTxnType, queryDoc, e.slices, true);
 
   // the forecaster table: one optional forecaster per command that is not @online
   d.print(
@@ -957,7 +967,7 @@ function generateEngine(d: Denter, annos: Annos, registry: PTypeRegistry, e: PEn
   const names = e.slices.map((s) => s.name).join(', ');
   d.print(`
 /** the Engine of ${e.name}, syncing ${names} */
-export class ${e.name} extends Engine<${txnType}, ${C}, ${N}> {
+export class ${e.name} extends Engine<${queryTxnType}, ${txnType}, ${C}, ${N}> {
   constructor(
     // if store is null, InMemStore is used
     store: Store | null,
@@ -975,7 +985,7 @@ export class ${e.name} extends Engine<${txnType}, ${C}, ${N}> {
     },
   ) {
     const forecasters = callbacks.forecasters;
-    super(${lowerFirst(e.name)}Txn, store, reg, connect, {
+    super(${lowerFirst(queryTxnType)}, ${lowerFirst(txnType)}, store, reg, connect, {
       reducers: ${reducersValue(e.slices, 'callbacks.reducers')},
       wants: ${JSON.stringify(wants)},
       forecaster: forecasters === undefined ? undefined : ${lowerFirst(e.name)}Forecaster(forecasters),
@@ -1004,7 +1014,7 @@ function generateDatabase(
 
   // the read context of precommit, maySee, and lookup
   const doc = `${db.name}'s read context: what precommit, maySee, and lookup read, over every slice`;
-  generateGlobalContext(d, annos, db.name, doc, db.slices);
+  generateGlobalContext(d, annos, txnType, doc, db.slices);
 
   // the precommit table: one handler per command, each seeing the command after intake
   d.print(`\n/** ${db.name}'s precommit handlers, one per command */\n`);

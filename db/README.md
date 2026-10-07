@@ -219,7 +219,10 @@ Every frame is an array whose first element is a tag.
   the first frame.  `live` is sent exactly once per connection and
   carries the same convergence meaning as a vouch at that position.
   A view frame may arrive during history when maySee changes; it
-  applies from that point on.
+  applies from that point on.  History is read in windows of the log,
+  each ending on an atom's end, and a window that ends past the last
+  events frame is followed by a vouch at its end, so a client whose
+  view matches little of the log still sees the replay advance.
 - Server side, a replay of any length buffers nothing: the connection
   registers its maySee up front, replays from the log unbuffered, then
   starts receiving live commits and replays the small gap up to the
@@ -310,8 +313,8 @@ Every frame is an array whose first element is a tag.
   per command; offline-queued work should not carry expectations.
 
     GET /snapshot/<ref>          ref = stream, wildcard, or *
-      → application/octet-stream: the blob (below), inline, not
-        resumable; or
+      → application/octet-stream: the blob (below), inline, with its
+        Content-Length, not resumable; or
       → text/plain: one URL to fetch the blob from with Range; a 404
         or 410 there means re-request here
       The origin's response carries PhaseLock-Position, the log
@@ -360,7 +363,7 @@ All integers big-endian.  Records sorted by key bytes.
 
     magic     "PLSN"
     u8        version = 1
-    u32 hlen  + msgpack map { ref, position, fold, count,
+    u32 hlen  + msgpack map { ref, position, fold,
                               streams: { name: seq, ... },
                               event_bytes?, state_bytes? }
     u32       crc32c of the header bytes

@@ -9,6 +9,7 @@ import {
   ev,
   type Forecaster,
   keys,
+  last,
   log,
   parkedEvent,
   type Rig,
@@ -17,6 +18,7 @@ import {
   settle,
   state,
   watch,
+  watchStatus,
 } from './harness.ts';
 
 type Record_ = { until: number; replacing: boolean; children: string[] };
@@ -269,9 +271,23 @@ describe('freeze and group land', () => {
     expect(keys(r.data(), '!park')).toEqual([]);
   });
 
-  test.todo(
-    'caughtUp is false while frozen, true after the group land and onLive, false again on a gap: no status key yet',
-  );
+  test('the status shows the freeze: frozen while a replacing backfill is in flight, unfrozen after the group land, and frozen again on a gap', async () => {
+    const r = await held();
+    const status = watchStatus(r);
+    await settle();
+    expect(last(status.connection)).toMatchObject({ state: 'live', hasBase: true, frozen: false });
+
+    const { release } = await freeze(r);
+    expect(last(status.connection)).toMatchObject({ state: 'live', hasBase: true, frozen: true });
+    release();
+    await settle();
+    expect(last(status.connection)).toMatchObject({ state: 'live', frozen: false });
+
+    r.server.hold('patron:p1');
+    r.server.events(ev('patron:p1', 9, 20));
+    await settle();
+    expect(last(status.connection)).toMatchObject({ frozen: true });
+  });
 
   test('optimistic updates keep flowing during a freeze: a new command forecasts against the frozen base and the graph runs', async () => {
     const r = await held(true);
@@ -356,5 +372,17 @@ describe('freeze and group land', () => {
     expect(seq(r.data(), 'book:b2')).toBe(1);
   });
 
-  test.todo('a status-only query runs while frozen: no status key yet');
+  test('a status-only query runs while frozen, and sees the replacing backfill until it lands', async () => {
+    const r = await held();
+    const { release } = await freeze(r);
+    const status = watchStatus(r);
+    await settle();
+    const { backfills, estimate } = last(status.progress);
+    expect(backfills.map((b) => [b.ref, b.replacing])).toEqual([['patron:p2', true]]);
+    expect(estimate).not.toBeNull();
+
+    release();
+    await settle();
+    expect(last(status.progress)).toMatchObject({ estimate: null, backfills: [] });
+  });
 });

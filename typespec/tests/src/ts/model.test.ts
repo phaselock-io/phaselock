@@ -158,11 +158,13 @@ const SNIPPETS: Record<string, string> = {
       Item,
       PasswordHash,
       Profile,
+      ReaderEngineQueryTxn,
       ReaderEngineTxn,
       WriterEngineTxn,
     } from './model.gen.ts';
 
     declare const reader: ReaderEngineTxn;
+    declare const readerQuery: ReaderEngineQueryTxn;
     declare const writer: WriterEngineTxn;
     declare const db: AppDBTxn;
     declare function export_(s: string): void;
@@ -197,6 +199,14 @@ const SNIPPETS: Record<string, string> = {
     // the database's context passes wherever one of its engines' contexts is wanted
     export const asWriter: WriterEngineTxn = db;
     export const asReader: ReaderEngineTxn = db;
+
+    // a query reads the engine's slices and the Engine's status; a forecast reads no status, and
+    // the query context passes wherever the engine's context is wanted
+    export const hasBase: boolean = readerQuery.status.connection().hasBase;
+    export const queried: Item | undefined = readerQuery.get.item('i1');
+    // @ts-expect-error a forecast reads no status
+    void reader.status;
+    export const asReaderFromQuery: ReaderEngineTxn = readerQuery;
   `,
 
   precommit: `
@@ -383,6 +393,9 @@ const SNIPPETS: Record<string, string> = {
     void reader.sendOnlineCommand(leave);
 
     export const q: Query<Item | undefined> = writer.newQuery((txn) => txn.get.item('i1'));
+    export const loading: Query<boolean> = writer.newQuery(
+      (txn) => !txn.status.connection().hasBase,
+    );
   `,
 
   engines: `

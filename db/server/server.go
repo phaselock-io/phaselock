@@ -575,6 +575,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// the last position the client has been told of, by an events frame or a vouch
+	told := cursor
 	replay := func(from, to uint64) bool {
 		items, err := s.core.readAtoms(from, to)
 		if err != nil {
@@ -586,6 +588,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				if !write(f) {
 					return false
 				}
+				told = atom[len(atom)-1].position
 			}
 		}
 		if len(items) > 0 {
@@ -606,6 +609,14 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 			if cursor == before {
 				break
+			}
+			// a window that ended past the last frame is vouched for, so a client whose view
+			// matched nothing in it still sees the replay advance
+			if cursor > told {
+				if !write(mpEncode([]any{"vouch", cursor})) {
+					return
+				}
+				told = cursor
 			}
 		}
 	}
@@ -741,6 +752,7 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(len(blob)))
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("PhaseLock-Position", fmt.Sprint(position))
 	w.Write(blob)

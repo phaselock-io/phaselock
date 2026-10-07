@@ -578,6 +578,10 @@ func TestViewAndWants(t *testing.T) {
 			t.Fatalf("leaked event: %+v", e)
 		}
 	}
+	// the replay ended on p2's invisible events, which a vouch covers
+	if f := s.next(); f[0] != "vouch" || asInt(f[1]) != 6 {
+		t.Fatalf("expected a vouch at 6 past the last frame, got %v", f)
+	}
 	s.live()
 	// other patrons' events are invisible and produce no frame at all
 	h.ack(admin, cmd("c4", "rename-patron", "id", "p2", "name", "Robert"))
@@ -797,6 +801,9 @@ func (h *harness) snapshot(token, ref string) blob {
 	if status != 200 {
 		h.t.Fatalf("snapshot %s: status %d: %s", ref, status, out)
 	}
+	if hdr.Get("Content-Length") != fmt.Sprint(len(out)) {
+		h.t.Fatalf("Content-Length %q for a %d-byte blob", hdr.Get("Content-Length"), len(out))
+	}
 	b := parseBlob(h.t, out)
 	if fmt.Sprint(b.position) != hdr.Get("PhaseLock-Position") {
 		h.t.Fatalf("position header %q != blob %d", hdr.Get("PhaseLock-Position"), b.position)
@@ -868,9 +875,6 @@ func parseBlob(t *testing.T, b []byte) blob {
 	}
 	if !sort.StringsAreSorted(out.keys) {
 		t.Fatalf("records not sorted: %v", out.keys)
-	}
-	if n, ok := header["count"]; ok && asInt(n) != int64(count) {
-		t.Fatalf("header count %v != %d", n, count)
 	}
 	return out
 }

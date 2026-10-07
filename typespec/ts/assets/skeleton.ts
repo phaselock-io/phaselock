@@ -2105,23 +2105,46 @@ export interface Query<T> {
 export type QueryFunction<QX, T> = (qx: QX) => T;
 
 /** what a query's run read: the keys it got, {key: true}, and what each walk of its scans
-    covered, with the pattern of the last one as text to know the walk's next batch */
-type ReadDeps = { keys: Record<string, true>; spans: ScanSpan[]; last: string | null };
+    covered, with the pattern of the last one as text to know the walk's next batch; held when
+    a read was one the Engine holds (see Held) */
+type ReadDeps = {
+  keys: Record<string, true>;
+  spans: ScanSpan[];
+  last: string | null;
+  held: boolean;
+};
+
+/** Thrown by a read the Engine holds: on first boot, until the first sync lands, a query may read
+    only the Engine's status.  The query waits, with no result, and runs again with the graph. */
+class Held extends Error {
+  constructor() {
+    super('the Engine holds this read until its first sync lands');
+  }
+}
 
 // A ReadTxn over a store transaction, recording what it reads in deps when given.  In dev mode
 // what it hands out is a read-only proxy, so a mutation of a result throws where it happens,
 // naming the key; the JS representation is the one the app touches.
 function readTxn(txn: RTxn, deps?: ReadDeps): ReadTxn {
+  // a held read marks the run, so the query waits even when it catches the throw
+  const read = <R>(fn: () => R): R => {
+    try {
+      return fn();
+    } catch (e: unknown) {
+      if (e instanceof Held && deps !== undefined) deps.held = true;
+      throw e;
+    }
+  };
   const rtx: ReadTxn = {
     get(key, type) {
       if (deps !== undefined) deps.keys[key] = true;
-      const value = txn.get(key, type, JS);
+      const value = read(() => txn.get(key, type, JS));
       return DEV ? readOnly(value, key) : value;
     },
     scan(req) {
       const values: ScanRequest['values'] =
         req.type === false ? false : { type: req.type, rep: JS };
-      const result = txn.scan({ ...req, values });
+      const result = read(() => txn.scan({ ...req, values }));
       if (deps !== undefined) record(deps, req, result.next);
       if (!DEV) return result;
       const entries: [string, unknown][] = result.entries.map(([k, v]) => [k, readOnly(v, k)]);
@@ -2166,9 +2189,11 @@ class QueryImpl<QX, T> {
   #subs: ((val: T) => void)[] = [];
   #fn: QueryFunction<QX, T>;
   // what the last run read
-  #deps: ReadDeps = { keys: {}, spans: [], last: null };
+  #deps: ReadDeps = { keys: {}, spans: [], last: null, held: false };
   #runs: number = 0;
   #result: T | undefined = undefined;
+  // the last run made a read the Engine held, so the next run goes ahead whatever changed
+  #held: boolean = false;
 
   constructor(fn: QueryFunction<QX, T>) {
     this.#fn = fn;
@@ -2193,17 +2218,26 @@ class QueryImpl<QX, T> {
       its result changed */
   run(txn: RTxn, context: (txn: ReadTxn) => QX, dirty: Record<string, true>): boolean {
     // a query that read nothing which changed keeps its result
-    if (this.#runs > 0 && !this.#reads(dirty)) return false;
+    if (this.#runs > 0 && !this.#held && !this.#reads(dirty)) return false;
 
     // run it, recording what it reads; its transaction closes when it returns
-    const deps: ReadDeps = { keys: {}, spans: [], last: null };
+    const deps: ReadDeps = { keys: {}, spans: [], last: null, held: false };
     const rtx = readTxn(txn, deps);
-    const old = this.#result;
+    let result: T;
     try {
-      this.#result = this.#fn(context(rtx));
+      result = this.#fn(context(rtx));
+    } catch (e: unknown) {
+      if (!deps.held) throw e;
     } finally {
       closedTxns.add(rtx);
     }
+
+    // a held read: the query keeps what it had and waits for the next run
+    this.#held = deps.held;
+    if (deps.held) return false;
+
+    const old = this.#result;
+    this.#result = result!;
     this.#deps = deps;
     this.#runs++;
     return this.#runs === 1 || this.#result !== old;
@@ -2356,11 +2390,6 @@ export class RemoteQueries {
 
 // connectors ////////////////////////////////////////////////////////////////////
 
-/*
-  Questions:
-  - who handles reconnects?  Is that transport-specific, or does it require some state? Or both?
-*/
-
 export type Backfill = {
   // what ref are we backfilling (stream name or prefix)
   ref: string;
@@ -2385,14 +2414,16 @@ export type Backfill = {
   push(item: BackfillItem): Promise<void>;
 };
 
-/** one delivery of a backfill: the blob's header (its cut position and the seq of every stream
-    in it), a batch of values with the byte offset after them, a page of tail events, or the end
-    of either half */
+/** One delivery of a backfill: the blob's whole length in bytes, when its response states one;
+    the blob's header (its cut position and the seq of every stream in it); a batch of values with
+    the byte offset after them; a page of tail events with the position its scan reached; or the
+    end of either half.  The length and the scan feed the Engine's progress status alone. */
 export type BackfillItem =
+  | { length: number }
   | { header: { position: number; seqs: Record<string, number> } }
   | { values: [string, Uint8Array][]; skip: number }
   | { valuesDone: true }
-  | { events: WireEvent[] }
+  | { events: WireEvent[]; scanned: number }
   | { eventsDone: true };
 
 export type CommandResult =
@@ -2415,9 +2446,10 @@ export interface Connector {
 }
 
 export interface ConnectorHooks {
-  // first, once per connection, before any frame: the epoch from the response headers, the log
-  // every position on this connection belongs to
-  onOpen(epoch: string): void;
+  // first, once per connection, before any frame: from the response headers, the epoch, the log
+  // every position on this connection belongs to, and the head, the log's position as the
+  // connection opened
+  onOpen(epoch: string, head: number): void;
   // the whole view: token is its hash, position the commit it is the view at, refs the set.
   // Sent first when the presented token was not current, and on every change, in stream order
   // ahead of the events it applies to.  The Engine diffs refs against what it holds.
@@ -2585,10 +2617,59 @@ type BackfillEntry = {
   controller: SignalController;
   status: 'downloading' | 'ready';
   parent: string | null;
-  // failed attempts in a row, for backoff, and the retry waiting to run
+  // failed attempts in a row, for backoff, and the retry waiting to run, due at retryAt
   attempts: number;
   retryTimer: unknown;
+  retryAt: number | null;
+  // the blob's length, when its response stated one, and how far the tail's scan has reached
+  length: number | null;
+  scanned: number;
 };
+
+// a backfill entry as it starts, with no attempt made
+function newBackfillEntry(record: BackfillRecord, parent: string | null): BackfillEntry {
+  return {
+    record,
+    controller: new host.AbortController(),
+    status: 'downloading',
+    parent,
+    attempts: 0,
+    retryTimer: null,
+    retryAt: null,
+    length: null,
+    scanned: -1,
+  };
+}
+
+// a backfill's status, from its record and what its connector has reported
+function backfillStatus(ref: string, entry: BackfillEntry): BackfillStatus {
+  const r = entry.record.resume;
+  const snapshot = {
+    bytes: r?.skipBytes ?? 0,
+    length: entry.length,
+    done: r?.snapshotDone ?? false,
+  };
+  const tail =
+    r === null
+      ? null
+      : {
+          cut: r.position,
+          scanned: Math.max(r.fromPosition, entry.scanned),
+          until: entry.record.until,
+          done: r.tailDone,
+        };
+  const retryAt = entry.retryAt === null ? null : new Date(entry.retryAt);
+  return { ref, replacing: entry.record.replacing, snapshot, tail, retryAt };
+}
+
+// a tail's share scanned: none before the blob's header gives its cut, and all once done
+function tailShare(b: BackfillStatus): number {
+  const t = b.tail;
+  if (t === null) return 0;
+  if (t.done || t.until <= t.cut) return 1;
+  return Math.min(1, Math.max(0, (t.scanned - t.cut) / (t.until - t.cut)));
+}
+
 /** whether a wire ref covers a stream name or a narrower ref: a wildcard (`*`, `chat:*`,
     `chat:acme,*`) covers the names under the prefix before its star, and a name covers itself */
 export function refCovers(ref: string, name: string): boolean {
@@ -2674,20 +2755,165 @@ export function outputList(out: unknown): ForecastOutput[] {
   return [out].flat(Infinity) as ForecastOutput[];
 }
 
-/** the app's forecast of what the database will do with a command, read through the query context
-    over the overlay; a throw, a Reject included, forecasts nothing */
-export type Forecaster<QX, C> = (qx: QX, command: C) => ForecastOutput[];
+/** the app's forecast of what the database will do with a command, read through the forecast
+    context over the overlay; a throw, a Reject included, forecasts nothing */
+export type Forecaster<FX, C> = (fx: FX, command: C) => ForecastOutput[];
+
+// status ////////////////////////////////////////////////////////////////////
+
+/* Queries read the Engine's status like any state: where the connection stands, how far syncing
+   has come, and the outbox.  Sync work comes in three kinds, which the Engine tells apart and the
+   UI may treat differently.
+
+   First boot.  The Engine has no base: nothing has been reduced yet, on a fresh store or on one
+   whose first sync never landed.  The first view's grants download as replacing backfills and
+   land together, so the first state queries see is complete.  Until then the Engine refuses every
+   query that reads past the status: such a query waits with no result and answers once the base
+   exists, while a query that reads only the status answers at once.  The UI shows a loading
+   screen, with a bar from the estimate, while `hasBase` is false.
+
+   Resync.  A connection replays history onto an existing base, from the checkpoint to the head,
+   and queries see each batch as it lands, so the app zooms forward at catch-up speed.  Every
+   state shown is a prefix of the log, consistent if stale.  The UI may let the zoom show, or
+   cover it with a loading screen while `state` is `syncing`.  A gap partway through replaces its
+   stream with a backfill and freezes the base until it lands; queries keep answering from the
+   frozen base.
+
+   Backfill.  Downloads on a live base: a new grant, or a gap's repair, and queries keep
+   answering through both.  A new grant is additive: the base keeps moving while it downloads,
+   and its streams appear when it lands.  A gap's repair is replacing: the base freezes until it
+   lands, and queries answer from the frozen base meanwhile.  The UI may show progress or
+   nothing.
+
+   The estimate runs from 0 to 1 over one episode of work, and is null between episodes.  It
+   weighs the stages of each kind:
+     - first boot and backfill: 5% knowing every backfill and its size, 85% the downloads, and
+       10% the land
+     - resync: 5% the ref list confirmed, by any frame after the open, 20% backfills, and 75% the
+       replay, the checkpoint's way from where the episode started to the head the server stated
+       when the connection opened
+   A download is half snapshot and half tail.  The snapshots are exact, bytes over lengths, while
+   every backfill in flight has a length its response stated, and otherwise fall back to
+   downloadCurve over the bytes downloaded.  A tail is the share of its span, from the blob's cut
+   to until, that its scan has reached.  A resync never knows which backfills it will need, so its
+   backfill share is half the held streams resolved, each when an event chains onto it, when its
+   backfill lands, or when the replay reaches head, and half the download, which is whole until a
+   backfill starts and then follows downloadCurve whatever lengths are known.
+
+   The estimate never goes back.  Work found partway, such as a gap's backfill or a backfill whose
+   size is unknown, pauses it until the work catches up, and a stage that finishes may jump it
+   forward. */
+
+/** Where the Engine's connection stands: `connecting` until the connection opens, `syncing`
+    while it replays history, `live` past that, and `offline` between attempts, the next at
+    `nextAttemptAt`.  `hasBase` is false until a first boot's sync lands, while queries may read
+    only the status; `frozen` is true while a replacing backfill is in flight and the base waits
+    for it. */
+export type ConnectionStatus = {
+  state: 'connecting' | 'syncing' | 'live' | 'offline';
+  nextAttemptAt: Date | null;
+  hasBase: boolean;
+  frozen: boolean;
+};
+
+/** One backfill in flight.  The snapshot is in bytes: those committed, and the blob's length
+    when its response states one.  The tail is in log positions, from the blob's cut to until,
+    scanned up to `scanned`; it is null until the blob's header gives the cut. */
+export type BackfillStatus = {
+  ref: string;
+  replacing: boolean;
+  snapshot: { bytes: number; length: number | null; done: boolean };
+  tail: { cut: number; scanned: number; until: number; done: boolean } | null;
+  retryAt: Date | null;
+};
+
+/** How far syncing has come.  `estimate` runs from 0 to 1 over the work in progress and never
+    goes back, and is null when nothing is in progress.  The log is in positions: where this
+    connection started, the server's head as last known, the checkpoint, and how far the base
+    has been reduced. */
+export type ProgressStatus = {
+  estimate: number | null;
+  log: { since: number; head: number | null; committed: number; reduced: number };
+  backfills: BackfillStatus[];
+};
+
+/** the outbox: commands the database has not acknowledged */
+export type OutboxStatus = { unacknowledged: number };
+
+/** The Engine's status, which a query reads like any state and runs again when it changes.
+    Every value is the Engine's latest, replaced whole when it changes and never mutated. */
+export type EngineStatus = {
+  connection(): ConnectionStatus;
+  progress(): ProgressStatus;
+  outbox(): OutboxStatus;
+};
+
+// the keys the status is read at, which no store holds; the Engine answers them from memory
+const STATUS_KEYS = {
+  connection: '!status:connection',
+  progress: '!status:progress',
+  outbox: '!status:outbox',
+} as const;
+
+/** the status accessor of a query context, over the query's read transaction so its reads are
+    recorded like any other */
+export function engineStatus(txn: ReadTxn): EngineStatus {
+  return {
+    connection: () => txn.get(STATUS_KEYS.connection, '.json') as ConnectionStatus,
+    progress: () => txn.get(STATUS_KEYS.progress, '.json') as ProgressStatus,
+    outbox: () => txn.get(STATUS_KEYS.outbox, '.json') as OutboxStatus,
+  };
+}
+
+// The read transaction queries run over: the status keys from the published status, every
+// other read from txn.  While held, every other read throws Held.
+function statusView(txn: RTxn, status: Map<string, unknown>, held: boolean): RTxn {
+  return {
+    get(key, type, rep) {
+      if (status.has(key)) return status.get(key);
+      if (held) throw new Held();
+      return txn.get(key, type, rep);
+    },
+    scan(req) {
+      if (held) throw new Held();
+      return txn.scan(req);
+    },
+  };
+}
+
+/** The share of a download of unknown size that `bytes` is taken to be: the remaining share
+    halves with every tenfold, so 1 MB is 19%, 10 MB 51%, and 100 MB 75% */
+export function downloadCurve(bytes: number): number {
+  return 1 - (1 + bytes / 1_000_000) ** -Math.log10(2);
+}
+
+/** one stretch of sync work, which the estimate measures; it keeps its kind until its work is
+    done */
+type Episode = {
+  kind: 'boot' | 'resync' | 'backfill';
+  // the most the estimate has shown, which it never goes below
+  shown: number;
+  // every backfill of the episode as last seen; one no longer in flight is complete
+  backfills: Map<string, BackfillStatus>;
+  // a resync's start: the checkpoint, and the streams held then, which each resolve when an event
+  // chains onto one, when its backfill lands, or when the replay reaches head
+  since: number;
+  held: Set<string>;
+  resolved: Set<string>;
+  // a resync's connection has delivered a frame after it opened, which confirms the ref list
+  confirmed: boolean;
+};
 
 /** what the connector delivered, in arrival order */
 type Inbound =
-  | { open: string }
+  | { open: { epoch: string; head: number } }
   | { view: ViewRecord }
   | { events: WireEvent[] }
   | { vouch: number }
   | { live: number }
   | { end: { code: number; reason: string } };
 
-export class Engine<QX, C, N = never> {
+export class Engine<QX, FX, C, N = never> {
   #store: Store;
   #reg: Registry;
   #connect: ConnectorFactory;
@@ -2696,7 +2922,7 @@ export class Engine<QX, C, N = never> {
   #streamPatterns: Record<string, RegExp>;
   // runs against the overlay for every outbox command in order on every rebuild; a string is a
   // rejection and forecasts nothing
-  #forecaster: null | Forecaster<QX, C>;
+  #forecaster: null | Forecaster<FX, C>;
   #wants: string[];
   #signal: Signal;
 
@@ -2715,7 +2941,20 @@ export class Engine<QX, C, N = never> {
   #connectorAbort: SignalController;
   #attempt: number = 0;
   #retryTimer: unknown = null;
+  #nextAttemptAt: number | null = null;
   #connectNow: boolean = false;
+
+  // the connection's checkpoint as it started, the server's head as last known, and whether a
+  // frame after the open has confirmed the ref list
+  #since: number = -1;
+  #head: number | null = null;
+  #confirmed: boolean = false;
+
+  // the status queries read, by key, as last published, with each value's JSON to tell a change
+  #status: Map<string, unknown> = new Map();
+  #statusJson: Map<string, string> = new Map();
+  // the sync work the progress estimate measures, if any is in progress
+  #episode: Episode | null = null;
 
   // the persisted state, held in memory and written through
   #view: ViewRecord | null = null;
@@ -2740,7 +2979,7 @@ export class Engine<QX, C, N = never> {
   // at or below it is in the base, events or none
   #reduced: number = -1;
 
-  // liveness: the connector has delivered `live`, and no replacing backfill is in flight
+  // the connector has delivered `live`
   #live: boolean = false;
   // the log this connection's positions belong to, from its first hook; null between connections
   #epoch: string | null = null;
@@ -2763,11 +3002,14 @@ export class Engine<QX, C, N = never> {
   #newQueries: boolean = false;
   // every new connection resends the outbox
   #resend: boolean = false;
-  // builds the query context, handed to every query and every forecast, over a read transaction
-  #context: (txn: ReadTxn) => QX;
+  // builds the forecast context, handed to every forecast, over a read transaction
+  #forecastContext: (txn: ReadTxn) => FX;
 
   constructor(
-    context: (txn: ReadTxn) => QX,
+    // the context a query reads, the engine's slices and the Engine's status, and the context a
+    // forecast reads, the slices alone; each over a read transaction
+    queryContext: (txn: ReadTxn) => QX,
+    forecastContext: (txn: ReadTxn) => FX,
     // if store is null, InMemStore is used
     store: Store | null,
     reg: Registry,
@@ -2779,7 +3021,7 @@ export class Engine<QX, C, N = never> {
       wants: string[];
       // optional: forecast what the database will do with a command, reading the state the
       // earlier outbox commands leave
-      forecaster?: Forecaster<QX, C>;
+      forecaster?: Forecaster<FX, C>;
       // optional: ends the Engine, its connector, and every backfill
       signal?: Signal;
       // optional: receives the error that ended the Engine; without it the error is thrown out
@@ -2788,7 +3030,7 @@ export class Engine<QX, C, N = never> {
     },
   ) {
     checkHost();
-    this.#context = context;
+    this.#forecastContext = forecastContext;
     this.#store = store ?? new InMemStore(reg);
     this.#reg = reg;
     this.#connect = connect;
@@ -2809,7 +3051,7 @@ export class Engine<QX, C, N = never> {
     this.#signal.addEventListener('abort', () => this.#schedule(), { once: true });
 
     this.#overlay = new Overlay(reg);
-    this.#graph = new QueryGraph(context);
+    this.#graph = new QueryGraph(queryContext);
 
     // let the advancer begin initializing
     this.#run();
@@ -2847,7 +3089,8 @@ export class Engine<QX, C, N = never> {
     this.#schedule();
   }
 
-  /** add a new Query to the graph */
+  /** Add a new Query to the graph.  On first boot, until the first sync lands, it answers only if
+      it reads the status alone. */
   newQuery<T>(fn: QueryFunction<QX, T>): Query<T> {
     this.#newQueries = true;
     this.#schedule();
@@ -2911,14 +3154,7 @@ export class Engine<QX, C, N = never> {
       });
       for (const [key, value] of backfillRows) {
         const record = value as BackfillRecord;
-        this.#backfills.set(key.slice('!backfill:'.length), {
-          record,
-          controller: new host.AbortController(),
-          status: 'downloading',
-          parent: null,
-          attempts: 0,
-          retryTimer: null,
-        });
+        this.#backfills.set(key.slice('!backfill:'.length), newBackfillEntry(record, null));
         if (record.replacing) this.#replacing++;
       }
     });
@@ -2964,11 +3200,11 @@ export class Engine<QX, C, N = never> {
       }
     });
 
-    // forecast every outbox command onto a fresh overlay
-    this.#rebuildOverlay();
-
     // the first connection attempt
     this.#connectNow = true;
+
+    // publish the status, and forecast every outbox command onto a fresh overlay
+    this.#refresh({}, true);
   }
 
   // the most specific in-flight ref that covers ref, other than itself, so the parent of a child
@@ -3012,9 +3248,9 @@ export class Engine<QX, C, N = never> {
         continue;
       }
 
-      if (this.#newQueries && this.#live) {
-        // a new page wants its first answer: extend the graph with the app's new queries
-        this.#onNewQueries();
+      if (this.#newQueries) {
+        // a new page wants its first answer: run the graph, the app's new queries with it
+        this.#refresh({});
         continue;
       }
 
@@ -3053,7 +3289,8 @@ export class Engine<QX, C, N = never> {
         continue;
       }
 
-      // nothing to do: wait for a hook, a timer, or the app
+      // nothing to do: publish the status this run left, then wait for a hook, a timer, or the app
+      this.#refresh({});
       return;
     }
   }
@@ -3148,18 +3385,11 @@ export class Engine<QX, C, N = never> {
     }
   }
 
-  #onNewQueries(): void {
-    const cbs = this.#store.read((base) => {
-      this.#newQueries = false;
-      return this.#graph.extend(this.#overlay.view(base));
-    });
-    cbs();
-  }
-
   // a new connection restarts every backfill that is still downloading and is not waiting on its
   // own backoff timer, and resends the outbox
   #onConnect(): void {
     this.#connectNow = false;
+    this.#nextAttemptAt = null;
     if (this.#retryTimer !== null) {
       host.clearTimeout(this.#retryTimer);
       this.#retryTimer = null;
@@ -3172,13 +3402,15 @@ export class Engine<QX, C, N = never> {
       this.#inbox.push(item);
       this.#schedule();
     };
+    this.#since = this.#checkpoint?.position ?? -1;
+    this.#confirmed = false;
     this.#connector = this.#connect(
-      this.#checkpoint?.position ?? -1,
+      this.#since,
       this.#view?.token ?? null,
       this.#wants,
       abort.signal,
       {
-        onOpen: (epoch) => push({ open: epoch }),
+        onOpen: (epoch, head) => push({ open: { epoch, head } }),
         onView: (token, position, refs) => push({ view: { token, position, refs } }),
         onEvents: (events) => push({ events }),
         onLive: (position) => push({ live: position }),
@@ -3231,6 +3463,13 @@ export class Engine<QX, C, N = never> {
   #parkPushIn(txn: WTxn, ref: string, item: BackfillItem): void {
     const entry = this.#backfills.get(ref)!;
     const record = entry.record;
+
+    // the blob's length is for the status alone, and parks nothing
+    if ('length' in item) {
+      entry.length = item.length;
+      return;
+    }
+
     if ('header' in item) {
       // a fresh download: a resumed tail keeps its floor, and a newer blob overrides it
       const { position, seqs } = item.header;
@@ -3262,6 +3501,7 @@ export class Engine<QX, C, N = never> {
         this.#maybeMarkBackfilling(txn, ev.stream, record.replacing);
         record.resume!.fromPosition = Math.max(record.resume!.fromPosition, ev.position);
       }
+      entry.scanned = Math.max(entry.scanned, item.scanned);
     } else if ('eventsDone' in item) {
       record.resume!.tailDone = true;
     } else {
@@ -3278,6 +3518,7 @@ export class Engine<QX, C, N = never> {
     if (held === 'backfill' || (typeof held === 'number' && !replacing)) return;
     this.#streams.set(stream, 'backfill');
     txn.set(`!seq:${stream}`, '.json', JS, 'backfill');
+    this.#episode?.resolved.delete(stream);
   }
 
   /* every queued outcome in one transaction.  Completion is known from the pushes themselves, so
@@ -3311,11 +3552,14 @@ export class Engine<QX, C, N = never> {
           if (entry.controller.signal.aborted) continue;
           entry.status = 'downloading';
           const delay = backoffDelay(entry.attempts++);
+          entry.retryAt = Date.now() + delay;
           entry.retryTimer = host.setTimeout(() => {
             entry.retryTimer = null;
+            entry.retryAt = null;
             // the entry may have gone, or the Engine, while the timer ran
             if (this.#backfills.get(ref) === entry && !this.#signal.aborted) {
               this.#startBackfill(ref);
+              this.#schedule();
             }
           }, delay);
         }
@@ -3633,6 +3877,7 @@ export class Engine<QX, C, N = never> {
     for (const [name, seq] of seqs) {
       this.#streams.set(name, seq);
       txn.set(`!seq:${name}`, '.json', JS, seq);
+      this.#resolve(name);
     }
   }
 
@@ -3701,14 +3946,7 @@ export class Engine<QX, C, N = never> {
     for (const ref of refs) {
       const record: BackfillRecord = { until, resume: null, replacing, children: [] };
       txn.set(`!backfill:${ref}`, '.json', JS, record);
-      this.#backfills.set(ref, {
-        record,
-        controller: new host.AbortController(),
-        status: 'downloading',
-        parent,
-        attempts: 0,
-        retryTimer: null,
-      });
+      this.#backfills.set(ref, newBackfillEntry(record, parent));
       if (replacing) this.#replacing++;
 
       // a stream ref is marked; a family has nothing to mark until its blob names its members
@@ -3778,16 +4016,23 @@ export class Engine<QX, C, N = never> {
     this.#store.write((txn) => {
       while (this.#inbox.length > 0 && !('end' in this.#inbox[0])) {
         const item = this.#inbox.shift()!;
+
+        // any frame after the open confirms the ref list: a view replaces it, and any other
+        // frame means the token presented was current
+        if (!('open' in item)) this.#confirmed = true;
+
         if ('events' in item) {
           this.#onEventsIn(txn, item.events, dirty);
         } else if ('open' in item) {
           // a different epoch is a replaced log, where the positions we hold mean nothing.
           // Dropping everything and backfilling every ref is the answer, and until that exists
           // this ends.
-          if (this.#checkpoint !== null && this.#checkpoint.epoch !== item.open) {
-            throw new Error(`epoch ${item.open}, checkpoint from ${this.#checkpoint.epoch}`);
+          const { epoch, head } = item.open;
+          if (this.#checkpoint !== null && this.#checkpoint.epoch !== epoch) {
+            throw new Error(`epoch ${epoch}, checkpoint from ${this.#checkpoint.epoch}`);
           }
-          this.#epoch = item.open;
+          this.#epoch = epoch;
+          this.#head = head;
         } else if ('view' in item) {
           if (this.#onViewIn(txn, item.view, dirty)) revoked = true;
         } else if ('vouch' in item) {
@@ -3799,15 +4044,19 @@ export class Engine<QX, C, N = never> {
       }
     });
 
-    // history is done: the graph runs once, unless frozen
+    // history is done: the backoff starts over, and the replay has proven every held stream that
+    // no backfill has taken
     if (wentLive) {
       this.#live = true;
       this.#attempt = 0;
+      for (const [stream, held] of this.#streams) {
+        if (typeof held === 'number') this.#resolve(stream);
+      }
     }
 
     // a revoke changes what queries may see, so the graph runs even while frozen: a new query
     // would otherwise disagree with the results already delivered
-    this.#refresh(dirty, revoked || (wentLive && this.#replacing === 0));
+    this.#refresh(dirty, revoked);
   }
 
   // one atom's events; each event reduces or parks by a streams-table lookup
@@ -3850,8 +4099,9 @@ export class Engine<QX, C, N = never> {
         const last = seqs.get(ev.stream) ?? (typeof held === 'number' ? held : 0);
         if (ev.seq <= last) continue;
         if (ev.seq === last + 1) {
-          // the next event: it joins the stream's run
+          // the next event: it joins the stream's run, and proves the stream needs no backfill
           seqs.set(ev.stream, ev.seq);
+          this.#resolve(ev.stream);
           if (!runs.has(ev.stream)) runs.set(ev.stream, []);
           runs.get(ev.stream)!.push(this.#decode(ev));
           reduced = ev.position;
@@ -3880,25 +4130,33 @@ export class Engine<QX, C, N = never> {
     this.#advanceCursorIn(txn, last);
   }
 
-  /* After a commit, the graph learns what changed and runs when live.  Base changes reach queries
-     only when not frozen, outbox changes always, since forecasts are not base state.  Then each
-     @online command whose round trip the queries now show settles. */
+  /* After a commit, the status is published and the graph learns what changed.  Base changes
+     reach queries only when not frozen, outbox changes always, since forecasts are not base state;
+     either rebuilds the overlay.  A changed status or a new query alone runs the graph over the
+     overlay as it is.  Then each @online command whose round trip the queries now show settles. */
   #refresh(dirty: Record<string, true>, always = false): void {
+    // the status first, so every query this pass runs sees the status that goes with its state
+    const status = this.#publish();
     this.#graph.dirty(dirty);
+    this.#graph.dirty(status);
+
+    // rebuild the overlay, or run the graph over it as it is
     const outbox = this.#outboxChanged;
     this.#outboxChanged = false;
     const changed = Object.keys(dirty).length > 0;
-    if (this.#live && (always || outbox || (changed && this.#replacing === 0))) {
+    if (always || outbox || (changed && this.#replacing === 0)) {
       this.#rebuildOverlay();
+    } else if (Object.keys(status).length > 0 || this.#newQueries) {
+      this.#runGraph();
     }
     this.#settleOnline();
   }
 
   /* An acked @online command has made its round trip once an event carrying its id is reduced, or
-     the base is reduced through its ack's position.  Queries show the base only when live and not
-     frozen, so it settles then. */
+     the base is reduced through its ack's position.  Queries show the base only when it exists and
+     is not frozen, so it settles then. */
   #settleOnline(): void {
-    if (!this.#live || this.#replacing > 0) return;
+    if (this.#reduced < 0 || this.#replacing > 0) return;
     for (const [id, online] of this.#online) {
       if (online.ack === null) continue;
       if (!online.seen && online.ack.position > this.#reduced) continue;
@@ -4095,10 +4353,12 @@ export class Engine<QX, C, N = never> {
     this.#epoch = null;
 
     // the next attempt, after backoff
+    const delay = backoffDelay(this.#attempt++);
+    this.#nextAttemptAt = Date.now() + delay;
     this.#retryTimer = host.setTimeout(() => {
       this.#retryTimer = null;
       this.#schedule();
-    }, backoffDelay(this.#attempt++));
+    }, delay);
   }
 
   // a fresh overlay over the base, every outbox command forecast onto it in order, and the graph
@@ -4143,9 +4403,200 @@ export class Engine<QX, C, N = never> {
 
       // run the graph, new queries included
       this.#newQueries = false;
-      return this.#graph.run(this.#overlay.view(base));
+      return this.#graph.run(this.#queryView(base));
     });
     cbs();
+  }
+
+  // the graph run over the overlay as it is, new queries included
+  #runGraph(): void {
+    const cbs = this.#store.read((base) => {
+      this.#newQueries = false;
+      return this.#graph.run(this.#queryView(base));
+    });
+    cbs();
+  }
+
+  // what queries read: the status, and the overlay over the base, held until the base exists
+  #queryView(base: RTxn): RTxn {
+    return statusView(this.#overlay.view(base), this.#status, this.#reduced < 0);
+  }
+
+  // the status the Engine's state gives, with each part that changed published whole in place of
+  // the last; returns the keys of the parts that changed
+  #publish(): Record<string, true> {
+    const parts: [string, unknown][] = [
+      [STATUS_KEYS.connection, this.#connectionStatus()],
+      [STATUS_KEYS.progress, this.#progressStatus()],
+      [STATUS_KEYS.outbox, { unacknowledged: this.#outbox.size - this.#acked.size }],
+    ];
+    const changed: Record<string, true> = {};
+    for (const [key, value] of parts) {
+      const json = JSON.stringify(value);
+      if (this.#statusJson.get(key) === json) continue;
+      this.#status.set(key, value);
+      this.#statusJson.set(key, json);
+      changed[key] = true;
+    }
+    return changed;
+  }
+
+  #connectionStatus(): ConnectionStatus {
+    // between attempts, opening, replaying history, or past it
+    let state: ConnectionStatus['state'];
+    if (this.#connector === null) {
+      state = this.#connectNow ? 'connecting' : 'offline';
+    } else if (this.#epoch === null) {
+      state = 'connecting';
+    } else {
+      state = this.#live ? 'live' : 'syncing';
+    }
+
+    const next = this.#nextAttemptAt;
+    return {
+      state,
+      nextAttemptAt: state === 'offline' && next !== null ? new Date(next) : null,
+      hasBase: this.#reduced >= 0,
+      frozen: this.#replacing > 0,
+    };
+  }
+
+  #progressStatus(): ProgressStatus {
+    const backfills = [...this.#backfills].map(([ref, entry]) => backfillStatus(ref, entry));
+    const log = {
+      since: this.#since,
+      head: this.#head,
+      committed: this.#checkpoint?.position ?? -1,
+      reduced: this.#reduced,
+    };
+    return { estimate: this.#estimate(backfills), log, backfills };
+  }
+
+  // the estimate for the episode in progress, which starts and ends with the work
+  #estimate(backfills: BackfillStatus[]): number | null {
+    // end the episode whose work is done, and start one for any work in progress
+    if (this.#episode !== null && this.#episodeDone(this.#episode)) this.#episode = null;
+    this.#episode ??= this.#startEpisode();
+    const e = this.#episode;
+    if (e === null) return null;
+
+    // every backfill of the episode as last seen
+    for (const b of backfills) e.backfills.set(b.ref, b);
+    const inFlight = new Set(backfills.map((b) => b.ref));
+    e.confirmed ||= this.#confirmed;
+
+    // the share done, held to what has been shown
+    const share =
+      e.kind === 'resync' ? this.#resyncShare(e, inFlight) : this.#downloadShare(e, inFlight);
+    e.shown = Math.max(e.shown, Math.min(1, Math.max(0, share)));
+    return e.shown;
+  }
+
+  // whether an episode's work is done: a boot's once the base exists, a resync's once the replay
+  // has reached head and every backfill has landed, a backfill episode's once they have landed
+  #episodeDone(e: Episode): boolean {
+    if (e.kind === 'boot') return this.#reduced >= 0;
+    if (e.kind === 'resync') return this.#live && this.#backfills.size === 0;
+    return this.#backfills.size === 0;
+  }
+
+  // an episode for the work in progress, or null when there is none
+  #startEpisode(): Episode | null {
+    // no base yet, a connection replaying onto one, or downloads onto a live one?
+    let kind: Episode['kind'];
+    if (this.#reduced < 0) {
+      kind = 'boot';
+    } else if (this.#connector !== null && !this.#live) {
+      kind = 'resync';
+    } else if (this.#backfills.size > 0) {
+      kind = 'backfill';
+    } else {
+      return null;
+    }
+
+    // a resync resolves the streams held as it starts
+    const held = new Set<string>();
+    if (kind === 'resync') {
+      for (const [stream, seq] of this.#streams) if (typeof seq === 'number') held.add(stream);
+    }
+    return {
+      kind,
+      shown: 0,
+      backfills: new Map(),
+      since: this.#checkpoint?.position ?? -1,
+      held,
+      resolved: new Set(),
+      confirmed: false,
+    };
+  }
+
+  // a boot's or a backfill episode's share done
+  #downloadShare(e: Episode, inFlight: Set<string>): number {
+    // a boot before its first view knows of no work yet
+    if (e.kind === 'boot' && this.#view === null) return 0;
+    const landed = e.kind === 'boot' ? this.#reduced >= 0 : inFlight.size === 0;
+    const all = [...e.backfills.values()];
+    if (all.length === 0) return 0.9 + (landed ? 0.1 : 0);
+    const going = (b: BackfillStatus) => inFlight.has(b.ref);
+
+    // a size is known once the response states a length or the blob's header arrives
+    const sized = all.filter((b) => !going(b) || b.snapshot.length !== null || b.tail !== null);
+
+    // the snapshots: exact over their lengths while every one in flight has a length, else the
+    // curve over the bytes downloaded; one no longer in flight is complete
+    let snapshots: number;
+    if (all.every((b) => !going(b) || b.snapshot.length !== null)) {
+      let got = 0;
+      let total = 0;
+      for (const b of all) {
+        const size = b.snapshot.length ?? b.snapshot.bytes;
+        total += size;
+        got += going(b) && !b.snapshot.done ? b.snapshot.bytes : size;
+      }
+      snapshots = total === 0 ? 1 : got / total;
+    } else {
+      snapshots = downloadCurve(all.reduce((n, b) => n + b.snapshot.bytes, 0));
+    }
+
+    // the tails: each one's share scanned, averaged
+    let tails = 0;
+    for (const b of all) tails += going(b) ? tailShare(b) : 1;
+    tails /= all.length;
+
+    const download = (snapshots + tails) / 2;
+    return 0.05 * (sized.length / all.length) + 0.85 * download + 0.1 * (landed ? 1 : 0);
+  }
+
+  // a resync's share done
+  #resyncShare(e: Episode, inFlight: Set<string>): number {
+    // the backfills: the held streams resolved, and the download, whole until a backfill is in
+    // flight and then the curve over every byte the episode's backfills have downloaded
+    const resolved = e.held.size === 0 ? 1 : e.resolved.size / e.held.size;
+    let downloaded = 1;
+    if (inFlight.size > 0) {
+      let bytes = 0;
+      for (const b of e.backfills.values()) bytes += b.snapshot.bytes;
+      downloaded = downloadCurve(bytes);
+    }
+
+    // the replay: whole once live, else the checkpoint's way from the start to the head
+    const committed = this.#checkpoint?.position ?? -1;
+    let replay = 0;
+    if (this.#live) {
+      replay = 1;
+    } else if (this.#head !== null) {
+      const head = Math.max(this.#head, committed);
+      replay = head <= e.since ? 1 : (committed - e.since) / (head - e.since);
+    }
+
+    const backfill = (resolved + downloaded) / 2;
+    return 0.05 * (e.confirmed ? 1 : 0) + 0.2 * backfill + 0.75 * replay;
+  }
+
+  // a held stream of a resync is proven to need no backfill
+  #resolve(stream: string): void {
+    const e = this.#episode;
+    if (e?.kind === 'resync' && e.held.has(stream)) e.resolved.add(stream);
   }
 
   // a command's wire bytes as the forecaster sees them, or undefined when the current vocabulary
@@ -4161,7 +4612,7 @@ export class Engine<QX, C, N = never> {
   // one command's forecast folded onto the overlay: each run of consecutive events on one stream
   // goes through its slice's reducer as pending, and a death drops the stream's keys; returns the
   // keys it changed
-  #forecastIn(txn: WTxn, forecaster: Forecaster<QX, C>, command: C): Record<string, true> {
+  #forecastIn(txn: WTxn, forecaster: Forecaster<FX, C>, command: C): Record<string, true> {
     const dirty: Record<string, true> = {};
     let stream = '';
     let run: unknown[] = [];
@@ -4178,7 +4629,7 @@ export class Engine<QX, C, N = never> {
     const rtx = readTxn(txn);
     let outs: ForecastOutput[];
     try {
-      outs = forecaster(this.#context(rtx), command);
+      outs = forecaster(this.#forecastContext(rtx), command);
     } finally {
       closedTxns.add(rtx);
     }

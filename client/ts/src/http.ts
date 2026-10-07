@@ -30,6 +30,21 @@ const sendRetryDelay = 100;
 
 type BlobHeader = { position: number; streams: Record<string, number> };
 
+// a blob response's whole length: a full response's Content-Length, or a range response's
+// Content-Range total; null when it states neither, or is encoded, which makes the stated length
+// the encoded one
+function blobLength(resp: Response): number | null {
+  const encoding = resp.headers.get('Content-Encoding');
+  if (encoding !== null && encoding !== 'identity') return null;
+  const stated =
+    resp.status === 206
+      ? /\/(\d+)$/.exec(resp.headers.get('Content-Range') ?? '')?.[1]
+      : resp.headers.get('Content-Length');
+  if (stated === undefined || stated === null || stated === '') return null;
+  const n = Number(stated);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
 function readU32(b: Uint8Array): number {
   return be(b, 0, 4);
 }
@@ -99,7 +114,13 @@ export class HTTPConnector implements Connector {
         this.#end(resp.status, 'stream: no epoch');
         return;
       }
-      this.#hooks.onOpen(epoch);
+      const position = resp.headers.get('PhaseLock-Position');
+      const head = position === null || position === '' ? NaN : Number(position);
+      if (!Number.isSafeInteger(head)) {
+        this.#end(resp.status, 'stream: no position');
+        return;
+      }
+      this.#hooks.onOpen(epoch, head);
       await frames(new ByteReader(resp.body), (f) => {
         switch (f.tag) {
           case 'events':
@@ -188,6 +209,11 @@ export class HTTPConnector implements Connector {
       return;
     }
     if (!resp.body) throw new Error(`snapshot ${b.ref}: no body`);
+
+    // the blob's whole length, for the Engine's progress, when the response states one
+    const length = blobLength(resp);
+    if (length !== null) await b.push({ length });
+
     const br = new ByteReader(resp.body, resp.status === 206 ? skip : 0);
     // a server that ignored the Range sent the whole blob; skip what we already have
     if (resp.status === 200 && skip > 0) await br.skipBytes(skip);
@@ -295,7 +321,12 @@ export class HTTPConnector implements Connector {
         events.push(...f.events);
         return true;
       });
-      if (events.length > 0) await b.push({ events });
+      if (events.length > 0) {
+        const reached = Number.isSafeInteger(scanned)
+          ? scanned
+          : events[events.length - 1].position;
+        await b.push({ events, scanned: reached });
+      }
       if (events.length < pageSize || !Number.isSafeInteger(scanned) || scanned >= b.until) {
         await b.push({ eventsDone: true });
         return;

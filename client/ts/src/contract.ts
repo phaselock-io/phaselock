@@ -56,14 +56,16 @@ export type Backfill = {
   push(item: BackfillItem): Promise<void>;
 };
 
-/** one delivery of a backfill: the blob's header (its cut position and the seq of every stream
-    in it), a batch of values with the byte offset after them, a page of tail events, or the end
-    of either half */
+/** One delivery of a backfill: the blob's whole length in bytes, when its response states one;
+    the blob's header (its cut position and the seq of every stream in it); a batch of values with
+    the byte offset after them; a page of tail events with the position its scan reached; or the
+    end of either half.  The length and the scan feed the Engine's progress status alone. */
 export type BackfillItem =
+  | { length: number }
   | { header: { position: number; seqs: Record<string, number> } }
   | { values: [string, Uint8Array][]; skip: number }
   | { valuesDone: true }
-  | { events: WireEvent[] }
+  | { events: WireEvent[]; scanned: number }
   | { eventsDone: true };
 
 export type CommandResult =
@@ -86,9 +88,10 @@ export interface Connector {
 }
 
 export interface ConnectorHooks {
-  // first, once per connection, before any frame: the epoch from the response headers, the log
-  // every position on this connection belongs to
-  onOpen(epoch: string): void;
+  // first, once per connection, before any frame: from the response headers, the epoch, the log
+  // every position on this connection belongs to, and the head, the log's position as the
+  // connection opened
+  onOpen(epoch: string, head: number): void;
   // the whole view: token is its hash, position the commit it is the view at, refs the set.
   // Sent first when the presented token was not current, and on every change, in stream order
   // ahead of the events it applies to.  The Engine diffs refs against what it holds.

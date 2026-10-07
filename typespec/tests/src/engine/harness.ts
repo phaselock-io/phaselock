@@ -9,15 +9,20 @@ import {
   type BackfillOutcome,
   type Command,
   type CommandResult,
+  type ConnectionStatus,
   type Connector,
   type ConnectorFactory,
   type ConnectorHooks,
   type DbEvent,
   Engine,
   type Forecaster as EngineForecaster,
+  engineStatus,
+  type EngineStatus,
   InMemStore,
   JS,
   MSGPACK,
+  type OutboxStatus,
+  type ProgressStatus,
   type ReadTxn,
   type ReducerTxn,
   type Registry,
@@ -176,12 +181,14 @@ export function death(stream: string, seq: number, position: number): WireEvent 
 
 // the fake server ///////////////////////////////////////////////////////////
 
-/** what a backfill of a ref serves: a snapshot at a cut and the events after it */
+/** what a backfill of a ref serves: a snapshot at a cut and the events after it, and the length
+    its response states, if any; each value counts as one byte */
 export type Blob = {
   position: number;
   seqs: Record<string, number>;
   values: [string, unknown][];
   tail?: WireEvent[];
+  length?: number;
 };
 
 export type BackfillCall = { ref: string; until: number; resume: Backfill['resume'] };
@@ -269,8 +276,8 @@ export class FakeServer {
   }
 
   // driving the live stream
-  open(epoch = this.epoch): void {
-    this.conn.hooks.onOpen(epoch);
+  open(epoch = this.epoch, head = 0): void {
+    this.conn.hooks.onOpen(epoch, head);
   }
   view(token: string, position: number, refs: string[]): void {
     this.conn.hooks.onView(token, position, refs);
@@ -334,6 +341,7 @@ export class FakeServer {
     const r = b.resume;
     if (!r?.snapshotDone) {
       if (r !== null && r.skipBytes > 0 && r.position !== blob.position) return 'stale';
+      if (blob.length !== undefined) await push({ length: blob.length });
       if (r === null || r.skipBytes === 0) {
         await push({ header: { position: blob.position, seqs: blob.seqs } });
         if (blob.values.length > 0) {
@@ -348,7 +356,7 @@ export class FakeServer {
     if (!r?.tailDone) {
       const from = Math.max(r?.fromPosition ?? blob.position, blob.position);
       const page = (blob.tail ?? []).filter((e) => e.position > from && e.position <= b.until);
-      if (page.length > 0) await push({ events: page });
+      if (page.length > 0) await push({ events: page, scanned: page[page.length - 1].position });
       await push({ eventsDone: true });
     }
     void conn;
@@ -370,13 +378,15 @@ export function engineError(): unknown {
 
 // the engine ////////////////////////////////////////////////////////////////
 
-/** the harness's query context is the read transaction itself */
+/** the harness's forecast context is the read transaction itself, and its query context the read
+    transaction with the Engine's status */
 export type Forecaster = EngineForecaster<ReadTxn, unknown>;
+export type QueryTxn = ReadTxn & { status: EngineStatus };
 
 export type Rig = {
   server: FakeServer;
   store: InMemStore;
-  engine: Engine<ReadTxn, unknown, unknown>;
+  engine: Engine<QueryTxn, ReadTxn, unknown, unknown>;
   abort: AbortController;
   /** every key in the store and its value, as of the call */
   data: () => Record<string, unknown>;
@@ -398,7 +408,8 @@ export function rig(
   const server = opts.server ?? new FakeServer();
   const store = opts.store ?? seeded(opts.seed ?? {});
   const abort = new AbortController();
-  const engine = new Engine<ReadTxn, unknown, unknown>(
+  const engine = new Engine<QueryTxn, ReadTxn, unknown, unknown>(
+    (txn) => Object.assign(txn, { status: engineStatus(txn) }),
     (txn) => txn,
     store,
     registry,
@@ -475,6 +486,26 @@ export function watch(
   q.subscribe((v) => values.push(v));
   return { values, runs: () => runs };
 }
+
+/** a query on each part of the Engine's status, collecting every value it delivers */
+export function watchStatus(r: Rig): {
+  connection: ConnectionStatus[];
+  progress: ProgressStatus[];
+  outbox: OutboxStatus[];
+} {
+  const seen = {
+    connection: [] as ConnectionStatus[],
+    progress: [] as ProgressStatus[],
+    outbox: [] as OutboxStatus[],
+  };
+  r.engine.newQuery((qx) => qx.status.connection()).subscribe((v) => seen.connection.push(v));
+  r.engine.newQuery((qx) => qx.status.progress()).subscribe((v) => seen.progress.push(v));
+  r.engine.newQuery((qx) => qx.status.outbox()).subscribe((v) => seen.outbox.push(v));
+  return seen;
+}
+
+/** the last of a list */
+export const last = <T>(xs: T[]): T => xs[xs.length - 1];
 
 /** the keys under a prefix, sorted */
 export function keys(data: Record<string, unknown>, prefix: string): string[] {
