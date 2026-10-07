@@ -3,8 +3,9 @@
 
 import { decode, encode } from '@msgpack/msgpack';
 import { describe, expect, test } from 'vitest';
-import { JS, MSGPACK, type Schema, type SchemaNode } from '../src/contract.js';
+import { type Command, JS, MSGPACK, type Schema, type SchemaNode } from '../src/contract.js';
 import { buildRegistry, ConvertError } from '../src/registry.js';
+import { uuidBytes } from '../src/uuid.js';
 
 // a schema shaped like the emitter's output for a small model: the catalog and inbox slices, the
 // writer engine's commands, two prepared fields, and a query interface
@@ -381,6 +382,9 @@ const schema: Schema = {
 const reg = buildRegistry(schema);
 
 const added = new Date('2026-01-02T03:04:05.678Z');
+// a command id as the Engine holds it, and as an envelope carries it
+const C1 = '00000000-0000-0000-0000-0000000000c1';
+const c1 = uuidBytes(C1);
 const itemAdded = { type: 'item-added', id: 'i1', title: 'Dune', added };
 
 /** bytes to the rich value of a type */
@@ -640,25 +644,28 @@ describe('the reserved identities', () => {
   test('.json and .command pass values through, bytes included', () => {
     const record = { epoch: 'e', position: 3, reduced: -1, when: added };
     expect(toJs('.json', toBytes('.json', record))).toEqual(record);
-    const command = { id: 'c1', data: encode({ type: 'noted' }) };
-    const back = toJs('.command', toBytes('.command', command)) as { id: string; data: Uint8Array };
-    expect(back.id).toBe('c1');
+    const command = { id: C1, session: 's1', n: 2, data: encode({ type: 'noted' }) };
+    const back = toJs('.command', toBytes('.command', command)) as Command<Uint8Array>;
+    expect([back.id, back.session, back.n]).toEqual([C1, 's1', 2]);
     expect(decode(back.data)).toEqual({ type: 'noted' });
+    const sessionless = { ...command, session: null, n: null };
+    const again = toJs('.command', toBytes('.command', sessionless)) as Command<Uint8Array>;
+    expect([again.session, again.n]).toEqual([null, null]);
   });
 
   test(".event reads the wire pair into a DbEvent, typing its data by the stream's family", () => {
-    const raw = encode([[7, 'catalog', 3, 'c1', added], { ...itemAdded }]);
+    const raw = encode([[7, 'catalog', 3, c1, added], { ...itemAdded }]);
     expect(toJs('.event', raw)).toEqual({
       position: 7,
       stream: 'catalog',
       seq: 3,
-      id: 'c1',
+      id: C1,
       servertime: added,
       data: itemAdded,
     });
     // a family's parameters do not change its type
     const inbox = encode([
-      [8, 'inbox:acme,u1', 1, 'c2', added],
+      [8, 'inbox:acme,u1', 1, c1, added],
       { type: 'noted', note: 'n', text: 't' },
     ]);
     expect((toJs('.event', inbox) as { data: unknown }).data).toEqual({
@@ -673,33 +680,34 @@ describe('the reserved identities', () => {
       position: 7,
       stream: 'catalog',
       seq: 3,
-      id: 'c1',
+      id: C1,
       servertime: added,
       data: itemAdded,
     };
-    expect(plain(toBytes('.event', ev))).toEqual([[7, 'catalog', 3, 'c1', added], itemAdded]);
+    expect(plain(toBytes('.event', ev))).toEqual([[7, 'catalog', 3, c1, added], itemAdded]);
   });
 
   test('.event skips envelope elements a later protocol appends', () => {
-    const raw = encode([[7, 'catalog', 3, 'c1', added, 'newer', { x: 1 }], itemAdded]);
+    const raw = encode([[7, 'catalog', 3, c1, added, 'newer', { x: 1 }], itemAdded]);
     expect((toJs('.event', raw) as { data: unknown }).data).toEqual(itemAdded);
   });
 
   test('.event passes system events through untyped', () => {
-    const birth = encode([[1, 'catalog', 1, 'c1', added], { $sys: 'birth' }]);
+    const birth = encode([[1, 'catalog', 1, c1, added], { $sys: 'birth' }]);
     expect((toJs('.event', birth) as { data: unknown }).data).toEqual({ $sys: 'birth' });
   });
 
   test('.event rejects a bad envelope, data that fails its type, and an unknown family', () => {
     rejects(
-      () => toJs('.event', encode([[7, 'catalog', 3, 'c1', 1700000000000], itemAdded])),
+      () => toJs('.event', encode([[7, 'catalog', 3, c1, 1700000000000], itemAdded])),
       'servertime',
     );
     rejects(
-      () => toJs('.event', encode([[7, 'catalog', 3, 'c1', added], { type: 'bogus' }])),
+      () => toJs('.event', encode([[7, 'catalog', 3, c1, added], { type: 'bogus' }])),
       'bogus',
     );
-    rejects(() => toJs('.event', encode([[7, 'nowhere:x', 3, 'c1', added], itemAdded])), 'nowhere');
+    rejects(() => toJs('.event', encode([[7, 'nowhere:x', 3, c1, added], itemAdded])), 'nowhere');
+    rejects(() => toJs('.event', encode([[7, 'catalog', 3, 'c1', added], itemAdded])), 'id');
   });
 });
 

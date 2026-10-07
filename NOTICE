@@ -58,3 +58,16 @@ Used for msgpack parsing and writing in the database core, in these
 files:
 
     - db/core/vendor/mpack/
+
+
+crypto-algorithms (Brad Conte), commit cfbde48
+https://github.com/B-Con/crypto-algorithms
+
+This code is released into the public domain free of any restrictions.
+The author requests acknowledgement if the code is used, but does not
+require it. This code is provided free of any liability and without any
+quality claims by the author.
+
+Used for SHA-256 in the database core, in these files:
+
+    - db/core/vendor/sha256/

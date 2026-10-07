@@ -83,7 +83,7 @@ plan above take precedence over it.
   sent, events come out of C as encoded `[envelope, data]` values, and
   Go writes only container headers around them.  The auth endpoints
   are Go-owned and decode their own small request bodies.
-- SQLite for everything in C: the log, the KV store, the command dedup
+- SQLite for everything in C: the log, the KV store, the session
   table, the known-streams table.  One write transaction per group
   commit, WAL mode, synchronous=FULL.
 - Threads in C: the txn loop (owns QuickJS, SQLite writer connection,
@@ -119,7 +119,9 @@ plan above take precedence over it.
 
 - The command is the atom.  A POST may carry several commands; each is
   checked, pre-committed, folded, and acked independently and in
-  order.  Group commit batches atoms per fsync.  The check runs in the
+  order.  Group commit batches atoms per fsync, and every log row
+  records the first position of its atom, which is how readers find
+  atom boundaries.  The check runs in the
   handler's cgo call, against the commands union of the registry and
   rejecting fields the model does not name, so a malformed command is
   answered there and never reaches dedup, `expect`, or the writer; the
@@ -143,10 +145,9 @@ plan above take precedence over it.
   `{stream, event}` pairs, any number per stream.  The C core stamps
   every emitted event with the command's id; precommit never sees or
   copies ids.  `{stream, death: true}` in the list ends a stream.
-- Dedup is keyed on the command id and nothing else.  A resubmitted id
-  is acked with its original position.
 - Envelope: `[position, stream, seq, commandid, servertime]`, least
   important last.  Readers must ignore elements appended later.
+  `commandid` is the command's 16-byte label, as it arrived.
 - `seq` is dense per stream name across the whole log: 1 on the first
   birth, and every later event on that name, including deaths and
   rebirths, takes the next number.  A client keeps one integer per
@@ -190,6 +191,48 @@ plan above take precedence over it.
   refs with a terminator on every entry: `chat:*`, `chat:acme,*`,
   `*`, and `name!` for an exact stream, so a bare name is a malformed
   ref and a bundle bug, never a grant.  The core strips the `!`.
+
+### Command dedup
+
+DEDUP.md's cut, with no frames in the log.
+
+- A command carries a session `S`, an opaque string of at most 64
+  bytes, and a number `n`, an integer from 1 to 2^53 - 1 that
+  increases within the session.  A command whose `S` and `n` are both
+  nil is sessionless: it runs with no dedup and leaves no session
+  state.
+- The session table has one row per session: the hex SHA-256 of `S`,
+  `hwm`, the highest `n` decided, and `time`, the server time of its
+  last decision.  Rows are kept forever: v0 has no horizon.
+- The dedup check runs on the txn loop, after the command check and
+  before `expect` and precommit, against the group's open transaction.
+  A command sees every decision ahead of it in its group, so two
+  copies of one `(S, n)` in a group run once.
+
+  | Case                     | Answer                               |
+  |--------------------------|--------------------------------------|
+  | sessionless              | run; nothing recorded                |
+  | `n <= hwm`               | `ok` at the head                     |
+  | otherwise                | run; `hwm = n`; the decision's reply |
+
+  An unknown session runs from whatever number it arrives with: rows
+  are never pruned, so a session the table does not hold has decided
+  nothing.
+
+- Every decision moves the mark: an accept, a precommit's `Reject`, a
+  bug's rejection, a conflict.  A command its savepoint rolled back
+  has its mark written after the rollback, in the group's transaction.
+- Every reply is sent after its group commits, rejects included.
+  `ok` carries a position at or after the decision, the log's head
+  when it was decided or answered: a client that has read that far
+  has its answer.  A reject's reason and a conflict's seqs reach only
+  the first reply; a resend of a rejected command gets `ok`.
+- The id is a label: the core checks its length, stamps it on the
+  atom's envelopes, and keys nothing on it.
+- The log carries no frames.  A session row commits in the
+  transaction of the group that decided it, so it is as durable as
+  the log, and v0 has no retention that would need them.  DEDUP.md
+  describes the frames of the final DB.
 
 ### Wire protocol
 
@@ -288,17 +331,20 @@ Every frame is an array whose first element is a tag.
   see, and a submitter whose command's events all landed in streams it
   cannot see passes its ack position on the next heartbeat.
 
-    POST /commands                     body: [commandid, data, expect?]*
+    POST /commands                     body: [S, n, id, data, expect?]*
       → msgpack array of outcomes, one per command, in order:
-        ["ack", position] | ["dup", position] | ["reject", reason]
+        ["ok", position] | ["reject", reason]
         | ["conflict", { stream: actualSeq }]
-      → 400 when the body is not a sequence of [commandid, data,
-        expect?] values with string ids; nothing can be answered for
-        such a body, command by command
+      → 400 when the body is not a sequence of [S, n, id, data,
+        expect?] values with S a string and n an integer, or both nil,
+        and id 16 bytes of bin; nothing can be answered for such a
+        body, command by command
 
+- Sessions, numbers, and the outcomes are under Command dedup.
 - A command whose data fails the check gets `["reject", reason]`, the
-  reason naming the path (`$.title: missing required field`), and its
-  id stays free, since it never reached dedup.
+  reason naming the path (`$.title: missing required field`).  It
+  never reached dedup, so it is not a decision and its session's mark
+  does not move.
 - `expect` is optional concurrency control: a map from exact stream
   name to the seq of the stream's last event as the client knows it
   (0 for a stream it believes was never born).  The client always has
@@ -308,7 +354,8 @@ Every frame is an array whose first element is a tag.
   after the dedup check and before precommit; any
   mismatch answers `conflict` listing the actual seq of every
   mismatched stream, and the command never reaches user code or the
-  log.  seq is the stream's clock, position the log's.  A conflict
+  log.  A conflict is a decision, and moves its session's mark like
+  any other.  seq is the stream's clock, position the log's.  A conflict
   means refresh and re-decide, where a reject is final.  It is opt-in
   per command; offline-queued work should not carry expectations.
 
@@ -354,8 +401,9 @@ Every frame is an array whose first element is a tag.
 Msgpack values are the JSON projection, with one extension: a date,
 the envelope's server time included, is the msgpack timestamp
 extension, at millisecond precision.  Uuids are strings; there is no
-bin and no other ext.  Command data and event data are the same
-values the browser engine produces and consumes.
+other ext, and the only bin is a command's id, in the command and in
+its envelopes.  Command data and event data are the same values the
+browser engine produces and consumes.
 
 ### Snapshot blob
 
@@ -428,8 +476,8 @@ fields are the stream row's counters and appear only for an exact ref.
 - A fresh data directory starts from the bundle's optional
   `bootstrap(ctx)`.  On startup with an empty log, the core runs it
   once, and everything it emits lands as one atom through the
-  ordinary append-and-fold path: implicit births, dense seqs, the
-  command id `bootstrap`, the server time, and the bundle's own
+  ordinary append-and-fold path: implicit births, dense seqs, a
+  command id the core mints, the server time, and the bundle's own
   reducers folding it.  The atom may be large; a seed of demo data is
   one commit.
 - `ctx` has three calls.  `emit(stream, event)` takes the same
@@ -468,7 +516,7 @@ app's slots:
 
     globalThis.__bundle = {
       schema,                   // the database's registry data
-      precommit(txn, cmd, principal) → reason | [{stream, event} |
+      precommit(txn, data, principal) → reason | [{stream, event} |
                                                  {stream, death: true}],
       reducers: { family: { reducer(txn, events, stream, pending),
                             template, keys } },
@@ -479,7 +527,7 @@ app's slots:
       mapStack(stack, file, map) → stack,
     }
 
-- `cmd` is `{id, data}`; `principal` is `{user}` with `user` null
+- `data` is the command's data; `principal` is `{user}` with `user` null
   for anonymous; `ident` is `{kind: "password", identity}` at
   login and the `token`/`refresh` shapes above otherwise.
 - The core defines `process.env.NODE_ENV` as `production` before
@@ -538,7 +586,8 @@ app's slots:
                   kernel, names.c stream names and keys against their
                   templates, mpjs.c untyped msgpack<->JS, js.c QuickJS
                   host, host.js the JS glue, scantest.c the scan
-                  conformance test's hold on the walk, vendor/mpack
+                  conformance test's hold on the walk, vendor/mpack,
+                  vendor/sha256
     db/server/    the Go layer: core.go cgo binding, server.go HTTP,
                   auth.go tokens and passwords, mp.go msgpack codec,
                   server_test.go feature tests, scan_test.go the

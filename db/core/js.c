@@ -716,16 +716,11 @@ static int parse_outputs(jsrt *js, JSValue r, pc_result *out) {
     return 0;
 }
 
-int js_precommit(jsrt *js, const char *id, JSValueConst data, JSValueConst principal,
-                 pc_result *out) {
+int js_precommit(jsrt *js, JSValueConst data, JSValueConst principal, pc_result *out) {
     JSContext *ctx = js->ctx;
     memset(out, 0, sizeof *out);
-    JSValue cmd = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, cmd, "id", JS_NewString(ctx, id));
-    JS_SetPropertyStr(ctx, cmd, "data", JS_DupValue(ctx, data));
-    JSValueConst args[2] = {cmd, principal};
+    JSValueConst args[2] = {data, principal};
     JSValue r = call_host(js, "precommit", 2, args);
-    JS_FreeValue(ctx, cmd);
     if (JS_IsException(r)) return -1;
     if (JS_IsString(r)) {
         // a reason is text to show, which a U+0000 in it ends

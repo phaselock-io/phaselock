@@ -47,8 +47,9 @@ export type SignalController = { readonly signal: Signal; abort(reason?: unknown
     provide all of it.  A host embedding a JS engine (QuickJS, goja, JavaScriptCore) installs it:
     timers that run their callback on the JS thread; an AbortController whose signals, and those
     AbortSignal.any combines, are of the host's own kind, for its connectors to use as they are,
-    each firing its abort listeners on the JS thread; and randomness for command ids, as
-    crypto.getRandomValues or a generateUuid of its own.  An Engine checks for them when built. */
+    each firing its abort listeners on the JS thread; and randomness for command ids and sessions,
+    as crypto.getRandomValues or a generateUuid of its own.  An Engine checks for them when
+    built. */
 export type HostGlobals = {
   setTimeout(callback: () => void, ms: number): unknown;
   clearTimeout(timer: unknown): void;
@@ -79,9 +80,9 @@ function checkHost(): void {
 }
 
 // a fresh command id: the host's own uuid when it mints them, else a version 4 uuid from its
-// randomness
+// randomness; lower-case, as the id a connector decodes from an envelope is
 function generateUuid(): string {
-  if (host.generateUuid !== undefined) return host.generateUuid();
+  if (host.generateUuid !== undefined) return host.generateUuid().toLowerCase();
 
   // 128 random bits, marked as RFC 4122 version 4
   const values = host.crypto!.getRandomValues(new Uint8Array(16));
@@ -100,6 +101,27 @@ function generateUuid(): string {
     out.substring(16, 20),
     out.substring(20, 32),
   ].join('-');
+}
+
+const BASE64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+
+// a fresh session: 16 random bytes as 22 base64url characters, or the host's own uuid when it has
+// no randomness to give
+function generateSession(): string {
+  if (host.crypto === undefined) return generateUuid();
+  const values = host.crypto.getRandomValues(new Uint8Array(16));
+  let bits = 0;
+  let count = 0;
+  let out = '';
+  for (const x of values) {
+    bits = (bits << 8) | x;
+    count += 8;
+    while (count >= 6) {
+      count -= 6;
+      out += BASE64URL[(bits >>> count) & 0x3f];
+    }
+  }
+  return out + BASE64URL[(bits << (6 - count)) & 0x3f];
 }
 
 // a value is a tree, so nothing legitimate nests this deep
@@ -1959,15 +1981,12 @@ export type BootstrapContext = {
 /** Bundle is what a database runs: the app's handlers behind the generated wrappers, installed
     as `globalThis.__bundle`, and the registry the database converts and checks every value by.
     precommit, maySee, and lookup read global keys; each reducer reads and writes its own stream's
-    keys.  Values are rich JS values.  `dev` is the bundle's DEV, so a host answers the errors of
-    a dev bundle in full, and `mapStack` maps an error's stack through the bundle's source map. */
+    keys.  precommit gets a command's data alone.  Values are rich JS values.  `dev` is the
+    bundle's DEV, so a host answers the errors of a dev bundle in full, and `mapStack` maps an
+    error's stack through the bundle's source map. */
 export type Bundle = {
   schema: Schema;
-  precommit: (
-    txn: ReadTxn,
-    cmd: Command<unknown>,
-    principal: Principal,
-  ) => string | ForecastOutput[];
+  precommit: (txn: ReadTxn, data: unknown, principal: Principal) => string | ForecastOutput[];
   reducers: Record<string, SliceReducer>;
   maySee: (txn: ReadTxn, principal: Principal) => string[];
   lookup: (txn: ReadTxn, ident: LookupIdent) => LookupResult | null;
@@ -2426,9 +2445,12 @@ export type BackfillItem =
   | { events: WireEvent[]; scanned: number }
   | { eventsDone: true };
 
+/** What the database answers for a command.  `ok` means it was decided at or before position, so
+    a client that has reduced that far can read the outcome from its state.  A reject's reason
+    and a conflict's current seqs come only in the first answer to a decision, and a resend of
+    either is answered `ok`. */
 export type CommandResult =
-  | { kind: 'ack'; position: number }
-  | { kind: 'dup'; position: number }
+  | { kind: 'ok'; position: number }
   | { kind: 'reject'; reason: string }
   | { kind: 'conflict'; current: Record<string, number> };
 
@@ -2474,9 +2496,13 @@ export type ConnectorFactory = (
 
 // engines ////////////////////////////////////////////////////////////////////
 
-/** Command wraps command data T with the client-minted id it will carry through the log. */
+/** Command wraps command data T with the client-minted id it will carry through the log, and
+    the session and number the database dedups it by: a sender numbers its commands in a session
+    it mints, and the database runs each number once.  A sessionless command has neither. */
 export type Command<T> = {
   id: string;
+  session: string | null;
+  n: number | null;
   data: T;
 };
 
@@ -2577,7 +2603,8 @@ export type WireEvent = DbEvent<Uint8Array> & { raw: Uint8Array };
        !seq:{stream}              the stream's last held seq, or 'backfill' while a backfill
                                   covering it is in flight
        !command:{ordinal}         Command<Uint8Array> (`.command`): the outbox, in send order,
-                                  each command's data as its wire bytes
+                                  each command's data as its wire bytes, under the session and
+                                  number it was minted with
        !backfill:{ref}            BackfillRecord: an in-flight backfill's until, resume, replacing,
                                   and children
        !backfill-seqs:{ref}       the backfill blob's header seqs, stream name to seq
@@ -2692,11 +2719,11 @@ type Submission<C, N> =
   | { online: N; resolve: (result: CommandResult) => void; reject: (e: unknown) => void };
 
 /** an @online command handed to a connector and not yet settled: its promise's resolvers, the
-    database's ack once it arrives, and whether an event carrying its id has been reduced */
+    database's ok once it arrives, and whether an event carrying its id has been reduced */
 type OnlineCommand = {
   resolve: (result: CommandResult) => void;
   reject: (e: unknown) => void;
-  ack: { kind: 'ack' | 'dup'; position: number } | null;
+  ack: { kind: 'ok'; position: number } | null;
   seen: boolean;
 };
 
@@ -2966,6 +2993,11 @@ export class Engine<QX, FX, C, N = never> {
   // the outbox in send order: command id to its ordinal in !command:{ordinal}
   #outbox: Map<string, number> = new Map();
   #nextOrdinal: number = 0;
+  // the session new commands are minted in, and the number the next one takes.  Neither touches
+  // the disk: a stored outbox resends under the sessions it was minted in, and new commands go in
+  // a session of this Engine's own, so two Engines over one copied store never share one.
+  readonly #session: string;
+  #nextN: number = 1;
   // outbox commands handed to the current connection with no outcome yet, and those acked, with
   // the position they landed at, waiting for the checkpoint to reach it
   #sent: Set<string> = new Set();
@@ -3030,6 +3062,7 @@ export class Engine<QX, FX, C, N = never> {
     },
   ) {
     checkHost();
+    this.#session = generateSession();
     this.#forecastContext = forecastContext;
     this.#store = store ?? new InMemStore(reg);
     this.#reg = reg;
@@ -3067,11 +3100,13 @@ export class Engine<QX, FX, C, N = never> {
     this.#schedule();
   }
 
-  /** Sends an @online command behind every command submitted before it, and settles with the
-      database's answer.  A reject or a conflict settles at once.  An ack settles on the round
-      trip, once the queries have run over the base the command's events reached.  It rejects when
-      there is no connection to send it on, when its call fails, and when the Engine ends.  It is
-      never persisted, forecast, or resent. */
+  /** Sends an @online command behind every command submitted before it, in the Engine's
+      session, and settles with the database's answer.  A reject or a conflict settles at once.
+      An ok settles on the round trip, once the queries have run over the base the position it
+      names reached; it means the command was decided, so a resend of a rejected one settles ok
+      too, and the app reads the outcome from state.  It rejects when there is no connection to
+      send it on, when its call fails, and when the Engine ends.  It is never persisted or
+      forecast, and the connector's retry of its call is the only resend. */
   sendOnlineCommand(command: N): Promise<CommandResult> {
     return new Promise((resolve, reject) => {
       if (this.#ended || this.#signal.aborted) {
@@ -3296,11 +3331,13 @@ export class Engine<QX, FX, C, N = never> {
   }
 
   /* The app's submissions, sent in submission order.  A new connection first resends every outbox
-     command it has not been handed, in ordinal order.  Then each submission in turn: an outbox
-     command goes into the outbox and joins the current call, and an @online command goes in a
-     call of its own.  The connector fails every call behind a failed one, which keeps that order.
-     Without a connector the outbox waits for the next connection, and every @online command
-     rejects. */
+     command it has not been handed, in ordinal order, each under the session and number it was
+     minted with.  Then each submission in turn takes the next number of the Engine's session: an
+     outbox command goes into the outbox and joins the current call, and an @online command goes
+     in a call of its own.  So numbers reach the database in the order they were minted, which is
+     what lets it answer a number at or below one it decided as decided already.  The connector
+     fails every call behind a failed one, which keeps that order.  Without a connector the outbox
+     waits for the next connection, and every @online command rejects. */
   #onSubmitted(): void {
     const submitted = this.#submitted.splice(0);
     const connector = this.#connector;
@@ -3329,16 +3366,16 @@ export class Engine<QX, FX, C, N = never> {
           if ('online' in s) {
             const data = this.#reg.convert(this.#reg.commands, s.online, JS, MSGPACK) as Uint8Array;
             const online = { resolve: s.resolve, reject: s.reject, ack: null, seen: false };
-            calls.push(
-              { wire: [{ id: generateUuid(), data }], online },
-              { wire: [], online: null },
-            );
+            const command = { id: generateUuid(), session: this.#session, n: this.#nextN++, data };
+            calls.push({ wire: [command], online }, { wire: [], online: null });
             continue;
           }
 
           // an outbox command takes the next ordinal
           const command: Command<Uint8Array> = {
             id: generateUuid(),
+            session: this.#session,
+            n: this.#nextN++,
             data: this.#reg.convert(this.#reg.commands, s.outbox, JS, MSGPACK) as Uint8Array,
           };
           const ordinal = this.#nextOrdinal++;
@@ -3643,7 +3680,7 @@ export class Engine<QX, FX, C, N = never> {
     if (frozen) {
       const landing = new Set(clean.flatMap((ref) => this.#subtree(ref)));
       const pending = [...this.#backfills].some(
-        ([ref, e]) => e.record.replacing && !landing.has(ref)
+        ([ref, e]) => e.record.replacing && !landing.has(ref),
       );
       // then nothing lands, or the base would show a partial replacement
       if (pending || !frozenClean) return;
@@ -3672,8 +3709,8 @@ export class Engine<QX, FX, C, N = never> {
   // whether a ref's whole subtree has finished downloading
   #landable(ref: string): boolean {
     return (
-      this.#backfills.get(ref)!.status === 'ready'
-      && this.#childrenOf(ref).every((c) => this.#landable(c))
+      this.#backfills.get(ref)!.status === 'ready' &&
+      this.#childrenOf(ref).every((c) => this.#landable(c))
     );
   }
 
@@ -4251,11 +4288,11 @@ export class Engine<QX, FX, C, N = never> {
       results.forEach((r, i) => {
         const id = ids[i];
 
-        // an @online command: a reject or a conflict settles it now, and an ack waits for the
+        // an @online command: a reject or a conflict settles it now, and an ok waits for the
         // round trip, which the refresh after this commit may already find
         const online = this.#online.get(id);
         if (online !== undefined) {
-          if (r.kind === 'ack' || r.kind === 'dup') {
+          if (r.kind === 'ok') {
             online.ack = r;
           } else {
             this.#online.delete(id);
@@ -4267,8 +4304,8 @@ export class Engine<QX, FX, C, N = never> {
         // a command already released, by its round trip or by an earlier answer to a resend
         if (!this.#outbox.has(id)) return;
 
-        if (r.kind === 'ack' || r.kind === 'dup') {
-          // the command landed at a position; it leaves once the base has reduced through it
+        if (r.kind === 'ok') {
+          // the command was decided by a position; it leaves once the base has reduced through it
           this.#acked.set(id, r.position);
           if (r.position <= this.#reduced) drop.push(id);
         } else {

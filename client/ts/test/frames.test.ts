@@ -1,27 +1,25 @@
 import { describe, expect, test } from 'vitest';
 import { decode, encode } from '@msgpack/msgpack';
 import { parseFrame } from '../src/frames.js';
+import { uuidBytes } from '../src/uuid.js';
 
 const at = new Date('2026-01-02T03:04:05.678Z');
+// a command id as a connector hands it on, and as an envelope carries it
+const ID = '01234567-89ab-cdef-0123-456789abcdef';
+const id = uuidBytes(ID);
 
 describe('parseFrame', () => {
   test('events: envelope decoded, data sliced out undecoded', () => {
     const f = parseFrame(
-      encode(['events', [[[7, 'patron:p1', 3, 'id-1', at], { type: 'x', n: [1, 2] }]]]),
+      encode(['events', [[[7, 'patron:p1', 3, id, at], { type: 'x', n: [1, 2] }]]]),
     );
     if (f.tag !== 'events') throw new Error(f.tag);
     expect(f.events).toHaveLength(1);
     const e = f.events[0];
-    expect([e.position, e.stream, e.seq, e.id, e.servertime]).toEqual([
-      7,
-      'patron:p1',
-      3,
-      'id-1',
-      at,
-    ]);
+    expect([e.position, e.stream, e.seq, e.id, e.servertime]).toEqual([7, 'patron:p1', 3, ID, at]);
     expect(decode(e.data)).toEqual({ type: 'x', n: [1, 2] });
     // raw is the whole pair, and data is a view into it
-    expect(decode(e.raw)).toEqual([[7, 'patron:p1', 3, 'id-1', at], { type: 'x', n: [1, 2] }]);
+    expect(decode(e.raw)).toEqual([[7, 'patron:p1', 3, id, at], { type: 'x', n: [1, 2] }]);
     expect(e.data.buffer).toBe(e.raw.buffer);
   });
 
@@ -30,9 +28,9 @@ describe('parseFrame', () => {
       encode([
         'events',
         [
-          [[1, 'a', 1, 'i', at], 'one'],
-          [[2, 'b', 1, 'i', at], 'two'],
-          [[3, 'a', 2, 'i', at], 'three'],
+          [[1, 'a', 1, id, at], 'one'],
+          [[2, 'b', 1, id, at], 'two'],
+          [[3, 'a', 2, id, at], 'three'],
         ],
       ]),
     );
@@ -46,7 +44,7 @@ describe('parseFrame', () => {
 
   test('later protocol additions are skipped: envelope, event pair, and frame elements', () => {
     const f = parseFrame(
-      encode(['events', [[[7, 's', 3, 'id', at, 'newer', { x: 1 }], 5, 'newer']], 'newer']),
+      encode(['events', [[[7, 's', 3, id, at, 'newer', { x: 1 }], 5, 'newer']], 'newer']),
     );
     if (f.tag !== 'events') throw new Error(f.tag);
     expect(decode(f.events[0].data)).toBe(5);
@@ -76,12 +74,17 @@ describe('parseFrame', () => {
     expect(() => parseFrame(encode(['nope']))).toThrow(/unknown frame/);
     expect(() => parseFrame(encode(['live']))).toThrow(/truncated/);
     expect(() => parseFrame(encode(['view', 'tok', 1]))).toThrow(/truncated/);
-    expect(() => parseFrame(encode(['events', [[[1, 's', 1, 'i'], 'x']]]))).toThrow(
+    expect(() => parseFrame(encode(['events', [[[1, 's', 1, id], 'x']]]))).toThrow(
       /short envelope/,
     );
-    expect(() => parseFrame(encode(['events', [[[1, 's', 1, 'i', at]]]]))).toThrow(/without data/);
+    expect(() => parseFrame(encode(['events', [[[1, 's', 1, id, at]]]]))).toThrow(/without data/);
     // the server time is a timestamp, never an integer
-    expect(() => parseFrame(encode(['events', [[[1, 's', 1, 'i', 0], 'x']]]))).toThrow(/timestamp/);
+    expect(() => parseFrame(encode(['events', [[[1, 's', 1, id, 0], 'x']]]))).toThrow(/timestamp/);
+    // the command id is 16 bytes of bin, never a string or another length
+    expect(() => parseFrame(encode(['events', [[[1, 's', 1, ID, at], 'x']]]))).toThrow(/bin/);
+    expect(() => parseFrame(encode(['events', [[[1, 's', 1, id.slice(1), at], 'x']]]))).toThrow(
+      /15 bytes/,
+    );
     expect(() => parseFrame(encode('not an array'))).toThrow(/expected msgpack array/);
   });
 });

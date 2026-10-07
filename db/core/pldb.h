@@ -16,10 +16,11 @@ enum {
     PLDB_R_LOOKUP = 4,  /* reqid, buf: msgpack of lookup's return, len 0 for null */
 };
 
-/* One event as the wire sees it: data is the encoded [envelope, data] value. */
+/* One event as the wire sees it: data is the encoded [envelope, data] value, and atom the first
+   position of the atom it belongs to. */
 typedef struct pldb_item {
     char *stream;
-    char *commandid;
+    uint64_t atom;
     uint64_t position;
     uint8_t *data;
     size_t len;
@@ -78,10 +79,11 @@ void pldb_result_free(pldb_result *r);
    against the bundle's registry, and the fields the database prepares for precommit are
    prepared, before anything reaches the writer.  body holds the commands that passed, in
    order; reasons has one entry per command of the request, NULL for one that passed and
-   why it was rejected otherwise.  arg is handed to the hash function for every password the
-   request carries.  Returns 0; -1 for a request that is not a sequence of [id, data] values;
-   or PLDB_HASH_BUSY or PLDB_HASH_LIMITED when the hash function refused, which refuses the
-   whole request, so the client can retry it later under the same ids. */
+   why it was rejected otherwise.  Each passing command's session is replaced by its key in the
+   session table.  arg is handed to the hash function for every password the request carries.
+   Returns 0; -1 for a request that is not a sequence of [S, n, id, data, expect?] values; or
+   PLDB_HASH_BUSY or PLDB_HASH_LIMITED when the hash function refused, which refuses the whole
+   request, so the client can retry it later under the same sessions and numbers. */
 typedef struct pldb_prepared {
     uint8_t *body;
     size_t len;

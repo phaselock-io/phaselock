@@ -195,7 +195,7 @@ describe('the outbox', () => {
   test('counts the commands the database has not acknowledged', async () => {
     const r = rig({ seed: resumed });
     const status = watchStatus(r);
-    let answer!: (results: { kind: 'ack'; position: number }[]) => void;
+    let answer!: (results: { kind: 'ok'; position: number }[]) => void;
     r.server.onSend = () => new Promise((resolve) => (answer = resolve));
     await settle();
     r.server.open('e1', 40);
@@ -208,7 +208,7 @@ describe('the outbox', () => {
     expect(last(status.outbox)).toEqual({ unacknowledged: 1 });
 
     // acknowledged, though not yet reduced
-    answer([{ kind: 'ack', position: 41 }]);
+    answer([{ kind: 'ok', position: 41 }]);
     await settle();
     expect(last(status.outbox)).toEqual({ unacknowledged: 0 });
   });

@@ -1076,8 +1076,8 @@ export function define${db.name}(slots: ${slotsType}): Bundle {
   const bootstrap = slots.bootstrap;
   const bundle: Bundle = {
     schema: ${lowerFirst(db.name)}Schema,
-    precommit: (txn, cmd, principal) =>
-      ${precommit}(slots.precommit, principal, ${lowerFirst(db.name)}Txn(txn), cmd.data),
+    precommit: (txn, data, principal) =>
+      ${precommit}(slots.precommit, principal, ${lowerFirst(db.name)}Txn(txn), data),
     reducers: ${reducersValue(db.slices, 'slots.reducers')},
     maySee: (txn, principal) => slots.maySee(${lowerFirst(db.name)}Txn(txn), principal),
     lookup: (txn, ident) => slots.lookup(${lowerFirst(db.name)}Txn(txn), ident),

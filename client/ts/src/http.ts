@@ -15,6 +15,7 @@ import { be, decodeAny, utf8, Writer } from './msgpack.js';
 import { crc32c, Fnv64, sameBytes } from './checksum.js';
 import { ByteReader } from './bytes.js';
 import { frames } from './frames.js';
+import { uuidBytes } from './uuid.js';
 
 /** TokenSource supplies the bearer token for each request, or null for anonymous */
 export type TokenSource = () => string | null;
@@ -441,8 +442,15 @@ async function postCommands(
 ): Promise<CommandResult[]> {
   const w = new Writer();
   for (const c of commands) {
-    w.arrayHeader(2);
-    w.str(c.id);
+    w.arrayHeader(4);
+    if (c.session === null || c.n === null) {
+      w.nil();
+      w.nil();
+    } else {
+      w.str(c.session);
+      w.int(c.n);
+    }
+    w.bin(uuidBytes(c.id));
     w.raw(c.data);
   }
   const resp = await fetch(`${url}/commands`, {
@@ -457,10 +465,8 @@ async function postCommands(
   const outcomes = decodeAny(new Uint8Array(await resp.arrayBuffer())) as unknown[][];
   return outcomes.map((o): CommandResult => {
     switch (o[0]) {
-      case 'ack':
-        return { kind: 'ack', position: o[1] as number };
-      case 'dup':
-        return { kind: 'dup', position: o[1] as number };
+      case 'ok':
+        return { kind: 'ok', position: o[1] as number };
       case 'reject':
         return { kind: 'reject', reason: o[1] as string };
       case 'conflict':
@@ -473,8 +479,9 @@ async function postCommands(
 
 /** Sends one command outside any Engine, such as one that creates an account before there is a
     token to connect with, and answers with its outcome.  The command is the wire envelope: an id
-    the caller mints and the command's wire bytes.  The token is null for an anonymous request.  A
-    failed request rejects, and nothing is retried. */
+    the caller mints, the command's wire bytes, and a session and number, or null for both to send
+    it sessionless.  The token is null for an anonymous request.  A failed request rejects, and
+    nothing is retried. */
 export async function postCommand(
   url: string,
   command: Command<Uint8Array>,

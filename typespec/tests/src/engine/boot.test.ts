@@ -230,14 +230,25 @@ describe('boot', () => {
   test('the outbox is rebuilt in ordinal order, flushed on connect, and the next ordinal continues', async () => {
     const data = {
       ...persisted(),
-      [commandKey(3)]: { id: 'c3', data: bytes({ type: 'bump', id: 'p1' }) },
-      [commandKey(5)]: { id: 'c5', data: bytes({ type: 'bump', id: 'p1' }) },
-      [commandKey(10)]: { id: 'c10', data: bytes({ type: 'bump', id: 'p1' }) },
+      [commandKey(3)]: { id: 'c3', session: 'old', n: 4, data: bytes({ type: 'bump', id: 'p1' }) },
+      [commandKey(5)]: { id: 'c5', session: 'old', n: 6, data: bytes({ type: 'bump', id: 'p1' }) },
+      [commandKey(10)]: {
+        id: 'c10',
+        session: null,
+        n: null,
+        data: bytes({ type: 'bump', id: 'p1' }),
+      },
     };
     const r = rig({ seed: data });
     await settle();
     expect(r.server.sends.length).toBe(1);
     expect(r.server.sends[0].map((c) => c.id)).toEqual(['c3', 'c5', 'c10']);
+    // the resend is under the sessions and numbers the rows were minted with
+    expect(r.server.sends[0].map((c) => [c.session, c.n])).toEqual([
+      ['old', 4],
+      ['old', 6],
+      [null, null],
+    ]);
     r.engine.sendCommand({ type: 'bump', id: 'p2' });
     await settle();
     expect(keys(r.data(), '!command:')).toEqual([
@@ -252,6 +263,11 @@ describe('boot', () => {
     });
     expect(r.server.sends.length).toBe(2);
     expect(r.server.sends[1].length).toBe(1);
+    // a new command is minted in a fresh session of the Engine's own, never a loaded one
+    const fresh = r.server.sends[1][0];
+    expect(fresh.session).not.toBe('old');
+    expect(fresh.session).toMatch(/^[A-Za-z0-9_-]{22}$/);
+    expect(fresh.n).toBe(1);
   });
 
   test('!checkpoint loads: the reduced position is restored and gates ack releases', async () => {
@@ -261,13 +277,13 @@ describe('boot', () => {
     r.server.open();
     // an ack above the restored reduced position waits
     r.server.onSend = (cmds) =>
-      Promise.resolve(cmds.map(() => ({ kind: 'ack' as const, position: 35 })));
+      Promise.resolve(cmds.map(() => ({ kind: 'ok' as const, position: 35 })));
     r.engine.sendCommand({ type: 'bump', id: 'p1' });
     await settle();
     expect(keys(r.data(), '!command:').length).toBe(1);
     // one at it releases at once
     r.server.onSend = (cmds) =>
-      Promise.resolve(cmds.map(() => ({ kind: 'ack' as const, position: 30 })));
+      Promise.resolve(cmds.map(() => ({ kind: 'ok' as const, position: 30 })));
     r.engine.sendCommand({ type: 'noop', id: 'p1' });
     await settle();
     expect(r.server.sends.length).toBe(2);

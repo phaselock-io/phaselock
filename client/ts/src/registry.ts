@@ -13,6 +13,7 @@ import {
   type SchemaSolution,
 } from './contract.js';
 import { decodeAny, encodeAny, Reader, setEntry, Writer } from './msgpack.js';
+import { uuidBytes, uuidString } from './uuid.js';
 
 const utf8 = new TextEncoder();
 
@@ -725,22 +726,38 @@ function compile(schema: Schema): Plan[] {
   return plans;
 }
 
-/* An outbox row, `.command`, is the pair [id, command], the command nested as the msgpack value
-   its wire bytes are, so a row reads back as those bytes with no vocabulary. */
+/* An outbox row, `.command`, is [id, session, n, command], the session and n nil for a
+   sessionless command and the command nested as the msgpack value its wire bytes are, so a row
+   reads back as those bytes with no vocabulary. */
 
 function readCommand(bytes: Uint8Array): Command<Uint8Array> {
   const r = new Reader(bytes);
-  if (r.arrayHeader() < 2) throw new Error('malformed outbox row');
+  if (r.arrayHeader() !== 4) throw new Error('malformed outbox row');
   const id = r.str();
+  let session: string | null = null;
+  let n: number | null = null;
+  if (r.tryNil()) {
+    r.nil();
+  } else {
+    session = r.str();
+    n = r.int();
+  }
   const data = r.raw();
   if (!r.done) throw new Error('malformed outbox row');
-  return { id, data };
+  return { id, session, n, data };
 }
 
 function writeCommand(c: Command<Uint8Array>): Uint8Array {
   const w = new Writer();
-  w.arrayHeader(2);
+  w.arrayHeader(4);
   w.str(c.id);
+  if (c.session === null || c.n === null) {
+    w.nil();
+    w.nil();
+  } else {
+    w.str(c.session);
+    w.int(c.n);
+  }
   w.raw(c.data);
   return w.bytes();
 }
@@ -828,8 +845,8 @@ class Registry_ implements Registry {
     if (r.kind() !== 'str') walk.fail('stream: expected a string');
     const stream = r.str();
     const seq = walk.readInt(r);
-    if (r.kind() !== 'str') walk.fail('id: expected a string');
-    const id = r.str();
+    if (r.kind() !== 'bin') walk.fail('id: expected bin');
+    const id = uuidString(r.bin());
     if (r.kind() !== 'ext') walk.fail('servertime: expected a timestamp');
     const servertime = r.timestamp();
     for (let k = 5; k < env; k++) r.skip();
@@ -865,7 +882,7 @@ class Registry_ implements Registry {
     w.int(ev.position);
     w.str(ev.stream);
     w.int(ev.seq);
-    w.str(ev.id);
+    w.bin(uuidBytes(ev.id));
     if (!(ev.servertime instanceof Date)) walk.fail('servertime: expected a Date');
     w.timestamp(ev.servertime);
     const data = ev.data;

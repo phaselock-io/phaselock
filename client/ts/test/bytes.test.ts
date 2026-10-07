@@ -19,7 +19,7 @@ function join(parts: Uint8Array[]): Uint8Array {
 describe('ByteReader', () => {
   const body = join([
     encode(['vouch', 1]),
-    encode(['events', [[[1, 's', 1, 'i', new Date(0)], 'x'.repeat(100000)]]]),
+    encode(['events', [[[1, 's', 1, new Uint8Array(16), new Date(0)], 'x'.repeat(100000)]]]),
     encode(['end', 0, '']),
   ]);
 

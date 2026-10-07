@@ -2,8 +2,13 @@
 // skeleton too, which has no imports; they are duplicated here verbatim, and structural typing
 // lines the two up.  Changing them costs a change in every client in every language.
 
+/** Command wraps command data T with the client-minted id it will carry through the log, and
+    the session and number the database dedups it by: a sender numbers its commands in a session
+    it mints, and the database runs each number once.  A sessionless command has neither. */
 export type Command<T> = {
   id: string;
+  session: string | null;
+  n: number | null;
   data: T;
 };
 
@@ -68,9 +73,12 @@ export type BackfillItem =
   | { events: WireEvent[]; scanned: number }
   | { eventsDone: true };
 
+/** What the database answers for a command.  `ok` means it was decided at or before position, so
+    a client that has reduced that far can read the outcome from its state.  A reject's reason
+    and a conflict's current seqs come only in the first answer to a decision, and a resend of
+    either is answered `ok`. */
 export type CommandResult =
-  | { kind: 'ack'; position: number }
-  | { kind: 'dup'; position: number }
+  | { kind: 'ok'; position: number }
   | { kind: 'reject'; reason: string }
   | { kind: 'conflict'; current: Record<string, number> };
 

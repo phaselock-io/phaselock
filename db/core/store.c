@@ -1,4 +1,4 @@
-/* SQLite storage: the KV store, the log, the command dedup table, and the
+/* SQLite storage: the KV store, the log, the session table, and the
    known-streams table live in one database file. */
 
 #include "internal.h"
@@ -8,7 +8,8 @@ struct store {
     char err[512];
     sqlite3_stmt *get, *set, *del, *scan, *scan_all, *del_prefix, *append, *read_log,
         *seek_ge, *seek_gt, *seek_le, *seek_lt, *seek_first, *seek_last,
-        *max_pos, *cmd_pos, *cmd_ins, *stream_live, *stream_birth, *stream_death, *stream_seq,
+        *max_pos, *session_hwm, *session_mark, *stream_live, *stream_birth, *stream_death,
+        *stream_seq,
         *live_streams, *live_streams_all, *live_stream, *kv_len, *stream_state, *stream_state_zero, *stream_stats,
         *read_stream_asc, *read_stream_desc, *read_prefix_asc, *read_prefix_desc;
     // the kv cursor's statement, positioned at its key, or NULL past the end of its walk
@@ -19,12 +20,12 @@ static const char *SCHEMA =
     "PRAGMA journal_mode=WAL;"
     "PRAGMA synchronous=FULL;"
     "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;"
-    "CREATE TABLE IF NOT EXISTS log (position INTEGER PRIMARY KEY, stream TEXT NOT NULL,"
-    "  seq INTEGER NOT NULL, commandid TEXT NOT NULL, servertime INTEGER NOT NULL,"
-    "  data BLOB NOT NULL);"
+    "CREATE TABLE IF NOT EXISTS log (position INTEGER PRIMARY KEY, atom INTEGER NOT NULL,"
+    "  stream TEXT NOT NULL, seq INTEGER NOT NULL, commandid BLOB NOT NULL,"
+    "  servertime INTEGER NOT NULL, data BLOB NOT NULL);"
     "CREATE INDEX IF NOT EXISTS log_stream ON log(stream, position);"
-    "CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, position INTEGER NOT NULL)"
-    "  WITHOUT ROWID;"
+    "CREATE TABLE IF NOT EXISTS sessions (key TEXT PRIMARY KEY, hwm INTEGER NOT NULL,"
+    "  time INTEGER NOT NULL) WITHOUT ROWID;"
     "CREATE TABLE IF NOT EXISTS streams (name TEXT PRIMARY KEY, birth INTEGER NOT NULL,"
     "  death INTEGER, seq INTEGER NOT NULL,"
     "  event_bytes INTEGER NOT NULL DEFAULT 0, state_bytes INTEGER NOT NULL DEFAULT 0)"
@@ -70,32 +71,35 @@ int store_open(const char *path, bool writer, store **out, char *err, size_t err
              prep(s, &s->seek_first, "SELECT key, value FROM kv ORDER BY key") ||
              prep(s, &s->seek_last, "SELECT key, value FROM kv ORDER BY key DESC") ||
              prep(s, &s->append,
-                  "INSERT INTO log (position, stream, seq, commandid, servertime, data)"
-                  " VALUES (?1, ?2, ?3, ?4, ?5, ?6)") ||
+                  "INSERT INTO log (position, atom, stream, seq, commandid, servertime, data)"
+                  " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)") ||
              prep(s, &s->read_log,
-                  "SELECT position, stream, seq, commandid, servertime, data FROM log"
+                  "SELECT position, atom, stream, seq, commandid, servertime, data FROM log"
                   " WHERE position >= ?1 AND position <= ?2 ORDER BY position") ||
              prep(s, &s->read_stream_asc,
-                  "SELECT position, stream, seq, commandid, servertime, data FROM log"
+                  "SELECT position, atom, stream, seq, commandid, servertime, data FROM log"
                   " WHERE stream = ?1 AND position > ?2 AND position < ?3"
                   " ORDER BY position LIMIT ?4") ||
              prep(s, &s->read_stream_desc,
-                  "SELECT position, stream, seq, commandid, servertime, data FROM log"
+                  "SELECT position, atom, stream, seq, commandid, servertime, data FROM log"
                   " WHERE stream = ?1 AND position > ?2 AND position < ?3"
                   " ORDER BY position DESC LIMIT ?4") ||
              /* rowid scan filtered by prefix; the (stream, position) index would
                 range the prefix and then sort every event in it */
              prep(s, &s->read_prefix_asc,
-                  "SELECT position, stream, seq, commandid, servertime, data FROM log"
+                  "SELECT position, atom, stream, seq, commandid, servertime, data FROM log"
                   " NOT INDEXED WHERE position > ?1 AND position < ?2"
                   " AND stream >= ?3 AND stream < ?4 ORDER BY position LIMIT ?5") ||
              prep(s, &s->read_prefix_desc,
-                  "SELECT position, stream, seq, commandid, servertime, data FROM log"
+                  "SELECT position, atom, stream, seq, commandid, servertime, data FROM log"
                   " NOT INDEXED WHERE position > ?1 AND position < ?2"
                   " AND stream >= ?3 AND stream < ?4 ORDER BY position DESC LIMIT ?5") ||
              prep(s, &s->max_pos, "SELECT COALESCE(MAX(position), 0) FROM log") ||
-             prep(s, &s->cmd_pos, "SELECT position FROM commands WHERE id = ?1") ||
-             prep(s, &s->cmd_ins, "INSERT INTO commands (id, position) VALUES (?1, ?2)") ||
+             prep(s, &s->session_hwm, "SELECT hwm FROM sessions WHERE key = ?1") ||
+             prep(s, &s->session_mark,
+                  "INSERT INTO sessions (key, hwm, time) VALUES (?1, ?2, ?3)"
+                  " ON CONFLICT (key) DO UPDATE SET hwm = MAX(hwm, excluded.hwm),"
+                  " time = excluded.time") ||
              prep(s, &s->stream_live, "SELECT death IS NULL FROM streams WHERE name = ?1") ||
              prep(s, &s->stream_birth,
                   "INSERT INTO streams (name, birth, seq) VALUES (?1, ?2, 0)"
@@ -131,7 +135,7 @@ void store_close(store *s) {
     sqlite3_stmt *stmts[] = {s->get, s->set, s->del, s->scan, s->scan_all, s->del_prefix,
                              s->seek_ge, s->seek_gt, s->seek_le, s->seek_lt, s->seek_first,
                              s->seek_last,
-                             s->append, s->read_log, s->max_pos, s->cmd_pos, s->cmd_ins,
+                             s->append, s->read_log, s->max_pos, s->session_hwm, s->session_mark,
                              s->stream_live, s->stream_birth, s->stream_death,
                              s->stream_seq, s->live_streams, s->live_streams_all, s->live_stream,
                              s->kv_len,
@@ -326,15 +330,24 @@ int store_del_prefix(store *s, const char *prefix) {
     return 0;
 }
 
-int store_append(store *s, uint64_t position, const char *stream, uint64_t seq,
-                 const char *commandid, int64_t servertime, const uint8_t *data, size_t len) {
+int store_append(store *s, uint64_t position, uint64_t atom, const char *stream, uint64_t seq,
+                 const uint8_t *commandid, int64_t servertime, const uint8_t *data, size_t len) {
     sqlite3_bind_int64(s->append, 1, (sqlite3_int64)position);
-    sqlite3_bind_text(s->append, 2, stream, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(s->append, 3, (sqlite3_int64)seq);
-    sqlite3_bind_text(s->append, 4, commandid, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(s->append, 5, servertime);
-    sqlite3_bind_blob(s->append, 6, data, (int)len, SQLITE_STATIC);
+    sqlite3_bind_int64(s->append, 2, (sqlite3_int64)atom);
+    sqlite3_bind_text(s->append, 3, stream, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(s->append, 4, (sqlite3_int64)seq);
+    sqlite3_bind_blob(s->append, 5, commandid, ID_LEN, SQLITE_STATIC);
+    sqlite3_bind_int64(s->append, 6, servertime);
+    sqlite3_bind_blob(s->append, 7, data, (int)len, SQLITE_STATIC);
     return step_done(s, s->append, "append");
+}
+
+/* one log row to its callback */
+static int log_row(sqlite3_stmt *st, store_log_fn fn, void *arg) {
+    return fn(arg, (uint64_t)sqlite3_column_int64(st, 0), (uint64_t)sqlite3_column_int64(st, 1),
+              (const char *)sqlite3_column_text(st, 2), (uint64_t)sqlite3_column_int64(st, 3),
+              sqlite3_column_blob(st, 4), sqlite3_column_int64(st, 5), sqlite3_column_blob(st, 6),
+              sqlite3_column_bytes(st, 6));
 }
 
 int store_read_log(store *s, uint64_t from, uint64_t to, store_log_fn fn, void *arg) {
@@ -343,10 +356,7 @@ int store_read_log(store *s, uint64_t from, uint64_t to, store_log_fn fn, void *
     sqlite3_bind_int64(st, 2, (sqlite3_int64)to);
     int rc, out = 0;
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-        if (fn(arg, (uint64_t)sqlite3_column_int64(st, 0),
-               (const char *)sqlite3_column_text(st, 1), (uint64_t)sqlite3_column_int64(st, 2),
-               (const char *)sqlite3_column_text(st, 3), sqlite3_column_int64(st, 4),
-               sqlite3_column_blob(st, 5), sqlite3_column_bytes(st, 5)) != 0) {
+        if (log_row(st, fn, arg) != 0) {
             out = -1;
             break;
         }
@@ -366,10 +376,7 @@ int store_read_stream(store *s, const char *stream, uint64_t from, uint64_t to, 
     sqlite3_bind_int64(st, 4, (sqlite3_int64)limit);
     int rc, out = 0;
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-        if (fn(arg, (uint64_t)sqlite3_column_int64(st, 0),
-               (const char *)sqlite3_column_text(st, 1), (uint64_t)sqlite3_column_int64(st, 2),
-               (const char *)sqlite3_column_text(st, 3), sqlite3_column_int64(st, 4),
-               sqlite3_column_blob(st, 5), sqlite3_column_bytes(st, 5)) != 0) {
+        if (log_row(st, fn, arg) != 0) {
             out = -1;
             break;
         }
@@ -393,10 +400,7 @@ int store_read_prefix(store *s, const char *prefix, uint64_t from, uint64_t to, 
     sqlite3_bind_int64(st, 5, (sqlite3_int64)limit);
     int rc, out = 0;
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-        if (fn(arg, (uint64_t)sqlite3_column_int64(st, 0),
-               (const char *)sqlite3_column_text(st, 1), (uint64_t)sqlite3_column_int64(st, 2),
-               (const char *)sqlite3_column_text(st, 3), sqlite3_column_int64(st, 4),
-               sqlite3_column_blob(st, 5), sqlite3_column_bytes(st, 5)) != 0) {
+        if (log_row(st, fn, arg) != 0) {
             out = -1;
             break;
         }
@@ -418,27 +422,28 @@ int store_max_position(store *s, uint64_t *out) {
     return 0;
 }
 
-int store_command_position(store *s, const char *id, uint64_t *pos) {
-    sqlite3_bind_text(s->cmd_pos, 1, id, -1, SQLITE_STATIC);
-    int rc = sqlite3_step(s->cmd_pos);
+int store_session_hwm(store *s, const char *key, uint64_t *hwm) {
+    sqlite3_bind_text(s->session_hwm, 1, key, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(s->session_hwm);
     int out;
     if (rc == SQLITE_ROW) {
-        *pos = (uint64_t)sqlite3_column_int64(s->cmd_pos, 0);
+        *hwm = (uint64_t)sqlite3_column_int64(s->session_hwm, 0);
         out = 1;
     } else if (rc == SQLITE_DONE) {
         out = 0;
     } else {
-        out = fail(s, "command_position");
+        out = fail(s, "session_hwm");
     }
-    sqlite3_reset(s->cmd_pos);
-    sqlite3_clear_bindings(s->cmd_pos);
+    sqlite3_reset(s->session_hwm);
+    sqlite3_clear_bindings(s->session_hwm);
     return out;
 }
 
-int store_command_insert(store *s, const char *id, uint64_t pos) {
-    sqlite3_bind_text(s->cmd_ins, 1, id, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(s->cmd_ins, 2, (sqlite3_int64)pos);
-    return step_done(s, s->cmd_ins, "command_insert");
+int store_session_mark(store *s, const char *key, uint64_t n, int64_t time) {
+    sqlite3_bind_text(s->session_mark, 1, key, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(s->session_mark, 2, (sqlite3_int64)n);
+    sqlite3_bind_int64(s->session_mark, 3, time);
+    return step_done(s, s->session_mark, "session_mark");
 }
 
 int store_stream_live(store *s, const char *name) {

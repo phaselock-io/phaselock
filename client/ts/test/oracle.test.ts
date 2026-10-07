@@ -249,11 +249,17 @@ describe('values with no schema', () => {
 describe("the registry's own identities", () => {
   const reg = buildRegistry({ nodes: [], ids: {}, commands: null, eventTypes: {}, storeTypes: {} });
 
-  test('an outbox row is the pair [id, command], the command nested as its own bytes', () => {
-    const row = { id: 'c1', data: encode({ type: 'noted' }) };
+  test('an outbox row is [id, session, n, command], the command nested as its own bytes', () => {
+    const row = { id: 'c1', session: 's1', n: 2, data: encode({ type: 'noted' }) };
     const bytes = reg.convert('.command', row, JS, MSGPACK) as Uint8Array;
-    expect(bytes).toEqual(encode(['c1', { type: 'noted' }]));
+    expect(bytes).toEqual(encode(['c1', 's1', 2, { type: 'noted' }]));
     expect(reg.convert('.command', bytes, MSGPACK, JS)).toEqual(row);
+
+    // a sessionless row has nil for both
+    const sessionless = { ...row, session: null, n: null };
+    const nils = reg.convert('.command', sessionless, JS, MSGPACK) as Uint8Array;
+    expect(nils).toEqual(encode(['c1', null, null, { type: 'noted' }]));
+    expect(reg.convert('.command', nils, MSGPACK, JS)).toEqual(sessionless);
   });
 
   test('an Engine record is any value, undefined properties left out', () => {

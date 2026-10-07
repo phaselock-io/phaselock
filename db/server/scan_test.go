@@ -162,26 +162,26 @@ func TestScanRequestErrors(t *testing.T) {
 func TestAPrecommitScans(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("b1", "add-book", "id", "b1", "title", "Dune"))
-	h.ack(admin, cmd("b2", "add-book", "id", "b2", "title", "Emma"))
-	h.ack(admin, cmd("b3", "add-book", "id", "b3", "title", "Dune"))
+	h.accept(admin, cmd("b1", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(admin, cmd("b2", "add-book", "id", "b2", "title", "Emma"))
+	h.accept(admin, cmd("b3", "add-book", "id", "b3", "title", "Dune"))
 
 	// shelve reads the shelf's copies, with their values, a batch of one at a time
-	h.ack(admin, cmd("s1", "shelve", "branch", "x", "book", "b1"))
-	h.ack(admin, cmd("s2", "shelve", "branch", "x", "book", "b2"))
+	h.accept(admin, cmd("s1", "shelve", "branch", "x", "book", "b1"))
+	h.accept(admin, cmd("s2", "shelve", "branch", "x", "book", "b2"))
 	if o := h.commands(admin, cmd("s3", "shelve", "branch", "x", "book", "b3"))[0]; o.kind != "reject" || o.reason != "title on shelf" {
 		t.Fatalf("a title already on the shelf: %+v", o)
 	}
 
 	// and only that shelf's
-	h.ack(admin, cmd("s4", "shelve", "branch", "y", "book", "b3"))
+	h.accept(admin, cmd("s4", "shelve", "branch", "y", "book", "b3"))
 }
 
 func TestAReducerScanSeesItsOwnWritesAndStream(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
 	for _, b := range [][2]string{{"b1", "Dune"}, {"b2", "Emma"}, {"b3", "Ivanhoe"}} {
-		h.ack(admin, cmd(b[0], "add-book", "id", b[0], "title", b[1]))
+		h.accept(admin, cmd(b[0], "add-book", "id", b[0], "title", b[1]))
 	}
 	shelved := func(branch string) string {
 		t.Helper()
@@ -193,14 +193,14 @@ func TestAReducerScanSeesItsOwnWritesAndStream(t *testing.T) {
 	}
 
 	// the reducer's scan sees the copy it set just before it, in local keys
-	h.ack(admin, cmd("s1", "shelve", "branch", "x", "book", "b1"))
+	h.accept(admin, cmd("s1", "shelve", "branch", "x", "book", "b1"))
 	if got := shelved("x"); got != "copy:b1" {
 		t.Fatalf("after the first copy: %s", got)
 	}
 
 	// and its own stream's copies only, not a neighbour's whose name extends its own
-	h.ack(admin, cmd("s2", "shelve", "branch", "x-2", "book", "b2"))
-	h.ack(admin, cmd("s3", "shelve", "branch", "x", "book", "b3"))
+	h.accept(admin, cmd("s2", "shelve", "branch", "x-2", "book", "b2"))
+	h.accept(admin, cmd("s3", "shelve", "branch", "x", "book", "b3"))
 	if got := shelved("x"); got != "copy:b1,copy:b3" {
 		t.Fatalf("shelf:x: %s", got)
 	}
@@ -212,7 +212,7 @@ func TestAReducerScanSeesItsOwnWritesAndStream(t *testing.T) {
 func TestAMaySeeScanRerunsForKeysItsWalkCovers(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("l1", "lend", "branch", "x", "patron", "r1"))
+	h.accept(admin, cmd("l1", "lend", "branch", "x", "patron", "r1"))
 
 	// r1 is audited, so each run of its maySee changes its view; it sees the shelves that lend
 	// to it, from a walk of every shelf's lend key for r1
@@ -224,7 +224,7 @@ func TestAMaySeeScanRerunsForKeysItsWalkCovers(t *testing.T) {
 	s.live()
 
 	// a key inside the walk re-runs maySee, and the grant arrives ahead of the events
-	h.ack(admin, cmd("l2", "lend", "branch", "y", "patron", "r1"))
+	h.accept(admin, cmd("l2", "lend", "branch", "y", "patron", "r1"))
 	f := s.nextTagged("view")
 	if got := strings.Join(strs(f[3]), ","); got != "book,patron:r1,shelf:run-2,shelf:x,shelf:y" {
 		t.Fatalf("a lend to r1: %v", got)
@@ -235,24 +235,24 @@ func TestAMaySeeScanRerunsForKeysItsWalkCovers(t *testing.T) {
 
 	// keys outside it do not, in a shelf r1 sees, whose events come with no view frame ahead of
 	// them, or in one it does not
-	h.ack(admin, cmd("l3", "lend", "branch", "x", "patron", "p9"))
+	h.accept(admin, cmd("l3", "lend", "branch", "x", "patron", "p9"))
 	if evs := events(s.nextTagged("events")); evs[0].stream != "shelf:x" {
 		t.Fatalf("a lend to another patron: %+v", evs)
 	}
-	h.ack(admin, cmd("l4", "lend", "branch", "z", "patron", "p9"))
+	h.accept(admin, cmd("l4", "lend", "branch", "z", "patron", "p9"))
 	s.quiet()
-	h.ack(admin, cmd("s1", "add-book", "id", "b1", "title", "Dune"))
-	h.ack(admin, cmd("s2", "shelve", "branch", "x", "book", "b1"))
+	h.accept(admin, cmd("s1", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(admin, cmd("s2", "shelve", "branch", "x", "book", "b1"))
 	events(s.nextTagged("events")) // the book
 	events(s.nextTagged("events")) // the copy
 
 	// nor does a death outside the walk's streams
-	h.ack(admin, cmd("p1", "add-patron", "id", "p2", "name", "Bob"))
-	h.ack(admin, cmd("p2", "remove-patron", "id", "p2"))
+	h.accept(admin, cmd("p1", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, cmd("p2", "remove-patron", "id", "p2"))
 	s.quiet()
 
 	// the death of a shelf r1 lends at deletes a key the walk read, so maySee runs again
-	h.ack(admin, cmd("c1", "close-shelf", "branch", "y"))
+	h.accept(admin, cmd("c1", "close-shelf", "branch", "y"))
 	f = s.nextTagged("view")
 	if got := strings.Join(strs(f[3]), ","); got != "book,patron:r1,shelf:run-3,shelf:x" {
 		t.Fatalf("a closed shelf: %v", got)

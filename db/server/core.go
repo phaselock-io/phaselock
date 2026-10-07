@@ -31,11 +31,13 @@ type principal struct {
 	gen       int64 // -1 skips the generation check
 }
 
+// item is one event of the log: its encoded [envelope, data] value, and atom the first position
+// of the atom it belongs to.
 type item struct {
-	stream    string
-	commandid string
-	position  uint64
-	data      []byte
+	stream   string
+	atom     uint64
+	position uint64
+	data     []byte
 }
 
 type result struct {
@@ -166,10 +168,10 @@ func goItems(arr *C.pldb_item, n C.size_t) []item {
 	out := make([]item, int(n))
 	for i := range out {
 		out[i] = item{
-			stream:    C.GoString(slice[i].stream),
-			commandid: C.GoString(slice[i].commandid),
-			position:  uint64(slice[i].position),
-			data:      C.GoBytes(unsafe.Pointer(slice[i].data), C.int(slice[i].len)),
+			stream:   C.GoString(slice[i].stream),
+			atom:     uint64(slice[i].atom),
+			position: uint64(slice[i].position),
+			data:     C.GoBytes(unsafe.Pointer(slice[i].data), C.int(slice[i].len)),
 		}
 	}
 	return out
@@ -266,7 +268,7 @@ func (c *core) readAtoms(from, to uint64) ([]item, error) {
 			return nil, err
 		}
 		n := 0
-		for n < len(more) && more[n].commandid == last.commandid {
+		for n < len(more) && more[n].atom == last.atom {
 			n++
 		}
 		items = append(items, more[:n]...)

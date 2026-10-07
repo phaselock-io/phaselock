@@ -3,6 +3,7 @@
 import type { WireEvent } from './contract.js';
 import { Reader } from './msgpack.js';
 import type { ByteReader } from './bytes.js';
+import { uuidString } from './uuid.js';
 
 export type Frame =
   | { tag: 'events'; events: WireEvent[] }
@@ -42,7 +43,7 @@ export function parseFrame(bytes: Uint8Array): Frame {
         const position = p.int();
         const stream = p.str();
         const seq = p.int();
-        const id = p.str();
+        const id = uuidString(p.bin());
         const servertime = p.timestamp();
         for (let k = 5; k < env; k++) p.skip();
         const data = p.view();

@@ -1,18 +1,18 @@
 CC ?= cc
 CFLAGS ?= -O2 -g
 CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fPIC
-CPPFLAGS += -Ivendor/mpack -I$(QJS) -DMPACK_EXTENSIONS=1
+CPPFLAGS += -Ivendor/mpack -Ivendor/sha256 -I$(QJS) -DMPACK_EXTENSIONS=1
 
 QJS = ../../examples/library/relay/quickjs
 QJS_OBJS = quickjs libregexp libunicode cutils dtoa
 
-OBJS = pldb.o store.o scan.o scantest.o mpjs.o js.o walk.o names.o crc32c.o mpack.o \
+OBJS = pldb.o store.o scan.o scantest.o mpjs.o js.o walk.o names.o crc32c.o mpack.o sha256.o \
        $(foreach o,$(QJS_OBJS),qjs_$(o).o)
 
 libpldb.a: $(OBJS)
 	ar rcs $@ $(OBJS)
 
-pldb.o: pldb.c pldb.h internal.h walk.h
+pldb.o: pldb.c pldb.h internal.h walk.h vendor/sha256/sha256.h
 store.o: store.c internal.h
 scan.o: scan.c internal.h
 scantest.o: scantest.c internal.h
@@ -27,6 +27,9 @@ host_js.h: host.js
 
 mpack.o: vendor/mpack/mpack.c vendor/mpack/mpack.h
 	$(CC) $(CPPFLAGS) -std=c11 -O2 -g -w -fPIC -c -o $@ vendor/mpack/mpack.c
+
+sha256.o: vendor/sha256/sha256.c vendor/sha256/sha256.h
+	$(CC) $(CPPFLAGS) -std=c11 -O2 -g -w -fPIC -c -o $@ vendor/sha256/sha256.c
 
 $(QJS)/.obj/%.pic.o:
 	$(MAKE) -C $(QJS) .obj/$*.pic.o

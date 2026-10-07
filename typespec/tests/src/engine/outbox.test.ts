@@ -82,8 +82,7 @@ function sendControl(server: FakeServer): SendCall[] {
   return calls;
 }
 
-const ack = (position: number): CommandResult => ({ kind: 'ack', position });
-const dup = (position: number): CommandResult => ({ kind: 'dup', position });
+const ok = (position: number): CommandResult => ({ kind: 'ok', position });
 const reject: CommandResult = { kind: 'reject', reason: 'no' };
 const conflict: CommandResult = { kind: 'conflict', current: {} };
 
@@ -136,7 +135,7 @@ describe('outbox rows and sends', () => {
     expect(typeof rows[0].id).toBe('string');
   });
 
-  test('ack and dup release once the reduced position reaches them; reject and conflict at once', async () => {
+  test('an ok releases once the reduced position reaches it; a reject and a conflict at once', async () => {
     const r = await held();
     const calls = sendControl(r.server);
     r.engine.sendCommand({ field: 'a' });
@@ -144,7 +143,7 @@ describe('outbox rows and sends', () => {
     r.engine.sendCommand({ field: 'c' });
     r.engine.sendCommand({ field: 'd' });
     await settle();
-    calls[0].resolve([ack(15), dup(16), reject, conflict]);
+    calls[0].resolve([ok(15), ok(16), reject, conflict]);
     await settle();
     const rows = outbox(r.data());
     expect(rows.map((x) => x.data)).toEqual([{ field: 'a' }, { field: 'b' }]);
@@ -167,7 +166,7 @@ describe('outbox rows and sends', () => {
     expect(outbox(r.data())).toEqual([]);
     expect(log(r.data(), 'patron:p1')).toEqual(['set a=1']);
     // the late ack finds nothing to release and changes nothing
-    calls[0].resolve([ack(11)]);
+    calls[0].resolve([ok(11)]);
     await settle();
     expect(outbox(r.data())).toEqual([]);
     expect(state(r.data(), 'patron:p1')).toEqual({ count: 2, fields: { a: 1 } });
@@ -229,7 +228,7 @@ describe('outbox rows and sends', () => {
     expect(w.values.at(-1)).toEqual({ count: 2, fields: {} });
 
     // acked like any other command
-    calls[0].resolve([ack(10)]);
+    calls[0].resolve([ok(10)]);
     await settle();
     expect(keys(r.data(), '!command:')).toEqual([]);
   });
@@ -239,7 +238,7 @@ describe('outbox rows and sends', () => {
     const calls = sendControl(r.server);
     r.engine.sendCommand({ field: 'a' });
     await settle();
-    calls[0].resolve([ack(500)]);
+    calls[0].resolve([ok(500)]);
     await settle();
     r.engine.sendCommand({ field: 'b' });
     r.engine.sendCommand({ field: 'c' });
@@ -279,12 +278,12 @@ describe('outbox rows and sends', () => {
     ]);
   });
 
-  test('acks are memory only: acked before a crash, resent, dup at the same position, dropped the same way', async () => {
+  test('acks are memory only: acked before a crash, resent under its session, ok again, dropped the same way', async () => {
     const r = await held();
     const calls = sendControl(r.server);
     r.engine.sendCommand({ field: 'a' });
     await settle();
-    calls[0].resolve([ack(15)]);
+    calls[0].resolve([ok(15)]);
     await settle();
     expect(outbox(r.data()).length).toBe(1);
     r.abort.abort();
@@ -296,13 +295,37 @@ describe('outbox rows and sends', () => {
     await settle();
     expect(server.sends.length).toBe(1);
     expect(server.sends[0].map((c) => parse(c.data))).toEqual([{ field: 'a' }]);
-    calls2[0].resolve([dup(15)]);
+    expect(server.sends[0].map((c) => [c.session, c.n])).toEqual(
+      r.server.sends[0].map((c) => [c.session, c.n]),
+    );
+    calls2[0].resolve([ok(15)]);
     await settle();
     expect(outbox(r.data()).length).toBe(1);
     server.open();
     server.vouch(15);
     await settle();
     expect(outbox(r.data())).toEqual([]);
+  });
+});
+
+describe('sessions', () => {
+  test('outbox and @online commands take consecutive numbers of one session, in submission order', async () => {
+    const r = await held();
+    sendControl(r.server);
+    r.engine.sendCommand({ field: 'a' });
+    void r.engine.sendOnlineCommand({ field: 'x' });
+    r.engine.sendCommand({ field: 'b' });
+    await settle();
+    const sent = r.server.sends.flat();
+    expect(sent.map((c) => c.n)).toEqual([1, 2, 3]);
+    expect(new Set(sent.map((c) => c.session)).size).toBe(1);
+    expect(sent[0].session).toMatch(/^[A-Za-z0-9_-]{22}$/);
+    // the outbox rows keep the session and number they were minted with
+    const rows = keys(r.data(), '!command:').map((k) => r.data()[k] as Command<Uint8Array>);
+    expect(rows.map((c) => [c.session, c.n])).toEqual([
+      [sent[0].session, 1],
+      [sent[0].session, 3],
+    ]);
   });
 });
 
@@ -377,7 +400,7 @@ describe('the reduced position', () => {
     expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 12, reduced: 11 });
     // frozen: the base change reaches no query
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1, b: 2 } });
-    calls[0].resolve([ack(11), ack(12)]);
+    calls[0].resolve([ok(11), ok(12)]);
     await settle();
     expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
     // the release rebuilds the overlay over the reduced base, b's forecast still on it
@@ -391,7 +414,7 @@ describe('the reduced position', () => {
     r.engine.sendCommand({ field: 'c', value: 3 });
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 3, fields: { b: 2, c: 3 } });
-    calls[1].resolve([ack(5)]);
+    calls[1].resolve([ok(5)]);
     await settle();
     expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
     // b's forecast never left the overlay through the freeze
@@ -429,7 +452,7 @@ describe('the reduced position', () => {
     r2.engine.sendCommand({ field: 'a' });
     r2.engine.sendCommand({ field: 'b' });
     await settle();
-    calls[0].resolve([ack(11), ack(12)]);
+    calls[0].resolve([ok(11), ok(12)]);
     await settle();
     expect(outbox(r2.data()).map((x) => x.data)).toEqual([{ field: 'b' }]);
   });
@@ -478,7 +501,7 @@ describe('the reduced position', () => {
     const unfreeze = await freeze(r);
     r.engine.sendCommand({ field: 'a' });
     await settle();
-    calls[0].resolve([ack(15)]);
+    calls[0].resolve([ok(15)]);
     r.server.vouch(15);
     await settle();
     expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, reduced: 10 });
@@ -560,13 +583,13 @@ describe('@online commands', () => {
     );
     await settle();
     // the command also wrote past the event this client sees
-    calls[0].resolve([ack(12)]);
+    calls[0].resolve([ok(12)]);
     await settle();
     expect(t.settled).toBe(false);
     const id = r.server.sends[0][0].id;
     r.server.events(ev('patron:p1', 3, 11, { type: 'set', field: 'x', value: 1 }, id));
     await settle();
-    expect(t.value).toEqual(ack(12));
+    expect(t.value).toEqual(ok(12));
     expect(shown).toEqual({ count: 2, fields: { x: 1 } });
   });
 
@@ -579,9 +602,9 @@ describe('@online commands', () => {
     r.server.events(ev('patron:p1', 3, 11, { type: 'set', field: 'x', value: 1 }, id));
     await settle();
     expect(t.settled).toBe(false);
-    calls[0].resolve([ack(12)]);
+    calls[0].resolve([ok(12)]);
     await settle();
-    expect(t.value).toEqual(ack(12));
+    expect(t.value).toEqual(ok(12));
   });
 
   test('an ack with no visible events settles once the base is reduced through its position', async () => {
@@ -589,13 +612,13 @@ describe('@online commands', () => {
     const calls = sendControl(r.server);
     const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
     await settle();
-    calls[0].resolve([ack(15)]);
+    calls[0].resolve([ok(15)]);
     r.server.vouch(14);
     await settle();
     expect(t.settled).toBe(false);
     r.server.vouch(15);
     await settle();
-    expect(t.value).toEqual(ack(15));
+    expect(t.value).toEqual(ok(15));
   });
 
   test('an acked command whose round trip is observed during a freeze settles at the unfreeze', async () => {
@@ -604,12 +627,12 @@ describe('@online commands', () => {
     const unfreeze = await freeze(r);
     const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
     await settle();
-    calls[0].resolve([ack(5)]);
+    calls[0].resolve([ok(5)]);
     await settle();
     expect(t.settled).toBe(false);
     unfreeze();
     await settle();
-    expect(t.value).toEqual(ack(5));
+    expect(t.value).toEqual(ok(5));
   });
 
   test('with no connection it rejects at once, while outbox commands wait for the next one', async () => {
@@ -652,7 +675,7 @@ describe('@online commands', () => {
     const calls = sendControl(r.server);
     const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
     await settle();
-    calls[0].resolve([ack(15)]);
+    calls[0].resolve([ok(15)]);
     await settle();
     r.server.end();
     await settle();
@@ -663,7 +686,7 @@ describe('@online commands', () => {
     r.server.open();
     r.server.live(15);
     await settle();
-    expect(t.value).toEqual(ack(15));
+    expect(t.value).toEqual(ok(15));
   });
 
   test('the Engine ending rejects every one waiting, and one sent afterwards', async () => {
@@ -672,7 +695,7 @@ describe('@online commands', () => {
     const answered = track(r.engine.sendOnlineCommand({ field: 'x' }));
     const inFlight = track(r.engine.sendOnlineCommand({ field: 'y' }));
     await settle();
-    calls[0].resolve([ack(15)]);
+    calls[0].resolve([ok(15)]);
     await settle();
     r.abort.abort();
     await settle();

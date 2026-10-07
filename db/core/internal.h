@@ -44,6 +44,9 @@ uint32_t pl_crc32c(const void *data, size_t len);
 uint64_t pl_fnv1a(const void *data, size_t len, uint64_t h);
 int64_t now_ms(void);
 
+/* the length of a command's id, a label the client mints */
+#define ID_LEN 16
+
 /* store.c: one SQLite connection */
 typedef struct store store;
 int store_open(const char *path, bool writer, store **out, char *err, size_t errlen);
@@ -67,19 +70,24 @@ int store_cursor_step(store *s);
 const char *store_cursor_key(store *s, size_t *n);
 const uint8_t *store_cursor_value(store *s, size_t *n);
 void store_cursor_end(store *s);
-int store_append(store *s, uint64_t position, const char *stream, uint64_t seq,
-                 const char *commandid, int64_t servertime, const uint8_t *data, size_t len);
-typedef int (*store_log_fn)(void *arg, uint64_t position, const char *stream, uint64_t seq,
-                            const char *commandid, int64_t servertime, const uint8_t *data,
-                            size_t len);
+/* A log row is one event: atom is the first position of the command's atom, and commandid the
+   command's label, ID_LEN bytes. */
+int store_append(store *s, uint64_t position, uint64_t atom, const char *stream, uint64_t seq,
+                 const uint8_t *commandid, int64_t servertime, const uint8_t *data, size_t len);
+typedef int (*store_log_fn)(void *arg, uint64_t position, uint64_t atom, const char *stream,
+                            uint64_t seq, const uint8_t *commandid, int64_t servertime,
+                            const uint8_t *data, size_t len);
 int store_read_log(store *s, uint64_t from, uint64_t to, store_log_fn fn, void *arg);
 int store_read_stream(store *s, const char *stream, uint64_t from, uint64_t to, bool reverse,
                       size_t limit, store_log_fn fn, void *arg);
 int store_read_prefix(store *s, const char *prefix, uint64_t from, uint64_t to, bool reverse,
                       size_t limit, store_log_fn fn, void *arg);
 int store_max_position(store *s, uint64_t *out);
-int store_command_position(store *s, const char *id, uint64_t *pos);
-int store_command_insert(store *s, const char *id, uint64_t pos);
+/* The session table, keyed by the hex SHA-256 of a session.  store_session_hwm answers 1 and
+   the session's mark if the session is known, 0 if not; store_session_mark raises the mark to n
+   at least and stamps the session's last decision. */
+int store_session_hwm(store *s, const char *key, uint64_t *hwm);
+int store_session_mark(store *s, const char *key, uint64_t n, int64_t time);
 int store_stream_live(store *s, const char *name);
 int store_stream_birth(store *s, const char *name, uint64_t pos);
 int store_stream_death(store *s, const char *name, uint64_t pos);
@@ -190,8 +198,7 @@ void js_close(jsrt *js);
 JSValue js_principal(jsrt *js, const char *user);
 /* run the bundle's bootstrap, if it has one, collecting what it emits */
 int js_bootstrap(jsrt *js, pc_result *out);
-int js_precommit(jsrt *js, const char *id, JSValueConst data, JSValueConst principal,
-                 pc_result *out);
+int js_precommit(jsrt *js, JSValueConst data, JSValueConst principal, pc_result *out);
 void pc_result_free(jsrt *js, pc_result *r);
 int js_reduce(jsrt *js, const char *family, const char *stream, JSValueConst events);
 int js_maysee(jsrt *js, JSValueConst principal, strlist *out);

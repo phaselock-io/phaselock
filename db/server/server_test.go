@@ -119,9 +119,12 @@ func (h *harness) token(identity string) string {
 func (h *harness) admin() string { return h.token("root") }
 func (h *harness) epoch() string { return h.srv.epoch }
 
+// command is one command to post: sessionless unless in names its session and number.
 type command struct {
-	id   string
-	data map[string]any
+	id      string
+	session string
+	n       int64
+	data    map[string]any
 }
 
 func cmd(id, typ string, kv ...any) command {
@@ -130,6 +133,34 @@ func cmd(id, typ string, kv ...any) command {
 		data[kv[i].(string)] = kv[i+1]
 	}
 	return command{id: id, data: data}
+}
+
+// in sends the command as number n of a session.
+func (c command) in(session string, n int64) command {
+	c.session = session
+	c.n = n
+	return c
+}
+
+// label is a test's command id as the 16 bytes on the wire: its name, padded with zeros.
+func label(id string) []byte {
+	if len(id) > 16 {
+		panic("command id too long: " + id)
+	}
+	return append([]byte(id), make([]byte, 16-len(id))...)
+}
+
+// encode is the command as the wire carries it, with expect when it is not nil.
+func (c command) encode(expect map[string]any) []byte {
+	var session, n any
+	if c.session != "" {
+		session, n = c.session, c.n
+	}
+	v := []any{session, n, label(c.id), c.data}
+	if expect != nil {
+		v = append(v, expect)
+	}
+	return mpEncode(v)
 }
 
 // commands posts commands and returns the outcomes.
@@ -146,7 +177,7 @@ func (h *harness) commandsStatus(token string, cmds ...command) (int, []outcome)
 	h.t.Helper()
 	var body []byte
 	for _, c := range cmds {
-		body = append(body, mpEncode([]any{c.id, c.data})...)
+		body = append(body, c.encode(nil)...)
 	}
 	status, _, out := h.do("POST", "/commands", token, body)
 	if status != 200 {
@@ -162,7 +193,7 @@ func decodeOutcomes(t *testing.T, out []byte) []outcome {
 		arr := r.([]any)
 		o := outcome{kind: arr[0].(string)}
 		switch o.kind {
-		case "ack", "dup":
+		case "ok":
 			o.position = asInt(arr[1])
 		case "reject":
 			o.reason = arr[1].(string)
@@ -187,7 +218,7 @@ type outcome struct {
 // expecting posts one command with an expect map and returns its outcome.
 func (h *harness) expecting(token string, c command, expect map[string]any) outcome {
 	h.t.Helper()
-	body := mpEncode([]any{c.id, c.data, expect})
+	body := c.encode(expect)
 	status, _, out := h.do("POST", "/commands", token, body)
 	if status != 200 {
 		h.t.Fatalf("commands: status %d", status)
@@ -195,11 +226,12 @@ func (h *harness) expecting(token string, c command, expect map[string]any) outc
 	return decodeOutcomes(h.t, out)[0]
 }
 
-func (h *harness) ack(token string, c command) int64 {
+// accept posts one command that must be accepted, and returns its position.
+func (h *harness) accept(token string, c command) int64 {
 	h.t.Helper()
 	outs := h.commands(token, c)
-	if outs[0].kind != "ack" {
-		h.t.Fatalf("expected ack for %s, got %+v", c.id, outs[0])
+	if outs[0].kind != "ok" {
+		h.t.Fatalf("expected ok for %s, got %+v", c.id, outs[0])
 	}
 	return outs[0].position
 }
@@ -349,7 +381,8 @@ type event struct {
 	position   int64
 	stream     string
 	seq        int64
-	commandid  string
+	id         []byte // the command id as it arrived
+	commandid  string // the id as a test names it: its bytes without label's zeros
 	servertime time.Time
 	data       map[string]any
 }
@@ -363,7 +396,8 @@ func events(f []any) []event {
 			position:   asInt(env[0]),
 			stream:     env[1].(string),
 			seq:        asInt(env[2]),
-			commandid:  env[3].(string),
+			id:         env[3].([]byte),
+			commandid:  strings.TrimRight(string(env[3].([]byte)), "\x00"),
 			servertime: env[4].(time.Time),
 			data:       pair[1].(map[string]any),
 		})
@@ -402,20 +436,20 @@ func strs(v any) []string {
 
 // tests ////////////////////////////////////////////////////////////////////
 
-func TestCommandsAckDupReject(t *testing.T) {
+func TestCommandsOkReject(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
 
-	outs := h.commands(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
-	if outs[0].kind != "ack" || outs[0].position < 1 {
-		t.Fatalf("expected ack, got %+v", outs[0])
+	outs := h.commands(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune").in("s1", 1))
+	if outs[0].kind != "ok" || outs[0].position < 1 {
+		t.Fatalf("expected ok, got %+v", outs[0])
 	}
 	first := outs[0].position
 
-	// resubmission is an idempotent ack with the original position
-	outs = h.commands(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
-	if outs[0].kind != "dup" || outs[0].position != first {
-		t.Fatalf("expected dup at %d, got %+v", first, outs[0])
+	// a resend is decided already, at or before the position it is answered with
+	outs = h.commands(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune").in("s1", 1))
+	if outs[0].kind != "ok" || outs[0].position < first {
+		t.Fatalf("expected ok at %d or later, got %+v", first, outs[0])
 	}
 
 	// precommit rejection, structural rejection, and a later ack in one post
@@ -430,8 +464,8 @@ func TestCommandsAckDupReject(t *testing.T) {
 	if outs[1].kind != "reject" || !strings.Contains(outs[1].reason, "$.title: missing required field") {
 		t.Fatalf("expected structural reject, got %+v", outs[1])
 	}
-	if outs[2].kind != "ack" || outs[2].position <= first {
-		t.Fatalf("expected ack after rejects, got %+v", outs[2])
+	if outs[2].kind != "ok" || outs[2].position <= first {
+		t.Fatalf("expected ok after rejects, got %+v", outs[2])
 	}
 
 	// anonymous is a principal; the bundle says it may not add books
@@ -441,10 +475,76 @@ func TestCommandsAckDupReject(t *testing.T) {
 	}
 }
 
+func TestSessionDedup(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	dune := func(id string) command { return cmd(id, "add-book", "id", "b1", "title", "Dune") }
+
+	// two copies of one (S, n) in one group: the first runs, and the second sees its decision,
+	// where running it again would have been rejected
+	outs := h.commands(admin, dune("c1").in("s1", 1), dune("c1").in("s1", 1))
+	if outs[0].kind != "ok" || outs[1].kind != "ok" || outs[1].position != outs[0].position {
+		t.Fatalf("copies in one group: %+v", outs)
+	}
+
+	// a reject is a decision: its resend is decided already, and its reason is gone
+	if o := h.commands(admin, dune("c2").in("s1", 2))[0]; o.kind != "reject" || o.reason != "book exists" {
+		t.Fatalf("first reply of a reject: %+v", o)
+	}
+	if o := h.commands(admin, dune("c2").in("s1", 2))[0]; o.kind != "ok" {
+		t.Fatalf("resent reject: %+v", o)
+	}
+
+	// so is a conflict, and an atom a reducer's failure rolled back
+	emma := cmd("c3", "add-book", "id", "b3", "title", "Emma").in("s1", 3)
+	if o := h.expecting(admin, emma, map[string]any{"book": 0}); o.kind != "conflict" {
+		t.Fatalf("first reply of a conflict: %+v", o)
+	}
+	if o := h.commands(admin, emma)[0]; o.kind != "ok" {
+		t.Fatalf("resent conflict: %+v", o)
+	}
+	nul := cmd("c4", "add-book", "id", "b1\x00x", "title", "Emma").in("s1", 4)
+	if o := h.commands(admin, nul)[0]; o.kind != "reject" || !strings.Contains(o.reason, "holds U+0000") {
+		t.Fatalf("first reply of a rolled-back atom: %+v", o)
+	}
+	if o := h.commands(admin, nul)[0]; o.kind != "ok" {
+		t.Fatalf("resent rolled-back atom: %+v", o)
+	}
+
+	// numbers may skip, and a number at or below the mark is decided already, run or not
+	head := h.accept(admin, cmd("c5", "add-book", "id", "b5", "title", "Persuasion").in("s1", 10))
+	if o := h.commands(admin, cmd("c6", "add-book", "id", "b6", "title", "Sanditon").in("s1", 7))[0]; o.kind != "ok" || o.position != head {
+		t.Fatalf("a number below the mark: %+v", o)
+	}
+
+	// none of the resends reached the log: the book stream holds b1 and b5 alone
+	evs, _, _ := h.eventsRange(admin, "book", -1, -1, false, 100)
+	if len(evs) != 3 || evs[1].data["id"] != "b1" || evs[2].data["id"] != "b5" {
+		t.Fatalf("the book stream: %+v", evs)
+	}
+
+	// an unknown session runs from whatever number it starts at, and the numbers below it are
+	// then decided already
+	h.accept(admin, cmd("c7", "add-book", "id", "b7", "title", "Emma").in("s2", 5))
+	if o := h.commands(admin, cmd("c8", "add-book", "id", "b8", "title", "Sanditon").in("s2", 1))[0]; o.kind != "ok" {
+		t.Fatalf("a number below an unknown session's first: %+v", o)
+	}
+	if o := h.commands(admin, dune("c8").in("s2", 6))[0]; o.kind != "reject" {
+		t.Fatalf("the next number of a session that started past 1: %+v", o)
+	}
+
+	// a sessionless command runs every time it is sent
+	for range 2 {
+		if o := h.commands(admin, dune("c9"))[0]; o.kind != "reject" || o.reason != "book exists" {
+			t.Fatalf("a sessionless command: %+v", o)
+		}
+	}
+}
+
 func TestBootstrapAndLiveAtoms(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
 
 	s := h.stream(admin, -1)
 	if s.header.Get("PhaseLock-Protocol") != "1" || len(s.header.Get("PhaseLock-Epoch")) != 32 {
@@ -456,7 +556,7 @@ func TestBootstrapAndLiveAtoms(t *testing.T) {
 	live := s.live()
 
 	// a new patron: birth then the event, one atom, one frame
-	pos := h.ack(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
+	pos := h.accept(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
 	f := s.nextTagged("events")
 	evs := events(f)
 	if len(evs) != 2 {
@@ -484,7 +584,7 @@ func TestBootstrapAndLiveAtoms(t *testing.T) {
 	}
 
 	// a multi-stream atom arrives as one frame
-	h.ack(admin, cmd("c3", "try-hold", "id", "h1", "book", "b1", "patron", "p1"))
+	h.accept(admin, cmd("c3", "try-hold", "id", "h1", "book", "b1", "patron", "p1"))
 	evs = events(s.nextTagged("events"))
 	if len(evs) != 2 || evs[0].stream != "book" || evs[1].stream != "patron:p1" {
 		t.Fatalf("expected book + patron events, got %+v", evs)
@@ -500,15 +600,15 @@ func TestBootstrapAndLiveAtoms(t *testing.T) {
 func TestLiveMultiAtomCommit(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	pos := h.ack(admin, cmd("c0", "add-book", "id", "b0", "title", "Zero"))
+	pos := h.accept(admin, cmd("c0", "add-book", "id", "b0", "title", "Zero"))
 	s := h.stream(admin, -1)
 	if s.header.Get("PhaseLock-Position") != fmt.Sprint(pos) {
 		t.Fatalf("PhaseLock-Position %q, want %d", s.header.Get("PhaseLock-Position"), pos)
 	}
 	s.nextTagged("live")
 	// one POST, two commands, one group commit: two atoms on the wire
-	body := append(mpEncode([]any{"c1", map[string]any{"type": "add-patron", "id": "p1", "name": "Ann"}}),
-		mpEncode([]any{"c2", map[string]any{"type": "add-patron", "id": "p2", "name": "Bob"}})...)
+	body := append(cmd("c1", "add-patron", "id", "p1", "name", "Ann").encode(nil),
+		cmd("c2", "add-patron", "id", "p2", "name", "Bob").encode(nil)...)
 	if status, _, _ := h.do("POST", "/commands", admin, body); status != 200 {
 		t.Fatalf("commands: status %d", status)
 	}
@@ -522,9 +622,9 @@ func TestLiveMultiAtomCommit(t *testing.T) {
 func TestHistoryReplay(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
-	p2 := h.ack(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
-	p3 := h.ack(admin, cmd("c3", "rename-patron", "id", "p1", "name", "Anne"))
+	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
+	p2 := h.accept(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
+	p3 := h.accept(admin, cmd("c3", "rename-patron", "id", "p1", "name", "Anne"))
 
 	// from genesis: book birth+add, patron birth+add, rename
 	s := h.stream(admin, 0)
@@ -543,7 +643,7 @@ func TestHistoryReplay(t *testing.T) {
 		t.Fatalf("live frame should carry the position history ended at")
 	}
 	// then live
-	h.ack(admin, cmd("c4", "rename-patron", "id", "p1", "name", "Annie"))
+	h.accept(admin, cmd("c4", "rename-patron", "id", "p1", "name", "Annie"))
 	evs := events(s.nextTagged("events"))
 	if evs[0].data["name"] != "Annie" {
 		t.Fatalf("expected live rename, got %+v", evs)
@@ -562,9 +662,9 @@ func TestHistoryReplay(t *testing.T) {
 func TestViewAndWants(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
-	h.ack(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
-	h.ack(admin, cmd("c3", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, cmd("c3", "add-patron", "id", "p2", "name", "Bob"))
 
 	// a patron sees the book shard and its own shard, from history
 	ann := h.token("p1")
@@ -584,9 +684,9 @@ func TestViewAndWants(t *testing.T) {
 	}
 	s.live()
 	// other patrons' events are invisible and produce no frame at all
-	h.ack(admin, cmd("c4", "rename-patron", "id", "p2", "name", "Robert"))
+	h.accept(admin, cmd("c4", "rename-patron", "id", "p2", "name", "Robert"))
 	s.quiet()
-	h.ack(admin, cmd("c5", "rename-patron", "id", "p1", "name", "Anne"))
+	h.accept(admin, cmd("c5", "rename-patron", "id", "p1", "name", "Anne"))
 	evs := events(s.nextTagged("events"))
 	if evs[0].stream != "patron:p1" {
 		t.Fatalf("expected own event, got %+v", evs)
@@ -602,9 +702,9 @@ func TestViewAndWants(t *testing.T) {
 		t.Fatalf("token should reflect the wants")
 	}
 	s2.live()
-	h.ack(admin, cmd("c6", "rename-patron", "id", "p1", "name", "Annie"))
+	h.accept(admin, cmd("c6", "rename-patron", "id", "p1", "name", "Annie"))
 	s2.quiet()
-	h.ack(admin, cmd("c7", "add-book", "id", "b2", "title", "Emma"))
+	h.accept(admin, cmd("c7", "add-book", "id", "b2", "title", "Emma"))
 	evs = events(s2.nextTagged("events"))
 	if evs[0].stream != "book" {
 		t.Fatalf("expected book event, got %+v", evs)
@@ -626,16 +726,16 @@ func TestViewAndWants(t *testing.T) {
 	// anonymous sees only the book shard
 	s3 := h.stream("", -1)
 	s3.live()
-	h.ack(admin, cmd("c8", "rename-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, cmd("c8", "rename-patron", "id", "p1", "name", "Ann"))
 	s3.quiet()
 }
 
 func TestMaySeeInvalidation(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
-	h.ack(admin, cmd("c2", "add-patron", "id", "p2", "name", "Bob"))
-	h.ack(admin, cmd("c3", "create-account", "user", "p1", "password", "hunter2"))
+	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, cmd("c2", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, cmd("c3", "create-account", "user", "p1", "password", "hunter2"))
 
 	ann := h.token("p1")
 	s := h.stream(ann, -1)
@@ -649,7 +749,7 @@ func TestMaySeeInvalidation(t *testing.T) {
 
 	// granting a view rewrites maySee's read-set key: a view frame arrives,
 	// before any events of the same commit, carrying the whole set of refs
-	grantPos := h.ack(admin, cmd("c4", "grant-view", "user", "p1", "prefix", "patron:p2!"))
+	grantPos := h.accept(admin, cmd("c4", "grant-view", "user", "p1", "prefix", "patron:p2!"))
 	f := s.nextTagged("view")
 	if f[1].(string) == token0 {
 		t.Fatalf("token should change on grant")
@@ -671,7 +771,7 @@ func TestMaySeeInvalidation(t *testing.T) {
 	sb.quiet()
 
 	// now p2's events flow
-	h.ack(admin, cmd("c5", "rename-patron", "id", "p2", "name", "Robert"))
+	h.accept(admin, cmd("c5", "rename-patron", "id", "p2", "name", "Robert"))
 	evs := events(s.nextTagged("events"))
 	if evs[0].stream != "patron:p2" {
 		t.Fatalf("expected granted stream, got %+v", evs)
@@ -695,7 +795,7 @@ func TestMaySeeInvalidation(t *testing.T) {
 	s3.resp.Body.Close()
 
 	// revocation: a view frame, and the same commit's events are withheld
-	h.ack(admin, cmd("c6", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
+	h.accept(admin, cmd("c6", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
 	f = s.nextTagged("view")
 	if got := strings.Join(strs(f[3]), ","); got != "book,patron:p1" {
 		t.Fatalf("revoke frame refs: %v", got)
@@ -703,13 +803,13 @@ func TestMaySeeInvalidation(t *testing.T) {
 	if f[1].(string) != token0 {
 		t.Fatalf("token should return to the original after revoke")
 	}
-	h.ack(admin, cmd("c7", "rename-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, cmd("c7", "rename-patron", "id", "p2", "name", "Bob"))
 	s.quiet()
 
 	// refs are never expanded: a family grant is one ref, and the client
 	// learns the members from the blob
-	h.ack(admin, cmd("c8", "add-patron", "id", "p3", "name", "Cy"))
-	h.ack(admin, cmd("c9", "grant-view", "user", "p1", "prefix", "patron:*"))
+	h.accept(admin, cmd("c8", "add-patron", "id", "p3", "name", "Cy"))
+	h.accept(admin, cmd("c9", "grant-view", "user", "p1", "prefix", "patron:*"))
 	f = s.nextTagged("view")
 	if got := strings.Join(strs(f[3]), ","); got != "book,patron:*,patron:p1" {
 		t.Fatalf("wildcard grant frame refs: %v", got)
@@ -717,22 +817,22 @@ func TestMaySeeInvalidation(t *testing.T) {
 	tokenFamily := f[1].(string)
 	// every change to the set is sent, even one that leaves coverage as it
 	// was: patron:p2 is inside the held patron:*
-	h.ack(admin, cmd("c9b", "grant-view", "user", "p1", "prefix", "patron:p2!"))
+	h.accept(admin, cmd("c9b", "grant-view", "user", "p1", "prefix", "patron:p2!"))
 	f = s.nextTagged("view")
 	if got := strings.Join(strs(f[3]), ","); got != "book,patron:*,patron:p1,patron:p2" || f[1].(string) == tokenFamily {
 		t.Fatalf("grant inside a held family: %v", f)
 	}
-	h.ack(admin, cmd("c9c", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
+	h.accept(admin, cmd("c9c", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
 	f = s.nextTagged("view")
 	if f[1].(string) != tokenFamily {
 		t.Fatalf("revoke inside a held family: %v", f)
 	}
-	h.ack(admin, cmd("c10", "add-patron", "id", "p4", "name", "Di"))
+	h.accept(admin, cmd("c10", "add-patron", "id", "p4", "name", "Di"))
 	evs = events(s.nextTagged("events"))
 	if evs[0].stream != "patron:p4" || evs[0].data["$sys"] != "birth" {
 		t.Fatalf("births under a held wildcard arrive in-stream: %+v", evs)
 	}
-	h.ack(admin, cmd("c11", "revoke-view", "user", "p1", "prefix", "patron:*"))
+	h.accept(admin, cmd("c11", "revoke-view", "user", "p1", "prefix", "patron:*"))
 	f = s.nextTagged("view")
 	if got := strings.Join(strs(f[3]), ","); got != "book,patron:p1" {
 		t.Fatalf("wildcard revoke frame refs: %v", got)
@@ -742,8 +842,8 @@ func TestMaySeeInvalidation(t *testing.T) {
 func TestBirthDeath(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
-	h.ack(admin, cmd("c2", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, cmd("c2", "add-patron", "id", "p2", "name", "Bob"))
 
 	// a bootstrap presents no token and gets the view frame first
 	s := h.stream(admin, -1)
@@ -751,7 +851,7 @@ func TestBirthDeath(t *testing.T) {
 		t.Fatalf("first view frame: %v", v)
 	}
 	s.live()
-	pos := h.ack(admin, cmd("c3", "remove-patron", "id", "p1"))
+	pos := h.accept(admin, cmd("c3", "remove-patron", "id", "p1"))
 	evs := events(s.nextTagged("events"))
 	if len(evs) != 1 || evs[0].data["$sys"] != "death" || evs[0].stream != "patron:p1" || evs[0].position != pos {
 		t.Fatalf("expected death, got %+v", evs)
@@ -770,7 +870,7 @@ func TestBirthDeath(t *testing.T) {
 	}
 
 	// rebirth under the same name
-	h.ack(admin, cmd("c4", "add-patron", "id", "p1", "name", "Ann II"))
+	h.accept(admin, cmd("c4", "add-patron", "id", "p1", "name", "Ann II"))
 	evs = events(s.nextTagged("events"))
 	if len(evs) != 2 || evs[0].data["$sys"] != "birth" || evs[1].data["name"] != "Ann II" {
 		t.Fatalf("expected rebirth, got %+v", evs)
@@ -891,9 +991,9 @@ func fnv1a(b []byte) uint64 {
 func TestSnapshots(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
-	h.ack(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
-	pos := h.ack(admin, cmd("c3", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
+	pos := h.accept(admin, cmd("c3", "add-patron", "id", "p2", "name", "Bob"))
 
 	one := h.snapshot(admin, "patron:p1")
 	if one.header["ref"] != "patron:p1" || one.position < pos || one.header["fold"] != h.epoch() {
@@ -934,7 +1034,7 @@ func TestSnapshots(t *testing.T) {
 	if len(book.keys) != 1 {
 		t.Fatalf("book keys: %v", book.keys)
 	}
-	later := h.ack(admin, cmd("c4", "add-book", "id", "b2", "title", "Emma"))
+	later := h.accept(admin, cmd("c4", "add-book", "id", "b2", "title", "Emma"))
 	book2 := h.snapshot(admin, "book")
 	if len(book2.keys) != 2 || book2.position < later {
 		t.Fatalf("book after write: %v @ %d", book2.keys, book2.position)
@@ -953,10 +1053,10 @@ func TestSnapshots(t *testing.T) {
 func TestPasswordAuth(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "add-patron", "id", "ann", "name", "Ann"))
+	h.accept(admin, cmd("c1", "add-patron", "id", "ann", "name", "Ann"))
 
 	// anyone may create an account; the password is hashed at intake
-	h.ack("", cmd("c2", "create-account", "user", "ann", "password", "hunter2"))
+	h.accept("", cmd("c2", "create-account", "user", "ann", "password", "hunter2"))
 	acct := h.snapshot(admin, "account:ann").records["account:ann!account"].(map[string]any)
 	hash := acct["hash"].(string)
 	if hash == "hunter2" || !strings.HasPrefix(hash, "$") {
@@ -984,7 +1084,7 @@ func TestPasswordAuth(t *testing.T) {
 
 	// the token acts as ann
 	outs := h.commands(tok, cmd("c3", "rename-patron", "id", "ann", "name", "Anne"))
-	if outs[0].kind != "ack" {
+	if outs[0].kind != "ok" {
 		t.Fatalf("rename as ann: %+v", outs[0])
 	}
 	outs = h.commands(tok, cmd("c4", "add-book", "id", "b1", "title", "Dune"))
@@ -1005,7 +1105,7 @@ func TestPasswordAuth(t *testing.T) {
 	}
 
 	// password change through the ordinary command path, as the user
-	h.ack(tok2, cmd("c5", "set-password", "user", "ann", "password", "correct horse"))
+	h.accept(tok2, cmd("c5", "set-password", "user", "ann", "password", "correct horse"))
 	status, _, _ = h.do("POST", "/auth/token", "", mpEncode(map[string]any{
 		"kind": "password", "identity": "ann", "password": "hunter2",
 	}))
@@ -1020,7 +1120,7 @@ func TestPasswordAuth(t *testing.T) {
 	}
 
 	// logout everywhere: existing tokens die on commands, streams, refresh
-	h.ack(tok2, cmd("c6", "revoke-sessions", "user", "ann"))
+	h.accept(tok2, cmd("c6", "revoke-sessions", "user", "ann"))
 	if status, _ := h.commandsStatus(tok2, cmd("c7", "rename-patron", "id", "ann", "name", "x")); status != 401 {
 		t.Fatalf("stale token accepted for commands: %d", status)
 	}
@@ -1046,10 +1146,10 @@ func TestPasswordAuth(t *testing.T) {
 		t.Fatalf("login after revoke: %d", status)
 	}
 	tok3 := mpDecodeOne(t, out).(map[string]any)["token"].(string)
-	h.ack(tok3, cmd("c8", "rename-patron", "id", "ann", "name", "Ann"))
+	h.accept(tok3, cmd("c8", "rename-patron", "id", "ann", "name", "Ann"))
 
 	// an account an admin creates as an admin is one
-	h.ack(admin, cmd("c9", "create-account", "user", "boss", "password", "pw", "admin", true))
+	h.accept(admin, cmd("c9", "create-account", "user", "boss", "password", "pw", "admin", true))
 	status, _, out = h.do("POST", "/auth/token", "", mpEncode(map[string]any{
 		"kind": "password", "identity": "boss", "password": "pw",
 	}))
@@ -1057,7 +1157,7 @@ func TestPasswordAuth(t *testing.T) {
 		t.Fatalf("boss login: %d", status)
 	}
 	boss := mpDecodeOne(t, out).(map[string]any)["token"].(string)
-	h.ack(boss, cmd("c10", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(boss, cmd("c10", "add-book", "id", "b1", "title", "Dune"))
 }
 
 func TestDevAuthCanBeDisabled(t *testing.T) {
@@ -1084,16 +1184,16 @@ func TestRestartKeepsEverything(t *testing.T) {
 	dir := t.TempDir()
 	h := startIn(t, dir)
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
-	pos := h.ack(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
-	h.ack("", cmd("c3", "create-account", "user", "p1", "password", "pw"))
+	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
+	pos := h.accept(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann").in("s1", 1))
+	h.accept("", cmd("c3", "create-account", "user", "p1", "password", "pw"))
 	h.stop()
 
 	h = startIn(t, dir)
 	admin = h.admin()
-	// dedup survives
-	outs := h.commands(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
-	if outs[0].kind != "dup" || outs[0].position != pos {
+	// dedup survives: the resend is not run again, which precommit would reject
+	outs := h.commands(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann").in("s1", 1))
+	if outs[0].kind != "ok" || outs[0].position < pos {
 		t.Fatalf("dedup lost across restart: %+v", outs[0])
 	}
 	// history survives and positions continue
@@ -1105,7 +1205,7 @@ func TestRestartKeepsEverything(t *testing.T) {
 	if all[5].stream != "account:p1" || all[5].position != 6 {
 		t.Fatalf("history after restart: %+v", all)
 	}
-	next := h.ack(admin, cmd("c4", "add-patron", "id", "p2", "name", "Bob"))
+	next := h.accept(admin, cmd("c4", "add-patron", "id", "p2", "name", "Bob"))
 	if next != 8 {
 		t.Fatalf("positions should continue at 7,8: got %d", next)
 	}
@@ -1174,8 +1274,8 @@ func TestColdReplayKeepsAtomsWhole(t *testing.T) {
 
 	// a one-event atom shifts the two-event atoms after it off the window grid, so one of them
 	// spans positions coldBatch and coldBatch+1
-	h.ack(admin, cmd("c0", "add-patron", "id", "p0", "name", "Ann"))
-	h.ack(admin, cmd("c1", "rename-patron", "id", "p0", "name", "Anne"))
+	h.accept(admin, cmd("c0", "add-patron", "id", "p0", "name", "Ann"))
+	h.accept(admin, cmd("c1", "rename-patron", "id", "p0", "name", "Anne"))
 	var cmds []command
 	for i := 1; i <= coldBatch/2; i++ {
 		cmds = append(cmds, cmd(fmt.Sprintf("a%d", i), "add-patron", "id", fmt.Sprintf("p%d", i), "name", "x"))
@@ -1234,7 +1334,7 @@ func TestLongCatchupNoOverflow(t *testing.T) {
 	s := h.streamPaused(admin, 0, startReading)
 	var last int64
 	for i := 0; i < 300; i++ {
-		last = h.ack(admin, cmd(fmt.Sprintf("l%d", i), "rename-patron", "id", "p1", "name", fmt.Sprint(i)))
+		last = h.accept(admin, cmd(fmt.Sprintf("l%d", i), "rename-patron", "id", "p1", "name", fmt.Sprint(i)))
 	}
 	close(startReading)
 
@@ -1269,7 +1369,7 @@ func TestLongCatchupNoOverflow(t *testing.T) {
 		t.Fatalf("no live frame")
 	}
 	// still connected and still live
-	pos := h.ack(admin, cmd("final", "rename-patron", "id", "p1", "name", "done"))
+	pos := h.accept(admin, cmd("final", "rename-patron", "id", "p1", "name", "done"))
 	if evs := events(s.nextTagged("events")); evs[0].position != pos {
 		t.Fatalf("expected live event at %d, got %+v", pos, evs)
 	}
@@ -1278,8 +1378,8 @@ func TestLongCatchupNoOverflow(t *testing.T) {
 func TestStreamByteCounters(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
-	h.ack(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne"))
+	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne"))
 
 	s := h.stream(admin, 0)
 	var evs []event
@@ -1312,7 +1412,7 @@ func TestStreamByteCounters(t *testing.T) {
 	}
 
 	// death zeroes state and still counts its own event bytes
-	h.ack(admin, cmd("c3", "remove-patron", "id", "p1"))
+	h.accept(admin, cmd("c3", "remove-patron", "id", "p1"))
 	dead := h.snapshot(admin, "patron:p1")
 	if asInt(dead.header["state_bytes"]) != 0 || asInt(dead.header["event_bytes"]) <= eventBytes {
 		t.Fatalf("after death: %v", dead.header)
@@ -1322,12 +1422,12 @@ func TestStreamByteCounters(t *testing.T) {
 func TestExpectAndConflict(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann")) // seq 1, 2
+	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann")) // seq 1, 2
 
 	// expectations are the stream's seq: exact, so a met one passes and
 	// the same one then conflicts, reporting the actual seq
-	o := h.expecting(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne"), map[string]any{"patron:p1": 2})
-	if o.kind != "ack" {
+	o := h.expecting(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne").in("s1", 1), map[string]any{"patron:p1": 2})
+	if o.kind != "ok" {
 		t.Fatalf("matching expect: %+v", o)
 	}
 	o = h.expecting(admin, cmd("c3", "rename-patron", "id", "p1", "name", "Annie"), map[string]any{"patron:p1": 2})
@@ -1341,7 +1441,7 @@ func TestExpectAndConflict(t *testing.T) {
 
 	// 0 asserts a stream was never born
 	o = h.expecting(admin, cmd("c4", "add-book", "id", "b1", "title", "Dune"), map[string]any{"book": 0})
-	if o.kind != "ack" {
+	if o.kind != "ok" {
 		t.Fatalf("expect 0 on unborn stream: %+v", o)
 	}
 	o = h.expecting(admin, cmd("c5", "add-patron", "id", "p2", "name", "Bob"), map[string]any{"patron:p2": 1})
@@ -1364,8 +1464,8 @@ func TestExpectAndConflict(t *testing.T) {
 	}
 
 	// dedup wins over a stale expectation
-	o = h.expecting(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne"), map[string]any{"patron:p1": 0})
-	if o.kind != "dup" {
+	o = h.expecting(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne").in("s1", 1), map[string]any{"patron:p1": 0})
+	if o.kind != "ok" {
 		t.Fatalf("resubmit with stale expect: %+v", o)
 	}
 
@@ -1375,7 +1475,7 @@ func TestExpectAndConflict(t *testing.T) {
 		t.Fatalf("expect survives hash intake: %+v", o)
 	}
 	o = h.expecting("", cmd("c8", "create-account", "user", "p1", "password", "pw"), map[string]any{"account:p1": 0})
-	if o.kind != "ack" {
+	if o.kind != "ok" {
 		t.Fatalf("hashed command with matching expect: %+v", o)
 	}
 }
@@ -1423,13 +1523,13 @@ func (h *harness) eventsRange(token, stream string, after, before int64, reverse
 func TestEventsRange(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann")) // 1, 2
-	h.ack(admin, cmd("c2", "add-patron", "id", "p2", "name", "Bob")) // 3, 4
+	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann")) // 1, 2
+	h.accept(admin, cmd("c2", "add-patron", "id", "p2", "name", "Bob")) // 3, 4
 	for i := 0; i < 5; i++ {
-		h.ack(admin, cmd(fmt.Sprintf("r%d", i), "rename-patron", "id", "p1", "name", fmt.Sprint(i))) // 5..9
+		h.accept(admin, cmd(fmt.Sprintf("r%d", i), "rename-patron", "id", "p1", "name", fmt.Sprint(i))) // 5..9
 	}
-	last := h.ack(admin, cmd("c3", "rename-patron", "id", "p2", "name", "Robert")) // 10
-	head := last + 1                                                               // a position the client does not have yet
+	last := h.accept(admin, cmd("c3", "rename-patron", "id", "p2", "name", "Robert")) // 10
+	head := last + 1                                                                  // a position the client does not have yet
 
 	// forward: only p1's events, ascending, range exhausted in one page
 	evs, scanned, _ := h.eventsRange(admin, "patron:p1", 0, head, false, 0)
@@ -1548,16 +1648,16 @@ func TestCommandCheck(t *testing.T) {
 	admin := h.admin()
 
 	// each malformed command is rejected where it stands, naming the problem,
-	// and the well-formed ones around it are acked
+	// and the well-formed ones around it are accepted
 	outs := h.commands(admin,
-		cmd("c1", "add-book", "id", "b1", "title", "Dune"),
-		cmd("c2", "add-book", "id", "b2"),
+		cmd("c1", "add-book", "id", "b1", "title", "Dune").in("s1", 1),
+		cmd("c2", "add-book", "id", "b2").in("s1", 2),
 		cmd("c3", "add-book", "id", 7, "title", "Emma"),
 		cmd("c4", "add-book", "id", "b4", "title", "Emma", "extra", true),
 		cmd("c5", "no-such-command", "id", "x"),
 		cmd("c6", "add-book", "id", "b6", "title", "Persuasion"),
 	)
-	kinds := []string{"ack", "reject", "reject", "reject", "reject", "ack"}
+	kinds := []string{"ok", "reject", "reject", "reject", "reject", "ok"}
 	for i, k := range kinds {
 		if outs[i].kind != k {
 			t.Fatalf("outcome %d: %+v, want %s", i, outs[i], k)
@@ -1574,17 +1674,18 @@ func TestCommandCheck(t *testing.T) {
 		}
 	}
 	if outs[5].position <= outs[0].position {
-		t.Fatalf("acks around the rejects: %+v", outs)
+		t.Fatalf("oks around the rejects: %+v", outs)
 	}
 
-	// a malformed command never reached dedup: its id is free for a good one
-	if o := h.commands(admin, cmd("c2", "add-book", "id", "b2", "title", "Mansfield Park"))[0]; o.kind != "ack" {
-		t.Fatalf("id of a rejected command reused: %+v", o)
+	// a malformed command never reached dedup, so it was not a decision: its number is free for
+	// a good one, which runs and lands past everything before it
+	if o := h.commands(admin, cmd("c2", "add-book", "id", "b2", "title", "Mansfield Park").in("s1", 2))[0]; o.kind != "ok" || o.position <= outs[5].position {
+		t.Fatalf("number of a malformed command reused: %+v", o)
 	}
 
 	// the discriminator may sit anywhere in the map, and the log has it first
 	body := rawCommand("c7", "id", "b7", "title", "Emma", "type", "add-book")
-	if status, _, out := h.do("POST", "/commands", admin, body); status != 200 || decodeOutcomes(t, out)[0].kind != "ack" {
+	if status, _, out := h.do("POST", "/commands", admin, body); status != 200 || decodeOutcomes(t, out)[0].kind != "ok" {
 		t.Fatalf("discriminator last: %d %s", status, out)
 	}
 	_, _, logged := h.do("GET", "/events/book", admin, nil)
@@ -1601,9 +1702,33 @@ func TestCommandCheck(t *testing.T) {
 	if status, _, _ := h.do("POST", "/commands", admin, []byte{0xc1}); status != 400 {
 		t.Fatalf("not msgpack: %d", status)
 	}
-	// a command that is not [id, data] is a 400 too, since nothing can be answered for it
-	if status, _, _ := h.do("POST", "/commands", admin, mpEncode("just a string")); status != 400 {
-		t.Fatalf("not a command pair: %d", status)
+	// a command that is not [S, n, id, data, expect?] is a 400 too, since nothing can be
+	// answered for it
+	data := map[string]any{"type": "add-book", "id": "b9", "title": "Emma"}
+	for name, c := range map[string][]any{
+		"a string":           {"just a string"},
+		"the old pair":       {"c9", data},
+		"a session, no n":    {"s1", nil, label("c9"), data},
+		"an n, no session":   {nil, int64(3), label("c9"), data},
+		"an empty session":   {"", int64(3), label("c9"), data},
+		"a long session":     {strings.Repeat("s", 65), int64(3), label("c9"), data},
+		"a zero n":           {"s1", int64(0), label("c9"), data},
+		"an n past 2^53 - 1": {"s1", int64(1) << 53, label("c9"), data},
+		"a string id":        {nil, nil, "c9", data},
+		"a short id":         {nil, nil, []byte("c9"), data},
+	} {
+		v := any(c)
+		if len(c) == 1 {
+			v = c[0]
+		}
+		if status, _, _ := h.do("POST", "/commands", admin, mpEncode(v)); status != 400 {
+			t.Fatalf("%s: %d", name, status)
+		}
+	}
+	// a session of the longest length and the largest n are well-formed
+	big := []any{strings.Repeat("s", 64), int64(1)<<53 - 1, label("c9"), data}
+	if status, _, out := h.do("POST", "/commands", admin, mpEncode(big)); status != 200 || decodeOutcomes(t, out)[0].kind != "ok" {
+		t.Fatalf("the largest session and n: %d %s", status, out)
 	}
 }
 
@@ -1613,7 +1738,7 @@ func TestTypedValues(t *testing.T) {
 	added := time.Date(2026, 1, 2, 3, 4, 5, 678e6, time.UTC)
 
 	// a date field travels as a timestamp: into the log, through the reducer, out of the store
-	h.ack(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune", "added", added))
+	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune", "added", added))
 	s := h.stream(admin, 0)
 	evs := events(s.nextTagged("events"))
 	if got, ok := evs[1].data["added"].(time.Time); !ok || !got.Equal(added) {
@@ -1640,7 +1765,7 @@ func TestTypedValues(t *testing.T) {
 	}
 
 	// an optional field left out stays out
-	h.ack(admin, cmd("c3", "add-book", "id", "b3", "title", "Emma"))
+	h.accept(admin, cmd("c3", "add-book", "id", "b3", "title", "Emma"))
 	if _, ok := h.snapshot(admin, "book").records["book!book:b3"].(map[string]any)["added"]; ok {
 		t.Fatalf("absent optional field written")
 	}
@@ -1649,10 +1774,10 @@ func TestTypedValues(t *testing.T) {
 func TestPreparedFields(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "add-patron", "id", "ann", "name", "Ann"))
+	h.accept(admin, cmd("c1", "add-patron", "id", "ann", "name", "Ann"))
 
 	// a NewPassword is replaced by its argon2id hash before precommit sees it
-	h.ack("", cmd("c2", "create-account", "user", "ann", "password", "hunter2"))
+	h.accept("", cmd("c2", "create-account", "user", "ann", "password", "hunter2"))
 	acct := h.snapshot(admin, "account:ann").records["account:ann!account"].(map[string]any)
 	hash := acct["hash"].(string)
 	if !strings.HasPrefix(hash, "$argon2id$") {
@@ -1708,8 +1833,9 @@ type raw []byte
 // rawCommand encodes one [id, data] command whose data map holds the fields in order, raw
 // values spliced in as they are.
 func rawCommand(id string, kv ...any) []byte {
-	b := mpArrayHeader(nil, 2)
-	b = mpAppendStr(b, id)
+	b := mpArrayHeader(nil, 4)
+	b = mpAppend(mpAppend(b, nil), nil)
+	b = mpAppend(b, label(id))
 	b = mpMapHeader(b, len(kv)/2)
 	for i := 0; i+1 < len(kv); i += 2 {
 		b = mpAppendStr(b, kv[i].(string))
@@ -1729,8 +1855,8 @@ func TestCheckEdges(t *testing.T) {
 	// a date in each of the timestamp's three sizes survives the log, the reducer, and the store
 	whole := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	old := time.Date(1960, 6, 7, 8, 9, 10, 123e6, time.UTC)
-	h.ack(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune", "added", whole))
-	h.ack(admin, cmd("c2", "add-book", "id", "b2", "title", "Emma", "added", old))
+	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune", "added", whole))
+	h.accept(admin, cmd("c2", "add-book", "id", "b2", "title", "Emma", "added", old))
 	records := h.snapshot(admin, "book").records
 	for key, want := range map[string]time.Time{"book!book:b1": whole, "book!book:b2": old} {
 		if got, ok := records[key].(map[string]any)["added"].(time.Time); !ok || !got.Equal(want) {
@@ -1771,13 +1897,13 @@ func TestCheckEdges(t *testing.T) {
 			t.Fatalf("outcome %d: %+v, want reject %q", i, outs[i], want)
 		}
 	}
-	if outs[6].kind != "ack" {
+	if outs[6].kind != "ok" {
 		t.Fatalf("the command after the rejects: %+v", outs[6])
 	}
 
 	// a map key that is not a string, where the walk reads keys
-	body = mpArrayHeader(nil, 2)
-	body = mpAppendStr(body, "e1")
+	body = mpArrayHeader(nil, 4)
+	body = mpAppend(mpAppend(mpAppend(body, nil), nil), label("e1"))
 	body = append(body, 0x84)
 	body = append(mpAppendStr(body, "type"), mpAppendStr(nil, "add-book")...)
 	body = append(mpAppendStr(body, "id"), mpAppendStr(nil, "b10")...)
@@ -1788,8 +1914,8 @@ func TestCheckEdges(t *testing.T) {
 	}
 
 	// elements a later protocol appends to a command are ignored
-	body = mpEncode([]any{"e2", map[string]any{"type": "add-book", "id": "b11", "title": "T"}, map[string]any{}, "newer"})
-	if o := h.commandsRaw(admin, body)[0]; o.kind != "ack" {
+	body = mpEncode([]any{nil, nil, label("e2"), map[string]any{"type": "add-book", "id": "b11", "title": "T"}, map[string]any{}, "newer"})
+	if o := h.commandsRaw(admin, body)[0]; o.kind != "ok" {
 		t.Fatalf("a command with an appended element: %+v", o)
 	}
 }
@@ -1817,7 +1943,7 @@ func login(h *harness, identity, password string) int {
 func TestLoginAttemptsAreRateLimitedPerClient(t *testing.T) {
 	h := startWith(t, t.Context(), Options{AuthBurst: 3, AuthRate: 0.001})
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "create-account", "user", "ann", "password", "hunter2"))
+	h.accept(admin, cmd("c1", "create-account", "user", "ann", "password", "hunter2"))
 
 	// the account's creation hashed once, so two attempts remain, right or wrong
 	if status := login(h, "ann", "wrong"); status != 401 {
@@ -1845,7 +1971,7 @@ func TestLoginForAnUnknownAccountCostsAHash(t *testing.T) {
 
 func TestIntakeHashingIsRateLimitedPerClient(t *testing.T) {
 	h := startWith(t, t.Context(), Options{AuthBurst: 1, AuthRate: 0.001})
-	h.ack("", cmd("c1", "create-account", "user", "ann", "password", "hunter2"))
+	h.accept("", cmd("c1", "create-account", "user", "ann", "password", "hunter2"))
 
 	// a request whose hash finds the budget spent is refused whole, so it can be retried later
 	// under the same ids
@@ -1855,7 +1981,7 @@ func TestIntakeHashingIsRateLimitedPerClient(t *testing.T) {
 	}
 
 	// commands that hash nothing are not limited
-	if o := h.commands(h.admin(), cmd("c3", "add-book", "id", "b1", "title", "Dune"))[0]; o.kind != "ack" {
+	if o := h.commands(h.admin(), cmd("c3", "add-book", "id", "b1", "title", "Dune"))[0]; o.kind != "ok" {
 		t.Fatalf("a command with no password: %+v", o)
 	}
 }
@@ -1935,14 +2061,15 @@ func TestBootstrapSeedsAnEmptyLog(t *testing.T) {
 	env := []string{"BOOTSTRAP_ADMIN", "BOOTSTRAP_PASSWORD"}
 	h := startWith(t, t.Context(), Options{DataDir: dir, BootstrapEnv: env})
 
-	// one atom, under bootstrap's command id: the stream's birth and the account's creation
+	// one atom, under the id the core minted for it: the stream's birth and the account's
+	// creation
 	s := h.stream(h.admin(), 0)
 	evs := events(s.nextTagged("events"))
 	if len(evs) != 2 || evs[0].data["$sys"] != "birth" || evs[1].data["type"] != "account-created" {
 		t.Fatalf("bootstrap's atom: %+v", evs)
 	}
 	for _, e := range evs {
-		if e.stream != "account:boss" || e.commandid != "bootstrap" {
+		if e.stream != "account:boss" || len(e.id) != 16 || !bytes.Equal(e.id, evs[0].id) {
 			t.Fatalf("bootstrap's event: %+v", e)
 		}
 	}
@@ -1962,7 +2089,7 @@ func TestBootstrapSeedsAnEmptyLog(t *testing.T) {
 	// a log that is not empty is not seeded again, and the seeded account acts as an admin
 	h.stop()
 	h = startWith(t, t.Context(), Options{DataDir: dir, BootstrapEnv: env})
-	if next := h.ack(boss, cmd("c1", "add-book", "id", "b1", "title", "Dune")); next != 4 {
+	if next := h.accept(boss, cmd("c1", "add-book", "id", "b1", "title", "Dune")); next != 4 {
 		t.Fatalf("after a restart, the next atom lands at %d, want 4: bootstrap ran again", next)
 	}
 }
@@ -2038,7 +2165,7 @@ func TestStreamNamesFillTheirTemplates(t *testing.T) {
 	admin := h.admin()
 
 	// a family template's terminal parameter may hold . and ~
-	h.ack(admin, cmd("c1", "add-patron", "id", "p.1~x", "name", "Ann"))
+	h.accept(admin, cmd("c1", "add-patron", "id", "p.1~x", "name", "Ann"))
 	if _, ok := h.snapshot(admin, "patron:p.1~x").records["patron:p.1~x!patron"]; !ok {
 		t.Fatalf("patron:p.1~x was not written")
 	}
@@ -2068,7 +2195,7 @@ func TestKeysHoldNoControlCharacterOrLoneSurrogate(t *testing.T) {
 	// a key's terminal parameter may hold any other text, the empty string included
 	ok := []string{"b\U0001F600", "b\uFF0Cc", "b\u200Dc", "b\u00A0c", ""}
 	for i, id := range ok {
-		h.ack(admin, cmd(fmt.Sprintf("ok%d", i), "add-book", "id", id, "title", "T"))
+		h.accept(admin, cmd(fmt.Sprintf("ok%d", i), "add-book", "id", id, "title", "T"))
 	}
 	records := h.snapshot(admin, "book").records
 	for _, id := range ok {
@@ -2088,7 +2215,7 @@ func TestKeysHoldNoControlCharacterOrLoneSurrogate(t *testing.T) {
 
 	// a key holding U+0000 is neither read short nor written: precommit's read of b1\x00x finds
 	// nothing although b1 is held, and the reducer's write is refused
-	h.ack(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
 	o := h.commands(admin, cmd("c2", "add-book", "id", "b1\x00x", "title", "Emma"))[0]
 	if o.kind != "reject" || !strings.Contains(o.reason, "a key beginning book!book:b1 holds U+0000") {
 		t.Fatalf("add-book with U+0000: %+v", o)
@@ -2103,7 +2230,7 @@ func TestAProductionBundleAnswersBugsWithInternalError(t *testing.T) {
 	}
 
 	// a rejection's reason is still the app's own
-	h.ack(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
 	if outs := h.commands(admin, cmd("c3", "add-patron", "id", "p1", "name", "Ann")); outs[0].reason != "patron exists" {
 		t.Fatalf("a rejection in a production bundle: %+v", outs[0])
 	}
@@ -2112,14 +2239,14 @@ func TestAProductionBundleAnswersBugsWithInternalError(t *testing.T) {
 func TestAFailingMaySeeGrantsNothing(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
-	h.ack(admin, cmd("c2", "create-account", "user", "p1", "password", "hunter2"))
+	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, cmd("c2", "create-account", "user", "p1", "password", "hunter2"))
 	ann := h.token("p1")
 	s := h.stream(ann, -1)
 	s.live()
 
 	// a granted wildcard that cuts into a stream's terminal parameter ends the connection
-	h.ack(admin, cmd("c3", "grant-view", "user", "p1", "prefix", "patron:p1,*"))
+	h.accept(admin, cmd("c3", "grant-view", "user", "p1", "prefix", "patron:p1,*"))
 	f := s.nextTagged("end")
 	if f[1] != "error" || !strings.Contains(f[2].(string), "malformed ref: patron:p1,*") {
 		t.Fatalf("end frame: %v", f)
@@ -2142,27 +2269,27 @@ func TestAFailingMaySeeGrantsNothing(t *testing.T) {
 func TestMaySeeRefsCarryATerminator(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.ack(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
-	h.ack(admin, cmd("c2", "add-patron", "id", "p2", "name", "Bob"))
-	h.ack(admin, cmd("c3", "create-account", "user", "p1", "password", "hunter2"))
+	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, cmd("c2", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, cmd("c3", "create-account", "user", "p1", "password", "hunter2"))
 	ann := h.token("p1")
 
 	// an exact stream is "name!", which grants the stream
-	h.ack(admin, cmd("c4", "grant-view", "user", "p1", "prefix", "patron:p2!"))
+	h.accept(admin, cmd("c4", "grant-view", "user", "p1", "prefix", "patron:p2!"))
 	if _, _, status := h.eventsRange(ann, "patron:p2", 0, 100, false, 0); status != 200 {
 		t.Fatalf("a granted stream: status %d", status)
 	}
-	h.ack(admin, cmd("c5", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
+	h.accept(admin, cmd("c5", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
 
 	// a bare name, a wildcard cutting into a parameter, and a wildcard after a singleton family
 	// are malformed, so the registration fails closed
 	for i, ref := range []string{"patron:p2", "patron:p*", "book:*", "patron:p2/"} {
-		h.ack(admin, cmd(fmt.Sprintf("g%d", i), "grant-view", "user", "p1", "prefix", ref))
+		h.accept(admin, cmd(fmt.Sprintf("g%d", i), "grant-view", "user", "p1", "prefix", ref))
 		status, _, body := h.do("GET", "/stream?since=-1", ann, nil)
 		if status != 500 || !strings.Contains(string(body), "malformed ref: "+ref) {
 			t.Fatalf("maySee returning %q: %d %s", ref, status, body)
 		}
-		h.ack(admin, cmd(fmt.Sprintf("r%d", i), "revoke-view", "user", "p1", "prefix", ref))
+		h.accept(admin, cmd(fmt.Sprintf("r%d", i), "revoke-view", "user", "p1", "prefix", ref))
 	}
 }
 
@@ -2172,7 +2299,7 @@ func TestAFamilyWalksInParameterOrder(t *testing.T) {
 
 	// a stream whose parameter is another's followed by '-' or '.' sorts after it
 	for i, id := range []string{"gen.x", "gen-2", "gen"} {
-		h.ack(admin, cmd(fmt.Sprintf("c%d", i), "add-patron", "id", id, "name", "N"))
+		h.accept(admin, cmd(fmt.Sprintf("c%d", i), "add-patron", "id", id, "name", "N"))
 	}
 	fam := h.snapshot(admin, "patron:*")
 	want := []string{
@@ -2186,7 +2313,7 @@ func TestAFamilyWalksInParameterOrder(t *testing.T) {
 
 	// and so does a key whose parameter is another's followed by '-'
 	for i, id := range []string{"2026-10-06", "2026-10"} {
-		h.ack(admin, cmd(fmt.Sprintf("b%d", i), "add-book", "id", id, "title", "T"))
+		h.accept(admin, cmd(fmt.Sprintf("b%d", i), "add-book", "id", id, "title", "T"))
 	}
 	if got := strings.Join(h.snapshot(admin, "book").keys, ","); got != "book!book:2026-10,book!book:2026-10-06" {
 		t.Fatalf("book keys: %s", got)

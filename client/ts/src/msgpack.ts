@@ -426,6 +426,21 @@ export class Reader {
     return s;
   }
 
+  /** the bytes of the bin at the cursor, as a view into the buffer */
+  bin(): Uint8Array {
+    this.#need(1);
+    const b = this.#buf[this.#pos];
+    let n: number;
+    if (b === 0xc4) n = this.#length(1);
+    else if (b === 0xc5) n = this.#length(2);
+    else if (b === 0xc6) n = this.#length(4);
+    else throw new Error(`expected msgpack bin, got 0x${b.toString(16)}`);
+    this.#need(n);
+    const out = this.#buf.subarray(this.#pos, this.#pos + n);
+    this.#pos += n;
+    return out;
+  }
+
   /** The index of the key at the cursor among keys, each UTF-8, compared as bytes with no
       string made; -1 for none, and the key is then lastKey(); -2, consuming nothing, for a
       value that is not a string.  The search starts at hint, the index a caller expects, and
@@ -771,6 +786,24 @@ export class Writer {
   bool(v: boolean): void {
     this.#ensure(1);
     this.#buf[this.#pos++] = v ? 0xc3 : 0xc2;
+  }
+
+  bin(b: Uint8Array): void {
+    this.#ensure(5 + b.length);
+    if (b.length < 0x100) {
+      this.#buf[this.#pos++] = 0xc4;
+      this.#buf[this.#pos++] = b.length;
+    } else if (b.length < 0x10000) {
+      this.#buf[this.#pos++] = 0xc5;
+      this.#data.setUint16(this.#pos, b.length);
+      this.#pos += 2;
+    } else {
+      this.#buf[this.#pos++] = 0xc6;
+      this.#data.setUint32(this.#pos, b.length);
+      this.#pos += 4;
+    }
+    this.#buf.set(b, this.#pos);
+    this.#pos += b.length;
   }
 
   nil(): void {

@@ -7,9 +7,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { decode, encode } from '@msgpack/msgpack';
 import { NewHTTPConnector } from '../src/http.js';
-import type { Backfill, Connector } from '../src/contract.js';
+import type { Backfill, Command, Connector } from '../src/contract.js';
 
 const db = join(import.meta.dirname, '..', '..', '..', 'db');
+
+// a command in one session, its id a uuid made from its name
+function cmd(name: string, n: number, data: unknown): Command<Uint8Array> {
+  const id = `00000000-0000-0000-0000-${name.padStart(12, '0')}`;
+  return { id, session: 'e2e', n, data: encode(data) };
+}
 const binary = join(db, 'pldb');
 
 describe.skipIf(!existsSync(binary))('against pldb', () => {
@@ -119,18 +125,18 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
     expect(live).toBe(0);
     expect(epoch).toMatch(/^[0-9a-f]{32}$/);
 
-    // commands: ack, ack, dup, reject
+    // commands: ok, ok, ok for a resend that is not run again, a structural reject
     const res = await conn.sendCommands([
-      { id: 'c1', data: encode({ type: 'add-patron', id: 'p1', name: 'Ann' }) },
-      { id: 'c2', data: encode({ type: 'add-patron', id: 'p2', name: 'Bob' }) },
-      { id: 'c1', data: encode({ type: 'add-patron', id: 'p1', name: 'Ann' }) },
-      { id: 'c3', data: encode({ type: 'nope' }) },
+      cmd('c1', 1, { type: 'add-patron', id: 'p1', name: 'Ann' }),
+      cmd('c2', 2, { type: 'add-patron', id: 'p2', name: 'Bob' }),
+      cmd('c1', 1, { type: 'add-patron', id: 'p1', name: 'Ann' }),
+      cmd('c3', 3, { type: 'nope' }),
     ]);
-    expect(res.map((r) => r.kind)).toEqual(['ack', 'ack', 'dup', 'reject']);
+    expect(res.map((r) => r.kind)).toEqual(['ok', 'ok', 'ok', 'reject']);
     const rename = await conn.sendCommands([
-      { id: 'c4', data: encode({ type: 'rename-patron', id: 'p1', name: 'Anne' }) },
+      cmd('c4', 4, { type: 'rename-patron', id: 'p1', name: 'Anne' }),
     ]);
-    expect(rename[0].kind).toBe('ack');
+    expect(rename[0].kind).toBe('ok');
     const cursor = (rename[0] as { position: number }).position;
 
     await new Promise((r) => setTimeout(r, 300));
@@ -192,9 +198,7 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
     expect(back.values).toEqual([]);
 
     // stale: the position no longer matches after a write
-    await conn.sendCommands([
-      { id: 'c5', data: encode({ type: 'rename-patron', id: 'p2', name: 'Rob' }) },
-    ]);
+    await conn.sendCommands([cmd('c5', 5, { type: 'rename-patron', id: 'p2', name: 'Rob' })]);
     const stale = await run(conn, 'patron:p1', cursor, {
       position: cursor,
       skipBytes: 30,

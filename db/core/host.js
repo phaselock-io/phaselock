@@ -33,8 +33,8 @@ globalThis.__host = (function () {
   const bundle = () => globalThis.__bundle;
 
   return {
-    precommit(cmd, principal) {
-      const out = bundle().precommit(rx, cmd, principal);
+    precommit(data, principal) {
+      const out = bundle().precommit(rx, data, principal);
       if (typeof out === 'string') return out;
       if (!Array.isArray(out)) throw new Error('precommit must return a reason or a list');
       return out.map((item) => ({

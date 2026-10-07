@@ -4,10 +4,12 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "internal.h"
+#include "sha256.h"
 
 enum { REQ_SUBMIT = 1, REQ_REGISTER, REQ_UNREGISTER, REQ_LOOKUP };
 
@@ -93,7 +95,6 @@ static pldb_item *items_push(items *it) {
 void pldb_items_free(pldb_item *items, size_t n) {
     for (size_t i = 0; i < n; i++) {
         free(items[i].stream);
-        free(items[i].commandid);
         free(items[i].data);
     }
     free(items);
@@ -103,7 +104,7 @@ void pldb_free(void *p) { free(p); }
 
 /* encode [ [position, stream, seq, commandid, servertime], data ] */
 static void encode_wire(buf *out, uint64_t position, const char *stream, uint64_t seq,
-                        const char *commandid, int64_t servertime, const uint8_t *data,
+                        const uint8_t *commandid, int64_t servertime, const uint8_t *data,
                         size_t len) {
     char *d = NULL;
     size_t size = 0;
@@ -114,7 +115,7 @@ static void encode_wire(buf *out, uint64_t position, const char *stream, uint64_
     mpack_write_u64(&w, position);
     mpack_write_cstr(&w, stream);
     mpack_write_u64(&w, seq);
-    mpack_write_cstr(&w, commandid);
+    mpack_write_bin(&w, (const char *)commandid, ID_LEN);
     mpack_write_timestamp(&w, servertime / 1000, (uint32_t)(servertime % 1000) * 1000000u);
     mpack_finish_array(&w);
     mpack_write_object_bytes(&w, (const char *)data, len);
@@ -124,10 +125,11 @@ static void encode_wire(buf *out, uint64_t position, const char *stream, uint64_
     free(d);
 }
 
-static void item_set(pldb_item *it, uint64_t position, const char *stream, uint64_t seq,
-                     const char *commandid, int64_t servertime, const uint8_t *data, size_t len) {
+static void item_set(pldb_item *it, uint64_t position, uint64_t atom, const char *stream,
+                     uint64_t seq, const uint8_t *commandid, int64_t servertime,
+                     const uint8_t *data, size_t len) {
     it->stream = xstrdup(stream);
-    it->commandid = xstrdup(commandid);
+    it->atom = atom;
     it->position = position;
     buf b = {0};
     encode_wire(&b, position, stream, seq, commandid, servertime, data, len);
@@ -135,12 +137,26 @@ static void item_set(pldb_item *it, uint64_t position, const char *stream, uint6
     it->len = b.len;
 }
 
+/* a command id written as a uuid, for the server's log */
+static void format_id(const uint8_t *id, char out[37]) {
+    char *p = out;
+    for (int i = 0; i < ID_LEN; i++) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) *p++ = '-';
+        p += snprintf(p, 3, "%02x", id[i]);
+    }
+}
+
 /* What a client is told of a failure that is a bug, as opposed to a rejection: the whole error
    when the bundle is a dev build, and "internal error" otherwise.  The whole error goes to the
    log either way, under the command it failed when it failed one.  Takes msg. */
-static char *bug_reason(const pldb *db, const char *id, char *msg) {
-    if (id) fprintf(stderr, "pldb: command %s: %s\n", id, msg);
-    else fprintf(stderr, "pldb: %s\n", msg);
+static char *bug_reason(const pldb *db, const uint8_t *id, char *msg) {
+    if (id) {
+        char uuid[37];
+        format_id(id, uuid);
+        fprintf(stderr, "pldb: command %s: %s\n", uuid, msg);
+    } else {
+        fprintf(stderr, "pldb: %s\n", msg);
+    }
     if (db->js.dev) return msg;
     free(msg);
     return xstrdup("internal error");
@@ -526,14 +542,14 @@ typedef struct batch {
 } batch;
 
 /* the stream row must exist: births create it before their event */
-static void append_event(pldb *db, batch *b, const char *stream, const char *commandid,
-                         const uint8_t *data, size_t len) {
+static void append_event(pldb *db, batch *b, uint64_t atom, const char *stream,
+                         const uint8_t *commandid, const uint8_t *data, size_t len) {
     uint64_t pos = ++db->position;
     uint64_t seq;
     if (store_stream_next_seq(db->w, stream, len, &seq)) die("next_seq: %s", store_err(db->w));
-    if (store_append(db->w, pos, stream, seq, commandid, b->servertime, data, len))
+    if (store_append(db->w, pos, atom, stream, seq, commandid, b->servertime, data, len))
         die("append: %s", store_err(db->w));
-    item_set(items_push(&b->commit), pos, stream, seq, commandid, b->servertime, data, len);
+    item_set(items_push(&b->commit), pos, atom, stream, seq, commandid, b->servertime, data, len);
 }
 
 static void family_of(const char *stream, char *out, size_t cap) {
@@ -595,10 +611,10 @@ static bool check_expect(pldb *db, mpack_writer_t *w, JSValueConst expect) {
    caller releases on success.  Births come before a born stream's first event, deaths clear the
    stream's keys, and each stream's events reach its family's reducer as one run.  Frees pc.
    Answers NULL, or why the atom was rolled back. */
-static char *apply_outputs(pldb *db, batch *b, const char *id, pc_result *pc) {
+static char *apply_outputs(pldb *db, batch *b, const uint8_t *id, pc_result *pc) {
     JSContext *ctx = db->js.ctx;
     char *reason = NULL;
-    uint64_t start = db->position;
+    uint64_t start = db->position, atom = start + 1;
     size_t commit_start = b->commit.n;
     size_t written_start = b->written.n, deleted_start = b->deleted.n;
     if (store_exec(db->w, "SAVEPOINT cmd")) die("savepoint: %s", store_err(db->w));
@@ -617,7 +633,7 @@ static char *apply_outputs(pldb *db, batch *b, const char *id, pc_result *pc) {
         if (live < 0) die("stream_live: %s", store_err(db->w));
         if (it->death) {
             if (!live) continue;
-            append_event(db, b, it->stream, id, DEATH, sizeof DEATH);
+            append_event(db, b, atom, it->stream, id, DEATH, sizeof DEATH);
             if (store_stream_death(db->w, it->stream, db->position)) die("death: %s", store_err(db->w));
             char prefix[1024];
             snprintf(prefix, sizeof prefix, "%s!", it->stream);
@@ -627,9 +643,9 @@ static char *apply_outputs(pldb *db, batch *b, const char *id, pc_result *pc) {
         }
         if (!live) {
             if (store_stream_birth(db->w, it->stream, db->position + 1)) die("birth: %s", store_err(db->w));
-            append_event(db, b, it->stream, id, BIRTH, sizeof BIRTH);
+            append_event(db, b, atom, it->stream, id, BIRTH, sizeof BIRTH);
         }
-        append_event(db, b, it->stream, id, it->bytes.p, it->bytes.len);
+        append_event(db, b, atom, it->stream, id, it->bytes.p, it->bytes.len);
         group *g = NULL;
         for (size_t j = 0; j < ngroups; j++)
             if (strcmp(groups[j].stream, it->stream) == 0) g = &groups[j];
@@ -662,7 +678,6 @@ static char *apply_outputs(pldb *db, batch *b, const char *id, pc_result *pc) {
         db->position = start;
         for (size_t i = commit_start; i < b->commit.n; i++) {
             free(b->commit.v[i].stream);
-            free(b->commit.v[i].commandid);
             free(b->commit.v[i].data);
         }
         b->commit.n = commit_start;
@@ -673,22 +688,33 @@ static char *apply_outputs(pldb *db, batch *b, const char *id, pc_result *pc) {
     return NULL;
 }
 
-static void run_command(pldb *db, batch *b, mpack_writer_t *w, const char *id, JSValueConst data,
-                        JSValueConst expect, JSValueConst principal) {
-    uint64_t pos;
-    int rc = store_command_position(db->w, id, &pos);
-    if (rc < 0) die("dedup: %s", store_err(db->w));
-    if (rc == 1) {
-        mpack_start_array(w, 2);
-        mpack_write_cstr(w, "dup");
-        mpack_write_u64(w, pos);
-        mpack_finish_array(w);
-        return;
-    }
+/* write an outcome of a kind and a reason */
+static void write_reason(mpack_writer_t *w, const char *kind, const char *reason) {
+    mpack_start_array(w, 2);
+    mpack_write_cstr(w, kind);
+    mpack_write_cstr(w, reason);
+    mpack_finish_array(w);
+}
+
+/* write an ok outcome: the command was decided at or before position */
+static void write_ok(mpack_writer_t *w, uint64_t position) {
+    mpack_start_array(w, 2);
+    mpack_write_cstr(w, "ok");
+    mpack_write_u64(w, position);
+    mpack_finish_array(w);
+}
+
+/* Decide one command: expect, precommit, and the append and fold of what precommit emitted.  A
+   reject or a conflict leaves nothing in the log or the store. */
+static void decide(pldb *db, batch *b, mpack_writer_t *w, const uint8_t *id, JSValueConst data,
+                   JSValueConst expect, JSValueConst principal) {
+    // the client's expectations of its streams
     if (check_expect(db, w, expect)) return;
+
+    // precommit, and the streams it emitted to
     char *reason = NULL;
     pc_result pc = {0};
-    if (js_precommit(&db->js, id, data, principal, &pc)) {
+    if (js_precommit(&db->js, data, principal, &pc)) {
         reason = bug_reason(db, id, strf("precommit error: %s", db->js.err));
     } else if (pc.reason) {
         reason = pc.reason;
@@ -702,29 +728,46 @@ static void run_command(pldb *db, batch *b, mpack_writer_t *w, const char *id, J
     }
     if (reason) {
         pc_result_free(&db->js, &pc);
-        mpack_start_array(w, 2);
-        mpack_write_cstr(w, "reject");
-        mpack_write_cstr(w, reason);
-        mpack_finish_array(w);
+        write_reason(w, "reject", reason);
         free(reason);
         return;
     }
 
+    // the atom, answered ok at the head after it
     reason = apply_outputs(db, b, id, &pc);
     if (reason) {
-        mpack_start_array(w, 2);
-        mpack_write_cstr(w, "reject");
-        mpack_write_cstr(w, reason);
-        mpack_finish_array(w);
+        write_reason(w, "reject", reason);
         free(reason);
         return;
     }
-    if (store_command_insert(db->w, id, db->position)) die("command_insert: %s", store_err(db->w));
     if (store_exec(db->w, "RELEASE cmd")) die("release: %s", store_err(db->w));
-    mpack_start_array(w, 2);
-    mpack_write_cstr(w, "ack");
-    mpack_write_u64(w, db->position);
-    mpack_finish_array(w);
+    write_ok(w, db->position);
+}
+
+/* One command, its outcome written into w.  A command in a session passes the dedup check first,
+   against the group's open transaction, so it sees every decision ahead of it in its group: a
+   number at or below the session's mark was decided already, and anything else runs, an unknown
+   session included, since session rows are kept forever.  Every decision moves the mark,
+   whatever it decided. */
+static void run_command(pldb *db, batch *b, mpack_writer_t *w, const char *session, uint64_t n,
+                        const uint8_t *id, JSValueConst data, JSValueConst expect,
+                        JSValueConst principal) {
+    // the dedup check
+    if (session) {
+        uint64_t hwm = 0;
+        int known = store_session_hwm(db->w, session, &hwm);
+        if (known < 0) die("session_hwm: %s", store_err(db->w));
+        if (known && n <= hwm) {
+            write_ok(w, db->position);
+            return;
+        }
+    }
+
+    decide(db, b, w, id, data, expect, principal);
+
+    // the decision moves the mark; a rolled-back atom has already left its savepoint
+    if (session && store_session_mark(db->w, session, n, b->servertime))
+        die("session_mark: %s", store_err(db->w));
 }
 
 static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) {
@@ -745,7 +788,8 @@ static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) 
     mpack_writer_init_growable(&w, &data, &size);
     mpack_build_array(&w);
 
-    /* walk the prepared [id, data, expect?] values, each already checked */
+    /* walk the prepared [key, n, id, data, expect?] values, each already checked, with a
+       session's key or nil in place of the session */
     mpack_tree_t tree;
     mpack_tree_init_data(&tree, (const char *)q->body, q->len);
     long commands = schema_commands(db->js.sc);
@@ -754,26 +798,32 @@ static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) 
         mpack_tree_parse(&tree);
         if (mpack_tree_error(&tree) != mpack_ok) die("prepared body: malformed msgpack");
         consumed += mpack_tree_size(&tree);
-        mpack_node_t pair = mpack_tree_root(&tree);
-        mpack_node_t idn = mpack_node_array_at(pair, 0);
-        size_t idlen = mpack_node_strlen(idn);
-        char *id = xmalloc(idlen + 1);
-        memcpy(id, mpack_node_str(idn), idlen);
-        id[idlen] = 0;
-        JSValue datav = walk_to_js(ctx, db->js.sc, mpack_node_array_at(pair, 1), commands, true, why,
+        mpack_node_t c = mpack_tree_root(&tree);
+
+        // the session's key and the command's number, or none for a sessionless command
+        mpack_node_t keyn = mpack_node_array_at(c, 0);
+        char *key = NULL;
+        uint64_t n = 0;
+        if (mpack_node_type(keyn) != mpack_type_nil) {
+            key = xmalloc(mpack_node_strlen(keyn) + 1);
+            memcpy(key, mpack_node_str(keyn), mpack_node_strlen(keyn));
+            key[mpack_node_strlen(keyn)] = 0;
+            n = mpack_node_u64(mpack_node_array_at(c, 1));
+        }
+        const uint8_t *id = (const uint8_t *)mpack_node_bin_data(mpack_node_array_at(c, 2));
+
+        // the data and the expectations, as JS values
+        JSValue datav = walk_to_js(ctx, db->js.sc, mpack_node_array_at(c, 3), commands, true, why,
                                    sizeof why);
         JSValue expectv = JS_UNDEFINED;
-        if (mpack_node_array_length(pair) > 2) expectv = mpjs_decode_node(ctx, mpack_node_array_at(pair, 2));
+        if (mpack_node_array_length(c) > 4) expectv = mpjs_decode_node(ctx, mpack_node_array_at(c, 4));
         if (JS_IsException(datav) || JS_IsException(expectv)) {
             if (JS_HasException(ctx)) JS_FreeValue(ctx, JS_GetException(ctx));
-            mpack_start_array(&w, 2);
-            mpack_write_cstr(&w, "reject");
-            mpack_write_cstr(&w, JS_IsException(datav) ? why : "malformed expect");
-            mpack_finish_array(&w);
+            write_reason(&w, "reject", JS_IsException(datav) ? why : "malformed expect");
         } else {
-            run_command(db, b, &w, id, datav, expectv, principal);
+            run_command(db, b, &w, key, n, id, datav, expectv, principal);
         }
-        free(id);
+        free(key);
         JS_FreeValue(ctx, datav);
         JS_FreeValue(ctx, expectv);
     }
@@ -913,9 +963,6 @@ static int load_epoch(const char *dir, char **out, char *err, size_t errlen) {
     return 0;
 }
 
-/* the command id bootstrap's atom carries */
-#define BOOTSTRAP_ID "bootstrap"
-
 /* On an empty log, the bundle's bootstrap seeds it: what it emits lands as one atom through the
    ordinary append and fold, before anything is served.  A bootstrap that throws, or emits to a
    malformed stream, fails the open. */
@@ -938,11 +985,19 @@ static int run_bootstrap(pldb *db, char *err, size_t errlen) {
         }
     }
 
+    // the atom's id, a label like any client's
+    uint8_t id[ID_LEN];
+    if (getrandom(id, sizeof id, 0) != (ssize_t)sizeof id) {
+        snprintf(err, errlen, "getrandom: %s", strerror(errno));
+        pc_result_free(&db->js, &pc);
+        return -1;
+    }
+
     // one transaction, as a group commit would run it
     batch b = {0};
     b.servertime = now_ms();
     if (store_exec(db->w, "BEGIN IMMEDIATE")) die("begin: %s", store_err(db->w));
-    char *reason = apply_outputs(db, &b, BOOTSTRAP_ID, &pc);
+    char *reason = apply_outputs(db, &b, id, &pc);
     if (reason) {
         if (store_exec(db->w, "ROLLBACK")) die("rollback: %s", store_err(db->w));
         snprintf(err, errlen, "bootstrap: %s", reason);
@@ -952,7 +1007,6 @@ static int run_bootstrap(pldb *db, char *err, size_t errlen) {
         strlist_free(&b.deleted);
         return -1;
     }
-    if (store_command_insert(db->w, BOOTSTRAP_ID, db->position)) die("command_insert: %s", store_err(db->w));
     if (store_exec(db->w, "RELEASE cmd") || store_exec(db->w, "COMMIT")) die("commit: %s", store_err(db->w));
 
     // nothing is subscribed yet, so the commit's items go nowhere
@@ -1044,10 +1098,10 @@ typedef struct read_ctx {
     items it;
 } read_ctx;
 
-static int read_cb(void *arg, uint64_t position, const char *stream, uint64_t seq,
-                   const char *commandid, int64_t servertime, const uint8_t *data, size_t len) {
+static int read_cb(void *arg, uint64_t position, uint64_t atom, const char *stream, uint64_t seq,
+                   const uint8_t *commandid, int64_t servertime, const uint8_t *data, size_t len) {
     read_ctx *rc = arg;
-    item_set(items_push(&rc->it), position, stream, seq, commandid, servertime, data, len);
+    item_set(items_push(&rc->it), position, atom, stream, seq, commandid, servertime, data, len);
     return 0;
 }
 
@@ -1211,20 +1265,62 @@ static char *reasonf(const char *fmt, ...) {
     return xstrdup(msg);
 }
 
-/* whether a parsed request element is [id, data, expect?] with a non-empty string id */
-static bool is_command_pair(mpack_node_t pair) {
-    if (mpack_node_type(pair) != mpack_type_array || mpack_node_array_length(pair) < 2) return false;
-    mpack_node_t id = mpack_node_array_at(pair, 0);
-    return mpack_node_type(id) == mpack_type_str && mpack_node_strlen(id) > 0;
+/* the longest session a command may carry, in bytes */
+#define SESSION_MAX 64
+
+/* whether a msgpack integer is a command number: from 1 to 2^53 - 1, so that every client's
+   numbers are exact */
+static bool is_number(mpack_node_t n) {
+    if (mpack_node_type(n) == mpack_type_uint) {
+        uint64_t v = mpack_node_u64(n);
+        return v >= 1 && v < (1ull << 53);
+    }
+    return mpack_node_type(n) == mpack_type_int && mpack_node_i64(n) >= 1 &&
+           mpack_node_i64(n) < (1ll << 53);
+}
+
+/* Whether a parsed request element is [S, n, id, data, expect?]: S a string of 1 to SESSION_MAX
+   bytes and n a command number, or both nil, and id ID_LEN bytes of bin.  Elements a later
+   protocol appends are ignored. */
+static bool is_command(mpack_node_t c) {
+    if (mpack_node_type(c) != mpack_type_array || mpack_node_array_length(c) < 4) return false;
+
+    // the session and the number
+    mpack_node_t session = mpack_node_array_at(c, 0), n = mpack_node_array_at(c, 1);
+    if (mpack_node_type(session) == mpack_type_nil) {
+        if (mpack_node_type(n) != mpack_type_nil) return false;
+    } else {
+        if (mpack_node_type(session) != mpack_type_str) return false;
+        size_t slen = mpack_node_strlen(session);
+        if (slen < 1 || slen > SESSION_MAX || !is_number(n)) return false;
+    }
+
+    // the id
+    mpack_node_t id = mpack_node_array_at(c, 2);
+    return mpack_node_type(id) == mpack_type_bin && mpack_node_bin_size(id) == ID_LEN;
+}
+
+/* write a command's session as its key in the session table: the hex SHA-256 of its bytes, so
+   that nothing the database stores lets its reader send under a live session */
+static void write_session_key(mpack_writer_t *w, mpack_node_t session) {
+    SHA256_CTX sha;
+    BYTE digest[SHA256_BLOCK_SIZE];
+    sha256_init(&sha);
+    sha256_update(&sha, (const BYTE *)mpack_node_str(session), mpack_node_strlen(session));
+    sha256_final(&sha, digest);
+    char hex[2 * SHA256_BLOCK_SIZE + 1];
+    for (int i = 0; i < SHA256_BLOCK_SIZE; i++) snprintf(hex + 2 * i, 3, "%02x", digest[i]);
+    mpack_write_str(w, hex, 2 * SHA256_BLOCK_SIZE);
 }
 
 /* Check one command's data and prepare its fields: a NewPassword is hashed; any other kind
-   cannot be verified yet.  Writes the prepared [id, data, expect?] to out, or answers why the
-   command is rejected; a hash function's refusal sets *refused instead, and answers NULL. */
-static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t pair, buf *out, int *refused) {
+   cannot be verified yet.  Writes the prepared [key, n, id, data, expect?] to out, its session
+   replaced by its key, or answers why the command is rejected; a hash function's refusal sets
+   *refused instead, and answers NULL. */
+static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t c, buf *out, int *refused) {
     long commands = schema_commands(db->js.sc);
     if (commands < 0) return xstrdup("this database takes no commands");
-    mpack_node_t data = mpack_node_array_at(pair, 1);
+    mpack_node_t data = mpack_node_array_at(c, 3);
     char why[512];
     intake_list il = {0};
     char *reason = NULL;
@@ -1260,13 +1356,20 @@ static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t pair, buf *ou
     size_t size = 0;
     mpack_writer_t w;
     mpack_writer_init_growable(&w, &bytes, &size);
-    size_t n = mpack_node_array_length(pair) > 2 ? 3 : 2;
-    mpack_node_t id = mpack_node_array_at(pair, 0);
-    mpack_start_array(&w, (uint32_t)n);
-    mpack_write_str(&w, mpack_node_str(id), (uint32_t)mpack_node_strlen(id));
+    size_t len = mpack_node_array_length(c) > 4 ? 5 : 4;
+    mpack_node_t session = mpack_node_array_at(c, 0), id = mpack_node_array_at(c, 2);
+    mpack_start_array(&w, (uint32_t)len);
+    if (mpack_node_type(session) == mpack_type_nil) {
+        mpack_write_nil(&w);
+        mpack_write_nil(&w);
+    } else {
+        write_session_key(&w, session);
+        mpack_write_u64(&w, (uint64_t)mpack_node_i64(mpack_node_array_at(c, 1)));
+    }
+    mpack_write_bin(&w, mpack_node_bin_data(id), ID_LEN);
     int rc = walk_write(db->js.sc, data, commands, true, &il, &w, why, sizeof why);
-    if (rc == 0 && n > 2) {
-        rc = walk_write(db->js.sc, mpack_node_array_at(pair, 2), -1, false, NULL, &w, why, sizeof why);
+    if (rc == 0 && len > 4) {
+        rc = walk_write(db->js.sc, mpack_node_array_at(c, 4), -1, false, NULL, &w, why, sizeof why);
         if (rc) snprintf(why, sizeof why, "malformed expect");
     }
     mpack_finish_array(&w);
@@ -1288,8 +1391,8 @@ int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, pldb_
     memset(out, 0, sizeof *out);
     mpack_tree_t tree;
 
-    // the request is a sequence of [id, data, expect?] values: count them, refusing the whole
-    // request when any is not one, since nothing can be answered for it
+    // the request is a sequence of [S, n, id, data, expect?] values: count them, refusing the
+    // whole request when any is not one, since nothing can be answered for it
     size_t ncmds = 0;
     mpack_tree_init_data(&tree, (const char *)body, len);
     for (size_t consumed = 0; consumed < len; ncmds++) {
@@ -1300,8 +1403,8 @@ int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, pldb_
             return -1;
         }
         consumed += mpack_tree_size(&tree);
-        if (!is_command_pair(mpack_tree_root(&tree))) {
-            snprintf(err, errlen, "command must be [id, data] with a string id");
+        if (!is_command(mpack_tree_root(&tree))) {
+            snprintf(err, errlen, "command must be [S, n, id, data, expect?]");
             mpack_tree_destroy(&tree);
             return -1;
         }

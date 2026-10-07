@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { decode, decodeMulti, encode } from '@msgpack/msgpack';
 import { NewHTTPConnector, postCommand } from '../src/http.js';
+import { uuidString } from '../src/uuid.js';
 import type {
   Backfill,
   BackfillOutcome,
@@ -98,6 +99,19 @@ function hooks(log: unknown[][]): ConnectorHooks {
 
 const settle = () => new Promise((r) => setTimeout(r, 50));
 
+// a test's command id as the wire carries it: its name in 16 bytes, zero-padded
+function label(name: string): Uint8Array {
+  const b = new Uint8Array(16);
+  b.set(new TextEncoder().encode(name));
+  return b;
+}
+// the name back from those bytes
+function nameOf(b: Uint8Array): string {
+  return new TextDecoder().decode(b).replace(/\0+$/, '');
+}
+// a test's command id as the Engine mints it, a uuid
+const uuidOf = (name: string) => uuidString(label(name));
+
 let stub: Stub;
 beforeEach(async () => {
   stub = new Stub();
@@ -113,7 +127,7 @@ describe('the live stream', () => {
     NewHTTPConnector(stub.url, () => 'jwt')(-1, null, ['*', 'book'], ctl.signal, hooks(log));
     await s.opened;
     s.push(['live', 0]);
-    s.push(['events', [[[1, 'book', 1, 'c1', new Date(5)], { $sys: 'birth' }]]]);
+    s.push(['events', [[[1, 'book', 1, label('c1'), new Date(5)], { $sys: 'birth' }]]]);
     s.push(['view', 't2', 2, ['book', 'patron:p1']]);
     s.push(['vouch', 3]);
     s.push(['end', 7, 'done']);
@@ -248,7 +262,7 @@ describe('sendCommands', () => {
     endStreamOnFirst = false;
     log = [];
     stub.routes.set('/commands', (req, body, res) => {
-      seen.push((decode(body) as [string, unknown])[0]);
+      seen.push(nameOf((decode(body) as unknown[])[2] as Uint8Array));
       if (endStreamOnFirst && seen.length === 1) stream.end();
       if (failures > 0) {
         failures--;
@@ -264,7 +278,7 @@ describe('sendCommands', () => {
       const delay = seen.length === 1 ? 100 : 0;
       setTimeout(() => {
         res.writeHead(200, { 'Content-Type': 'application/msgpack' });
-        res.end(Buffer.from(encode([['ack', seen.length]])));
+        res.end(Buffer.from(encode([['ok', seen.length]])));
       }, delay);
     });
     conn = NewHTTPConnector(stub.url, () => 'jwt')(
@@ -276,25 +290,26 @@ describe('sendCommands', () => {
     );
   });
   const ends = () => log.filter((entry) => entry[0] === 'end');
-  const send = (id: string) => conn.sendCommands([{ id, data: encode({ type: 'noop' }) }]);
+  const send = (id: string) =>
+    conn.sendCommands([{ id: uuidOf(id), session: 's1', n: 1, data: encode({ type: 'noop' }) }]);
 
   test('calls are applied in call order even when the first is slow', async () => {
     const [a, b, c] = await Promise.all([send('a'), send('b'), send('c')]);
     expect(seen).toEqual(['a', 'b', 'c']);
     expect([a, b, c].map((r) => r[0])).toEqual([
-      { kind: 'ack', position: 1 },
-      { kind: 'ack', position: 2 },
-      { kind: 'ack', position: 3 },
+      { kind: 'ok', position: 1 },
+      { kind: 'ok', position: 2 },
+      { kind: 'ok', position: 3 },
     ]);
     const req = stub.requests.find((r) => r.path === '/commands')!;
     expect(req.headers['content-type']).toBe('application/msgpack');
-    expect(decode(req.body)).toEqual(['a', { type: 'noop' }]);
+    expect(decode(req.body)).toEqual(['s1', 1, label('a'), { type: 'noop' }]);
   });
 
-  test('a 5xx is retried under the same ids, and the call succeeds', async () => {
+  test('a 5xx is retried under the same sessions and numbers, and the call succeeds', async () => {
     failures = 1;
     failStatus = 503;
-    expect((await send('a'))[0]).toEqual({ kind: 'ack', position: 2 });
+    expect((await send('a'))[0]).toEqual({ kind: 'ok', position: 2 });
     expect(seen).toEqual(['a', 'a']);
     expect(ends()).toEqual([]);
   });
@@ -338,26 +353,45 @@ describe('sendCommands', () => {
   test('every outcome kind, and several commands in one call', async () => {
     stub.routes.set('/commands', (_req, body, res) => {
       // the body is back-to-back command frames
-      const ids = [...decodeMulti(body)].map((v) => (v as [string, unknown])[0]);
-      expect(ids).toEqual(['a', 'b', 'c', 'd']);
+      const cmds = [...decodeMulti(body)] as unknown[][];
+      expect(cmds.map((c) => nameOf(c[2] as Uint8Array))).toEqual(['a', 'b', 'c', 'd']);
+      expect(cmds.map((c) => [c[0], c[1]])).toEqual([
+        ['s1', 1],
+        ['s1', 2],
+        [null, null],
+        ['s2', 7],
+      ]);
       res.writeHead(200);
       res.end(
         Buffer.from(
           encode([
-            ['ack', 10],
-            ['dup', 3],
+            ['ok', 10],
             ['reject', 'no'],
             ['conflict', { 'patron:p1': 4 }],
+            ['ok', 3],
           ]),
         ),
       );
     });
-    const r = await conn.sendCommands(['a', 'b', 'c', 'd'].map((id) => ({ id, data: encode({}) })));
+    const sessions: [string | null, number | null][] = [
+      ['s1', 1],
+      ['s1', 2],
+      [null, null],
+      ['s2', 7],
+    ];
+    const r = await conn.sendCommands(
+      ['a', 'b', 'c', 'd'].map((id, i) => ({
+        id: uuidOf(id),
+        session: sessions[i][0],
+        n: sessions[i][1],
+        data: encode({}),
+      })),
+    );
     expect(r).toEqual([
-      { kind: 'ack', position: 10 },
-      { kind: 'dup', position: 3 },
+      { kind: 'ok', position: 10 },
       { kind: 'reject', reason: 'no' },
       { kind: 'conflict', current: { 'patron:p1': 4 } },
+      { kind: 'ok', position: 3 },
     ]);
   });
 });
@@ -368,7 +402,12 @@ describe('postCommand', () => {
       res.writeHead(200);
       res.end(Buffer.from(encode([['reject', 'taken']])));
     });
-    const command = { id: 'c1', data: encode({ type: 'create-account' }) };
+    const command = {
+      id: uuidOf('c1'),
+      session: null,
+      n: null,
+      data: encode({ type: 'create-account' }),
+    };
     expect(await postCommand(stub.url, command, 'jwt')).toEqual({
       kind: 'reject',
       reason: 'taken',
@@ -377,7 +416,7 @@ describe('postCommand', () => {
     const [signed, anonymous] = stub.requests;
     expect(signed.headers.authorization).toBe('Bearer jwt');
     expect(signed.headers['content-type']).toBe('application/msgpack');
-    expect(decode(signed.body)).toEqual(['c1', { type: 'create-account' }]);
+    expect(decode(signed.body)).toEqual([null, null, label('c1'), { type: 'create-account' }]);
     expect(anonymous.headers.authorization).toBeUndefined();
   });
 
@@ -386,7 +425,7 @@ describe('postCommand', () => {
       res.writeHead(503);
       res.end('busy');
     });
-    const command = { id: 'c1', data: encode({}) };
+    const command = { id: uuidOf('c1'), session: null, n: null, data: encode({}) };
     await expect(postCommand(stub.url, command)).rejects.toThrow('commands: 503');
     expect(stub.requests.length).toBe(1);
   });
@@ -486,7 +525,7 @@ describe('backfill', () => {
         'PhaseLock-Scanned': String(scanned),
       });
       const body = page.map(([p, s, seq]) =>
-        encode(['events', [[[p, s, seq, `c${p}`, new Date(0)], { p }]]]),
+        encode(['events', [[[p, s, seq, label(`c${p}`), new Date(0)], { p }]]]),
       );
       res.end(Buffer.concat(body.map((b) => Buffer.from(b))));
     });

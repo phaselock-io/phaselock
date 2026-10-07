@@ -284,11 +284,11 @@ func (s *Server) send(c *conn, f frame) {
 	}
 }
 
-// groupAtoms splits a commit's items into atoms by command id.
+// groupAtoms splits a commit's items into atoms.
 func groupAtoms(items []item) [][]item {
 	var atoms [][]item
 	for i, it := range items {
-		if i == 0 || it.commandid != items[i-1].commandid {
+		if i == 0 || it.atom != items[i-1].atom {
 			atoms = append(atoms, nil)
 		}
 		atoms[len(atoms)-1] = append(atoms[len(atoms)-1], it)

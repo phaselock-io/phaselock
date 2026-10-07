@@ -898,8 +898,8 @@ describe('precommit', () => {
       },
     });
     const { txn } = fakeTxn();
-    b.precommit(txn, { id: 'c1', data: { type: 'sweep', id: 'i9' } }, anyone);
-    b.precommit(txn, { id: 'c2', data: { type: 'note-many', notes: ['a', 'b'] } }, anyone);
+    b.precommit(txn, { type: 'sweep', id: 'i9' }, anyone);
+    b.precommit(txn, { type: 'note-many', notes: ['a', 'b'] }, anyone);
     expect(seen).toEqual(['sweep i9', 'noteMany a,b']);
   });
 
@@ -914,7 +914,7 @@ describe('precommit', () => {
       },
     });
     const data = { type: 'remove-item', id: 'i1' };
-    b.precommit(txn, { id: 'c1', data }, { user: 'u1' });
+    b.precommit(txn, data, { user: 'u1' });
     expect(got).toEqual(['u1', { id: 'i1' }, data]);
     expect(calls).toEqual([['get', 'catalog!item:i1', 'Item']]);
   });
@@ -940,15 +940,13 @@ describe('precommit', () => {
     const b = bundle();
     const { txn } = fakeTxn();
     const leave = { type: 'leave', check: { kind: 'password' } };
-    expect(b.precommit(txn, { id: 'c1', data: leave }, anyone)).toEqual([
+    expect(b.precommit(txn, leave, anyone)).toEqual([
       { stream: 'inbox:acme,u1', death: true },
       { stream: 'catalog', event: itemRemoved },
       { stream: 'catalog', event: { type: 'item-removed', id: 'i2' } },
     ]);
     const note = { type: 'noted', note: 'n1', text: 'hi' };
-    expect(b.precommit(txn, { id: 'c2', data: note }, anyone)).toEqual([
-      { stream: 'catalog', event: note },
-    ]);
+    expect(b.precommit(txn, note, anyone)).toEqual([{ stream: 'catalog', event: note }]);
   });
 
   it('makes a missing handler and a misspelled extra handler compile errors', () => {
@@ -957,7 +955,7 @@ describe('precommit', () => {
 
   it('rejects a handler that returns without an authorization decision (fail closed)', () => {
     const { txn } = fakeTxn();
-    const sweep = { id: 'c1', data: { type: 'sweep', id: 'i1' } };
+    const sweep = { type: 'sweep', id: 'i1' };
 
     // in dev mode, a loud error naming the handler
     const silent = bundle({ sweep: () => ({ stream: 'catalog', event: itemRemoved }) });

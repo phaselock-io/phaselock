@@ -241,9 +241,9 @@ export class FakeServer {
   backfills: BackfillCall[] = [];
   /** every sendCommands() call, in order */
   sends: Command<Uint8Array>[][] = [];
-  /** what sendCommands answers; the default acks each command at a new position */
+  /** what sendCommands answers; the default answers each command ok at a new position */
   onSend: (cmds: Command<Uint8Array>[]) => Promise<CommandResult[]> = (cmds) =>
-    Promise.resolve(cmds.map(() => ({ kind: 'ack' as const, position: this.nextAckPosition++ })));
+    Promise.resolve(cmds.map(() => ({ kind: 'ok' as const, position: this.nextAckPosition++ })));
   nextAckPosition = 1000;
   /** holds: a backfill of the ref waits at the start until released */
   holds = new Map<string, Hold>();
