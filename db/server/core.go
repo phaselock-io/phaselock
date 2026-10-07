@@ -248,6 +248,35 @@ func (c *core) readLog(from, to uint64) ([]item, error) {
 	return goItems(items, n), nil
 }
 
+// readAtoms reads the log from `from` through `to` and on to the end of the atom that `to`
+// falls in, so a window over the log never ends partway through an atom.  `from` must be the
+// first position of an atom.
+func (c *core) readAtoms(from, to uint64) ([]item, error) {
+	items, err := c.readLog(from, to)
+	if err != nil || len(items) == 0 {
+		return items, err
+	}
+
+	// peek at the next position, then read on a batch at a time while the atom continues
+	step := uint64(1)
+	for {
+		last := items[len(items)-1]
+		more, err := c.readLog(last.position+1, last.position+step)
+		if err != nil {
+			return nil, err
+		}
+		n := 0
+		for n < len(more) && more[n].commandid == last.commandid {
+			n++
+		}
+		items = append(items, more[:n]...)
+		if n == 0 || n < len(more) {
+			return items, nil
+		}
+		step = coldBatch
+	}
+}
+
 func (c *core) readEvents(ref string, from, to uint64, reverse bool, limit int) ([]item, error) {
 	if from+1 >= to {
 		return nil, nil

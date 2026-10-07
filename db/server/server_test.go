@@ -1164,6 +1164,52 @@ func TestMsgpackCodec(t *testing.T) {
 	}
 }
 
+func TestColdReplayKeepsAtomsWhole(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+
+	// a one-event atom shifts the two-event atoms after it off the window grid, so one of them
+	// spans positions coldBatch and coldBatch+1
+	h.ack(admin, cmd("c0", "add-patron", "id", "p0", "name", "Ann"))
+	h.ack(admin, cmd("c1", "rename-patron", "id", "p0", "name", "Anne"))
+	var cmds []command
+	for i := 1; i <= coldBatch/2; i++ {
+		cmds = append(cmds, cmd(fmt.Sprintf("a%d", i), "add-patron", "id", fmt.Sprintf("p%d", i), "name", "x"))
+	}
+	h.commands(admin, cmds...)
+
+	// every frame is one whole atom: no command id spans two frames
+	s := h.stream(admin, 0)
+	seen := map[string]bool{}
+	straddled := false
+	for {
+		f := s.next()
+		if f[0] == "live" {
+			break
+		}
+		if f[0] != "events" {
+			continue
+		}
+		evs := events(f)
+		id := evs[0].commandid
+		if seen[id] {
+			t.Fatalf("atom %s split across frames", id)
+		}
+		seen[id] = true
+		for _, e := range evs {
+			if e.commandid != id {
+				t.Fatalf("frame mixes atoms %s and %s", id, e.commandid)
+			}
+		}
+		if evs[0].position == coldBatch && evs[len(evs)-1].position == coldBatch+1 {
+			straddled = true
+		}
+	}
+	if !straddled {
+		t.Fatalf("no atom spanned positions %d and %d", coldBatch, coldBatch+1)
+	}
+}
+
 func TestLongCatchupNoOverflow(t *testing.T) {
 	h := start(t)
 	admin := h.admin()

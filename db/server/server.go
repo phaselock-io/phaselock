@@ -576,7 +576,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	replay := func(from, to uint64) bool {
-		items, err := s.core.readLog(from, to)
+		items, err := s.core.readAtoms(from, to)
 		if err != nil {
 			write(mpEncode([]any{"end", "error", err.Error()}))
 			return false
