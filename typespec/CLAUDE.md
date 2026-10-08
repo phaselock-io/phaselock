@@ -96,9 +96,13 @@ layout, build commands, and the test suite.
   command's `@command`.
 - **`@command` outputs.**  The argument is the precommit handler's return type, taken
   literally, generated as `{Command}Output`: each event wrapped as `{stream, event}` with the
-  stream of a slice that folds it (a singleton slice's label is its literal family name; an event
-  several slices fold may go to any of their streams), unions as alternatives, tuples and arrays
-  as lists, and `{stream, death: true}` to end a stream.  A passthrough names its own type.
+  stream of a slice that folds it (a singleton slice's label is its literal family name, any
+  other slice's its family template as a template literal type, `` `chat:${string},${string}` ``;
+  an event several slices fold may go to any of their streams), unions as alternatives, tuples
+  and arrays as lists, and `{stream, death: true}` to end a stream, whose stream is any string.
+  The template type checks the family and its separators, never the parameters' characters, so
+  a stream name built as a plain string is a compile error and the database's check stays the
+  exact one.  A passthrough names its own type.
 - **Prepared fields.**  The intake types (`NewPassword`, `CommandAuth`, `CaptchaToken`,
   `IdentityProof`) are a closed vocabulary lowered by identity; each appears only as a top-level
   field of an `@online` command, and its result (`PasswordHash`, ...) is a plain alias of its

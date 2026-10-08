@@ -148,7 +148,7 @@ const precommit: TestDBPrecommit = {
     const b = txn.get.book(cmd.book);
     if (b === undefined) throw new Reject('no such book');
     requirePatron(txn, cmd.patron);
-    const stream = `patron:${cmd.patron}`;
+    const stream = `patron:${cmd.patron}` as const;
     if (b.hold) {
       return { stream, event: { type: 'hold-failed', book: cmd.book, reason: 'already held' } };
     }

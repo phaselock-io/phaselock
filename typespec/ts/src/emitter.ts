@@ -491,11 +491,19 @@ function precommitView(annos: Annos, cmd: PCommand): string {
   return intakeFields(cmd).length > 0 ? `${cmd.name}ForPrecommit` : annos.get(cmd.type)!;
 }
 
-/** the stream label of an event folded by these slices: a singleton's literal name, else any */
+/** the stream label of an event folded by these slices: the union of their stream patterns */
 function streamLabel(slices: readonly PSlice[]): string {
-  const labels = new Set(slices.map((s) => (s.params.length === 0 ? `"${s.family}"` : 'string')));
-  if (labels.size === 0 || labels.has('string')) return 'string';
+  const labels = new Set(slices.map(streamPattern));
+  if (labels.size === 0) return 'string';
   return [...labels].join(' | ');
+}
+
+/** A slice's stream names as a type: a singleton's literal name, or its family template as a
+    template literal type with a string for each parameter, as in `patron:${string}`.  The type
+    checks the family and the separators; the parameters' characters are the database's to check. */
+function streamPattern(slice: PSlice): string {
+  if (slice.params.length === 0) return JSON.stringify(slice.family);
+  return '`' + slice.family + ':' + slice.params.map(() => '${string}').join(',') + '`';
 }
 
 /** the annotation of what a handler returns for a command, from its @command output */

@@ -251,7 +251,7 @@ const SNIPPETS: Record<string, string> = {
       },
       setProfile: (auth, _txn, cmd) => {
         auth.authorize(auth.user === cmd.user);
-        const stream = 'inbox:' + cmd.org + ',' + cmd.user;
+        const stream = \`inbox:\${cmd.org},\${cmd.user}\` as const;
         return [
           { stream, event: { type: 'profile-set', name: cmd.name } },
           { stream, event: { type: 'noted', note: 'n1', text: 'profile set' } },
@@ -272,8 +272,8 @@ const SNIPPETS: Record<string, string> = {
         auth.authorizeAnyone();
         const hash: PasswordHash = cmd.password;
         return [
-          { stream: 'secret:' + cmd.user, event: { type: 'secret-set', password: hash } },
-          { stream: 'inbox:' + cmd.org + ',' + cmd.user, event: { type: 'profile-set', name: cmd.name } },
+          { stream: \`secret:\${cmd.user}\`, event: { type: 'secret-set', password: hash } },
+          { stream: \`inbox:\${cmd.org},\${cmd.user}\`, event: { type: 'profile-set', name: cmd.name } },
         ];
       },
       leave: (auth, txn, cmd) => {
@@ -306,7 +306,13 @@ const SNIPPETS: Record<string, string> = {
       // @ts-expect-error an event the output does not name
       removeItem: (_auth, _txn, cmd) => ({ stream: 'catalog', event: { type: 'item-added', id: cmd.id, title: '', added: new Date() } }),
       // @ts-expect-error a tuple output returns every item
-      setProfile: (_auth, _txn, cmd) => [{ stream: 'inbox:' + cmd.org, event: { type: 'profile-set', name: cmd.name } }],
+      setProfile: (_auth, _txn, cmd) => [{ stream: \`inbox:\${cmd.org},\${cmd.user}\`, event: { type: 'profile-set', name: cmd.name } }],
+      // @ts-expect-error a stream name built as a plain string
+      noted: (_auth, _txn, cmd) => ({ stream: 'catalog' + cmd.note, event: cmd }),
+      // @ts-expect-error a stream name with a parameter missing
+      signUp: (_auth, _txn, cmd) => [{ stream: \`secret:\${cmd.user}\`, event: { type: 'secret-set', password: cmd.password } }, { stream: \`inbox:\${cmd.org}\`, event: { type: 'profile-set', name: cmd.name } }],
+      // @ts-expect-error an event on a family that does not fold it
+      noteMany: (_auth, _txn, cmd) => cmd.notes.map((note) => ({ stream: \`secret:\${note}\` as const, event: { type: 'noted' as const, note, text: '' } })),
       // @ts-expect-error a death is { stream, death: true }
       leave: () => [{ stream: 'inbox:a,b', death: false }, []],
     };
@@ -929,7 +935,13 @@ describe('precommit', () => {
   });
 
   it("types an event folded by several slices with any of those slices' streams", () => {
-    expect(text).toMatch(/export type NotedOutput = \{ stream: string; event: Noted \};/);
+    expect(text).toContain(
+      'export type NotedOutput = { stream: "catalog" | `inbox:${string},${string}`; event: Noted };',
+    );
+  });
+
+  it("types a parameterized slice's stream label as its family template", () => {
+    expect(text).toContain('{ stream: `secret:${string}`; event: SecretSet }');
   });
 
   it('types a Death output as { stream, death: true }', () => {
