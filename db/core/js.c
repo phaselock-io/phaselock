@@ -3,6 +3,7 @@
    through __host. */
 
 #include <errno.h>
+#include <sys/random.h>
 
 #include "internal.h"
 #include "host_js.h"
@@ -358,6 +359,29 @@ static JSValue native_env(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     return JS_NewString(ctx, v ? v : "");
 }
 
+/* __pl_random(n): an ArrayBuffer of n bytes from the kernel's CSPRNG, the source of the host's
+   crypto.getRandomValues; n is at most 65536, as the Web Crypto API allows */
+static JSValue native_random(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    int32_t n;
+    if (JS_ToInt32(ctx, &n, argv[0])) return JS_EXCEPTION;
+    if (n < 0 || n > 65536) {
+        return JS_ThrowRangeError(ctx, "random bytes: %d is not in 0..65536", n);
+    }
+    uint8_t *buf = xmalloc((size_t)n + 1);
+    for (int32_t got = 0; got < n;) {
+        ssize_t r = getrandom(buf + got, (size_t)(n - got), 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            free(buf);
+            return JS_ThrowInternalError(ctx, "getrandom: %s", strerror(errno));
+        }
+        got += (int32_t)r;
+    }
+    JSValue out = JS_NewArrayBufferCopy(ctx, buf, (size_t)n);
+    free(buf);
+    return out;
+}
+
 static JSValue native_log(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     fprintf(stderr, "bundle:");
     for (int i = 0; i < argc; i++) {
@@ -555,6 +579,8 @@ int js_open(jsrt *js, const char *bundle_path, store *st, char *err, size_t errl
     JS_SetPropertyStr(js->ctx, global, "__pl_scan", JS_NewCFunction(js->ctx, native_scan, "__pl_scan", 1));
     JS_SetPropertyStr(js->ctx, global, "__pl_hash", JS_NewCFunction(js->ctx, native_hash, "__pl_hash", 1));
     JS_SetPropertyStr(js->ctx, global, "__pl_env", JS_NewCFunction(js->ctx, native_env, "__pl_env", 1));
+    JS_SetPropertyStr(js->ctx, global, "__pl_random",
+                      JS_NewCFunction(js->ctx, native_random, "__pl_random", 1));
     JSValue console = JS_NewObject(js->ctx);
     JS_SetPropertyStr(js->ctx, console, "log", JS_NewCFunction(js->ctx, native_log, "log", 1));
     JS_SetPropertyStr(js->ctx, global, "console", console);

@@ -194,7 +194,8 @@ plan above take precedence over it.
 
 ### Command dedup
 
-DEDUP.md's cut, with no frames in the log.
+Sessions with one mark each, and no frames in the log; a fuller
+write-up of the dedup design is coming.
 
 - A command carries a session `S`, an opaque string of at most 64
   bytes, and a number `n`, an integer from 1 to 2^53 - 1 that
@@ -231,8 +232,8 @@ DEDUP.md's cut, with no frames in the log.
   atom's envelopes, and keys nothing on it.
 - The log carries no frames.  A session row commits in the
   transaction of the group that decided it, so it is as durable as
-  the log, and v0 has no retention that would need them.  DEDUP.md
-  describes the frames of the final DB.
+  the log, and v0 has no retention that would need them; the final DB
+  will record each decision as a frame.
 
 ### Wire protocol
 
@@ -450,12 +451,12 @@ fields are the stream row's counters and appear only for an exact ref.
   user}`; refresh calls it
   with `{kind: "refresh", user}`; a null result means no
   account and fails like a moved generation, since a token speaks only
-  for an existing account (AUTH.md), dev tokens included.
+  for an existing account, dev tokens included.
 - A command's `NewPassword` fields, which the registry marks, are
   hashed in the handler's cgo call, before precommit.  Precommit and
   the log see only the hash.  Password-bearing commands are `@online`
   in the model, so the generated client API never puts them in the
-  outbox (AUTH.md).  The other prepared kinds (CommandAuth,
+  outbox.  The other prepared kinds (CommandAuth,
   CaptchaToken, IdentityProof) are recognized, and a command carrying
   one is rejected until their verification is built.  A registry
   naming a kind the database does not know stops it at startup: the
@@ -523,6 +524,7 @@ app's slots:
       maySee(txn, principal) → [ref...],
       lookup(txn, ident) → null | { user, generation, secret },
       bootstrap(ctx),           // optional; see Bootstrap
+      plugins: { name: { kind, run(txn, cmd) → [output...] } },
       dev,                      // the skeleton's DEV
       mapStack(stack, file, map) → stack,
     }
@@ -530,6 +532,19 @@ app's slots:
 - `data` is the command's data; `principal` is `{user}` with `user` null
   for anonymous; `ident` is `{kind: "password", identity}` at
   login and the `token`/`refresh` shapes above otherwise.
+- The `txn` of precommit, maySee, and lookup also has `emit(outputs)`,
+  which a plugin's request calls to add outputs to the command running.
+  A command's atom is what was emitted while precommit ran, in call
+  order, then what precommit returned; a rejection or a throw drops
+  both.  maySee or lookup emitting is a bug, which fails the slot.
+- `plugins` are the installed plugins by name.  `run`, present for a
+  plugin with commands of its own (a cron tick, a worker's result),
+  hands the plugin one command with the database's contexts bound to
+  `txn`, as precommit's are; the plugin calls the app's hooks from it.
+  A built-in is recognized by its `kind`, with its config on the same
+  entry.  The core reads none of this yet.
+- The host installs `crypto.getRandomValues` and `crypto.randomUUID`
+  over `getrandom(2)`, as browsers and Node have them.
 - The core defines `process.env.NODE_ENV` as `production` before
   evaluating the bundle, for a bundle built without a define; a build
   that defines it, as the test bundle does with `development`, wins.

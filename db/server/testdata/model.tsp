@@ -248,6 +248,16 @@ model AuthenticatedCommand {
   check: CommandAuth;
 }
 
+// a command whose handler makes plugin requests, each emitting a hold failure for one of its
+// reasons; `reject` rejects the command after its requests
+@command(HoldFailed)
+model Notify {
+  type: "notify";
+  patron: Id;
+  reasons: string[];
+  reject?: boolean;
+}
+
 // the audiences //
 
 union TestCommands {
@@ -270,6 +280,7 @@ union DbCommands {
   CreateAccount,
   SetPassword,
   AuthenticatedCommand,
+  Notify,
 }
 
 interface TestDB extends Database<[TestEngine], [AccountSlice], DbCommands> {}

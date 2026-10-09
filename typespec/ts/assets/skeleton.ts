@@ -1550,10 +1550,13 @@ export class ExternalStore implements Store {
 // reducers /////////////////////////////////////////////////////////////////
 
 /** ReadTxn is what a query, a forecast, or precommit reads through: rich JS values by key and type,
-    undefined for an absent key, and scans by pattern. */
+    undefined for an absent key, and scans by pattern.  The database's own adds `emit`, which
+    plugin code calls to add outputs to the atom being built, after the outputs emitted before them
+    and ahead of what the running handler returns. */
 export interface ReadTxn {
   get(key: string, type: string): unknown;
   scan(req: ReadScan): StoreScan;
+  emit?(outputs: ForecastOutput[]): void;
 }
 
 /** a scan through a ReadTxn: its values are rich JS values of `type`, or keys only for false */
@@ -1666,6 +1669,29 @@ function* batches(
   }
 }
 
+// contexts //////////////////////////////////////////////////////////////////
+
+/** the transaction a generated context reads through, as its holder last bound it */
+export type TxnCell<T> = { txn: T };
+
+/** A generated context that stays one object for its holder's lifetime.  `bind` points it at the
+    transaction it reads through until the next bind, and answers it; a holder binds whenever the
+    transaction it runs over changes, so no context is built per call. */
+export type ContextBinding<X, T = ReadTxn> = { readonly ctx: X; bind(txn: T): X };
+
+/** a cell that holds no transaction yet, throwing on any use of it */
+export function unboundCell<T extends object>(): TxnCell<T> {
+  const unbound = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error('a context was used before it was bound to a transaction');
+      },
+    },
+  );
+  return { txn: unbound as T };
+}
+
 // typed scans ///////////////////////////////////////////////////////////////
 
 /** a match on one parameter, as a generated scan accessor takes it: an exact value, a range, or a
@@ -1703,8 +1729,12 @@ export type ScanTemplate = {
 type ScanOptions = { reverse?: boolean; keys?: boolean };
 type NamedMatch = Partial<Record<string, ScanMatch>>;
 
-/** a scan accessor over a global context's read transaction */
-export function globalScan<P extends string, V>(txn: ReadTxn, t: ScanTemplate): ScanAccessor<P, V> {
+/** a scan accessor over a global context's read transaction, whichever the cell holds when it is
+    called */
+export function globalScan<P extends string, V>(
+  cell: TxnCell<ReadTxn>,
+  t: ScanTemplate,
+): ScanAccessor<P, V> {
   const scan = (match: NamedMatch = {}, options: ScanOptions = {}) => {
     const n = t.stream.length;
     const params = t.stream.map((p, i) => {
@@ -1716,21 +1746,22 @@ export function globalScan<P extends string, V>(txn: ReadTxn, t: ScanTemplate): 
       local: localMatches(t, match),
     };
     const type = options.keys === true ? false : t.type;
-    const walk = scanEach(txn, { pattern, type, reverse: options.reverse });
+    const walk = scanEach(cell.txn, { pattern, type, reverse: options.reverse });
     return named(walk, [...t.stream, ...t.local], options.keys === true);
   };
   return scan as ScanAccessor<P, V>;
 }
 
-/** a scan accessor over a reducer's transaction, of its own stream */
+/** a scan accessor over a reducer's transaction, of its own stream, whichever the cell holds when
+    it is called */
 export function localScan<P extends string, V>(
-  txn: ReducerTxn,
+  cell: TxnCell<ReducerTxn>,
   t: ScanTemplate,
 ): ScanAccessor<P, V> {
   const scan = (match: NamedMatch = {}, options: ScanOptions = {}) => {
     const local = localMatches(t, match);
     const type = options.keys === true ? false : t.type;
-    const walk = scanEachLocal(txn, { name: t.name, local, type, reverse: options.reverse });
+    const walk = scanEachLocal(cell.txn, { name: t.name, local, type, reverse: options.reverse });
     return named(walk, t.local, options.keys === true);
   };
   return scan as ScanAccessor<P, V>;
@@ -1981,9 +2012,10 @@ export type BootstrapContext = {
 /** Bundle is what a database runs: the app's handlers behind the generated wrappers, installed
     as `globalThis.__bundle`, and the registry the database converts and checks every value by.
     precommit, maySee, and lookup read global keys; each reducer reads and writes its own stream's
-    keys.  precommit gets a command's data alone.  Values are rich JS values.  `dev` is the
-    bundle's DEV, so a host answers the errors of a dev bundle in full, and `mapStack` maps an
-    error's stack through the bundle's source map. */
+    keys.  precommit gets a command's data alone.  Values are rich JS values.  `plugins` are the
+    database's installed plugins by name, as the host calls them.  `dev` is the bundle's DEV, so a
+    host answers the errors of a dev bundle in full, and `mapStack` maps an error's stack through
+    the bundle's source map. */
 export type Bundle = {
   schema: Schema;
   precommit: (txn: ReadTxn, data: unknown, principal: Principal) => string | ForecastOutput[];
@@ -1991,9 +2023,104 @@ export type Bundle = {
   maySee: (txn: ReadTxn, principal: Principal) => string[];
   lookup: (txn: ReadTxn, ident: LookupIdent) => LookupResult | null;
   bootstrap?: (ctx: BootstrapContext) => void;
+  plugins: Record<string, BundlePlugin>;
   dev: boolean;
   mapStack: typeof mapStack;
 };
+
+// plugins ///////////////////////////////////////////////////////////////////
+
+/** A plugin as one database holds it: the kind that prefixes its type identities, the name it is
+    installed under, its request API, which app code calls as `txn.{name}`, bind, which points
+    the plugin's own contexts at the transaction the database runs over, and, for a plugin with
+    commands of its own, run, which handles one of them, a cron tick or a worker's result, and
+    answers its outputs. */
+export interface Plugin<Api extends object = object> {
+  readonly kind: string;
+  readonly name: string;
+  readonly api: Api;
+  bind(txn: ReadTxn): void;
+  run?(cmd: unknown): ForecastOutput[];
+}
+
+/** What a plugin's install answers and a plugin set lists: the plugin's kind, and create, which
+    makes the plugin under the name a database installs it by.  ctx is the database's context, the
+    txn of the app's hooks: the plugin's own context offers each hook as a field whose wrapper
+    calls the hook over ctx and emits what it returns, and only those wrappers hold ctx. */
+export interface PluginInstall<Api extends object = object> {
+  readonly kind: string;
+  create(name: string, ctx: unknown): Plugin<Api>;
+}
+
+/** An installed plugin as a host sees it: its kind, by which the host recognizes a built-in, and,
+    for a plugin with commands of its own, run, which binds the database's context and every
+    plugin to the transaction, as every entry into the bundle does, and hands the plugin one
+    command. */
+export type BundlePlugin = {
+  readonly kind: string;
+  readonly run?: (txn: ReadTxn, cmd: unknown) => ForecastOutput[];
+};
+
+/** the types a database hands a plugin's handlers: the txn they read through and the outputs they
+    return */
+export type DbTypes = { txn: unknown; output: unknown };
+
+/** What ties an installed plugin to one database's types.  DB appears bare, so a plugin's install
+    infers it from the slot it lands in, and an install for one database fits no other's. */
+export type DbMarker<DB extends DbTypes> = { readonly db: (db: DB) => DB };
+
+/** the request APIs of a plugin set, as the fields of a txn */
+export type PluginApis<P> = { [K in keyof P]: P[K] extends PluginInstall<infer A> ? A : never };
+
+/** the fields of a database context, which no plugin may be named after */
+export type ContextField = 'get' | 'scan' | 'status';
+
+/** the names no plugin may take: a context's fields, and __proto__, which an assignment would take
+    as the object's prototype rather than a field */
+export type ReservedPluginName = ContextField | '__proto__';
+const RESERVED_PLUGIN_NAMES: readonly string[] = ['get', 'scan', 'status', '__proto__'];
+
+// a plugin's name: a JS identifier without $, so it is also a stream name's text
+const PLUGIN_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** a database's plugins slot: each plugin of the set P under its name, tied to the database's
+    types DB */
+export type PluginSlots<P, DB extends DbTypes> = {
+  [K in keyof P]: K extends ReservedPluginName ? never : P[K] & DbMarker<DB>;
+};
+
+/** Install a database's plugins: create each under its name, which is checked, over the database
+    context, and attach its request API to that context under its name.  Answers the plugins by
+    name as a host calls them, and the bind a database runs on every entry, which points the
+    context and every plugin at the transaction. */
+export function installPlugins<X extends object>(
+  b: ContextBinding<X>,
+  installs: Record<string, PluginInstall>,
+): { plugins: Record<string, BundlePlugin>; bind: (txn: ReadTxn) => X } {
+  const all: Plugin[] = [];
+  const bind = (txn: ReadTxn): X => {
+    for (const plugin of all) plugin.bind(txn);
+    return b.bind(txn);
+  };
+
+  // create each plugin, attach its API, and give a plugin with commands its entry
+  const plugins: Record<string, BundlePlugin> = {};
+  for (const [name, install] of Object.entries(installs)) {
+    if (RESERVED_PLUGIN_NAMES.includes(name)) throw new Error(`a plugin may not be named ${name}`);
+    if (!PLUGIN_NAME_RE.test(name)) {
+      throw new Error(`plugin name ${JSON.stringify(name)} is not a JS identifier without $`);
+    }
+    const plugin = install.create(name, b.ctx);
+    all.push(plugin);
+    (b.ctx as Record<string, unknown>)[name] = plugin.api;
+    const run = (txn: ReadTxn, cmd: unknown): ForecastOutput[] => {
+      bind(txn);
+      return plugin.run!(cmd);
+    };
+    plugins[name] = plugin.run === undefined ? { kind: plugin.kind } : { kind: plugin.kind, run };
+  }
+  return { plugins, bind };
+}
 
 // source maps ////////////////////////////////////////////////////////////////
 
@@ -2884,11 +3011,11 @@ const STATUS_KEYS = {
 
 /** the status accessor of a query context, over the query's read transaction so its reads are
     recorded like any other */
-export function engineStatus(txn: ReadTxn): EngineStatus {
+export function engineStatus(cell: TxnCell<ReadTxn>): EngineStatus {
   return {
-    connection: () => txn.get(STATUS_KEYS.connection, '.json') as ConnectionStatus,
-    progress: () => txn.get(STATUS_KEYS.progress, '.json') as ProgressStatus,
-    outbox: () => txn.get(STATUS_KEYS.outbox, '.json') as OutboxStatus,
+    connection: () => cell.txn.get(STATUS_KEYS.connection, '.json') as ConnectionStatus,
+    progress: () => cell.txn.get(STATUS_KEYS.progress, '.json') as ProgressStatus,
+    outbox: () => cell.txn.get(STATUS_KEYS.outbox, '.json') as OutboxStatus,
   };
 }
 

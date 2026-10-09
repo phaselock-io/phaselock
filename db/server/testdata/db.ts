@@ -3,8 +3,11 @@
 import {
   type AccountSliceReducers,
   type BookSliceReducers,
+  type DbMarker,
+  type DbTypes,
   defineTestDB,
   type PatronSliceReducers,
+  type PluginInstall,
   type Principal,
   type ReadTxn,
   Reject,
@@ -13,11 +16,16 @@ import {
   type TestDBTxn,
 } from './model.gen.ts';
 
+// the database's randomness, which the host installs
+declare const crypto: { randomUUID(): string };
+
 /* The users the tests sign in as without creating an account first.  root is an admin, and r1 is
    audited: its every maySee run changes its view, so a test sees each run as a view frame. */
-const TEST_USERS = ['root', 'p1', 'r1'];
+const TEST_USERS = ['root', 'p1', 'r1', 'requester'];
 const ROOT = 'root';
 const AUDITED = 'r1';
+// a user whose maySee makes a plugin request, which no maySee may
+const REQUESTER = 'requester';
 
 // whether the principal is root or an account flagged admin
 const isAdmin = (txn: TestDBTxn, p: Principal): boolean =>
@@ -112,6 +120,38 @@ const account: AccountSliceReducers = {
     }),
 };
 
+// plugins //
+
+/* A plugin's install as its package would ship one, written out by hand.  Its one request emits a
+   hold failure to the patron's stream, standing in for the streams of its own a plugin emits to,
+   which would carry its install name. */
+type NoticePlugin = PluginInstall<{ post(patron: string, reason: string): void }>;
+
+function installNotice<DB extends DbTypes>(): NoticePlugin & DbMarker<DB> {
+  return {
+    kind: 'notice',
+    create(name) {
+      let raw: ReadTxn | undefined;
+      return {
+        kind: 'notice',
+        name,
+        api: {
+          post(patron, reason) {
+            const event = { type: 'hold-failed', book: '', reason };
+            raw!.emit!([{ stream: `patron:${patron}`, event }]);
+          },
+        },
+        bind(txn) {
+          raw = txn;
+        },
+      };
+    },
+    db: (db) => db,
+  };
+}
+
+type TestPlugins = { notice: NoticePlugin };
+
 // precommit //
 
 function requirePatron(txn: TestDBTxn, id: string): void {
@@ -122,7 +162,7 @@ function requireAccount(txn: TestDBTxn, user: string): void {
   if (txn.get.account(user) === undefined) throw new Reject('no such account');
 }
 
-const precommit: TestDBPrecommit = {
+const precommit: TestDBPrecommit<TestPlugins> = {
   addBook: (auth, txn, cmd) => {
     auth.authorize(isAdmin(txn, auth));
     if (txn.get.book(cmd.id) !== undefined) throw new Reject('book exists');
@@ -211,15 +251,30 @@ const precommit: TestDBPrecommit = {
     requireAccount(txn, cmd.user);
     return { stream: `account:${cmd.user}`, event: { type: 'sessions-revoked' } };
   },
+  notify: (auth, txn, cmd) => {
+    auth.authorize(isAdmin(txn, auth));
+    requirePatron(txn, cmd.patron);
+    // a request per reason, "uuid" standing for a fresh random one
+    for (const reason of cmd.reasons) {
+      txn.notice.post(cmd.patron, reason === 'uuid' ? crypto.randomUUID() : reason);
+    }
+    if (cmd.reject === true) throw new Reject('rejected after its requests');
+    const own = { type: 'hold-failed', book: '', reason: 'own' } as const;
+    return { stream: `patron:${cmd.patron}`, event: own };
+  },
 };
 
 // the bundle //
 
-const bundle = defineTestDB({
+const bundle = defineTestDB<TestPlugins>({
   reducers: { book, patron, shelf, account },
   precommit,
   maySee: (txn, principal) => {
     if (principal.user === null) return ['book!'];
+    if (principal.user === REQUESTER) {
+      // maySee's txn offers no plugins, so only a cast reaches the one precommit sees
+      (txn as TestDBTxn<TestPlugins>).notice.post('p1', 'from maySee');
+    }
     if (isAdmin(txn, principal)) return ['*'];
     const out = ['book!', `patron:${principal.user}!`];
     const a = txn.get.account(principal.user);
@@ -245,6 +300,7 @@ const bundle = defineTestDB({
     const hash = ctx.hashPassword(ctx.env('BOOTSTRAP_PASSWORD'));
     ctx.emit(`account:${user}`, { type: 'account-created', user, hash, admin: true });
   },
+  plugins: { notice: installNotice() },
 });
 
 // maySee, holding its transaction while it runs

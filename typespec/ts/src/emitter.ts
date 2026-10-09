@@ -631,10 +631,10 @@ function printGetTypes(d: Denter, list: Accessor[]): void {
   for (const a of list) d.print(`${prop(a.name)}: (${args(a)}) => ${a.anno} | undefined;\n`);
 }
 
-/** the members of a context's get accessors, reading through $txn */
+/** the members of a context's get accessors, reading through the transaction $cell holds */
 function printGets(d: Denter, list: Accessor[]): void {
   for (const a of list) {
-    const read = `$txn.get(\`${a.key}\`, ${JSON.stringify(a.type)})`;
+    const read = `$cell.txn.get(\`${a.key}\`, ${JSON.stringify(a.type)})`;
     d.print(`${prop(a.name)}: (${args(a)}) => ${read} as ${a.anno} | undefined,\n`);
   }
 }
@@ -673,12 +673,12 @@ function printScanTypes(d: Denter, list: Scanner[]): void {
   for (const s of list) d.print(`${prop(s.name)}: ScanAccessor<${scanTypeArgs(s)}>;\n`);
 }
 
-/** the members of a context's scan accessors, walking through $txn with the skeleton's global or
-    local scan */
+/** the members of a context's scan accessors, walking through the transaction $cell holds with
+    the skeleton's global or local scan */
 function printScans(d: Denter, list: Scanner[], global: boolean): void {
   const make = global ? 'globalScan' : 'localScan';
   for (const s of list) {
-    d.print(`${prop(s.name)}: ${make}<${scanTypeArgs(s)}>($txn, ${s.template}),\n`);
+    d.print(`${prop(s.name)}: ${make}<${scanTypeArgs(s)}>($cell, ${s.template}),\n`);
   }
 }
 
@@ -734,13 +734,16 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   d.dedent();
   d.print('};\n');
 
-  // the reducer context over a stream's transaction
-  d.print(`\nfunction ${lowerFirst(base)}Txn($txn: ReducerTxn, params: ${txnType}['params']): `);
-  d.print(`${txnType} {\n`);
+  // the reducer context, one object bound to each stream's transaction and parameters in turn
+  d.print(`\nfunction create${txnType}(): {\n`);
+  d.print(`  readonly ctx: ${txnType};\n`);
+  d.print(`  bind(txn: ReducerTxn, params: ${txnType}['params']): ${txnType};\n`);
+  d.print('} {\n');
   d.indent('  ');
-  d.print('return {\n');
+  d.print('const $cell = unboundCell<ReducerTxn>();\n');
+  d.print(`const ctx: ${txnType} = {\n`);
   d.indent('  ');
-  d.print('params,\nget: {\n');
+  d.print(`params: {} as ${txnType}['params'],\nget: {\n`);
   d.indent('  ');
   printGets(d, local);
   d.dedent();
@@ -752,13 +755,15 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   d.indent('  ');
   for (const a of local) {
     const v = own(a, 'value');
-    const write = `$txn.set(\`${a.key}\`, ${JSON.stringify(a.type)}, ${v})`;
+    const write = `$cell.txn.set(\`${a.key}\`, ${JSON.stringify(a.type)}, ${v})`;
     d.print(`${prop(a.name)}: (${args(a, ['value', a.anno])}) => ${write},\n`);
   }
   d.dedent();
   d.print('},\ndel: {\n');
   d.indent('  ');
-  for (const a of local) d.print(`${prop(a.name)}: (${args(a)}) => $txn.del(\`${a.key}\`),\n`);
+  for (const a of local) {
+    d.print(`${prop(a.name)}: (${args(a)}) => $cell.txn.del(\`${a.key}\`),\n`);
+  }
   d.dedent();
   d.print('},\n');
   if (updatable.length === 0) {
@@ -768,13 +773,21 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
     d.indent('  ');
     for (const a of updatable) {
       const fn = own(a, 'fn');
-      const call = `updateKey($txn, \`${a.key}\`, ${JSON.stringify(a.type)}, ${fn})`;
+      const call = `updateKey($cell.txn, \`${a.key}\`, ${JSON.stringify(a.type)}, ${fn})`;
       d.print(`${prop(a.name)}: <R>(${args(a, ['fn', `(value: ${a.anno}) => R`])}) => ${call},\n`);
     }
     d.dedent();
     d.print('},\n');
   }
   d.dedent();
+  d.print('};\n');
+  d.print('return {\n');
+  d.print('  ctx,\n');
+  d.print('  bind(txn, params) {\n');
+  d.print('    $cell.txn = txn;\n');
+  d.print('    ctx.params = params;\n');
+  d.print('    return ctx;\n');
+  d.print('  },\n');
   d.print('};\n');
   d.dedent();
   d.print('}\n');
@@ -819,6 +832,7 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   d.print(`\n/** the SliceReducer that folds ${base}'s events through its handlers */\n`);
   d.print(`export function ${lowerFirst(base)}Reducer(handlers: ${tableType}): SliceReducer {\n`);
   d.indent('  ');
+  d.print(`const context = create${txnType}();\n`);
   d.print('return {\n');
   d.indent('  ');
   d.print(
@@ -826,7 +840,7 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   );
   d.indent('  ');
   if (n > 1) d.print(`const parts = stream.slice(${skip}).split(",");\n`);
-  d.print(`const txn = ${lowerFirst(base)}Txn($txn, ${parsed});\n`);
+  d.print(`const txn = context.bind($txn, ${parsed});\n`);
   d.print(`for (const event of events) ${reduce}(handlers, txn, pending, event);\n`);
   d.dedent();
   d.print('},\n');
@@ -838,7 +852,7 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   d.print('}\n');
 
   // the slice's global accessors, for every context that reads it
-  d.print(`\nfunction ${lowerFirst(base)}Get($txn: ReadTxn) {\n`);
+  d.print(`\nfunction ${lowerFirst(base)}Get($cell: TxnCell<ReadTxn>) {\n`);
   d.indent('  ');
   d.print('return {\n');
   d.indent('  ');
@@ -847,7 +861,7 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   d.print('};\n');
   d.dedent();
   d.print('}\n');
-  d.print(`\nfunction ${lowerFirst(base)}Scan($txn: ReadTxn) {\n`);
+  d.print(`\nfunction ${lowerFirst(base)}Scan($cell: TxnCell<ReadTxn>) {\n`);
   d.indent('  ');
   d.print('return {\n');
   d.indent('  ');
@@ -858,18 +872,19 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   d.print('}\n');
 }
 
-/** a global context's type and its factory over a read transaction, with the Engine's status
-    when the context is a query's */
+/** A global context's type and the factory of its bindings, with the Engine's status when the
+    context is a query's.  A database's context takes the database's plugin set, whose request APIs
+    are its fields by plugin name. */
 function generateGlobalContext(
   d: Denter,
   annos: Annos,
   type: string,
   doc: string,
   slices: readonly PSlice[],
-  status = false,
+  extra: 'status' | 'plugins' | null = null,
 ): void {
   d.print(`\n/** ${doc} */\n`);
-  d.print(`export type ${type} = {\n`);
+  d.print(`export type ${type}${extra === 'plugins' ? '<P = {}>' : ''} = {\n`);
   d.indent('  ');
   d.print('get: {\n');
   d.indent('  ');
@@ -880,16 +895,24 @@ function generateGlobalContext(
   for (const slice of slices) printScanTypes(d, scanners(annos, slice, true));
   d.dedent();
   d.print('};\n');
-  if (status) d.print('status: EngineStatus;\n');
+  if (extra === 'status') d.print('status: EngineStatus;\n');
   d.dedent();
-  d.print('};\n');
+  d.print(extra === 'plugins' ? '} & PluginApis<P>;\n' : '};\n');
 
-  const gets = slices.map((s) => `...${lowerFirst(s.name)}Get($txn)`).join(', ');
-  const scans = slices.map((s) => `...${lowerFirst(s.name)}Scan($txn)`).join(', ');
+  const gets = slices.map((s) => `...${lowerFirst(s.name)}Get($cell)`).join(', ');
+  const scans = slices.map((s) => `...${lowerFirst(s.name)}Scan($cell)`).join(', ');
   const members = [`get: { ${gets} }`, `scan: { ${scans} }`];
-  if (status) members.push('status: engineStatus($txn)');
-  d.print(`\nexport function ${lowerFirst(type)}($txn: ReadTxn): ${type} {\n`);
-  d.print(`  return { ${members.join(', ')} };\n`);
+  if (extra === 'status') members.push('status: engineStatus($cell)');
+  d.print(`\nexport function create${type}(): ContextBinding<${type}> {\n`);
+  d.print('  const $cell = unboundCell<ReadTxn>();\n');
+  d.print(`  const ctx: ${type} = { ${members.join(', ')} };\n`);
+  d.print('  return {\n');
+  d.print('    ctx,\n');
+  d.print('    bind(txn) {\n');
+  d.print('      $cell.txn = txn;\n');
+  d.print('      return ctx;\n');
+  d.print('    },\n');
+  d.print('  };\n');
   d.print('}\n');
 }
 
@@ -923,7 +946,7 @@ function generateEngine(d: Denter, annos: Annos, registry: PTypeRegistry, e: PEn
   const queryDoc =
     `${e.name}'s query context: what its queries read, over its slices, ` +
     "and the Engine's status";
-  generateGlobalContext(d, annos, queryTxnType, queryDoc, e.slices, true);
+  generateGlobalContext(d, annos, queryTxnType, queryDoc, e.slices, 'status');
 
   // the forecaster table: one optional forecaster per command that is not @online
   d.print(
@@ -993,7 +1016,9 @@ export class ${e.name} extends Engine<${queryTxnType}, ${txnType}, ${C}, ${N}> {
     },
   ) {
     const forecasters = callbacks.forecasters;
-    super(${lowerFirst(queryTxnType)}, ${lowerFirst(txnType)}, store, reg, connect, {
+    const queries = create${queryTxnType}();
+    const forecasts = create${txnType}();
+    super((txn) => queries.bind(txn), (txn) => forecasts.bind(txn), store, reg, connect, {
       reducers: ${reducersValue(e.slices, 'callbacks.reducers')},
       wants: ${JSON.stringify(wants)},
       forecaster: forecasters === undefined ? undefined : ${lowerFirst(e.name)}Forecaster(forecasters),
@@ -1019,17 +1044,36 @@ function generateDatabase(
   const tableType = `${db.name}Precommit`;
   const ctxType = `${db.name}BootstrapContext`;
   const slotsType = `${db.name}Slots`;
+  const outputType = `${db.name}Output`;
+  const typesType = `${db.name}Types`;
 
-  // the read context of precommit, maySee, and lookup
-  const doc = `${db.name}'s read context: what precommit, maySee, and lookup read, over every slice`;
-  generateGlobalContext(d, annos, txnType, doc, db.slices);
+  // the read context of precommit, maySee, lookup, and plugin hooks, with the plugins of P
+  const doc =
+    `${db.name}'s read context: what precommit, maySee, lookup, and plugin hooks read, over ` +
+    'every slice, and the request APIs of the plugin set P';
+  generateGlobalContext(d, annos, txnType, doc, db.slices, 'plugins');
+
+  // what a plugin hook may return: any event of a slice labelled with one of its streams, or a death
+  const outputs = db.slices.map(
+    (s) => `{ stream: ${streamLabel([s])}; event: ${annos.get(s.events)!} }`,
+  );
+  d.print(
+    `\n/** any output of ${db.name}: an event of a slice on one of its streams, or a death */\n`,
+  );
+  d.print(`export type ${outputType} =\n`);
+  for (const o of [...outputs, '{ stream: string; death: true }']) d.print(`  | ${o}\n`);
+  d.print(';\n');
+
+  // the types a plugin's handlers are typed by
+  d.print(`\n/** ${db.name}'s types, as an installed plugin's handlers take them */\n`);
+  d.print(`export type ${typesType}<P = {}> = { txn: ${txnType}<P>; output: ${outputType} };\n`);
 
   // the precommit table: one handler per command, each seeing the command after intake
-  d.print(`\n/** ${db.name}'s precommit handlers, one per command */\n`);
-  d.print(`export type ${tableType} = {\n`);
+  d.print(`\n/** ${db.name}'s precommit handlers, one per command, with the plugin set P */\n`);
+  d.print(`export type ${tableType}<P = {}> = {\n`);
   d.indent('  ');
   for (const c of db.commands) {
-    d.print(`${prop(lowerFirst(c.name))}: (auth: Auth, txn: ${txnType}, `);
+    d.print(`${prop(lowerFirst(c.name))}: (auth: Auth, txn: ${txnType}<P>, `);
     d.print(`cmd: ${precommitView(annos, c)}) => ${c.name}Output;\n`);
   }
   d.dedent();
@@ -1038,8 +1082,8 @@ function generateDatabase(
   // each command to its handler, run with a fresh Auth
   const precommit = `precommit${db.name}`;
   const signature =
-    `${precommit}(table: ${tableType}, principal: Principal, txn: ${txnType}, val: any): ` +
-    'string | ForecastOutput[]';
+    `${precommit}(table: ${tableType}<any>, principal: Principal, txn: ${txnType}<any>, ` +
+    'val: any): string | ForecastOutput[]';
   if (commandUnion !== undefined) {
     const commandOf = new Map(db.commands.map((c) => [c.type, c]));
     generateDispatch(d, registry, signature, commandUnion, (t) => {
@@ -1066,30 +1110,36 @@ function generateDatabase(
   // the bundle's slots, as the app writes them
   d.print(`
 /** what ${db.name}'s bundle is made of: every slice's reducer handlers, precommit, maySee, lookup,
-    and an optional bootstrap */
-export type ${slotsType} = {
+    an optional bootstrap, and the installed plugins of the set P, every one of them under its
+    name */
+export type ${slotsType}<P = {}> = {
   reducers: ${reducersAnno(db.slices)};
-  precommit: ${tableType};
+  precommit: ${tableType}<P>;
   maySee: (txn: ${txnType}, principal: Principal) => string[];
   lookup: (txn: ${txnType}, ident: LookupIdent) => LookupResult | null;
   bootstrap?: (ctx: ${ctxType}) => void;
-};
+} & ({} extends P
+  ? { plugins?: PluginSlots<P, ${typesType}<P>> }
+  : { plugins: PluginSlots<P, ${typesType}<P>> });
 `);
 
   // the bundle, over the generated wrappers
   d.print(`
 /** Install ${db.name}'s bundle as globalThis.__bundle, the app's slots behind the generated
-    wrappers, and answer it. */
-export function define${db.name}(slots: ${slotsType}): Bundle {
+    wrappers, and answer it.  P is the plugin set, which the slots' precommit and plugins share. */
+export function define${db.name}<P = {}>(slots: ${slotsType}<P>): Bundle {
   const bootstrap = slots.bootstrap;
+  const installs = (slots.plugins ?? {}) as Record<string, PluginInstall>;
+  const { plugins, bind } = installPlugins(create${txnType}(), installs);
   const bundle: Bundle = {
     schema: ${lowerFirst(db.name)}Schema,
     precommit: (txn, data, principal) =>
-      ${precommit}(slots.precommit, principal, ${lowerFirst(db.name)}Txn(txn), data),
+      ${precommit}(slots.precommit, principal, bind(txn), data),
     reducers: ${reducersValue(db.slices, 'slots.reducers')},
-    maySee: (txn, principal) => slots.maySee(${lowerFirst(db.name)}Txn(txn), principal),
-    lookup: (txn, ident) => slots.lookup(${lowerFirst(db.name)}Txn(txn), ident),
+    maySee: (txn, principal) => slots.maySee(bind(txn), principal),
+    lookup: (txn, ident) => slots.lookup(bind(txn), ident),
     bootstrap: bootstrap === undefined ? undefined : (ctx) => bootstrap(ctx as ${ctxType}),
+    plugins,
     dev: DEV,
     mapStack,
   };

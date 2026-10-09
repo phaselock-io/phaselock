@@ -446,6 +446,133 @@ const SNIPPETS: Record<string, string> = {
     // @ts-expect-error no slice folds such an event
     ctx.emit('catalog', { type: 'bogus' });
   `,
+  plugins: `
+    import {
+      type AppDBPrecommit,
+      type AppDBSlots,
+      type DbMarker,
+      type DbTypes,
+      type PluginInstall,
+      defineAppDB,
+    } from './model.gen.ts';
+
+    // a plugin with requests, as its package ships it: the request API, and an install whose
+    // handlers take the database's types from the slot the install lands in
+    type EmailPlugin = PluginInstall<{ send(requestId: string, to: string): void }>;
+    declare const Email: {
+      install<DB extends DbTypes>(handlers: {
+        sent(txn: DB['txn'], requestId: string): DB['output'][];
+      }): EmailPlugin & DbMarker<DB>;
+    };
+
+    // a plugin without requests, as cron is
+    type Tick = { name: string; slot: Date; now: Date };
+    type CronPlugin = PluginInstall<{}>;
+    declare const Cron: {
+      install<DB extends DbTypes>(
+        entries: Record<string, { spec: string; hook(txn: DB['txn'], tick: Tick): DB['output'][] }>,
+      ): CronPlugin & DbMarker<DB>;
+    };
+
+    // the app's plugin set, named once for precommit and the database
+    type MyPlugins = { email: EmailPlugin; cron: CronPlugin };
+    declare const reducers: AppDBSlots['reducers'];
+    declare const precommit: AppDBPrecommit<MyPlugins>;
+
+    // precommit requests through the txn
+    export const sweep: AppDBPrecommit<MyPlugins>['sweep'] = (auth, txn, cmd) => {
+      auth.authorizeAnyone();
+      txn.email.send(cmd.id, 'a@b');
+      const _cron: {} = txn.cron;
+      // @ts-expect-error not a request of the email plugin
+      txn.email.charge(cmd.id);
+      return { stream: 'catalog', event: { type: 'item-removed', id: cmd.id } };
+    };
+
+    // installs infer the database's types, so their handlers read the txn and request through it
+    defineAppDB<MyPlugins>({
+      reducers,
+      precommit,
+      maySee: (txn) => {
+        // @ts-expect-error maySee's txn requests nothing
+        txn.email.send('r1', 'a@b');
+        return [];
+      },
+      lookup: () => null,
+      plugins: {
+        email: Email.install({
+          sent: (txn, requestId) => {
+            txn.email.send(\`\${requestId}-again\`, 'a@b');
+            return [];
+          },
+        }),
+        cron: Cron.install({
+          digest: {
+            spec: '0 8 * * *',
+            hook: (txn, tick) => [
+              { stream: 'catalog', event: { type: 'item-removed', id: txn.get.item('i1')?.id ?? String(tick.slot.getTime()) } },
+            ],
+          },
+          bogus: {
+            spec: '0 9 * * *',
+            // @ts-expect-error no slice folds such an event
+            hook: () => [{ stream: 'catalog', event: { type: 'bogus' } }],
+          },
+        }),
+      },
+    });
+
+    // every plugin of the set is installed
+    defineAppDB<MyPlugins>({
+      reducers,
+      precommit,
+      maySee: () => [],
+      lookup: () => null,
+      // @ts-expect-error the set names cron, which is not installed
+      plugins: { email: Email.install({ sent: () => [] }) },
+    });
+
+    // a set that names plugins needs its plugins slot
+    // @ts-expect-error no plugins slot
+    defineAppDB<MyPlugins>({ reducers, precommit, maySee: () => [], lookup: () => null });
+
+    // and nothing outside the set is installed
+    type MailOnly = { email: EmailPlugin };
+    declare const mailOnly: AppDBPrecommit<MailOnly>;
+    defineAppDB<MailOnly>({
+      reducers,
+      precommit: mailOnly,
+      maySee: () => [],
+      lookup: () => null,
+      plugins: {
+        email: Email.install({ sent: () => [] }),
+        // @ts-expect-error cron is not in the set
+        cron: Cron.install({}),
+      },
+    });
+
+    // a precommit written for another set than the database installs
+    defineAppDB<MailOnly>({
+      reducers,
+      // @ts-expect-error its handlers expect cron on the txn
+      precommit,
+      maySee: () => [],
+      lookup: () => null,
+      plugins: { email: Email.install({ sent: () => [] }) },
+    });
+
+    // no plugin is named after a context field
+    type Shadowing = { get: EmailPlugin };
+    declare const shadowing: AppDBPrecommit<Shadowing>;
+    defineAppDB<Shadowing>({
+      reducers,
+      precommit: shadowing,
+      maySee: () => [],
+      lookup: () => null,
+      // @ts-expect-error get is a context field
+      plugins: { get: Email.install({ sent: () => [] }) },
+    });
+  `,
 };
 
 let M: any;
@@ -500,6 +627,21 @@ function catalogRecorder(seen: unknown[][]) {
 }
 
 describe('reducer contexts', () => {
+  it('folds every stream through one context, bound to its transaction and parameters in turn', () => {
+    const seen: unknown[] = [];
+    const reducer = M.inboxSliceReducer({
+      profileSet: (t: any) => seen.push(t, { ...t.params }, t.get.profile()),
+      noted: () => {},
+    });
+    const one = fakeTxn(new Map([['profile', 'one']]));
+    const two = fakeTxn(new Map([['profile', 'two']]));
+    reducer.reducer(one.txn, [{ type: 'profile-set', name: 'Ann' }], 'inbox:acme,u1', false);
+    reducer.reducer(two.txn, [{ type: 'profile-set', name: 'Bob' }], 'inbox:acme,u2', false);
+    expect(seen[3]).toBe(seen[0]);
+    expect(seen.slice(1, 3)).toEqual([{ org: 'acme', user: 'u1' }, 'one']);
+    expect(seen.slice(4)).toEqual([{ org: 'acme', user: 'u2' }, 'two']);
+  });
+
   it('generates one reducer context per slice, over its local key templates', () => {
     const { txn, calls } = fakeTxn();
     const reducer = M.catalogSliceReducer({
@@ -614,22 +756,39 @@ describe('reducer contexts', () => {
 });
 
 describe('global contexts', () => {
+  it('keeps one context per binding, reading through the transaction it was last bound to', () => {
+    const one = fakeTxn(new Map([['catalog!count', 1]]));
+    const two = fakeTxn(new Map([['catalog!count', 2]]));
+    const binding = M.createAppDBTxn();
+    const ctx = binding.bind(one.txn);
+    expect(ctx.get.count()).toBe(1);
+    expect(binding.bind(two.txn)).toBe(ctx);
+    expect(binding.ctx).toBe(ctx);
+    expect(ctx.get.count()).toBe(2);
+  });
+
+  it('throws when a context is used before it is bound', () => {
+    expect(() => M.createAppDBTxn().ctx.get.count()).toThrow(
+      'a context was used before it was bound to a transaction',
+    );
+  });
+
   it('generates a read-only global context per engine, over its slices', () => {
     const { txn } = fakeTxn();
-    expect(Object.keys(M.readerEngineTxn(txn).get).sort()).toEqual(['count', 'item']);
-    expect(Object.keys(M.writerEngineTxn(txn).get).sort()).toEqual([
+    expect(Object.keys(M.createReaderEngineTxn().bind(txn).get).sort()).toEqual(['count', 'item']);
+    expect(Object.keys(M.createWriterEngineTxn().bind(txn).get).sort()).toEqual([
       'count',
       'item',
       'note',
       'profile',
     ]);
-    expect(Object.keys(M.writerEngineTxn(txn)).sort()).toEqual(['get', 'scan']);
+    expect(Object.keys(M.createWriterEngineTxn().bind(txn)).sort()).toEqual(['get', 'scan']);
     compiles('contexts');
   });
 
   it('generates a read-only global context per database, over all of its slices', () => {
     const { txn } = fakeTxn();
-    expect(Object.keys(M.appDBTxn(txn).get).sort()).toEqual([
+    expect(Object.keys(M.createAppDBTxn().bind(txn).get).sort()).toEqual([
       'count',
       'item',
       'note',
@@ -640,7 +799,7 @@ describe('global contexts', () => {
 
   it("gives global accessors the family's parameters, then the local key's", () => {
     const { txn, calls } = fakeTxn();
-    const ctx = M.appDBTxn(txn);
+    const ctx = M.createAppDBTxn().bind(txn);
     ctx.get.item('i1');
     ctx.get.count();
     ctx.get.profile('acme', 'u1');
@@ -657,7 +816,7 @@ describe('global contexts', () => {
 
   it('checks each parameter against its place in its template', () => {
     const { txn, calls } = fakeTxn();
-    const ctx = M.appDBTxn(txn);
+    const ctx = M.createAppDBTxn().bind(txn);
 
     // a terminal family parameter may hold . and ~, and a terminal key parameter anything
     ctx.get.note('acme', 'u.1~x', 'a!b,c:d');
@@ -690,7 +849,7 @@ describe('global contexts', () => {
       ['acme-2', 'gen', '2026-10'],
     ];
     const { txn, calls } = fakeTxn();
-    const ctx = M.appDBTxn(txn);
+    const ctx = M.createAppDBTxn().bind(txn);
     for (const [org, user, note] of tuples) ctx.get.note(org, user, note);
     const keys = calls.map(([, key]) => key as string);
     expect(keys[0]).toBe('inbox:acme,gen!note:2026-10');
@@ -758,15 +917,24 @@ describe('scan accessors', () => {
 
   it('generates a scan accessor for each template with a parameter that varies in its context', () => {
     const { txn } = fakeTxn();
-    expect(Object.keys(M.writerEngineTxn(txn).scan).sort()).toEqual(['item', 'note', 'profile']);
-    expect(Object.keys(M.appDBTxn(txn).scan).sort()).toEqual(['item', 'note', 'profile', 'secret']);
+    expect(Object.keys(M.createWriterEngineTxn().bind(txn).scan).sort()).toEqual([
+      'item',
+      'note',
+      'profile',
+    ]);
+    expect(Object.keys(M.createAppDBTxn().bind(txn).scan).sort()).toEqual([
+      'item',
+      'note',
+      'profile',
+      'secret',
+    ]);
     compiles('contexts');
   });
 
   it('walks a match by parameter name, yielding every parameter by name with the value', () => {
     const store = notes(...keys);
     const got = store.read((r) => {
-      const ctx = M.appDBTxn(readOf(r));
+      const ctx = M.createAppDBTxn().bind(readOf(r));
       return {
         org: [...ctx.scan.note({ org: 'acme', note: { gte: '2026-10' } })],
         reversed: [...ctx.scan.note({ user: { prefix: 'gen' } }, { reverse: true })],
@@ -806,7 +974,7 @@ describe('scan accessors', () => {
   it('checks an exact value as get checks the parameter, and every value for lone surrogates', () => {
     const store = notes(...keys);
     store.read((r) => {
-      const ctx = M.appDBTxn(readOf(r));
+      const ctx = M.createAppDBTxn().bind(readOf(r));
       expect(() => [...ctx.scan.note({ org: 'ac,me' })]).toThrow(
         'note: org "ac,me" is not a non-empty run of A-Z a-z 0-9 _ -',
       );
@@ -885,7 +1053,7 @@ const anyone = { user: null };
 
 describe('precommit', () => {
   it('generates a precommit interface with one handler per @command model', () => {
-    expect(text).toContain('export type AppDBPrecommit = {');
+    expect(text).toContain('export type AppDBPrecommit<P = {}> = {');
     compiles('precommit');
   });
 
@@ -1028,6 +1196,152 @@ describe('sending commands', () => {
   });
 
   it.todo("gives the database's own commands a direct-send helper, for use before sign-in");
+});
+
+describe('plugins', () => {
+  /** An install whose plugin's one request records its argument, recording each create, with the
+      context it was given, and each bind.  With commands, its plugin runs a command by recording
+      it and answering one output. */
+  function recorder(kind = 'recorder', commands = false) {
+    const created: string[] = [];
+    const contexts: unknown[] = [];
+    const sent: string[] = [];
+    const bound: unknown[] = [];
+    const ran: string[] = [];
+    const install = {
+      kind,
+      create: (name: string, ctx: unknown) => {
+        created.push(name);
+        contexts.push(ctx);
+        const run = (cmd: any) => {
+          ran.push(`${name} ${cmd.id}`);
+          return [{ stream: 'catalog', event: { type: 'item-removed', id: cmd.id } }];
+        };
+        return {
+          kind,
+          name,
+          api: { send: (id: string) => sent.push(`${name} ${id}`) },
+          bind: (txn: unknown) => bound.push(txn),
+          ...(commands ? { run } : {}),
+        };
+      },
+      db: (db: unknown) => db,
+    };
+    return { install, created, contexts, sent, bound, ran };
+  }
+
+  /** the slots bundle() passes, with plugins */
+  function slotsWith(plugins: Record<string, unknown>, precommit: Record<string, unknown> = {}) {
+    return {
+      reducers: {
+        catalog: catalogRecorder([]),
+        inbox: { profileSet: () => {}, noted: () => {} },
+        secret: { secretSet: () => {} },
+      },
+      precommit: { ...passthrough(), ...precommit },
+      maySee: () => [],
+      lookup: () => null,
+      plugins,
+    };
+  }
+
+  it('types the plugin set shared by precommit and the database, and each install against it', () => {
+    compiles('plugins');
+  });
+
+  it('creates every plugin under its name when the database is defined', () => {
+    const { install, created } = recorder();
+    const b = M.defineAppDB(slotsWith({ supportMail: install, alertsMail: install }));
+    expect(created).toEqual(['supportMail', 'alertsMail']);
+    expect(Object.keys(b.plugins)).toEqual(['supportMail', 'alertsMail']);
+    expect(b.plugins.alertsMail).toEqual({ kind: 'recorder' });
+  });
+
+  it("creates every plugin over the database's context, the txn precommit gets", () => {
+    const { install, contexts } = recorder();
+    let seen: unknown;
+    const b = M.defineAppDB(
+      slotsWith(
+        { supportMail: install, alertsMail: install },
+        {
+          sweep: (auth: any, txn: any) => {
+            auth.authorizeAnyone();
+            seen = txn;
+            return [];
+          },
+        },
+      ),
+    );
+    b.precommit(fakeTxn().txn, { type: 'sweep', id: 'i9' }, anyone);
+    expect(contexts).toHaveLength(2);
+    for (const ctx of contexts) expect(ctx).toBe(seen);
+  });
+
+  it("runs a plugin's own command after binding every plugin to the transaction", () => {
+    const { install: mail, bound: mailBound } = recorder();
+    const { install: cron, ran, bound: cronBound } = recorder('cron', true);
+    const b = M.defineAppDB(slotsWith({ mail, cron }));
+    expect(b.plugins.mail.run).toBeUndefined();
+    const { txn } = fakeTxn();
+    expect(b.plugins.cron.run!(txn, { id: 'tick1' })).toEqual([
+      { stream: 'catalog', event: { type: 'item-removed', id: 'tick1' } },
+    ]);
+    expect(ran).toEqual(['cron tick1']);
+    expect(mailBound).toEqual([txn]);
+    expect(cronBound).toEqual([txn]);
+  });
+
+  it("attaches each plugin's request API to the txn under its name, binding every plugin on entry", () => {
+    const { install, sent, bound } = recorder();
+    const b = M.defineAppDB(
+      slotsWith(
+        { supportMail: install, alertsMail: install },
+        {
+          sweep: (auth: any, txn: any, cmd: any) => {
+            auth.authorizeAnyone();
+            txn.alertsMail.send(cmd.id);
+            return [];
+          },
+        },
+      ),
+    );
+    const { txn } = fakeTxn();
+    expect(b.precommit(txn, { type: 'sweep', id: 'i9' }, anyone)).toEqual([]);
+    expect(sent).toEqual(['alertsMail i9']);
+    expect(bound).toEqual([txn, txn]);
+  });
+
+  it('binds every plugin to the transaction of maySee and lookup too', () => {
+    const { install, bound } = recorder();
+    const b = M.defineAppDB(slotsWith({ mail: install }));
+    const one = fakeTxn();
+    const two = fakeTxn();
+    b.maySee(one.txn, anyone);
+    b.lookup(two.txn, { kind: 'token', user: 'u1' });
+    expect(bound).toEqual([one.txn, two.txn]);
+  });
+
+  it('refuses a plugin named after a context field, or __proto__', () => {
+    for (const name of ['get', 'scan', 'status', '__proto__']) {
+      const { install } = recorder();
+      expect(() => M.defineAppDB(slotsWith({ [name]: install }))).toThrow(
+        `a plugin may not be named ${name}`,
+      );
+    }
+  });
+
+  it('refuses a plugin name that is not a JS identifier without $', () => {
+    for (const name of ['my$mail', 'my-mail', '1mail', '']) {
+      const { install } = recorder();
+      expect(() => M.defineAppDB(slotsWith({ [name]: install }))).toThrow(
+        `plugin name ${JSON.stringify(name)} is not a JS identifier without $`,
+      );
+    }
+  });
+
+  it('answers no plugins for a database that installs none', () => {
+    expect(bundle().plugins).toEqual({});
+  });
 });
 
 describe('schema and bundle', () => {

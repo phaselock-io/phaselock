@@ -409,7 +409,7 @@ export function rig(
   const store = opts.store ?? seeded(opts.seed ?? {});
   const abort = new AbortController();
   const engine = new Engine<QueryTxn, ReadTxn, unknown, unknown>(
-    (txn) => Object.assign(txn, { status: engineStatus(txn) }),
+    (txn) => Object.assign(txn, { status: engineStatus({ txn }) }),
     (txn) => txn,
     store,
     registry,

@@ -130,6 +130,36 @@ layout, build commands, and the test suite.
   authorization check plus a call to the engine's forecaster for the same command.  TypeScript
   compares classes with private fields nominally, so `{Engine}Txn` and `{Database}Txn` stay object
   types; `tests/src/ts/model.test.ts`'s `contexts` and `precommit` snippets hold the emitter to it.
+- **Generated contexts are singletons.**  Every context is built once and rebound, never built
+  per call: `create{Context}()` answers a `ContextBinding`, `{ ctx, bind(txn) }`, whose accessors
+  read through a `TxnCell` that `bind` points at the raw transaction.  A holder binds whenever its
+  raw txn changes: the Engine subclass holds a binding for its forecasts and one for its queries,
+  each slice reducer one reducer context, bound per stream with the stream's parameters, and
+  `define{Database}` one database context.  Building a context costs about 650 ns per accessor in
+  QuickJS, so a per-call build grows with the model; a scan reads the cell when it is called and
+  keeps that transaction for its walk.
+- **A database takes a plugin set**, a TypeScript type the app names once (`type MyPlugins = {
+  email: EmailPlugin }`), as the parameter `P` of `{Database}Txn<P>`,
+  `{Database}Precommit<P>`, `{Database}Slots<P>`, and `define{Database}<P>`, all defaulting to
+  none.  The txn of precommit and of plugin hooks is the read context plus each plugin's request
+  API under its name; maySee's and lookup's has none.  `{Database}Output` is any output of the
+  database and `{Database}Types<P>` its `{ txn, output }`, which an installed plugin's marker
+  (`DbMarker`) names bare so that `install` infers it from the plugins slot (`PluginSlots`), which
+  holds exactly the set's plugins.  The set lists installs (`PluginInstall`, `{ kind,
+  create(name, ctx) }`), which `define{Database}` turns into plugins (`Plugin`, `{ kind, name,
+  api, bind, run? }`) eagerly, over its context and under names that are JS identifiers without
+  `$` and never `get`, `scan`, `status`, or `__proto__`; it attaches every plugin's API to its
+  context, binds every plugin with it on each entry, and hands the `Bundle` each plugin as a host
+  calls it (`BundlePlugin`, `{ kind, run? }`, whose `run` binds before handing the plugin its
+  command).  The app's emitter knows no plugin: a plugin's types come from its own package.
+- **A plugin calls the app's hooks through its own context**, as the app makes requests through
+  its own.  Each hook is a field of the plugin's context whose wrapper calls the app's hook over
+  the database context the plugin was created with and emits what it returns, so only those
+  wrappers hold the app's context.  A plugin's `run` handles one of its own commands and calls any
+  of its hooks, any number of times; hook names share the plugin's context with its own fields,
+  so `get`, `scan`, `emit`, and the like are reserved there.  A hook that throws is a bug, which
+  drops its command's whole atom.  The plugin emitter that will generate the wrappers is not
+  written; a hand-written plugin writes its own.
 - **Generated names keep the declaration's name whole, for now.**  `PatronSlice` gives
   `PatronSliceTxn`, `PatronSliceReducers`, and `patronSliceReducer`; `UserEngine` gives
   `UserEngineTxn`, `UserEngineForecasters`, and the `UserEngine` class; `LibraryDB` gives

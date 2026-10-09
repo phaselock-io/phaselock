@@ -1,14 +1,50 @@
 // The JS side of the QuickJS host.  Hands the bundle's slots transactions over the natives
 // (__pl_get, __pl_scan, __pl_set, __pl_del), which convert every value through the bundle's
-// registry under the type the call names, and exposes one entry point per slot on
-// globalThis.__host.
+// registry under the type the call names, installs crypto over __pl_random, and exposes one
+// entry point per slot on globalThis.__host.
+
+// the Web Crypto randomness a bundle may use, over the kernel's CSPRNG
+globalThis.crypto = {
+  getRandomValues(array) {
+    const bytes = new Uint8Array(__pl_random(array.byteLength));
+    new Uint8Array(array.buffer, array.byteOffset, array.byteLength).set(bytes);
+    return array;
+  },
+  randomUUID() {
+    // 128 random bits, marked as RFC 9562 version 4, in hex grouped 8-4-4-4-12
+    const b = new Uint8Array(__pl_random(16));
+    b[6] = 0x40 | (b[6] & 0x0f);
+    b[8] = 0x80 | (b[8] & 0x3f);
+    const hex = Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+    const group = (from, to) => hex.slice(from, to);
+    return [group(0, 8), group(8, 12), group(12, 16), group(16, 20), group(20, 32)].join('-');
+  },
+};
 
 globalThis.__host = (function () {
-  // the read transaction over global keys that precommit, maySee, and lookup read through
+  // the outputs plugin requests emit during one call into the bundle, in call order
+  let emitted = [];
+
+  // the read transaction over global keys that precommit, maySee, and lookup read through, which
+  // also takes what a plugin request emits
   const rx = {
     get: (key, type) => __pl_get(key, type),
     scan: (req) => __pl_scan(req),
+    emit(outputs) {
+      for (const output of outputs) emitted.push(output);
+    },
   };
+
+  // run a slot that requests nothing, as maySee and lookup, where a plugin request is a bug
+  function withoutRequests(slot, fn) {
+    try {
+      const out = fn();
+      if (emitted.length > 0) throw new Error(`${slot} made a plugin request`);
+      return out;
+    } finally {
+      emitted = [];
+    }
+  }
 
   // a reducer's transaction: its stream's local keys, prefixed here
   function reducerTxn(stream) {
@@ -34,10 +70,19 @@ globalThis.__host = (function () {
 
   return {
     precommit(data, principal) {
-      const out = bundle().precommit(rx, data, principal);
+      // the handler's outputs, after what its plugin requests emitted while it ran; a rejection or
+      // a throw drops them all
+      let out;
+      let requests;
+      try {
+        out = bundle().precommit(rx, data, principal);
+        requests = emitted;
+      } finally {
+        emitted = [];
+      }
       if (typeof out === 'string') return out;
       if (!Array.isArray(out)) throw new Error('precommit must return a reason or a list');
-      return out.map((item) => ({
+      return [...requests, ...out].map((item) => ({
         stream: item.stream,
         death: item.death === true,
         event: item.death === true ? null : item.event,
@@ -60,13 +105,14 @@ globalThis.__host = (function () {
       slice.reducer(reducerTxn(stream), events, stream, false);
       return true;
     },
-    maySee: (principal) => bundle().maySee(rx, principal),
+    maySee: (principal) => withoutRequests('maySee', () => bundle().maySee(rx, principal)),
     lookup(ident) {
-      const r = bundle().lookup(rx, ident);
+      const r = withoutRequests('lookup', () => bundle().lookup(rx, ident));
       return r == null ? null : r;
     },
     generation(principal) {
-      const r = bundle().lookup(rx, { kind: 'token', user: principal.user });
+      const ident = { kind: 'token', user: principal.user };
+      const r = withoutRequests('lookup', () => bundle().lookup(rx, ident));
       return r == null ? -1 : (r.generation ?? 0);
     },
   };
