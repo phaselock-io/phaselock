@@ -473,10 +473,10 @@ export type Rep = typeof JS | typeof HOST | typeof MSGPACK;
 
 /** Registry converts between representations of typed values and names the types the store
     holds.  Types are model names from the TypeSpec, plus three reserved names: `.json` for the
-    Engine's own shapes; `.command` for the outbox envelope, `{id, data}` with `data` already the
-    command's wire bytes, so it needs no vocabulary to read; and `.event` for a parked event, the
-    wire pair `[env, data]` in `msgpack` and a DbEvent in `js`, its `data` converted through the
-    union of the stream's slice. */
+    Engine's own shapes; `.command` for the outbox envelope, `{id, session, n, data}` with `data`
+    already the command's wire bytes, so it needs no vocabulary to read; and `.event` for a parked
+    event, the wire pair `[env, data]` in `msgpack` and a DbEvent in `js`, its `data` converted
+    through the union of the stream's slice. */
 export interface Registry {
   /** a value of type `type`, given in one representation, in another */
   convert(type: string, value: unknown, from: Rep, to: Rep): unknown;
@@ -2655,98 +2655,6 @@ export type DbEvent<T> = {
     the bytes the server sent, and the whole wire pair `[env, data]` so if needs to be parked, the
     full msgpack format is readily available. */
 export type WireEvent = DbEvent<Uint8Array> & { raw: Uint8Array };
-
-/** Engine builds a sync engine out of a Store implementation and a reducer to process incoming
-   events.
-
-   Optionally, it also receives the following user configurations:
-     - a migrate function, to prepare the Store on startup
-     - an onCommands hook and a forecaster, to enable optimistic updates, such as for a UI.
-
-   When provided with onCommands, forecaster, and a persistent Store implementation, Engine forms
-   the core of a fully offline-capable application.
-
-   Engine internals diagram:
-
-       (* = owned by user)
-        ______________________________________________________
-       |  PWA                                                 |
-       |    _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _   |
-       |   | engine                                        |  |
-       |       ___________           __________________       |
-       |   |  |           |       C |                  |   |  |
-       |      | *reducers |<------->| *store + overlay |      |
-       |   |  |___________|         |__________________|   |  |
-       |         ^ B    ^              ^         |            |
-       |   |     |      |              |         | D       |  |
-       |         |     _|___________   |   ______v______      |
-       |   |     |    |             |  |  |             |  |  |
-       |         |    |*forecasters |  |  | query graph |     |
-       |   |     |    |_____________|  |  |_____________|  |  |
-       |         |             ^ G     |         |            |
-       |   |     |         I   |     H |         |         |  |
-       |         |       +-----+-------+         |            |
-       |   |_ _ _|_ _ _ _|_ _ _^_ _ _ _ _ _ _ _ _|_ _ _ _ _|  |
-       |         |       |     |                 | E          |
-       |       __|_______v__   |              ___v__          |
-       |      |             |  | F           |      |         |
-       |      | *transport  |  +-------------| *UI  |         |
-       |      |_____________|                |______|         |
-       |            ^ A                                       |
-       |____________|_________________________________________|
-                    |
-               _____v______
-              |            |
-              |   *relay   |
-              |____________|
-                    ^
-                    |
-               _____v______
-              |            |
-              | KurrentDB  |
-              |____________|
-
-       A: transport talks to relay, reading events, writing commands, and handling disconnects
-
-       B: transport calls Engine.recvEvents() on new events, which triggers reducers
-
-       C: reducers process incoming batches, updating store
-
-       D: query graph wakes after store update and reruns queries whose dependencies have changed
-
-       E: fresh query results are delivered to the UI
-
-       F: UI submits new commands with Engine.sendCommand()
-
-       G: new commands trigger forecaster; forecasted events are reduced onto storage overlay
-
-       H: new commands are also stored in an outbox in the store
-
-       I: new commands also trigger the user's onCommands() hook so they can be sent over transport
-
-   Engine-owned store keys.  Slice state lives at `{stream}!{local key}`; everything the Engine
-   keeps for itself lives in the nameless stream, which no stream name can reach, so its keys
-   start with `!`.  Its local keys follow the template grammar, and the parked keys' terminal
-   parameter is itself a stream or ref, `!`, then the rest.  The registry types them as `.json`
-   unless noted:
-
-       !view                      ViewRecord: the view token, its position, and the refs granted
-       !checkpoint                CheckpointRecord: the cursor, advanced with every batch and
-                                  vouch, and how far the base is reduced
-       !seq:{stream}              the stream's last held seq, or 'backfill' while a backfill
-                                  covering it is in flight
-       !command:{ordinal}         Command<Uint8Array> (`.command`): the outbox, in send order,
-                                  each command's data as its wire bytes, under the session and
-                                  number it was minted with
-       !backfill:{ref}            BackfillRecord: an in-flight backfill's until, resume, replacing,
-                                  and children
-       !backfill-seqs:{ref}       the backfill blob's header seqs, stream name to seq
-       !park-ev:{stream}!{seq}    a parked event (`.event`), raw as delivered; seq zero-padded to
-                                  20 digits so a stream's range walks its chain; a ref's key
-                                  prefix after `!park-ev:` covers its streams' events
-       !park-kv:{ref}!{key}       a slice value from the ref's backfill blob, typed as its key
-                                  is, moved to {key} when the backfill lands
-*/
 /** one slice's reducer, keyed by stream prefix in the Engine's table.  The Engine calls it with a
     run of one stream's events, in order, inside the transaction that brings them in, through a
     ReducerTxn over that stream's own keys.  `pending` is true when the events are a forecast
@@ -2762,7 +2670,7 @@ export type SliceReducer = {
 
 /** the view, as persisted at !view when a reconciliation commits */
 export type ViewRecord = { token: string; position: number; refs: string[] };
-/** the cursor, as persisted at !checkpoint with every batch and vouch */
+/** the cursor, as persisted at !checkpoint with every batch, vouch, and live mark */
 export type CheckpointRecord = { epoch: string; position: number; reduced: number };
 /** a backfill in flight, as persisted at !backfill:{ref} */
 export type BackfillRecord = {
@@ -3073,6 +2981,97 @@ type Inbound =
   | { live: number }
   | { end: { code: number; reason: string } };
 
+/** Engine builds a sync engine out of a ConnectorFactory, a Store, a user's reducers, and
+    optionally a user's forecasters.  The Engine is responsible for managing connection status, the
+    synchronization protocol, and the flow of events and commands, ultimately keeping the Store as
+    up-to-date with the PhaseLockDB server as possible.
+
+    An application interacts with the Engine primarily through newQuery(), which returns a
+    subscribable stream of results, and sendCommand(), which sends commands back to PhaseLockDB.
+    If forecasters were provided, the Engine also provides optimistic updates.
+
+    With forecasters and a persistent Store implementation, the Engine is the basis for a fully
+    offline-capable application.
+
+    Engine internals diagram:
+
+        (* = owned by user)
+         ______________________________________________________
+        |  PWA                                                 |
+        |    _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _   |
+        |   | Engine                                        |  |
+        |       ___________           __________________       |
+        |   |  |           |       C |                  |   |  |
+        |      | *reducers |<------->|  store + overlay |      |
+        |   |  |___________|         |__________________|   |  |
+        |         ^ B    ^              ^         |            |
+        |   |     |      |              | H       | D       |  |
+        |         |    __|___________   |   ______v______      |
+        |   |     |   |              |  |  |             |  |  |
+        |         |   | *forecasters |  |  | query graph |     |
+        |   |     |   |______________|  |  |_____________|  |  |
+        |         |               ^     |    _ _ _|_ _ _ _ _   |
+        |   |     |               | G   |   |     | E          |
+        |       __|__________     |     |       __v___         |
+        |   |  |             | I  |     |   |  |      |        |
+        |      |  connector  |<---+-----+------| *UI  |        |
+        |   |  |_____________|            F |  |______|        |
+        |           ^                                          |
+        |   |_ _ _ _|_ _ _ _ _ _ _ _ _ _ _ _|                  |
+        |___________|__________________________________________|
+                    |
+                    | A
+               _____v_______
+              |             |
+              | PhaseLockDB |
+              |_____________|
+
+        A: connector talks to PhaseLockDB, reading events and writing commands
+
+        B: events received by connector are passed to reducers
+
+        C: reducers process incoming batches, updating store
+
+        D: query graph wakes after store update and reruns queries whose dependencies have changed
+
+        E: fresh query results are delivered to the UI
+
+        F: UI submits new commands with Engine.sendCommand()
+
+        G: new commands trigger forecaster; forecasted events are reduced onto storage overlay
+
+        H: new commands are also stored in an outbox in the store
+
+        I: new commands are also sent through the connector
+
+    Engine-owned store keys.  Slice state lives at `{stream}!{local key}`; everything the Engine
+    keeps for itself lives in the nameless stream, which no stream name can reach, so its keys
+    start with `!`.  Its local keys follow the template grammar, and the parked keys' terminal
+    parameter is itself a stream or ref, `!`, then the rest.  Each is stored as `.json` unless
+    noted:
+
+        !view                      ViewRecord: the view token, its position, and the refs granted
+        !checkpoint                CheckpointRecord: the epoch of the log the cursor is in, the
+                                   cursor, advanced with every batch, vouch, and live mark, and
+                                   how far the base is reduced
+        !seq:{stream}              the stream's last held seq, or 'backfill' while a backfill
+                                   covering it is in flight
+        !command:{ordinal}         Command<Uint8Array> (`.command`): the outbox, in send order,
+                                   each command's data as its wire bytes, under the session and
+                                   number it was minted with; ordinal zero-padded to 20 digits so
+                                   a scan walks the outbox in order
+        !backfill:{ref}            BackfillRecord: an in-flight backfill's until, resume, replacing,
+                                   and children
+        !backfill-seqs:{ref}       the backfill blob's header seqs, stream name to seq
+        !park-ev:{stream}!{seq}    a parked event (`.event`), raw as delivered; seq zero-padded to
+                                   20 digits so a stream's range walks its chain; a ref's key
+                                   prefix after `!park-ev:` covers its streams' events
+        !park-kv:{ref}!{key}       a slice value from the ref's backfill blob, typed as its key
+                                   is, moved to {key} when the backfill lands
+        !status:{part}             the Engine's status that queries read, its connection,
+                                   progress, or outbox; no store holds it, since the Engine
+                                   answers it from memory
+*/
 export class Engine<QX, FX, C, N = never> {
   #store: Store;
   #reg: Registry;
