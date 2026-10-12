@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/cgo"
+	"time"
 	"unsafe"
 )
 
@@ -50,6 +51,7 @@ type result struct {
 	buf      []byte
 	token    string
 	prefixes []string
+	marks    []int64 // every cron entry's mark, in Unix seconds
 	errmsg   string
 }
 
@@ -59,6 +61,8 @@ const (
 	rOutcome  = C.PLDB_R_OUTCOME
 	rView     = C.PLDB_R_VIEW
 	rLookup   = C.PLDB_R_LOOKUP
+	rArm      = C.PLDB_R_ARM
+	rTick     = C.PLDB_R_TICK
 )
 
 func bytesReader(b []byte) *bytes.Reader { return bytes.NewReader(b) }
@@ -148,6 +152,33 @@ func (c *core) lookup(reqid uint64, ident []byte) {
 	C.pldb_lookup(c.db, C.uint64_t(reqid), ptr, l)
 }
 
+// cronEntry is one entry of a cron install, as the bundle names it.
+type cronEntry struct {
+	install, name, spec string
+}
+
+// cronEntries are the bundle's cron entries, in the order the core numbers them.
+func (c *core) cronEntries() []cronEntry {
+	var arr *C.pldb_cron_entry
+	n := C.pldb_cron_entries(c.db, &arr)
+	if n == 0 {
+		return nil
+	}
+	out := make([]cronEntry, int(n))
+	for i, e := range unsafe.Slice(arr, int(n)) {
+		out[i] = cronEntry{C.GoString(e.install), C.GoString(e.entry), C.GoString(e.spec)}
+	}
+	return out
+}
+
+func (c *core) cronArm(reqid uint64, minute time.Time) {
+	C.pldb_cron_arm(c.db, C.uint64_t(reqid), C.int64_t(minute.Unix()))
+}
+
+func (c *core) cronTick(reqid uint64, i int, slot time.Time) {
+	C.pldb_cron_tick(c.db, C.uint64_t(reqid), C.size_t(i), C.int64_t(slot.Unix()))
+}
+
 func goStrings(arr **C.char, n C.size_t) []string {
 	if n == 0 {
 		return nil
@@ -195,6 +226,11 @@ func (c *core) pop() result {
 	}
 	if r.errmsg != nil {
 		out.errmsg = C.GoString(r.errmsg)
+	}
+	if r.nmarks > 0 {
+		for _, m := range unsafe.Slice(r.marks, int(r.nmarks)) {
+			out.marks = append(out.marks, int64(m))
+		}
 	}
 	return out
 }

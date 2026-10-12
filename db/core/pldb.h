@@ -14,6 +14,8 @@ enum {
     PLDB_R_OUTCOME = 2, /* reqid, buf: msgpack array of per-command outcomes */
     PLDB_R_VIEW = 3,    /* conn: initial or changed maySee result */
     PLDB_R_LOOKUP = 4,  /* reqid, buf: msgpack of lookup's return, len 0 for null */
+    PLDB_R_ARM = 5,     /* reqid, marks: every cron entry's mark, in entry order */
+    PLDB_R_TICK = 6,    /* reqid; status 500 with errmsg when the tick's hook failed */
 };
 
 /* One event as the wire sees it: data is the encoded [envelope, data] value, and atom the first
@@ -38,6 +40,8 @@ typedef struct pldb_result {
     size_t len;
     char **prefixes; /* what maySee allows, sorted and unique */
     size_t nprefixes;
+    int64_t *marks;
+    size_t nmarks;
     char *errmsg;
     struct pldb_result *next;
 } pldb_result;
@@ -70,6 +74,21 @@ int pldb_submit(pldb *db, uint64_t reqid, const char *user, int64_t gen, const u
 int pldb_register(pldb *db, uint64_t reqid, uint64_t conn, const char *user, int64_t gen);
 int pldb_unregister(pldb *db, uint64_t conn);
 int pldb_lookup(pldb *db, uint64_t reqid, const uint8_t *ident, size_t len);
+
+/* Cron.  The bundle's cron entries are read when the database opens: every entry of every cron
+   install, in install and entry order, which db owns.  An entry's mark is the last of its slots
+   decided, a Unix time in seconds.  pldb_cron_arm gives every entry without a mark the mark
+   minute and answers every entry's mark as a PLDB_R_ARM; pldb_cron_tick decides slot of entry
+   i, running its hook unless the slot is at or below its mark, and answers a PLDB_R_TICK.  Both
+   run on the writer, as commands do. */
+typedef struct pldb_cron_entry {
+    const char *install;
+    const char *entry;
+    const char *spec;
+} pldb_cron_entry;
+size_t pldb_cron_entries(pldb *db, const pldb_cron_entry **out);
+int pldb_cron_arm(pldb *db, uint64_t reqid, int64_t minute);
+int pldb_cron_tick(pldb *db, uint64_t reqid, size_t i, int64_t slot);
 
 /* Blocks until a result is available.  The caller frees it. */
 pldb_result *pldb_pop(pldb *db);

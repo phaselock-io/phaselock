@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -22,6 +23,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/robfig/cron/v3"
 )
 
 type Options struct {
@@ -58,6 +61,10 @@ type Server struct {
 	nextConn atomic.Uint64
 	position atomic.Uint64
 	done     chan struct{}
+
+	// the bundle's cron entries, in the core's order, and the scheduler's end
+	cron     []cronEntry
+	cronDone chan struct{}
 }
 
 // conn is one stream connection.  Its view is what maySee allows cut down
@@ -113,6 +120,22 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// the cron entries, every spec of which must parse
+	entries := c.cronEntries()
+	scheds := make([]cron.Schedule, len(entries))
+	for i, e := range entries {
+		sched, notice, err := parseCron(e.spec)
+		if err != nil {
+			c.close()
+			return nil, fmt.Errorf("cron entry %s of %s: %q: %w", e.name, e.install, e.spec, err)
+		}
+		if notice != "" {
+			log.Printf("cron entry %s of %s: %s", e.name, e.install, notice)
+		}
+		scheds[i] = sched
+	}
+
 	workers := o.HashWorkers
 	if workers <= 0 {
 		workers = runtime.GOMAXPROCS(0)
@@ -126,20 +149,61 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Server{
-		ctx:     ctx,
-		cancel:  cancel,
-		hashes:  newHashPool(ctx, workers, 2*workers),
-		limit:   newLimiter(rate, burst),
-		core:    c,
-		secret:  secret,
-		devAuth: o.DevAuth,
-		epoch:   c.epoch(),
-		pending: map[uint64]chan result{},
-		conns:   map[uint64]*conn{},
-		done:    make(chan struct{}),
+		ctx:      ctx,
+		cancel:   cancel,
+		hashes:   newHashPool(ctx, workers, 2*workers),
+		limit:    newLimiter(rate, burst),
+		core:     c,
+		secret:   secret,
+		devAuth:  o.DevAuth,
+		epoch:    c.epoch(),
+		pending:  map[uint64]chan result{},
+		conns:    map[uint64]*conn{},
+		done:     make(chan struct{}),
+		cron:     entries,
+		cronDone: make(chan struct{}),
 	}
 	go s.dispatch()
+
+	// arm every new entry at the current minute, then tick every entry from its mark
+	if len(entries) == 0 {
+		close(s.cronDone)
+		return s, nil
+	}
+	r := s.arm(time.Now().Truncate(time.Minute))
+	if r.status != 0 {
+		s.Close()
+		return nil, fmt.Errorf("arming cron: %s", r.errmsg)
+	}
+	marks := make([]time.Time, len(r.marks))
+	for i, m := range r.marks {
+		marks[i] = time.Unix(m, 0).UTC()
+	}
+	sched := &cronScheduler{scheds: scheds, marks: marks, fire: s.fireCron, now: time.Now}
+	go func() {
+		defer close(s.cronDone)
+		sched.run(s.ctx)
+	}()
 	return s, nil
+}
+
+// arm gives every cron entry without a mark the mark minute, and answers every entry's mark.
+func (s *Server) arm(minute time.Time) result {
+	return s.request(func(reqid uint64) { s.core.cronArm(reqid, minute) })
+}
+
+// tick decides one slot of cron entry i.
+func (s *Server) tick(i int, slot time.Time) result {
+	return s.request(func(reqid uint64) { s.core.cronTick(reqid, i, slot) })
+}
+
+// fireCron is the scheduler's fire: a tick, whose hook's failure is a bug in the bundle, logged.
+func (s *Server) fireCron(i int, slot time.Time) {
+	r := s.tick(i, slot)
+	if r.status == http.StatusInternalServerError {
+		e := s.cron[i]
+		log.Printf("cron entry %s of %s at %s: %s", e.name, e.install, slot.Format(time.RFC3339), r.errmsg)
+	}
 }
 
 func loadSecret(path string) ([]byte, error) {
@@ -154,11 +218,13 @@ func loadSecret(path string) ([]byte, error) {
 	return b, nil
 }
 
-// Close ends the server: its context, then the hash workers once their hashes in hand finish,
-// then the core, which commits the batch in hand.  Call it once no handler is running, after
-// the HTTP server has shut down, since a handler would otherwise reach a closed core.
+// Close ends the server: its context, then the cron scheduler and the hash workers once their
+// work in hand finishes, then the core, which commits the batch in hand.  Call it once no handler
+// is running, after the HTTP server has shut down, since a handler would otherwise reach a closed
+// core.
 func (s *Server) Close() {
 	s.cancel()
+	<-s.cronDone
 	s.hashes.wait()
 	s.core.close()
 	<-s.done
@@ -212,7 +278,7 @@ func (s *Server) dispatch() {
 			}
 			s.mu.Unlock()
 			return
-		case rOutcome, rLookup:
+		case rOutcome, rLookup, rArm, rTick:
 			s.reply(r)
 		case rView:
 			s.mu.Lock()

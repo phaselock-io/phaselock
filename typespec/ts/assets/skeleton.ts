@@ -2030,34 +2030,36 @@ export type Bundle = {
 
 // plugins ///////////////////////////////////////////////////////////////////
 
-/** A plugin as one database holds it: the kind that prefixes its type identities, the name it is
-    installed under, its request API, which app code calls as `txn.{name}`, bind, which points
-    the plugin's own contexts at the transaction the database runs over, and, for a plugin with
-    commands of its own, run, which handles one of them, a cron tick or a worker's result, and
-    answers its outputs. */
+/** A plugin as one database holds it: the name it is installed under, its request API, which app
+    code calls as `txn.{name}`, bind, which points the plugin's own contexts at the transaction
+    the database runs over, and, for a plugin with commands of its own, run, which handles one of
+    them, a cron tick or a worker's result, and answers its outputs.  A built-in's config is what
+    the host reads of it, by its install's kind. */
 export interface Plugin<Api extends object = object> {
-  readonly kind: string;
   readonly name: string;
   readonly api: Api;
+  readonly config?: unknown;
   bind(txn: ReadTxn): void;
   run?(cmd: unknown): ForecastOutput[];
 }
 
-/** What a plugin's install answers and a plugin set lists: the plugin's kind, and create, which
-    makes the plugin under the name a database installs it by.  ctx is the database's context, the
-    txn of the app's hooks: the plugin's own context offers each hook as a field whose wrapper
-    calls the hook over ctx and emits what it returns, and only those wrappers hold ctx. */
+/** What a plugin's install answers and a plugin set lists: the plugin's kind, which prefixes its
+    type identities, and create, which makes the plugin under the name a database installs it by.
+    ctx is the database's context, the txn of the app's hooks: the plugin's own context offers
+    each hook as a field whose wrapper calls the hook over ctx and emits what it returns, and only
+    those wrappers hold ctx. */
 export interface PluginInstall<Api extends object = object> {
   readonly kind: string;
   create(name: string, ctx: unknown): Plugin<Api>;
 }
 
-/** An installed plugin as a host sees it: its kind, by which the host recognizes a built-in, and,
-    for a plugin with commands of its own, run, which binds the database's context and every
-    plugin to the transaction, as every entry into the bundle does, and hands the plugin one
-    command. */
+/** An installed plugin as a host sees it: its kind, by which the host recognizes a built-in, a
+    built-in's config, and, for a plugin with commands of its own, run, which binds the database's
+    context and every plugin to the transaction, as every entry into the bundle does, and hands
+    the plugin one command. */
 export type BundlePlugin = {
   readonly kind: string;
+  readonly config?: unknown;
   readonly run?: (txn: ReadTxn, cmd: unknown) => ForecastOutput[];
 };
 
@@ -2117,7 +2119,11 @@ export function installPlugins<X extends object>(
       bind(txn);
       return plugin.run!(cmd);
     };
-    plugins[name] = plugin.run === undefined ? { kind: plugin.kind } : { kind: plugin.kind, run };
+    plugins[name] = {
+      kind: install.kind,
+      ...(plugin.config === undefined ? {} : { config: plugin.config }),
+      ...(plugin.run === undefined ? {} : { run }),
+    };
   }
   return { plugins, bind };
 }

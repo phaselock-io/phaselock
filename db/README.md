@@ -204,7 +204,8 @@ write-up of the dedup design is coming.
   state.
 - The session table has one row per session: the hex SHA-256 of `S`,
   `hwm`, the highest `n` decided, and `time`, the server time of its
-  last decision.  Rows are kept forever: v0 has no horizon.
+  last decision.  Rows are kept forever: v0 has no horizon.  Cron's
+  marks share the table (Cron).
 - The dedup check runs on the txn loop, after the command check and
   before `expect` and precommit, against the group's open transaction.
   A command sees every decision ahead of it in its group, so two
@@ -509,6 +510,40 @@ fields are the stream row's counters and appear only for an exact ref.
   users, `root` (an admin) and `p1`, with no account in the log, so
   the log of every other test starts empty.
 
+### Cron
+
+- Cron is the built-in plugin of `@phaselock/plugins` (`plugins/`).
+  When the core opens, it finds every install of kind `cron` in the
+  bundle's `plugins` and reads each entry's name and spec from its
+  config; an entry's name is 1 to 64 bytes of `[A-Za-z0-9_-]`.  Go
+  parses every spec with robfig/cron's `ParseStandard`, in UTC unless
+  it starts with `CRON_TZ=` or `TZ=`, and rounds an `@every` up to a
+  whole minute, with a notice in the log.  A name or spec that fails
+  stops startup.
+- An entry's mark, the last of its slots decided, is its row in the
+  session table, under the key `$cron:<install>,<entry>` as it is,
+  with `hwm` the slot in Unix seconds.  A client's key is hex, so the
+  two never meet.
+- At startup, once the specs parse, one request on the txn loop gives
+  every entry without a row the current minute as its mark, so a new
+  or renamed entry first fires at its first slot after that, and
+  answers every entry's mark.
+- The scheduler (`server/cron.go`) wakes at the earliest next slot, or
+  after a minute at most, and fires each entry's latest slot at or
+  before the wall clock's now, and only that one, so downtime fires
+  each entry once.  The mark becomes the slot, never the time it
+  fired, so `@every d` keeps its slots at `mark + k·d`; a clock
+  stepped backwards fires nothing until it passes the marks.
+- A tick runs on the txn loop, past intake.  A slot at or below the
+  entry's mark was decided already.  Any other calls the host's
+  `tick`, which hands the install's `run` the command `{entry, slot,
+  now}`, with `now` the group's server time, and what the hook's
+  requests emitted and what it returned land as one atom under a label
+  the core mints.  The decision moves the mark, whatever the hook did:
+  a hook that throws is a bug, logged, and its atom is dropped.
+- Restoring a backup rewinds the marks with the log, and each entry's
+  latest slot past its mark fires again.
+
 ### Bundle contract
 
 The bundle installs the skeleton's `Bundle` (typespec/ts/assets/
@@ -524,7 +559,7 @@ app's slots:
       maySee(txn, principal) → [ref...],
       lookup(txn, ident) → null | { user, generation, secret },
       bootstrap(ctx),           // optional; see Bootstrap
-      plugins: { name: { kind, run(txn, cmd) → [output...] } },
+      plugins: { name: { kind, config, run(txn, cmd) → [output...] } },
       dev,                      // the skeleton's DEV
       mapStack(stack, file, map) → stack,
     }
@@ -532,17 +567,18 @@ app's slots:
 - `data` is the command's data; `principal` is `{user}` with `user` null
   for anonymous; `ident` is `{kind: "password", identity}` at
   login and the `token`/`refresh` shapes above otherwise.
-- The `txn` of precommit, maySee, and lookup also has `emit(outputs)`,
-  which a plugin's request calls to add outputs to the command running.
-  A command's atom is what was emitted while precommit ran, in call
-  order, then what precommit returned; a rejection or a throw drops
-  both.  maySee or lookup emitting is a bug, which fails the slot.
+- The `txn` of precommit, maySee, lookup, and a plugin's `run` also
+  has `emit(outputs)`, which plugin code calls to add outputs to the
+  command running.  A command's atom is what was emitted while
+  precommit or `run` ran, in call order, then what it returned; a
+  rejection or a throw drops both.  maySee or lookup emitting is a
+  bug, which fails the slot.
 - `plugins` are the installed plugins by name.  `run`, present for a
   plugin with commands of its own (a cron tick, a worker's result),
   hands the plugin one command with the database's contexts bound to
   `txn`, as precommit's are; the plugin calls the app's hooks from it.
-  A built-in is recognized by its `kind`, with its config on the same
-  entry.  The core reads none of this yet.
+  A built-in is recognized by its `kind` and carries a `config` the
+  core reads; cron is the one the core knows (Cron).
 - The host installs `crypto.getRandomValues` and `crypto.randomUUID`
   over `getrandom(2)`, as browsers and Node have them.
 - The core defines `process.env.NODE_ENV` as `production` before
@@ -604,19 +640,23 @@ app's slots:
                   conformance test's hold on the walk, vendor/mpack,
                   vendor/sha256
     db/server/    the Go layer: core.go cgo binding, server.go HTTP,
-                  auth.go tokens and passwords, mp.go msgpack codec,
-                  server_test.go feature tests, scan_test.go the
+                  auth.go tokens and passwords, cron.go the cron
+                  scheduler, mp.go msgpack codec, server_test.go
+                  feature tests, plugins_test.go plugins and cron
+                  ticks, cron_test.go the scheduler, scan_test.go the
                   scans, scantest.go their test-only binding
     db/server/testdata/
                   the test bundle: model.tsp and db.ts, generated into
                   bundle.js (dev, with an inline source map) and
-                  bundle.prod.js by the TypeScript emitter and esbuild
+                  bundle.prod.js by the TypeScript emitter and esbuild,
+                  with @phaselock/plugins from plugins/
 
 QuickJS objects come from the library example's checkout
 (`examples/library/relay/quickjs`, built by its Makefile); SQLite is
 the system library.  The Go side depends on `golang.org/x/crypto` for
-argon2id.  The tests need pnpm: `make -C db test`
-rebuilds the typespec workspace and the test bundle on every run.
+argon2id and `github.com/robfig/cron/v3` for cron specs.  The tests
+need pnpm: `make -C db test` rebuilds the typespec workspace,
+`plugins/`, and the test bundle on every run.
 
     make -C db          build core and the pldb binary
     make -C db test     build core and the test bundle, run the Go tests

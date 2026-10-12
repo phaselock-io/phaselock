@@ -1,7 +1,7 @@
 // The JS side of the QuickJS host.  Hands the bundle's slots transactions over the natives
 // (__pl_get, __pl_scan, __pl_set, __pl_del), which convert every value through the bundle's
 // registry under the type the call names, installs crypto over __pl_random, and exposes one
-// entry point per slot on globalThis.__host.
+// entry point per slot, and per plugin command the core makes, on globalThis.__host.
 
 // the Web Crypto randomness a bundle may use, over the kernel's CSPRNG
 globalThis.crypto = {
@@ -68,6 +68,14 @@ globalThis.__host = (function () {
 
   const bundle = () => globalThis.__bundle;
 
+  // outputs as the core reads them
+  const items = (outputs) =>
+    outputs.map((item) => ({
+      stream: item.stream,
+      death: item.death === true,
+      event: item.death === true ? null : item.event,
+    }));
+
   return {
     precommit(data, principal) {
       // the handler's outputs, after what its plugin requests emitted while it ran; a rejection or
@@ -82,11 +90,31 @@ globalThis.__host = (function () {
       }
       if (typeof out === 'string') return out;
       if (!Array.isArray(out)) throw new Error('precommit must return a reason or a list');
-      return [...requests, ...out].map((item) => ({
-        stream: item.stream,
-        death: item.death === true,
-        event: item.death === true ? null : item.event,
-      }));
+      return items([...requests, ...out]);
+    },
+    // every entry of every cron install, as [install, entry, spec], in install and entry order
+    cronEntries() {
+      const out = [];
+      for (const [install, plugin] of Object.entries(bundle().plugins)) {
+        if (plugin.kind !== 'cron') continue;
+        for (const e of plugin.config.entries) out.push([install, e.name, e.spec]);
+      }
+      return out;
+    },
+    // A cron entry's tick, as its install's command: what the plugin emitted while it ran, its
+    // hook's outputs among them, then what it returned.  A throw drops them all.
+    tick(install, entry, slot, now) {
+      const cmd = { entry, slot: new Date(slot), now: new Date(now) };
+      let out;
+      let emits;
+      try {
+        out = bundle().plugins[install].run(rx, cmd);
+        emits = emitted;
+      } finally {
+        emitted = [];
+      }
+      if (!Array.isArray(out)) throw new Error(`plugin ${install} must return a list`);
+      return items([...emits, ...out]);
     },
     bootstrap() {
       const seed = bundle().bootstrap;

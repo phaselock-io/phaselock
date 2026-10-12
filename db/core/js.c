@@ -765,6 +765,36 @@ int js_bootstrap(jsrt *js, pc_result *out) {
     return parse_outputs(js, r, out);
 }
 
+int js_cron_entries(jsrt *js, strlist *out) {
+    JSContext *ctx = js->ctx;
+    JSValue r = call_host(js, "cronEntries", 0, NULL);
+    if (JS_IsException(r)) return -1;
+    JSValue lenv = JS_GetPropertyStr(ctx, r, "length");
+    int64_t n = 0;
+    JS_ToInt64(ctx, &n, lenv);
+    JS_FreeValue(ctx, lenv);
+    int rc = 0;
+    for (int64_t i = 0; i < n && rc == 0; i++) {
+        JSValue entry = JS_GetPropertyUint32(ctx, r, (uint32_t)i);
+        rc = strings_of(js, entry, out);
+        JS_FreeValue(ctx, entry);
+    }
+    JS_FreeValue(ctx, r);
+    return rc;
+}
+
+int js_tick(jsrt *js, const char *install, const char *entry, int64_t slot, int64_t now,
+            pc_result *out) {
+    JSContext *ctx = js->ctx;
+    memset(out, 0, sizeof *out);
+    JSValue args[4] = {JS_NewString(ctx, install), JS_NewString(ctx, entry),
+                       JS_NewFloat64(ctx, (double)slot), JS_NewFloat64(ctx, (double)now)};
+    JSValue r = call_host(js, "tick", 4, args);
+    for (int i = 0; i < 4; i++) JS_FreeValue(ctx, args[i]);
+    if (JS_IsException(r)) return -1;
+    return parse_outputs(js, r, out);
+}
+
 void pc_result_free(jsrt *js, pc_result *r) {
     free(r->reason);
     for (size_t i = 0; i < r->n; i++) {

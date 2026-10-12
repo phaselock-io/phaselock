@@ -1,5 +1,6 @@
 // The bundle the server tests run: the test model's reducers, precommit, maySee, and lookup.
 
+import { Cron, type CronPlugin } from '@phaselock/plugins';
 import {
   type AccountSliceReducers,
   type BookSliceReducers,
@@ -14,6 +15,7 @@ import {
   type ShelfSliceReducers,
   type TestDBPrecommit,
   type TestDBTxn,
+  type TestDBTypes,
 } from './model.gen.ts';
 
 // the database's randomness, which the host installs
@@ -133,7 +135,6 @@ function installNotice<DB extends DbTypes>(): NoticePlugin & DbMarker<DB> {
     create(name) {
       let raw: ReadTxn | undefined;
       return {
-        kind: 'notice',
         name,
         api: {
           post(patron, reason) {
@@ -150,7 +151,29 @@ function installNotice<DB extends DbTypes>(): NoticePlugin & DbMarker<DB> {
   };
 }
 
-type TestPlugins = { notice: NoticePlugin };
+/* The cron entries, which tests tick directly; their yearly specs keep the real schedule out of
+   every test.  reap notes its tick to patron p1, behind a notice request, once p1 exists; zoned
+   has a zone; broken throws. */
+const cron = Cron.install<TestDBTypes<TestPlugins>>({
+  reap: {
+    spec: '0 0 1 1 *',
+    hook: (txn, tick) => {
+      if (txn.get.patron('p1') === undefined) return [];
+      txn.notice.post('p1', `requested ${tick.slot.toISOString()}`);
+      const reason = `${tick.name} ${tick.slot.toISOString()} ${tick.now.toISOString()}`;
+      return { stream: 'patron:p1', event: { type: 'hold-failed', book: '', reason } };
+    },
+  },
+  zoned: { spec: 'CRON_TZ=America/New_York 0 0 1 1 *', hook: () => [] },
+  broken: {
+    spec: '0 0 1 1 *',
+    hook: () => {
+      throw new Error('the broken entry');
+    },
+  },
+});
+
+type TestPlugins = { notice: NoticePlugin; cron: CronPlugin };
 
 // precommit //
 
@@ -300,7 +323,7 @@ const bundle = defineTestDB<TestPlugins>({
     const hash = ctx.hashPassword(ctx.env('BOOTSTRAP_PASSWORD'));
     ctx.emit(`account:${user}`, { type: 'account-created', user, hash, admin: true });
   },
-  plugins: { notice: installNotice() },
+  plugins: { notice: installNotice(), cron },
 });
 
 // maySee, holding its transaction while it runs

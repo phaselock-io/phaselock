@@ -8,6 +8,9 @@ importers:
 
   .:
     devDependencies:
+      '@phaselock/plugins':
+        specifier: link:../../../plugins
+        version: link:../../../plugins
       '@phaselock/typespec-core':
         specifier: link:../../../typespec/core
         version: link:../../../typespec/core

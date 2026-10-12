@@ -1200,8 +1200,8 @@ describe('sending commands', () => {
 
 describe('plugins', () => {
   /** An install whose plugin's one request records its argument, recording each create, with the
-      context it was given, and each bind.  With commands, its plugin runs a command by recording
-      it and answering one output. */
+      context it was given, and each bind.  With commands, its plugin has a config, and runs a
+      command by recording it and answering one output. */
   function recorder(kind = 'recorder', commands = false) {
     const created: string[] = [];
     const contexts: unknown[] = [];
@@ -1218,11 +1218,10 @@ describe('plugins', () => {
           return [{ stream: 'catalog', event: { type: 'item-removed', id: cmd.id } }];
         };
         return {
-          kind,
           name,
           api: { send: (id: string) => sent.push(`${name} ${id}`) },
           bind: (txn: unknown) => bound.push(txn),
-          ...(commands ? { run } : {}),
+          ...(commands ? { run, config: { entries: [name] } } : {}),
         };
       },
       db: (db: unknown) => db,
@@ -1281,7 +1280,8 @@ describe('plugins', () => {
     const { install: mail, bound: mailBound } = recorder();
     const { install: cron, ran, bound: cronBound } = recorder('cron', true);
     const b = M.defineAppDB(slotsWith({ mail, cron }));
-    expect(b.plugins.mail.run).toBeUndefined();
+    expect(b.plugins.mail).toEqual({ kind: 'recorder' });
+    expect(b.plugins.cron.config).toEqual({ entries: ['cron'] });
     const { txn } = fakeTxn();
     expect(b.plugins.cron.run!(txn, { id: 'tick1' })).toEqual([
       { stream: 'catalog', event: { type: 'item-removed', id: 'tick1' } },

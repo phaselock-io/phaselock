@@ -35,6 +35,8 @@ examples/
 client/ts/        @phaselock/client: the JS host's connector over HTTP,
                   its msgpack cursor, and the Registry that walks the
                   generated type registry.
+plugins/          @phaselock/plugins: the plugins we ship, as a
+                  database's bundle installs them; cron so far.
 db/               The v0 database: a C core (QuickJS, SQLite, the
                   conversion kernel) under a Go HTTP layer.  See
                   db/README.md.

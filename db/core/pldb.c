@@ -1,6 +1,7 @@
 /* The core: request and result queues, the txn loop, maySee registrations,
    and the reader-side calls. */
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -11,7 +12,7 @@
 #include "internal.h"
 #include "sha256.h"
 
-enum { REQ_SUBMIT = 1, REQ_REGISTER, REQ_UNREGISTER, REQ_LOOKUP };
+enum { REQ_SUBMIT = 1, REQ_REGISTER, REQ_UNREGISTER, REQ_LOOKUP, REQ_ARM, REQ_TICK };
 
 /* a formatted string, malloc'd */
 static char *strf(const char *fmt, ...) {
@@ -33,6 +34,8 @@ typedef struct req {
     int64_t gen;
     uint8_t *body;
     size_t len;
+    size_t entry; /* a tick's cron entry */
+    int64_t slot; /* a tick's slot, or an arm's minute */
     struct req *next;
 } req;
 
@@ -73,6 +76,10 @@ struct pldb {
     bool started;
     uint64_t position;
     reg *regs;
+
+    pldb_cron_entry *cron;
+    char **cron_keys; /* each entry's session key, $cron:<install>,<entry> */
+    size_t ncron;
 };
 
 /* item lists for commit results and log reads */
@@ -202,6 +209,7 @@ void pldb_result_free(pldb_result *r) {
     pldb_items_free(r->items, r->nitems);
     free(r->buf);
     free_strings(r->prefixes, r->nprefixes);
+    free(r->marks);
     free(r->errmsg);
     free(r);
 }
@@ -269,6 +277,28 @@ int pldb_lookup(pldb *db, uint64_t reqid, const uint8_t *ident, size_t len) {
     q->body = xmalloc(len);
     memcpy(q->body, ident, len);
     q->len = len;
+    enqueue(db, q);
+    return 0;
+}
+
+size_t pldb_cron_entries(pldb *db, const pldb_cron_entry **out) {
+    *out = db->cron;
+    return db->ncron;
+}
+
+int pldb_cron_arm(pldb *db, uint64_t reqid, int64_t minute) {
+    if (minute <= 0) return -1;
+    req *q = req_new(REQ_ARM, reqid, NULL, -1);
+    q->slot = minute;
+    enqueue(db, q);
+    return 0;
+}
+
+int pldb_cron_tick(pldb *db, uint64_t reqid, size_t i, int64_t slot) {
+    if (i >= db->ncron || slot <= 0) return -1;
+    req *q = req_new(REQ_TICK, reqid, NULL, -1);
+    q->entry = i;
+    q->slot = slot;
     enqueue(db, q);
     return 0;
 }
@@ -850,6 +880,76 @@ static void handle_lookup(pldb *db, req *q, pldb_result **after_tail) {
     *after_tail = r;
 }
 
+/* Give every cron entry without a mark the request's minute, so that it first fires at its
+   first slot after that, and answer every entry's mark. */
+static void handle_arm(pldb *db, batch *b, req *q, pldb_result **after_tail) {
+    pldb_result *r = result_new(PLDB_R_ARM);
+    r->reqid = q->reqid;
+    r->marks = xmalloc(sizeof(int64_t) * (db->ncron ? db->ncron : 1));
+    r->nmarks = db->ncron;
+    for (size_t i = 0; i < db->ncron; i++) {
+        uint64_t mark = 0;
+        int known = store_session_hwm(db->w, db->cron_keys[i], &mark);
+        if (known < 0) die("session_hwm: %s", store_err(db->w));
+        if (!known) {
+            mark = (uint64_t)q->slot;
+            if (store_session_mark(db->w, db->cron_keys[i], mark, b->servertime))
+                die("session_mark: %s", store_err(db->w));
+        }
+        r->marks[i] = (int64_t)mark;
+    }
+    (*after_tail)->next = r;
+    *after_tail = r;
+}
+
+/* One tick of a cron entry, past intake.  A slot at or below the entry's mark was decided
+   already; any other runs the entry's hook as its install's command, with the batch's server
+   time as the tick's now, and lands what it emitted as one atom under a label of its own.  The
+   decision moves the mark, a hook's failure included. */
+static void handle_tick(pldb *db, batch *b, req *q, pldb_result **after_tail) {
+    pldb_result *r = result_new(PLDB_R_TICK);
+    r->reqid = q->reqid;
+    (*after_tail)->next = r;
+    *after_tail = r;
+    const pldb_cron_entry *e = &db->cron[q->entry];
+    const char *key = db->cron_keys[q->entry];
+
+    // the dedup check
+    uint64_t mark = 0;
+    int known = store_session_hwm(db->w, key, &mark);
+    if (known < 0) die("session_hwm: %s", store_err(db->w));
+    if (known && (uint64_t)q->slot <= mark) return;
+
+    // the hook, and the streams it emitted to
+    uint8_t id[ID_LEN];
+    if (getrandom(id, sizeof id, 0) != (ssize_t)sizeof id) die("getrandom: %s", strerror(errno));
+    char *reason = NULL;
+    pc_result pc;
+    if (js_tick(&db->js, e->install, e->entry, q->slot * 1000, b->servertime, &pc)) {
+        reason = bug_reason(db, id, strf("cron %s,%s: %s", e->install, e->entry, db->js.err));
+    }
+    for (size_t i = 0; i < pc.n && !reason; i++)
+        if (!stream_fills(&db->js, pc.items[i].stream)) {
+            reason = bug_reason(db, id, strf("invalid stream name: %s", pc.items[i].stream));
+        }
+
+    // the atom
+    if (reason) {
+        pc_result_free(&db->js, &pc);
+    } else {
+        reason = apply_outputs(db, b, id, &pc);
+        if (!reason && store_exec(db->w, "RELEASE cmd")) die("release: %s", store_err(db->w));
+    }
+    if (reason) {
+        r->status = 500;
+        r->errmsg = reason;
+    }
+
+    // the decision moves the mark
+    if (store_session_mark(db->w, key, (uint64_t)q->slot, b->servertime))
+        die("session_mark: %s", store_err(db->w));
+}
+
 static void run_batch(pldb *db, req *head) {
     batch b = {0};
     b.servertime = now_ms();
@@ -870,6 +970,12 @@ static void run_batch(pldb *db, req *head) {
             break;
         case REQ_LOOKUP:
             handle_lookup(db, q, &after_tail);
+            break;
+        case REQ_ARM:
+            handle_arm(db, &b, q, &after_tail);
+            break;
+        case REQ_TICK:
+            handle_tick(db, &b, q, &after_tail);
             break;
         }
     }
@@ -1016,6 +1122,44 @@ static int run_bootstrap(pldb *db, char *err, size_t errlen) {
     return 0;
 }
 
+/* whether an entry's name is 1 to 64 bytes of [A-Za-z0-9_-] */
+static bool cron_name(const char *s) {
+    size_t n = strlen(s);
+    if (n == 0 || n > 64) return false;
+    for (size_t i = 0; i < n; i++)
+        if (!isalnum((unsigned char)s[i]) && s[i] != '_' && s[i] != '-') return false;
+    return true;
+}
+
+/* Read the bundle's cron entries, each with the session key that holds its mark.  An install's
+   name is a JS identifier without $, which the bundle's plugin set checks, and an entry's name
+   must be fit for the key too. */
+static int load_cron(pldb *db, char *err, size_t errlen) {
+    strlist l = {0};
+    if (js_cron_entries(&db->js, &l)) {
+        snprintf(err, errlen, "cron entries: %s", db->js.err);
+        strlist_free(&l);
+        return -1;
+    }
+    for (size_t i = 0; i + 2 < l.n; i += 3)
+        if (!cron_name(l.v[i + 1])) {
+            snprintf(err, errlen, "cron entry %s of %s: not 1 to 64 of [A-Za-z0-9_-]", l.v[i + 1],
+                     l.v[i]);
+            strlist_free(&l);
+            return -1;
+        }
+    db->ncron = l.n / 3;
+    db->cron = xmalloc(sizeof(pldb_cron_entry) * (db->ncron ? db->ncron : 1));
+    db->cron_keys = xmalloc(sizeof(char *) * (db->ncron ? db->ncron : 1));
+    for (size_t i = 0; i < db->ncron; i++) {
+        const char *install = l.v[3 * i], *entry = l.v[3 * i + 1], *spec = l.v[3 * i + 2];
+        db->cron[i] = (pldb_cron_entry){xstrdup(install), xstrdup(entry), xstrdup(spec)};
+        db->cron_keys[i] = strf("$cron:%s,%s", install, entry);
+    }
+    strlist_free(&l);
+    return 0;
+}
+
 int pldb_open(const char *dir, const char *bundle, pldb_hash_fn hasher, const char *const *env,
               int nenv, pldb **out, char *err, size_t errlen) {
     pldb *db = xmalloc(sizeof *db);
@@ -1057,6 +1201,10 @@ int pldb_open(const char *dir, const char *bundle, pldb_hash_fn hasher, const ch
         pldb_close(db);
         return -1;
     }
+    if (load_cron(db, err, errlen)) {
+        pldb_close(db);
+        return -1;
+    }
     if (pthread_create(&db->thread, NULL, txn_loop, db)) {
         snprintf(err, errlen, "pthread_create failed");
         pldb_close(db);
@@ -1078,6 +1226,14 @@ void pldb_close(pldb *db) {
         results_push(db, result_new(PLDB_R_SHUTDOWN));
     }
     js_close(&db->js);
+    for (size_t i = 0; i < db->ncron; i++) {
+        free((char *)db->cron[i].install);
+        free((char *)db->cron[i].entry);
+        free((char *)db->cron[i].spec);
+        free(db->cron_keys[i]);
+    }
+    free(db->cron);
+    free(db->cron_keys);
     free(db->epoch);
     while (db->regs) {
         reg *g = db->regs;

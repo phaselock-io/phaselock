@@ -199,6 +199,11 @@ JSValue js_principal(jsrt *js, const char *user);
 /* run the bundle's bootstrap, if it has one, collecting what it emits */
 int js_bootstrap(jsrt *js, pc_result *out);
 int js_precommit(jsrt *js, JSValueConst data, JSValueConst principal, pc_result *out);
+/* every cron entry of the bundle's cron installs, as install, entry, and spec, three strings each */
+int js_cron_entries(jsrt *js, strlist *out);
+/* one tick of a cron entry, slot and now in Unix milliseconds, collecting what it emits */
+int js_tick(jsrt *js, const char *install, const char *entry, int64_t slot, int64_t now,
+            pc_result *out);
 void pc_result_free(jsrt *js, pc_result *r);
 int js_reduce(jsrt *js, const char *family, const char *stream, JSValueConst events);
 int js_maysee(jsrt *js, JSValueConst principal, strlist *out);

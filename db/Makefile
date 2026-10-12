@@ -4,15 +4,20 @@ all: core/libpldb.a
 core/libpldb.a: $(wildcard core/*.c core/*.h core/host.js)
 	$(MAKE) -C core
 
-# the test bundle: the test model through the TypeScript emitter, bundled with its user code.
-# It is rebuilt on every test run, the emitter with it, so it never lags the typespec sources.
+# the test bundle: the test model through the TypeScript emitter, bundled with its user code and
+# @phaselock/plugins.  It is rebuilt on every test run, the emitter and the plugins with it, so it
+# never lags their sources.
 BUNDLE = server/testdata/bundle.js
 
 server/testdata/node_modules: server/testdata/package.json
 	cd server/testdata && pnpm install --prefer-offline && touch node_modules
 
-bundle: server/testdata/node_modules
+../plugins/node_modules: ../plugins/package.json
+	cd ../plugins && pnpm install --prefer-offline && touch node_modules
+
+bundle: server/testdata/node_modules ../plugins/node_modules
 	cd ../typespec && pnpm build
+	cd ../plugins && pnpm build
 	cd server/testdata && pnpm gen
 
 test: core/libpldb.a bundle
