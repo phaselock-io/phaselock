@@ -472,6 +472,14 @@ fields are the stream row's counters and appear only for an exact ref.
   request whose hash is refused, by a full pool or a spent budget, is
   refused whole with the same status, so its ids are still free to
   retry; refusing one command would be a final rejection.
+- An IPv6 client is budgeted by its /64, since a single host is
+  commonly given a whole /64.  Behind a proxy, `--client-ip-header
+  <name>` takes each client's address from a header the proxy sets to
+  one address, such as Cloudflare's `CF-Connecting-IP`; a request
+  without a valid one falls back to the address it connects from.  The
+  header is trusted from every request, so the flag is for a server
+  only the proxy can reach.  `X-Forwarded-For` and `Forwarded`, which
+  hold lists, are refused at startup.
 
 ### Bootstrap
 

@@ -13,8 +13,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -143,14 +143,41 @@ func verifyPassword(hash, pw string) bool {
 	return subtle.ConstantTimeCompare(key, want) == 1
 }
 
-// clientOf names the client a request comes from, for its hashing budget: the address it
-// connected from
-func clientOf(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+/*
+clientOf names the client a request comes from, for its hashing budget: its address from the
+
+	client IP header, when the server names one and the request carries a valid one, or else the
+	address it connected from.  An IPv6 client is named by its /64, since a single host is commonly
+	given a whole /64 to draw addresses from.
+*/
+func (s *Server) clientOf(r *http.Request) string {
+	if s.clientIPHeader != "" {
+		if addr, err := netip.ParseAddr(strings.TrimSpace(r.Header.Get(s.clientIPHeader))); err == nil {
+			return clientKey(addr)
+		}
 	}
-	return host
+	if ap, err := netip.ParseAddrPort(r.RemoteAddr); err == nil {
+		return clientKey(ap.Addr())
+	}
+	return r.RemoteAddr
+}
+
+// clientKey is the budget key of an address: an IPv4 address itself, an IPv6 one its /64
+func clientKey(addr netip.Addr) string {
+	addr = addr.Unmap()
+	if addr.Is4() {
+		return addr.String()
+	}
+	return netip.PrefixFrom(addr.WithZone(""), 64).Masked().String()
+}
+
+// checkClientIPHeader refuses a client IP header that holds a list of addresses rather than one
+func checkClientIPHeader(name string) error {
+	if strings.EqualFold(name, "X-Forwarded-For") || strings.EqualFold(name, "Forwarded") {
+		return fmt.Errorf("client IP header %s is unsupported: name a header holding one address, "+
+			"such as CF-Connecting-IP", name)
+	}
+	return nil
 }
 
 // hashFailed answers a request whose password hashing did not run: the client's budget is spent,
@@ -259,7 +286,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		if a != nil && a.secret != "" {
 			check = func() bool { return verifyPassword(a.secret, password) }
 		}
-		ok, err := s.verifyFor(r.Context(), clientOf(r), check)
+		ok, err := s.verifyFor(r.Context(), s.clientOf(r), check)
 		if err != nil {
 			hashFailed(w, err)
 			return

@@ -40,6 +40,10 @@ type Options struct {
 	AuthRate    float64
 	// the environment variables the bundle's bootstrap may read; any other reads as ""
 	BootstrapEnv []string
+	// the header a proxy in front of the server sets to the client's address, such as
+	// CF-Connecting-IP; trusted from every request, so set only when nothing but the proxy can
+	// reach the server
+	ClientIPHeader string
 }
 
 type Server struct {
@@ -53,6 +57,8 @@ type Server struct {
 	epoch   string
 	hashes  *hashPool
 	limit   *limiter
+	// the header naming each request's client, if any
+	clientIPHeader string
 
 	mu       sync.Mutex
 	pending  map[uint64]chan result
@@ -105,6 +111,9 @@ const eventsPage = 1000
 // Open starts a server that lives until ctx ends or Close is called.  Its handler's requests
 // should run under BaseContext, so that they end with it.
 func Open(ctx context.Context, o Options) (*Server, error) {
+	if err := checkClientIPHeader(o.ClientIPHeader); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(o.DataDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -149,19 +158,20 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Server{
-		ctx:      ctx,
-		cancel:   cancel,
-		hashes:   newHashPool(ctx, workers, 2*workers),
-		limit:    newLimiter(rate, burst),
-		core:     c,
-		secret:   secret,
-		devAuth:  o.DevAuth,
-		epoch:    c.epoch(),
-		pending:  map[uint64]chan result{},
-		conns:    map[uint64]*conn{},
-		done:     make(chan struct{}),
-		cron:     entries,
-		cronDone: make(chan struct{}),
+		ctx:            ctx,
+		cancel:         cancel,
+		hashes:         newHashPool(ctx, workers, 2*workers),
+		limit:          newLimiter(rate, burst),
+		core:           c,
+		secret:         secret,
+		devAuth:        o.DevAuth,
+		clientIPHeader: o.ClientIPHeader,
+		epoch:          c.epoch(),
+		pending:        map[uint64]chan result{},
+		conns:          map[uint64]*conn{},
+		done:           make(chan struct{}),
+		cron:           entries,
+		cronDone:       make(chan struct{}),
 	}
 	go s.dispatch()
 
@@ -747,7 +757,7 @@ func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	prepared, reasons, err := s.core.prepare(s, r.Context(), clientOf(r), body)
+	prepared, reasons, err := s.core.prepare(s, r.Context(), s.clientOf(r), body)
 	if errors.Is(err, errBusy) || errors.Is(err, errLimited) {
 		hashFailed(w, err)
 		return

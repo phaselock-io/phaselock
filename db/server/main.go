@@ -16,6 +16,8 @@ func main() {
 	bundle := flag.String("bundle", "", "path to the bundle JS file")
 	listen := flag.String("listen", "127.0.0.1:8080", "listen address")
 	devAuth := flag.Bool("dev-auth", false, "sign in as any existing account with no credential at /auth/token")
+	clientIPHeader := flag.String("client-ip-header", "", "the header a proxy sets to the client's address, "+
+		"such as CF-Connecting-IP; set only when nothing but the proxy can reach the listen address")
 	var bootstrapEnv []string
 	flag.Func("bootstrap-env", "an environment variable the bundle's bootstrap may read (repeatable)", func(name string) error {
 		bootstrapEnv = append(bootstrapEnv, name)
@@ -31,7 +33,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv, err := Open(ctx, Options{DataDir: *data, Bundle: *bundle, DevAuth: *devAuth, BootstrapEnv: bootstrapEnv})
+	srv, err := Open(ctx, Options{DataDir: *data, Bundle: *bundle, DevAuth: *devAuth, BootstrapEnv: bootstrapEnv,
+		ClientIPHeader: *clientIPHeader})
 	if err != nil {
 		log.Fatal(err)
 	}

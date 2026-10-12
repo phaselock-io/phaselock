@@ -1969,6 +1969,44 @@ func TestLoginForAnUnknownAccountCostsAHash(t *testing.T) {
 	}
 }
 
+func TestClientsAreNamedByAddressOrTheirSlash64(t *testing.T) {
+	direct := &Server{}
+	proxied := &Server{clientIPHeader: "CF-Connecting-IP"}
+	for _, c := range []struct {
+		s      *Server
+		remote string
+		header string
+		want   string
+	}{
+		{direct, "203.0.113.7:5000", "", "203.0.113.7"},
+		{direct, "[2001:db8:1:2:aaaa::1]:5000", "", "2001:db8:1:2::/64"},
+		{direct, "[::ffff:203.0.113.7]:5000", "", "203.0.113.7"},
+		{direct, "203.0.113.7:5000", "198.51.100.1", "203.0.113.7"},
+		{proxied, "127.0.0.1:5000", "198.51.100.1", "198.51.100.1"},
+		{proxied, "127.0.0.1:5000", " 2001:db8:1:2:bbbb::9 ", "2001:db8:1:2::/64"},
+		{proxied, "127.0.0.1:5000", "", "127.0.0.1"},
+		{proxied, "127.0.0.1:5000", "198.51.100.1, 198.51.100.2", "127.0.0.1"},
+	} {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = c.remote
+		if c.header != "" {
+			r.Header.Set("CF-Connecting-IP", c.header)
+		}
+		if got := c.s.clientOf(r); got != c.want {
+			t.Fatalf("%s with header %q (server header %q): %s, want %s",
+				c.remote, c.header, c.s.clientIPHeader, got, c.want)
+		}
+	}
+}
+
+func TestAListClientIPHeaderIsRefused(t *testing.T) {
+	for _, name := range []string{"X-Forwarded-For", "x-forwarded-for", "Forwarded"} {
+		if _, err := Open(t.Context(), Options{DataDir: t.TempDir(), ClientIPHeader: name}); err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+}
+
 func TestIntakeHashingIsRateLimitedPerClient(t *testing.T) {
 	h := startWith(t, t.Context(), Options{AuthBurst: 1, AuthRate: 0.001})
 	h.accept("", cmd("c1", "create-account", "user", "ann", "password", "hunter2"))
