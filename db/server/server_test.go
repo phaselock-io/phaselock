@@ -1268,6 +1268,64 @@ func TestMsgpackCodec(t *testing.T) {
 	}
 }
 
+// injectingWriter is a response writer that runs a callback inside its first body write, which
+// the stream handler makes with the view registered and the connection not yet streaming, and
+// that ends the request at the live frame
+type injectingWriter struct {
+	t      *testing.T
+	header http.Header
+	frames [][]any
+	inject func()
+	cancel context.CancelFunc
+}
+
+func (w *injectingWriter) Header() http.Header { return w.header }
+func (w *injectingWriter) WriteHeader(int)     {}
+func (w *injectingWriter) Flush()              {}
+
+func (w *injectingWriter) Write(b []byte) (int, error) {
+	if len(w.frames) == 0 {
+		w.inject()
+	}
+	f := mpDecodeOne(w.t, b).([]any)
+	w.frames = append(w.frames, f)
+	if f[0] == "live" {
+		w.cancel()
+	}
+	return len(b), nil
+}
+
+func TestBootstrapDeliversEverythingAboveTheViewPosition(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, cmd("c0", "add-patron", "id", "p0", "name", "Ann"))
+
+	// a commit lands after the view is registered and before the connection streams, inside
+	// the view frame's write
+	ctx, cancel := context.WithCancel(t.Context())
+	var pos int64
+	w := &injectingWriter{t: t, header: http.Header{}, cancel: cancel, inject: func() {
+		pos = h.accept(admin, cmd("c1", "rename-patron", "id", "p0", "name", "Anne"))
+	}}
+	req := httptest.NewRequest("GET", "/stream?since=-1", nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+admin)
+	h.srv.handleStream(w, req)
+
+	// the view frame, then the commit's events, then live at its position
+	if len(w.frames) != 3 {
+		t.Fatalf("expected view, events, live, got %v", w.frames)
+	}
+	if w.frames[0][0] != "view" || asInt(w.frames[0][2]) != pos-1 {
+		t.Fatalf("expected the view at %d, got %v", pos-1, w.frames[0])
+	}
+	if w.frames[1][0] != "events" || events(w.frames[1])[0].position != pos {
+		t.Fatalf("expected the events at %d, got %v", pos, w.frames[1])
+	}
+	if w.frames[2][0] != "live" || asInt(w.frames[2][1]) != pos {
+		t.Fatalf("expected live at %d, got %v", pos, w.frames[2])
+	}
+}
+
 func TestColdReplayKeepsAtomsWhole(t *testing.T) {
 	h := start(t)
 	admin := h.admin()

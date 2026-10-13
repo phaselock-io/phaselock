@@ -624,7 +624,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	prefixes := view.prefixes
-	cursor := uint64(0)
+	// the stream delivers everything above the cursor: the client's checkpoint, or on a bootstrap
+	// the view's position, which the client takes as the bound of what its snapshots must cover
+	cursor := view.position
 	if since >= 0 {
 		cursor = uint64(since)
 	}
@@ -674,26 +676,24 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// cold catchup: unbuffered, as long as it takes
-	if since >= 0 {
-		for {
-			if !drainViews() {
+	for {
+		if !drainViews() {
+			return
+		}
+		before := cursor
+		if !replay(cursor+1, cursor+coldBatch) {
+			return
+		}
+		if cursor == before {
+			break
+		}
+		// a window that ended past the last frame is vouched for, so a client whose view
+		// matched nothing in it still sees the replay advance
+		if cursor > told {
+			if !write(mpEncode([]any{"vouch", cursor})) {
 				return
 			}
-			before := cursor
-			if !replay(cursor+1, cursor+coldBatch) {
-				return
-			}
-			if cursor == before {
-				break
-			}
-			// a window that ended past the last frame is vouched for, so a client whose view
-			// matched nothing in it still sees the replay advance
-			if cursor > told {
-				if !write(mpEncode([]any{"vouch", cursor})) {
-					return
-				}
-				told = cursor
-			}
+			told = cursor
 		}
 	}
 
@@ -704,10 +704,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	hot := s.position.Load()
 	prefixes = append([]string(nil), c.prefixes...)
 	s.mu.Unlock()
-	if since >= 0 {
-		if !replay(cursor+1, hot) {
-			return
-		}
+	if !replay(cursor+1, hot) {
+		return
 	}
 	cursor = max(cursor, hot)
 	if !write(mpEncode([]any{"live", cursor})) {

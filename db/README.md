@@ -260,8 +260,9 @@ Every frame is an array whose first element is a tag.
 
 - `since=N` replays history from N+1, then sends `live` with the last
   position the replay reached; nothing after `live` repeats a position
-  at or below it.  `since=-1` means bootstrap: no history, so `live` is
-  the first frame.  `live` is sent exactly once per connection and
+  at or below it.  `since=-1` means bootstrap: history from the view's
+  position, so everything above the position the view frame carries
+  arrives on the stream.  `live` is sent exactly once per connection and
   carries the same convergence meaning as a vouch at that position.
   A view frame may arrive during history when maySee changes; it
   applies from that point on.  History is read in windows of the log,
