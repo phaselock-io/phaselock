@@ -95,6 +95,13 @@ model RemovePatron {
   id: Id;
 }
 
+// ends the patron's stream and erases its history
+@command(Erasure)
+model ForgetPatron {
+  type: "forget-patron";
+  id: Id;
+}
+
 // the catalogue and the patron learn of the hold, or the patron alone learns why it failed
 @command([HoldOpened, PatronHold] | HoldFailed)
 model TryHold {
@@ -265,6 +272,7 @@ union TestCommands {
   AddPatron,
   RenamePatron,
   RemovePatron,
+  ForgetPatron,
   TryHold,
   Shelve,
   Lend,

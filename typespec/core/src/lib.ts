@@ -90,7 +90,7 @@ export const $lib = createTypeSpecLibrary({
     'invalid-command-output': {
       severity: 'error',
       messages: {
-        default: paramMessage`the @command output of '${'name'}' may only combine event models, Death, unions, tuples, and arrays (found ${'found'})`,
+        default: paramMessage`the @command output of '${'name'}' may only combine event models, Death, Erasure, unions, tuples, and arrays (found ${'found'})`,
       },
     },
     'command-output-not-event': {
@@ -108,7 +108,7 @@ export const $lib = createTypeSpecLibrary({
     'death-placement': {
       severity: 'error',
       messages: {
-        default: `Death may only appear in a @command output`,
+        default: `Death and Erasure may only appear in a @command output`,
       },
     },
     'placement-violation': {

@@ -73,6 +73,7 @@ globalThis.__host = (function () {
     outputs.map((item) => ({
       stream: item.stream,
       death: item.death === true,
+      erase: item.death === true && item.erase === true,
       event: item.death === true ? null : item.event,
     }));
 

@@ -512,7 +512,9 @@ function outputAnno(annos: Annos, o: POutput): string {
     case 'event':
       return `{ stream: ${streamLabel(o.slices)}; event: ${annos.get(o.type)!} }`;
     case 'death':
-      return '{ stream: string; death: true }';
+      return o.erase
+        ? '{ stream: string; death: true; erase: true }'
+        : '{ stream: string; death: true }';
     case 'oneOf':
       return o.options.map((x) => outputAnno(annos, x)).join(' | ');
     case 'all':
@@ -1053,15 +1055,18 @@ function generateDatabase(
     'every slice, and the request APIs of the plugin set P';
   generateGlobalContext(d, annos, txnType, doc, db.slices, 'plugins');
 
-  // what a plugin hook may return: any event of a slice labelled with one of its streams, or a death
+  // what a plugin hook may return: any event of a slice labelled with one of its streams, or a
+  // death, erasing the stream's history or not
   const outputs = db.slices.map(
     (s) => `{ stream: ${streamLabel([s])}; event: ${annos.get(s.events)!} }`,
   );
   d.print(
-    `\n/** any output of ${db.name}: an event of a slice on one of its streams, or a death */\n`,
+    `\n/** any output of ${db.name}: an event of a slice on one of its streams, or a death, ` +
+      "erasing the stream's history or not */\n",
   );
   d.print(`export type ${outputType} =\n`);
-  for (const o of [...outputs, '{ stream: string; death: true }']) d.print(`  | ${o}\n`);
+  const death = '{ stream: string; death: true; erase?: true }';
+  for (const o of [...outputs, death]) d.print(`  | ${o}\n`);
   d.print(';\n');
 
   // the types a plugin's handlers are typed by

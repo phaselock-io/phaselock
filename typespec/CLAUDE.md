@@ -40,7 +40,7 @@ layout, build commands, and the test suite.
   the host's Registry under the wire type and the query id plus `#result`.
 - **Commands are models carrying `@command(output)`**, where the output is the precommit
   handler's return type (see `@command` outputs below); an engine's commands are a named union of
-  them, or one.  `@online` and `Death` are vocabulary too, and so are the intake types
+  them, or one.  `@online`, `Death`, and `Erasure` are vocabulary too, and so are the intake types
   (`NewPassword`, `CommandAuth`, ...), which lower by identity to `PIntake` and `PResult`.
 - **Constraint validation (`@minLength`, `@pattern`, ...): decided, not implemented.**  The
   emitters currently ignore the constraint decorators entirely; the registry walk checks
@@ -99,7 +99,8 @@ layout, build commands, and the test suite.
   stream of a slice that folds it (a singleton slice's label is its literal family name, any
   other slice's its family template as a template literal type, `` `chat:${string},${string}` ``;
   an event several slices fold may go to any of their streams), unions as alternatives, tuples
-  and arrays as lists, and `{stream, death: true}` to end a stream, whose stream is any string.
+  and arrays as lists, and `{stream, death: true}` to end a stream, or `{stream, death: true,
+  erase: true}` to end it and erase its history, whose stream is any string.
   The template type checks the family and its separators, never the parameters' characters, so
   a stream name built as a plain string is a compile error and the database's check stays the
   exact one.  A passthrough names its own type.

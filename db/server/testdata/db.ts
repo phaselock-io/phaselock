@@ -206,6 +206,11 @@ const precommit: TestDBPrecommit<TestPlugins> = {
     requirePatron(txn, cmd.id);
     return { stream: `patron:${cmd.id}`, death: true };
   },
+  forgetPatron: (auth, txn, cmd) => {
+    auth.authorize(isAdmin(txn, auth));
+    requirePatron(txn, cmd.id);
+    return { stream: `patron:${cmd.id}`, death: true, erase: true };
+  },
   tryHold: (auth, txn, cmd) => {
     auth.authorize(isAdmin(txn, auth) || isSelf(auth, cmd.patron));
     const b = txn.get.book(cmd.book);

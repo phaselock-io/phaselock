@@ -839,6 +839,63 @@ func TestMaySeeInvalidation(t *testing.T) {
 	}
 }
 
+func TestAnErasureDeletesTheStreamsHistory(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne"))
+	h.accept(admin, cmd("c3", "add-patron", "id", "p2", "name", "Bob"))
+	pos := h.accept(admin, cmd("c4", "forget-patron", "id", "p1"))
+
+	// the death is all that remains of the stream, at its seq; the other stream is untouched
+	evs, _, _ := h.eventsRange(admin, "patron:p1", -1, -1, false, 0)
+	if len(evs) != 1 || evs[0].data["$sys"] != "death" || evs[0].seq != 4 || evs[0].position != pos {
+		t.Fatalf("after erasure: %+v", evs)
+	}
+	if evs, _, _ := h.eventsRange(admin, "patron:p2", -1, -1, false, 0); len(evs) != 2 {
+		t.Fatalf("other stream: %+v", evs)
+	}
+
+	// the stream's state is gone, and its event bytes are the death's alone
+	dead := h.snapshot(admin, "patron:p1")
+	deathBytes := int64(len(mpEncode(map[string]any{"$sys": "death"})))
+	if len(dead.records) != 0 || asInt(dead.header["event_bytes"]) != deathBytes {
+		t.Fatalf("dead stream: %v %v", dead.records, dead.header)
+	}
+
+	// a replay from the start delivers the death alone, whose seq shows the gap
+	s := h.stream(admin, 0)
+	var p1 []event
+	for {
+		f := s.next()
+		if f[0] == "live" {
+			break
+		}
+		if f[0] != "events" {
+			continue
+		}
+		for _, e := range events(f) {
+			if e.stream == "patron:p1" {
+				p1 = append(p1, e)
+			}
+		}
+	}
+	if len(p1) != 1 || p1[0].seq != 4 {
+		t.Fatalf("replayed: %+v", p1)
+	}
+
+	// a rebirth takes the next seq, and a plain death keeps its stream's history
+	h.accept(admin, cmd("c5", "add-patron", "id", "p1", "name", "Ann"))
+	evs, _, _ = h.eventsRange(admin, "patron:p1", -1, -1, false, 0)
+	if len(evs) != 3 || evs[1].data["$sys"] != "birth" || evs[1].seq != 5 {
+		t.Fatalf("after rebirth: %+v", evs)
+	}
+	h.accept(admin, cmd("c6", "remove-patron", "id", "p2"))
+	if evs, _, _ := h.eventsRange(admin, "patron:p2", -1, -1, false, 0); len(evs) != 3 {
+		t.Fatalf("after a plain death: %+v", evs)
+	}
+}
+
 func TestBirthDeath(t *testing.T) {
 	h := start(t)
 	admin := h.admin()

@@ -2816,8 +2816,11 @@ export function parsePark(key: string): { stream: string; seq: number } {
   return { stream: key.slice(at, bang), seq: Number(key.slice(bang + 1)) };
 }
 
-/** one thing a forecast emits: an event labelled with its stream, or the end of a stream */
-export type ForecastOutput = { stream: string; event: unknown } | { stream: string; death: true };
+/** Like precommit, forecast emits either an event labelled with a stream, or the death of a stream.
+    Unlike precommit, if a death is labeled with .erase=true, nothing happens, since .erase is about
+    the history of events, which the Engine does not track anyway. */
+export type ForecastOutput =
+  { stream: string; event: unknown } | { stream: string; death: true; erase?: true };
 
 /** a handler's typed output, which nests tuples and arrays of outputs, as the flat list of them */
 export function outputList(out: unknown): ForecastOutput[] {

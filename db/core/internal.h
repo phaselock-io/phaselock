@@ -91,6 +91,7 @@ int store_session_mark(store *s, const char *key, uint64_t n, int64_t time);
 int store_stream_live(store *s, const char *name);
 int store_stream_birth(store *s, const char *name, uint64_t pos);
 int store_stream_death(store *s, const char *name, uint64_t pos);
+int store_stream_erase(store *s, const char *name, uint64_t before);
 int store_stream_next_seq(store *s, const char *name, size_t bytes, uint64_t *seq);
 int store_stream_stats(store *s, const char *name, uint64_t *seq, uint64_t *event_bytes,
                        uint64_t *state_bytes);
@@ -183,6 +184,8 @@ typedef struct jsrt {
 typedef struct pc_item {
     char *stream;
     bool death;
+    // with death, whether the stream's earlier events go too
+    bool erase;
     JSValue event;
     buf bytes;
 } pc_item;

@@ -69,7 +69,7 @@ interface Queries {}
  * `@command(HoldOpened | HoldFailed)` returns exactly one of the two, a tuple returns each of its
  * members, and an array any number.  Each event is labelled with a stream of a slice that folds it.
  * A passthrough names its own type, `@command(AddBook)` on `AddBook`; `Death` ends the stream it
- * is labelled with.
+ * is labelled with, and `Erasure` ends it and erases its history.
  */
 extern dec command(target: Model, output: unknown);
 
@@ -83,6 +83,12 @@ extern dec online(target: Model);
 
 /** The end of a stream, in a `@command` output. */
 model Death {}
+
+/**
+ * The end of a stream and the erasure of its history, in a `@command` output: the stream's
+ * state and every event before its death are deleted, and the death stays as its last event.
+ */
+model Erasure {}
 
 // Fields the database prepares for precommit.  Each is a top-level field of an `@online`
 // command, which the database replaces before precommit runs: a NewPassword with its

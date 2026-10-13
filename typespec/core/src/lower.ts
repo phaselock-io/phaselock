@@ -194,6 +194,7 @@ export function lowerProgram(program: Program): LoweredProgram {
       case 'IdentityResult':
         return resultType(name);
       case 'Death':
+      case 'Erasure':
         reportDiagnostic(program, { code: 'death-placement', target: type });
         return registry.json();
       default:
@@ -446,7 +447,8 @@ export function lowerProgram(program: Program): LoweredProgram {
 
     switch (type.kind) {
       case 'Model': {
-        if (vocabName(type) === 'Death') return { kind: 'death' };
+        if (vocabName(type) === 'Death') return { kind: 'death', erase: false };
+        if (vocabName(type) === 'Erasure') return { kind: 'death', erase: true };
         if (isArrayModelType(type)) {
           return { kind: 'many', item: lowerOutput(cmd, type.indexer.value) };
         }

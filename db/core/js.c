@@ -688,8 +688,8 @@ static int strings_of(jsrt *js, JSValueConst arr, strlist *out) {
     return 0;
 }
 
-/* the outputs a precommit or bootstrap answered, [{stream, event} | {stream, death: true}], each
-   event's bytes under the type its stream's family folds; takes r */
+/* the outputs a precommit or bootstrap answered, [{stream, event} | {stream, death: true,
+   erase?: true}], each event's bytes under the type its stream's family folds; takes r */
 static int parse_outputs(jsrt *js, JSValue r, pc_result *out) {
     JSContext *ctx = js->ctx;
     JSValue lenv = JS_GetPropertyStr(ctx, r, "length");
@@ -708,6 +708,9 @@ static int parse_outputs(jsrt *js, JSValue r, pc_result *out) {
         JSValue dv = JS_GetPropertyStr(ctx, item, "death");
         pi->death = JS_ToBool(ctx, dv) == 1;
         JS_FreeValue(ctx, dv);
+        JSValue ev = JS_GetPropertyStr(ctx, item, "erase");
+        pi->erase = pi->death && JS_ToBool(ctx, ev) == 1;
+        JS_FreeValue(ctx, ev);
         pi->event = JS_GetPropertyStr(ctx, item, "event");
         out->n++;
         JS_FreeValue(ctx, item);

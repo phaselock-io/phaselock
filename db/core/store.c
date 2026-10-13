@@ -9,7 +9,7 @@ struct store {
     sqlite3_stmt *get, *set, *del, *scan, *scan_all, *del_prefix, *append, *read_log,
         *seek_ge, *seek_gt, *seek_le, *seek_lt, *seek_first, *seek_last,
         *max_pos, *session_hwm, *session_mark, *stream_live, *stream_birth, *stream_death,
-        *stream_seq,
+        *stream_erase, *stream_bytes, *stream_seq,
         *live_streams, *live_streams_all, *live_stream, *kv_len, *stream_state, *stream_state_zero, *stream_stats,
         *read_stream_asc, *read_stream_desc, *read_prefix_asc, *read_prefix_desc;
     // the kv cursor's statement, positioned at its key, or NULL past the end of its walk
@@ -106,6 +106,10 @@ int store_open(const char *path, bool writer, store **out, char *err, size_t err
                   " ON CONFLICT (name) DO UPDATE SET birth = excluded.birth, death = NULL") ||
              prep(s, &s->stream_death,
                   "UPDATE streams SET death = ?2 WHERE name = ?1 AND death IS NULL") ||
+             prep(s, &s->stream_erase, "DELETE FROM log WHERE stream = ?1 AND position < ?2") ||
+             prep(s, &s->stream_bytes,
+                  "UPDATE streams SET event_bytes = (SELECT COALESCE(SUM(length(data)), 0)"
+                  " FROM log WHERE stream = ?1) WHERE name = ?1") ||
              prep(s, &s->stream_seq,
                   "UPDATE streams SET seq = seq + 1, event_bytes = event_bytes + ?2"
                   " WHERE name = ?1 RETURNING seq") ||
@@ -136,8 +140,9 @@ void store_close(store *s) {
                              s->seek_ge, s->seek_gt, s->seek_le, s->seek_lt, s->seek_first,
                              s->seek_last,
                              s->append, s->read_log, s->max_pos, s->session_hwm, s->session_mark,
-                             s->stream_live, s->stream_birth, s->stream_death,
-                             s->stream_seq, s->live_streams, s->live_streams_all, s->live_stream,
+                             s->stream_live, s->stream_birth, s->stream_death, s->stream_erase,
+                             s->stream_bytes, s->stream_seq, s->live_streams,
+                             s->live_streams_all, s->live_stream,
                              s->kv_len,
                              s->stream_state, s->stream_state_zero, s->stream_stats,
                              s->read_stream_asc, s->read_stream_desc, s->read_prefix_asc,
@@ -472,6 +477,16 @@ int store_stream_death(store *s, const char *name, uint64_t pos) {
     sqlite3_bind_text(s->stream_death, 1, name, -1, SQLITE_STATIC);
     sqlite3_bind_int64(s->stream_death, 2, (sqlite3_int64)pos);
     return step_done(s, s->stream_death, "stream_death");
+}
+
+/* an erasure: the stream's events below the position go, and its event bytes are those of the
+   events that remain */
+int store_stream_erase(store *s, const char *name, uint64_t before) {
+    sqlite3_bind_text(s->stream_erase, 1, name, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(s->stream_erase, 2, (sqlite3_int64)before);
+    if (step_done(s, s->stream_erase, "stream_erase")) return -1;
+    sqlite3_bind_text(s->stream_bytes, 1, name, -1, SQLITE_STATIC);
+    return step_done(s, s->stream_bytes, "stream_bytes");
 }
 
 int store_stream_next_seq(store *s, const char *name, size_t bytes, uint64_t *seq) {

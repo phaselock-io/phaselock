@@ -61,7 +61,7 @@ demos:
   - sql txn is committed
 
 Features not bothered with:
-  - deletions and retention policies
+  - retention policies
   - ha configurations
   - live snapshots
   - memory conservation
@@ -144,7 +144,8 @@ plan above take precedence over it.
 - precommit returns either a rejection reason or a list of
   `{stream, event}` pairs, any number per stream.  The C core stamps
   every emitted event with the command's id; precommit never sees or
-  copies ids.  `{stream, death: true}` in the list ends a stream.
+  copies ids.  `{stream, death: true}` in the list ends a stream, and
+  `{stream, death: true, erase: true}` ends it and erases its history.
 - Envelope: `[position, stream, seq, commandid, servertime]`, least
   important last.  Readers must ignore elements appended later.
   `commandid` is the command's 16-byte label, as it arrived.
@@ -163,12 +164,14 @@ plan above take precedence over it.
 - Births are implicit: the first event to an unknown stream is
   preceded, in the same atom, by a system event with data
   `{"$sys": "birth"}`.  A death is `{"$sys": "death"}` followed by
-  deletion of the stream's keys and of every earlier event of the
-  stream; the death itself stays, as the stream's last event.  Dead
-  streams stay in the known-streams table as tombstones (name, birth,
-  death); a new event to a dead name is a rebirth with a new birth
-  position.  A client needs nothing of the deleted events: the death
-  is a reset, and a rebirth starts from empty.
+  deletion of the stream's keys.  An erasure is a death that also
+  deletes every earlier event of the stream, in the death's own atom;
+  the death itself stays, as the stream's last event, and on the wire
+  it is a death like any other.  Dead streams stay in the
+  known-streams table as tombstones (name, birth, death); a new event
+  to a dead name is a rebirth with a new birth position.  A client
+  needs nothing of the erased events: the death is a reset, and a
+  rebirth starts from empty.
 - Store keys are plain strings: `<stream>!<local key>`, as in
   `chat:acme,general!reply:t1,m5`; a key's stream is everything
   before its first `!`.  A template is a name, then, if it has

@@ -403,12 +403,13 @@ export class PSlice {
 
 /**
  * What a command's precommit handler returns, from its `@command`: one event labelled with a
- * stream of any of the slices that fold it, a death, exactly one of several options, each of
- * several items in order, or any number of one item.
+ * stream of any of the slices that fold it, a death, with or without the erasure of the stream's
+ * history, exactly one of several options, each of several items in order, or any number of one
+ * item.
  */
 export type POutput =
   | { kind: 'event'; type: PType; slices: readonly PSlice[] }
-  | { kind: 'death' }
+  | { kind: 'death'; erase: boolean }
   | { kind: 'oneOf'; options: readonly POutput[] }
   | { kind: 'all'; items: readonly POutput[] }
   | { kind: 'many'; item: POutput };

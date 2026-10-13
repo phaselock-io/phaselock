@@ -639,7 +639,8 @@ static bool check_expect(pldb *db, mpack_writer_t *w, JSValueConst expect) {
 
 /* Append a command's outputs as one atom and fold them, inside a savepoint named cmd that the
    caller releases on success.  Births come before a born stream's first event, deaths clear the
-   stream's keys, and each stream's events reach its family's reducer as one run.  Frees pc.
+   stream's keys, an erasure its earlier events too, and each stream's events reach its family's
+   reducer as one run.  Frees pc.
    Answers NULL, or why the atom was rolled back. */
 static char *apply_outputs(pldb *db, batch *b, const uint8_t *id, pc_result *pc) {
     JSContext *ctx = db->js.ctx;
@@ -665,6 +666,9 @@ static char *apply_outputs(pldb *db, batch *b, const uint8_t *id, pc_result *pc)
             if (!live) continue;
             append_event(db, b, atom, it->stream, id, DEATH, sizeof DEATH);
             if (store_stream_death(db->w, it->stream, db->position)) die("death: %s", store_err(db->w));
+            if (it->erase && store_stream_erase(db->w, it->stream, db->position)) {
+                die("erase: %s", store_err(db->w));
+            }
             char prefix[1024];
             snprintf(prefix, sizeof prefix, "%s!", it->stream);
             if (store_del_prefix(db->w, prefix)) die("del_prefix: %s", store_err(db->w));

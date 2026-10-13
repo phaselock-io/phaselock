@@ -79,12 +79,15 @@ const SOURCE = `
   @command([Death, ItemRemoved[]])
   model Leave { type: "leave"; check: CommandAuth; }
 
+  @command(Erasure)
+  model Forget { type: "forget"; org: Id; user: Id; }
+
   @command(ItemRemoved)
   model Sweep { type: "sweep"; id: Id; }
 
   interface ReaderEngine extends Engine<[CatalogSlice], AddItem> {}
 
-  union WriterCommands { AddItem, RemoveItem, SetProfile, NoteMany, Noted, Leave }
+  union WriterCommands { AddItem, RemoveItem, SetProfile, NoteMany, Noted, Leave, Forget }
 
   interface WriterEngine extends Engine<[CatalogSlice, InboxSlice], WriterCommands> {}
 
@@ -281,6 +284,10 @@ const SNIPPETS: Record<string, string> = {
         const gone = txn.get.item('i1') === undefined ? [] : [{ stream: 'catalog' as const, event: { type: 'item-removed' as const, id: 'i1' } }];
         return [{ stream: 'inbox:acme,' + auth.user, death: true }, gone];
       },
+      forget: (auth, _txn, cmd) => {
+        auth.authorizeAnyone();
+        return { stream: \`inbox:\${cmd.org},\${cmd.user}\`, death: true, erase: true };
+      },
       sweep,
     };
   `,
@@ -315,6 +322,8 @@ const SNIPPETS: Record<string, string> = {
       noteMany: (_auth, _txn, cmd) => cmd.notes.map((note) => ({ stream: \`secret:\${note}\` as const, event: { type: 'noted' as const, note, text: '' } })),
       // @ts-expect-error a death is { stream, death: true }
       leave: () => [{ stream: 'inbox:a,b', death: false }, []],
+      // @ts-expect-error an erasure is { stream, death: true, erase: true }
+      forget: () => ({ stream: 'inbox:a,b', death: true }),
     };
   `,
 
@@ -1022,6 +1031,7 @@ function passthrough() {
       { stream: `secret:${c.user}`, event: { type: 'secret-set', password: c.password } },
       { stream: `inbox:${c.org},${c.user}`, event: { type: 'profile-set', name: c.name } },
     ]),
+    forget: open((c) => ({ stream: `inbox:${c.org},${c.user}`, death: true, erase: true })),
     leave: open(() => [
       { stream: 'inbox:acme,u1', death: true },
       [
@@ -1116,6 +1126,10 @@ describe('precommit', () => {
     expect(text).toContain('{ stream: string; death: true }');
   });
 
+  it('types an Erasure output as { stream, death: true, erase: true }', () => {
+    expect(text).toContain('{ stream: string; death: true; erase: true }');
+  });
+
   it('flattens tuple and array outputs into the list the wrapper returns', () => {
     const b = bundle();
     const { txn } = fakeTxn();
@@ -1127,6 +1141,10 @@ describe('precommit', () => {
     ]);
     const note = { type: 'noted', note: 'n1', text: 'hi' };
     expect(b.precommit(txn, note, anyone)).toEqual([{ stream: 'catalog', event: note }]);
+    const forget = { type: 'forget', org: 'acme', user: 'u1' };
+    expect(b.precommit(txn, forget, anyone)).toEqual([
+      { stream: 'inbox:acme,u1', death: true, erase: true },
+    ]);
   });
 
   it('makes a missing handler and a misspelled extra handler compile errors', () => {
