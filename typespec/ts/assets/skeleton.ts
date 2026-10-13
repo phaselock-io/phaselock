@@ -2552,7 +2552,8 @@ export type Backfill = {
   // skipped outright.  Otherwise skipBytes > 0 resumes the blob download, and the header's
   // position must then equal position or the outcome is 'stale'; skipBytes === 0 fetches from
   // the start and accepts any position.  The tail starts at max(fromPosition, header position),
-  // so a newer blob overrides the floor.
+  // so a newer blob overrides the floor.  It reads forward, which may result in gaps if retention
+  // pruning happens concurrently, so it must be checked for gaps just before landing.
   resume: null | {
     position: number;
     skipBytes: number;

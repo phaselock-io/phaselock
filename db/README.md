@@ -399,7 +399,21 @@ Every frame is an array whose first element is a tag.
   and tail.  A family blob is therefore never invalidated as a whole;
   it degrades one member at a time.
 - `reverse` is a general read option, not part of the backfill: it is
-  how a person reads the log starting at the tail.
+  how a person reads the log starting at the tail.  The backfill's
+  tail reads forward from the cut.  Gaplessness could be proven by
+  reading backwards from the live cursor to the seq of the event
+  from which the snapshot was cut; since the earliest seq in the tail
+  was read last, and deletions happen forwards, there must not be any
+  gaps.  What breaks that is the family backfill.  An overlapping
+  strategy for a family of streams would be difficult or impossible
+  to express to the /events endpoint, except by accepting substantial
+  overread.  The forward read from the snapshots position, however,
+  has no such overread properties, but does have its own downside.
+  When reading forwards, gaps may appear at any position and the lack
+  of any events may be because no events have arrived or because the
+  entire tail was pruned.  That can only be distinguished by the
+  eventual arrival of a later event, which should be very quick in
+  the deleted tail case.
 
 Msgpack values are the JSON projection, with one extension: a date,
 the envelope's server time included, is the msgpack timestamp
@@ -430,6 +444,12 @@ the store keys with the ref's scope intact (`patron:X!patron`).
 and is the authoritative list of what the blob holds; a live stream
 with no keys appears in the map and nowhere else.  The optional header
 fields are the stream row's counters and appear only for an exact ref.
+A blob is cut in one read transaction, so every stream in it is at
+`position`.  That is a practical requirement, not a logical one: the
+client chains each stream by the seq the header gives it, so a blob
+assembled from parts cut at different positions would technicall work,
+but the client would have to tail from its lowest position, causing an
+unbounded waste of event downloads.
 
 ### Auth
 
