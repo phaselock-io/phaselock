@@ -3867,14 +3867,18 @@ export class Engine<QX, FX, C, N = never> {
     return header;
   }
 
-  // the streams among a subtree's parked events, or among the frozen events (null), whose chain
-  // does not continue from the state that will be in place; key-only
+  /* The streams among a subtree's parked events, or among the frozen events (null), whose chain
+     does not continue from the state that will be in place.  Key-only while a chain continues; a
+     gap reads the stream's values once, since a reset after it mends it, and so does the cut for
+     a stream no blob names. */
   #brokenStreamsIn(txn: RTxn, ref: string | null): string[] {
     const header = ref === null ? {} : this.#mergedHeaderIn(txn, ref);
     const broken: string[] = [];
     let range = this.#parkRange(ref, false);
     let stream = '';
     let last = 0;
+    // whether the stream was judged at a gap, which settles the rest of its run
+    let judged = false;
 
     // walk the parked keys in stream then seq order
     for (;;) {
@@ -3890,21 +3894,74 @@ export class Engine<QX, FX, C, N = never> {
         if (park.stream !== stream) {
           stream = park.stream;
           last = Math.max(typeof held === 'number' ? held : 0, header[stream] ?? 0);
+          judged = false;
         }
 
         // at or below the base, the snapshot covers this event
-        if (park.seq <= last) continue;
+        if (judged || park.seq <= last) continue;
 
         // does the chain continue?
-        if (park.seq !== last + 1) {
-          if (!broken.includes(stream)) broken.push(stream);
+        if (park.seq === last + 1) {
+          last = park.seq;
           continue;
         }
-        last = park.seq;
+
+        // a gap: the run's values settle the stream, once
+        judged = true;
+        const cut = this.#cutOf(ref, header, stream);
+        if (!this.#mendsIn(txn, stream, park.seq, cut)) broken.push(stream);
       }
       if (next === null) return broken;
       range = { ...range, after: next };
     }
+  }
+
+  /* Whether a stream's parked run holds past a gap at gapSeq, walking its values backwards from
+     the newest: it does when a reset follows the gap and the events after that reset chain, since
+     nothing before a reset is reduced, or when the whole run from the gap on lies at or below cut,
+     which covers it. */
+  #mendsIn(txn: RTxn, stream: string, gapSeq: number, cut: number | null): boolean {
+    let range: ScanRequest = {
+      pattern: engineKeys('park-ev', { prefix: `${stream}!` }),
+      reverse: true,
+      limit: 1000,
+      values: { type: '.event', rep: JS },
+    };
+    // the seq the next event walked must have, and whether the newest lies at or below the cut
+    let expected: number | null = null;
+    let covered = false;
+    for (;;) {
+      const { entries, next } = txn.scan(range);
+      for (const [, value] of entries) {
+        const ev = value as DbEvent<unknown>;
+        if (expected === null) {
+          covered = cut !== null && ev.position <= cut;
+        } else if (ev.seq !== expected) {
+          return false;
+        }
+        expected = ev.seq - 1;
+        if (sysOf(ev.data) !== null) return true;
+        if (ev.seq === gapSeq) return covered;
+      }
+      if (next === null) return false;
+      range = { ...range, after: next };
+    }
+  }
+
+  /* The cut covering a stream that no blob of a subtree names: the newest among the subtree's
+     entries whose ref covers it, each of which found the stream dead or unborn at its cut.  Null
+     for a stream some blob names or that is held, whose seq is its base, and among the frozen
+     events (null). */
+  #cutOf(ref: string | null, header: Record<string, number>, stream: string): number | null {
+    if (ref === null || stream in header) return null;
+    if (typeof this.#streams.get(stream) === 'number') return null;
+    let cut: number | null = null;
+    for (const r of this.#subtree(ref)) {
+      const position = this.#backfills.get(r)!.record.resume?.position;
+      if (position === undefined || !refCovers(r, stream)) continue;
+      if (cut === null || position > cut) cut = position;
+    }
+    return cut;
   }
 
   // a broken stream with an entry restarts it; the rest become children of the ref checked, or
@@ -3997,7 +4054,8 @@ export class Engine<QX, FX, C, N = never> {
   /* Reduce the parked events of a subtree, or of every stream under no backfill for the frozen
      events (null), each stream's run in one reducer call, then clear each walked stream's range.
      Chains were checked before any write.  Every landed stream's seq is written once: the last
-     walked for a stream with events, the cut's for a header stream without. */
+     walked for a stream with events, covered ones included, the cut's for a header stream
+     without. */
   #reduceParkedIn(
     txn: WTxn,
     ref: string | null,
@@ -4010,6 +4068,8 @@ export class Engine<QX, FX, C, N = never> {
     let range = this.#parkRange(ref, { type: '.event', rep: JS });
     let stream = '';
     let run: DbEvent<unknown>[] = [];
+    // the cut covering the stream, for one no blob names
+    let cut: number | null = null;
 
     // walk the parked events in stream then seq order, reducing each stream's run as it ends
     for (;;) {
@@ -4028,11 +4088,14 @@ export class Engine<QX, FX, C, N = never> {
           run = [];
           walked.push(stream);
           seqs.set(stream, Math.max(typeof held === 'number' ? held : 0, seqs.get(stream) ?? 0));
+          cut = this.#cutOf(ref, header, stream);
         }
 
-        // at or below the base, the snapshot covers this event
+        // at or below the base, the snapshot covers this event; so does the cut, for a stream no
+        // blob names, and the stream is held at the covered seq
         if (ev.seq <= seqs.get(stream)!) continue;
         seqs.set(stream, ev.seq);
+        if (cut !== null && ev.position <= cut) continue;
         run.push(ev);
       }
       if (next === null) break;
@@ -4052,10 +4115,11 @@ export class Engine<QX, FX, C, N = never> {
   }
 
   /* One stream's run of events, in order, through its slice's reducer.  Births and deaths are the
-     Engine's: a death drops the stream's keys, the stream stays known so a rebirth chains, and
-     neither reaches a reducer.  This is where events enter the base, so an event carrying the id
-     of an outbox or @online command is that command's round trip, whichever path parked or
-     delivered it. */
+     Engine's: either is a reset, after which the stream's state is empty whatever came before, so
+     a reset drops the stream's keys, nothing before the run's last reset reaches a reducer, and
+     the stream stays known so a rebirth chains.  This is where events enter the base, so an event
+     carrying the id of an outbox or @online command is that command's round trip, whichever path
+     parked or delivered it. */
   #reduceStreamIn(
     txn: WTxn,
     stream: string,
@@ -4065,31 +4129,34 @@ export class Engine<QX, FX, C, N = never> {
     // the server sends nothing outside the wants, and the wants are the families with reducers
     const slice = this.#reducers[stream.split(':')[0]];
     if (slice === undefined) throw new Error(`no reducer for ${stream}`);
-    let data: unknown[] = [];
+    const data: unknown[] = [];
 
-    // reduce the pending events, if any
-    const reduce = () => {
-      if (data.length === 0) return;
-      slice.reducer(reducerTxn(txn, stream, dirty), data, stream, false);
-      data = [];
-    };
+    // the run's last reset, if any
+    let from = 0;
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (sysOf(events[i].data) !== null) {
+        from = i;
+        break;
+      }
+    }
 
-    for (const ev of events) {
+    for (let i = 0; i < events.length; i++) {
+      const ev = events[i];
+
       // our own command's event: the round trip is observed
       if (this.#outbox.has(ev.id)) this.#releaseIn(txn, [ev.id]);
       const online = this.#online.get(ev.id);
       if (online !== undefined) online.seen = true;
 
-      const sys = sysOf(ev.data);
-      if (sys === 'death') {
-        // the stream died: reduce what came before, then drop its state
-        reduce();
+      if (i < from) continue;
+      if (sysOf(ev.data) !== null) {
+        // the last reset: the stream's state is empty from here
         markDirty(dirty, txn.delPrefix(`${stream}!`));
-      } else if (sys === null) {
+      } else {
         data.push(ev.data);
       }
     }
-    reduce();
+    if (data.length > 0) slice.reducer(reducerTxn(txn, stream, dirty), data, stream, false);
   }
 
   // a ref whose tail did not reach its parked live events downloads again from a fresh snapshot,
@@ -4239,9 +4306,11 @@ export class Engine<QX, FX, C, N = never> {
     let reduced = this.#reduced;
 
     // route each event
-    for (const ev of events) {
+    for (let i = 0; i < events.length; i++) {
+      const ev = events[i];
       const held = this.#streams.get(ev.stream);
       let park = held === 'backfill';
+      let decoded: DbEvent<unknown> | null = null;
 
       // an unknown stream?
       if (held === undefined && !seqs.has(ev.stream) && !born.has(ev.stream)) {
@@ -4251,10 +4320,14 @@ export class Engine<QX, FX, C, N = never> {
           const replacing = this.#backfills.get(parent)!.record.replacing;
           this.#maybeMarkBackfilling(txn, ev.stream, replacing);
           park = true;
-        } else if (sysOf(this.#decode(ev).data) !== 'birth') {
-          // a stream we missed the birth of: backfill it on its own, and park
-          this.#spawnIn(txn, null, [ev.stream], ev.position, false);
-          park = true;
+        } else {
+          // a reset starts the stream afresh below; any other event is one we missed the birth
+          // of, so the stream is backfilled on its own, and the event parks
+          decoded = this.#decode(ev);
+          if (sysOf(decoded.data) === null) {
+            this.#spawnIn(txn, null, [ev.stream], ev.position, false);
+            park = true;
+          }
         }
       }
 
@@ -4264,16 +4337,21 @@ export class Engine<QX, FX, C, N = never> {
         if (held === undefined) born.add(ev.stream);
       }
 
-      // a held stream, or a birth: does the event chain?
+      // a held stream, or an unknown one's reset: does the event chain?
       if (!park) {
         const last = seqs.get(ev.stream) ?? (typeof held === 'number' ? held : 0);
         if (ev.seq <= last) continue;
-        if (ev.seq === last + 1) {
-          // the next event: it joins the stream's run, and proves the stream needs no backfill
+        if (decoded === null) decoded = this.#decode(ev);
+
+        /* The next event chains.  So does a reset at any seq above the last, since the stream's
+           state is empty after it whatever was missed, and so does an event that a reset follows
+           within this atom, since the run's reduction starts at its last reset.  The event joins
+           the stream's run, and proves the stream needs no backfill. */
+        if (ev.seq === last + 1 || sysOf(decoded.data) !== null || this.#resetAhead(events, i)) {
           seqs.set(ev.stream, ev.seq);
           this.#resolve(ev.stream);
           if (!runs.has(ev.stream)) runs.set(ev.stream, []);
-          runs.get(ev.stream)!.push(this.#decode(ev));
+          runs.get(ev.stream)!.push(decoded);
           reduced = ev.position;
           continue;
         }
@@ -4298,6 +4376,15 @@ export class Engine<QX, FX, C, N = never> {
     const last = events[events.length - 1].position;
     this.#reducedTo(txn, this.#replacing > 0 ? reduced : last);
     this.#advanceCursorIn(txn, last);
+  }
+
+  // whether a reset for the event's stream follows it within its atom
+  #resetAhead(events: WireEvent[], i: number): boolean {
+    for (let j = i + 1; j < events.length; j++) {
+      const e = events[j];
+      if (e.stream === events[i].stream && sysOf(this.#decode(e).data) !== null) return true;
+    }
+    return false;
   }
 
   /* After a commit, the status is published and the graph learns what changed.  Base changes

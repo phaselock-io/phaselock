@@ -152,17 +152,23 @@ plan above take precedence over it.
   birth, and every later event on that name, including deaths and
   rebirths, takes the next number.  A client keeps one integer per
   known stream; an event whose seq is not last + 1 means it missed
-  events (retention, or a death and rebirth) and it drops the stream
-  and re-backfills.  Densely numbered survivors are what make gap
-  detection complete under keep-the-last-K retention: a deletion
-  always leaves later events behind, and they arrive in the client's
-  own history replay.
+  events (a deletion, or a death and rebirth).  A birth or a death is
+  a reset: the stream's state is empty after it whatever came before,
+  so the client accepts one at any seq above the last, wipes the
+  stream, and chains from it.  Any other event after a gap drops the
+  stream and re-backfills it.  Densely numbered survivors are what
+  make gap detection complete under deletion: a deletion always
+  leaves later events behind, and they arrive in the client's own
+  history replay.
 - Births are implicit: the first event to an unknown stream is
   preceded, in the same atom, by a system event with data
   `{"$sys": "birth"}`.  A death is `{"$sys": "death"}` followed by
-  deletion of the stream's keys.  Dead streams stay in the
-  known-streams table as tombstones (name, birth, death); a new event
-  to a dead name is a rebirth with a new birth position.
+  deletion of the stream's keys and of every earlier event of the
+  stream; the death itself stays, as the stream's last event.  Dead
+  streams stay in the known-streams table as tombstones (name, birth,
+  death); a new event to a dead name is a rebirth with a new birth
+  position.  A client needs nothing of the deleted events: the death
+  is a reset, and a rebirth starts from empty.
 - Store keys are plain strings: `<stream>!<local key>`, as in
   `chat:acme,general!reply:t1,m5`; a key's stream is everything
   before its first `!`.  A template is a name, then, if it has
@@ -273,18 +279,25 @@ Every frame is an array whose first element is a tag.
   registers its maySee up front, replays from the log unbuffered, then
   starts receiving live commits and replays the small gap up to the
   first one, deduplicating by position.
-- Retention, when it arrives, keeps at least the last event of every
-  stream, deaths included.  With that floor a replay from any
-  checkpoint introduces every stream born since (its surviving event
-  hits the unknown-stream rule) and delivers every death, so replay
-  on a matching token is complete under any policy, and a client that
-  receives a gapped stream's survivors sees the gap through seq.  A
-  server that would rather not replay a stream, because retention
-  gapped it for this client or because its byte counters say a cut is
-  cheaper, sends only the stream's last event: the seq jump is the
-  notice, and the client parks it, cuts, and drops it below the
-  position, the same path as any other gap.  There is no separate
-  horizon frame.
+- Every deletion keeps at least the last event of every stream, even
+  deleted streams, whose last event is a deletion event.  With that floor
+  a replay from any checkpoint introduces every stream born since (its
+  surviving event hits the unknown-stream rule) and delivers every death,
+  so replay on a matching token is complete under any policy, and a
+  client that receives a gapped stream's survivors sees the gap through
+  seq.  A gap observed before a birth or death is tolerated by the
+  client, since the client would ignore earlier events anyway.  A gap on
+  a live stream, as may occur under retention policies, is repaired by an
+  exact-ref backfill, which implies a requirement that retention must not
+  delete an event of a live stream that is newer than its stream's latest
+  cut snapshot, and the latest available snapshot is always served to
+  backfill requests.  The exception to that rule is gaps that occur prior
+  to birth or death events, since the client would ignore those earlier
+  events anyway.  A server that would rather not replay a stream, because
+  retention gapped it for this client or because its byte counters say a
+  cut is cheaper, sends only the stream's last event: the seq jump is the
+  notice, and the client parks it, cuts, and drops it below the position,
+  the same path as any other gap.
 - `want` is a list of refs: what the client can fold.  No `want`
   means `*`, everything maySee allows.
 - maySee that throws, or returns a ref that is malformed or does not
@@ -397,7 +410,14 @@ Every frame is an array whose first element is a tag.
   seq, so a stream whose chain breaks, in the tail or later on the
   live stream, is re-backfilled by itself with an exact-ref snapshot
   and tail.  A family blob is therefore never invalidated as a whole;
-  it degrades one member at a time.
+  it degrades one member at a time.  A chain is checked from its last
+  reset: of a stream's parked events, those before its last birth or
+  death are never reduced, the run from that reset is applied, and a
+  run with no reset must chain from the seq the blob or the held
+  state gives, or the stream is broken.  A stream the map does not
+  name was dead or unborn at the cut, so its parked events at or below
+  the blob's position are covered and never reduced, and its run above
+  the cut must start at a reset.
 - `reverse` is a general read option, not part of the backfill: it is
   how a person reads the log starting at the tail.  The backfill's
   tail reads forward from the cut.  Gaplessness could be proven by
@@ -442,7 +462,8 @@ Max record size 16 MiB; a larger klen or vlen is corruption.  Keys are
 the store keys with the ref's scope intact (`patron:X!patron`).
 `streams` maps every live stream the ref covers to its seq at the cut,
 and is the authoritative list of what the blob holds; a live stream
-with no keys appears in the map and nowhere else.  The optional header
+with no keys appears in the map and nowhere else, and a stream the
+map does not name was dead or unborn at the cut.  The optional header
 fields are the stream row's counters and appear only for an exact ref.
 A blob is cut in one read transaction, so every stream in it is at
 `position`.  That is a practical requirement, not a logical one: the
