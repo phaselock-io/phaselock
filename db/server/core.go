@@ -53,7 +53,27 @@ type result struct {
 	prefixes []string
 	marks    []int64 // every cron entry's mark, in Unix seconds
 	errmsg   string
+	// an outcome that stopped at a proven command whose credentials changed: buf holds the
+	// outcomes before it, and hash what lookup answers now, nil for none
+	bounce bool
+	hash   *string
 }
+
+// verdict is a command's proof as checked: whether it carries one, and if so whether it passed
+// against hash, the password hash lookup answered for the sender's token, nil for none
+type verdict struct {
+	state int
+	hash  *string
+}
+
+const (
+	proofNone   = C.PLDB_PROOF_NONE
+	proofPassed = C.PLDB_PROOF_PASSED
+	proofFailed = C.PLDB_PROOF_FAILED
+
+	// how many times a call may bounce before the writer takes a changed hash for lookup's bug
+	maxBounces = C.PLDB_MAX_BOUNCES
+)
 
 const (
 	rShutdown = C.PLDB_R_SHUTDOWN
@@ -130,10 +150,26 @@ func cbytes(b []byte) (*C.uint8_t, C.size_t) {
 	return (*C.uint8_t)(unsafe.Pointer(&b[0])), C.size_t(len(b))
 }
 
-func (c *core) submit(reqid uint64, p principal, body []byte) {
+// submit hands the writer prepared commands with their verdicts, one per command or none, and
+// the number of times the call has bounced
+func (c *core) submit(reqid uint64, p principal, body []byte, verdicts []verdict, attempt int) {
+	var arr *C.pldb_verdict
+	if len(verdicts) > 0 {
+		arr = (*C.pldb_verdict)(C.calloc(C.size_t(len(verdicts)), C.size_t(unsafe.Sizeof(C.pldb_verdict{}))))
+		defer C.free(unsafe.Pointer(arr))
+		cv := unsafe.Slice(arr, len(verdicts))
+		for i, v := range verdicts {
+			cv[i].state = C.int(v.state)
+			if v.hash != nil {
+				cv[i].hash = C.CString(*v.hash)
+				defer C.free(unsafe.Pointer(cv[i].hash))
+			}
+		}
+	}
 	withPrincipal(p, func(user *C.char, gen C.int64_t) {
 		ptr, l := cbytes(body)
-		C.pldb_submit(c.db, C.uint64_t(reqid), user, gen, ptr, l)
+		C.pldb_submit(c.db, C.uint64_t(reqid), user, gen, ptr, l, arr, C.size_t(len(verdicts)),
+			C.int(attempt))
 	})
 }
 
@@ -227,6 +263,11 @@ func (c *core) pop() result {
 	if r.errmsg != nil {
 		out.errmsg = C.GoString(r.errmsg)
 	}
+	out.bounce = r.bounce != 0
+	if r.hash != nil {
+		h := C.GoString(r.hash)
+		out.hash = &h
+	}
 	if r.nmarks > 0 {
 		for _, m := range unsafe.Slice(r.marks, int(r.nmarks)) {
 			out.marks = append(out.marks, int64(m))
@@ -235,12 +276,21 @@ func (c *core) pop() result {
 	return out
 }
 
+// prepared is a request as the core checked and prepared it
+type prepared struct {
+	body    []byte
+	reasons []string // one per command of the request, "" for one that passed
+	// for each passing command, in body order: its start in body, and the password of each
+	// CommandAuth proof it carries
+	offsets []int
+	proofs  [][]string
+}
+
 // prepare checks every command of a request against the bundle's registry and prepares the
 // fields the database replaces before precommit, hashing passwords on the pool for client under
-// ctx.  It returns the body of the commands that passed, in order, and one reason per command of
-// the request, "" for a command that passed; errBusy or errLimited when a hash was refused, which
-// refuses the whole request.
-func (c *core) prepare(s *Server, ctx context.Context, client string, body []byte) ([]byte, []string, error) {
+// ctx, and setting each CommandAuth proof's password aside for the caller to check.  It returns
+// errBusy or errLimited when a hash was refused, which refuses the whole request.
+func (c *core) prepare(s *Server, ctx context.Context, client string, body []byte) (*prepared, error) {
 	call := cgo.NewHandle(&hashCall{s: s, ctx: ctx, client: client})
 	defer call.Delete()
 	ptr, l := cbytes(body)
@@ -250,27 +300,42 @@ func (c *core) prepare(s *Server, ctx context.Context, client string, body []byt
 	switch rc {
 	case 0:
 	case C.PLDB_HASH_BUSY:
-		return nil, nil, errBusy
+		return nil, errBusy
 	case C.PLDB_HASH_LIMITED:
-		return nil, nil, errLimited
+		return nil, errLimited
 	default:
-		return nil, nil, errors.New(cstr(errbuf))
+		return nil, errors.New(cstr(errbuf))
 	}
 	defer C.pldb_prepared_free(&out)
-	reasons := make([]string, int(out.n))
+	pc := &prepared{reasons: make([]string, int(out.n))}
+	if out.body != nil {
+		pc.body = C.GoBytes(unsafe.Pointer(out.body), C.int(out.len))
+	}
+
+	// each passing command's start, and the index in body order of each command of the request
+	order := make([]int, int(out.n))
 	if out.n > 0 {
-		slice := unsafe.Slice(out.reasons, int(out.n))
-		for i := range reasons {
-			if slice[i] != nil {
-				reasons[i] = C.GoString(slice[i])
+		reasons := unsafe.Slice(out.reasons, int(out.n))
+		offsets := unsafe.Slice(out.offsets, int(out.n))
+		for i := range pc.reasons {
+			if reasons[i] != nil {
+				pc.reasons[i] = C.GoString(reasons[i])
+				continue
 			}
+			order[i] = len(pc.offsets)
+			pc.offsets = append(pc.offsets, int(offsets[i]))
 		}
 	}
-	var prepared []byte
-	if out.body != nil {
-		prepared = C.GoBytes(unsafe.Pointer(out.body), C.int(out.len))
+
+	// each proof's password, under its command
+	pc.proofs = make([][]string, len(pc.offsets))
+	if out.nproofs > 0 {
+		for _, p := range unsafe.Slice(out.proofs, int(out.nproofs)) {
+			j := order[int(p.command)]
+			pc.proofs[j] = append(pc.proofs[j], C.GoString(p.password))
+		}
 	}
-	return prepared, reasons, nil
+	return pc, nil
 }
 
 func (c *core) readLog(from, to uint64) ([]item, error) {

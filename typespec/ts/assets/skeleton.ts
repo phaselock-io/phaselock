@@ -1986,19 +1986,23 @@ export function runPrecommit(
 
 // the database bundle ////////////////////////////////////////////////////////
 
-/** what an endpoint asks lookup about: a sign-in by identity, or a token's principal at refresh
-    and on every check of its account's generation */
+/** What the database asks lookup about: a sign-in by identity, a token's principal at refresh,
+    and a token's principal on every check of its account's generation and of a CommandAuth
+    proof its commands carry.  A proof is checked against the answer before its command reaches
+    the writer, and the writer asks again in the command's turn: a proof whose answer changed
+    meanwhile is checked again, so the answer for a token should change only when the account's
+    credentials do. */
 export type LookupIdent =
   | { kind: 'password'; identity: string }
   | { kind: 'refresh'; user: string }
   | { kind: 'token'; user: string };
 
 /** an existing account: its user, the generation every token of it must carry, and the stored
-    password hash a sign-in verifies against */
+    password hash a sign-in or a password proof verifies against */
 export type LookupResult = {
   user: string;
   generation?: number;
-  secret?: string;
+  passwordHash?: string;
 };
 
 /** what the database hands bootstrap: emit appends an event to the seed atom, hashPassword makes

@@ -226,6 +226,16 @@ model SetPassword {
   password: NewPassword;
 }
 
+// changes the sender's own password, proving the one it has
+@online
+@command(PasswordSet)
+model ChangePassword {
+  type: "change-password";
+  user: Id;
+  check: CommandAuth;
+  password: NewPassword;
+}
+
 @command(SessionsRevoked)
 model RevokeSessions {
   type: "revoke-sessions";
@@ -246,7 +256,7 @@ model RevokeView {
   prefix: string;
 }
 
-// a command carrying a prepared field the database recognizes but cannot verify yet
+// a command proving its sender's credentials, which revokes the sender's sessions
 @online
 @command(SessionsRevoked)
 model AuthenticatedCommand {
@@ -287,6 +297,7 @@ interface TestEngine extends Engine<[BookSlice, PatronSlice, ShelfSlice], TestCo
 union DbCommands {
   CreateAccount,
   SetPassword,
+  ChangePassword,
   AuthenticatedCommand,
   Notify,
 }

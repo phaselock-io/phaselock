@@ -89,12 +89,14 @@ long schema_event_type(const schema *sc, const char *stream);
 /* walks /////////////////////////////////////////////////////////////////// */
 
 /* One field the database prepares for precommit, met by a check: its kind, its key, its value,
-   and the result to write in its place, which the caller fills in and the list owns. */
+   and the result to write in its place, which the caller fills in: a string the list owns, or a
+   CommandAuthResult's kind, written as {kind}. */
 typedef struct intake {
     const char *kind;
     char key[256];
     mpack_node_t node;
     char *result;
+    const char *result_kind;
 } intake;
 
 typedef struct intake_list {
@@ -122,6 +124,12 @@ int walk_write(const schema *sc, mpack_node_t node, long type, bool strict, cons
    fails its type, or with a pending JS exception when the heap did. */
 JSValue walk_to_js(JSContext *ctx, const schema *sc, mpack_node_t node, long type, bool strict,
                    char *err, size_t errlen);
+
+/* Build the JS value of a command walk_write prepared: walked strictly under type as
+   walk_to_js walks it, except that each prepared field of the top-level value holds the result
+   written in its place and is converted as it is. */
+JSValue walk_prepared_to_js(JSContext *ctx, const schema *sc, mpack_node_t node, long type,
+                            char *err, size_t errlen);
 
 /* Write a JS value as msgpack, appended to out.  Returns 0, or -1 with a message. */
 int walk_to_mpack(jsenv *env, const schema *sc, JSValueConst v, long type, bool strict,

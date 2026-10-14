@@ -5,6 +5,7 @@ package main
 // the parameters they were made with.
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -13,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/netip"
 	"strings"
@@ -191,11 +193,23 @@ func hashFailed(w http.ResponseWriter, err error) {
 	}
 }
 
-// the bundle's lookup result
+// the bundle's lookup result; passwordHash is nil for an account without one
 type account struct {
-	user       string
-	generation int64
-	secret     string
+	user         string
+	generation   int64
+	passwordHash *string
+}
+
+// whether two lookup answers hold the same credentials: no account in either, or the same user
+// with the same password hash
+func sameCredentials(a, b *account) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.user != b.user || (a.passwordHash == nil) != (b.passwordHash == nil) {
+		return false
+	}
+	return a.passwordHash == nil || *a.passwordHash == *b.passwordHash
 }
 
 func (s *Server) lookup(ident map[string]any) (*account, error) {
@@ -216,11 +230,62 @@ func (s *Server) lookup(ident map[string]any) (*account, error) {
 	}
 	a := &account{}
 	a.user, _ = m["user"].(string)
-	a.secret, _ = m["secret"].(string)
+	if h, ok := m["passwordHash"].(string); ok {
+		a.passwordHash = &h
+	}
 	if g, ok := m["generation"]; ok && g != nil {
 		a.generation = asInt64(g)
 	}
 	return a, nil
+}
+
+// passwordHashOf is the password hash lookup answers for a principal's token, which its
+// CommandAuth proofs are checked against: nil for the anonymous principal and for none
+func (s *Server) passwordHashOf(p principal) (*string, error) {
+	if p.anonymous {
+		return nil, nil
+	}
+	a, err := s.lookup(map[string]any{"kind": "token", "user": p.user})
+	if err != nil || a == nil {
+		return nil, err
+	}
+	return a.passwordHash, nil
+}
+
+// prove checks each command's proofs, the passwords prepare set aside, against hash, and answers
+// each command's verdict: none for a command without proofs, and failed for one when there is no
+// hash.  A first check spends the client's budget, as a login does; a check after a bounce does
+// not (recheck).
+func (s *Server) prove(ctx context.Context, client string, hash *string, proofs [][]string,
+	first bool) ([]verdict, error) {
+	verdicts := make([]verdict, len(proofs))
+	for i, passwords := range proofs {
+		if len(passwords) == 0 {
+			continue
+		}
+		verdicts[i] = verdict{state: proofPassed, hash: hash}
+		for _, password := range passwords {
+			ok := false
+			if hash != nil {
+				h := *hash
+				check := func() bool { return verifyPassword(h, password) }
+				var err error
+				if first {
+					ok, err = s.verifyFor(ctx, client, check)
+				} else {
+					ok, err = s.recheck(ctx, check)
+				}
+				if err != nil {
+					return nil, err
+				}
+			}
+			if !ok {
+				verdicts[i].state = proofFailed
+				break
+			}
+		}
+	}
+	return verdicts, nil
 }
 
 func asInt64(v any) int64 {
@@ -275,21 +340,52 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	case "password":
 		identity, _ := req["identity"].(string)
 		password, _ := req["password"].(string)
-		a, err := s.lookup(map[string]any{"kind": "password", "identity": identity})
+		ident := map[string]any{"kind": "password", "identity": identity}
+		a, err := s.lookup(ident)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		// an unknown account gets a dummy verification, so it answers no faster than a wrong
-		// password and spends the same budget
-		check := func() bool { return dummyVerify(password) }
-		if a != nil && a.secret != "" {
-			check = func() bool { return verifyPassword(a.secret, password) }
-		}
-		ok, err := s.verifyFor(r.Context(), s.clientOf(r), check)
-		if err != nil {
-			hashFailed(w, err)
-			return
+		var ok bool
+		for attempt := 0; ; attempt++ {
+			// an unknown account gets a dummy verification, so it answers no faster than a wrong
+			// password and spends the same budget
+			check := func() bool { return dummyVerify(password) }
+			if a != nil && a.passwordHash != nil {
+				hash := *a.passwordHash
+				check = func() bool { return verifyPassword(hash, password) }
+			}
+			if attempt == 0 {
+				ok, err = s.verifyFor(r.Context(), s.clientOf(r), check)
+			} else {
+				ok, err = s.recheck(r.Context(), check)
+			}
+			if err != nil {
+				hashFailed(w, err)
+				return
+			}
+			if s.proved != nil {
+				s.proved()
+			}
+
+			// the login is decided against the credentials lookup answers now, so a password
+			// checked against credentials that changed meanwhile is checked again
+			now, err := s.lookup(ident)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if sameCredentials(a, now) {
+				a = now
+				break
+			}
+			if attempt == maxBounces {
+				log.Printf("pldb: lookup answered different credentials for %q on each of %d reads",
+					identity, maxBounces+2)
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			a = now
 		}
 		if !ok {
 			http.Error(w, "invalid credentials", http.StatusUnauthorized)

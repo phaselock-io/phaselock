@@ -212,6 +212,9 @@ int js_reduce(jsrt *js, const char *family, const char *stream, JSValueConst eve
 int js_maysee(jsrt *js, JSValueConst principal, strlist *out);
 int js_lookup(jsrt *js, const uint8_t *ident, size_t len, buf *out);
 int64_t js_generation(jsrt *js, JSValueConst principal);
+/* the password hash lookup answers for the principal's token, malloc'd into out, or NULL for
+   none; -1 when lookup threw */
+int js_password_hash(jsrt *js, JSValueConst principal, char **out);
 
 /* names.c: stream names and keys against their slice's templates */
 /* the slice whose family a stream name's first segment names, or NULL */

@@ -71,6 +71,10 @@ type Server struct {
 	// the bundle's cron entries, in the core's order, and the scheduler's end
 	cron     []cronEntry
 	cronDone chan struct{}
+
+	// tests only: called once a login's password, or a request's proofs, have been checked,
+	// before what they were checked against is read again
+	proved func()
 }
 
 // conn is one stream connection.  Its view is what maySee allows cut down
@@ -755,7 +759,8 @@ func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	prepared, reasons, err := s.core.prepare(s, r.Context(), s.clientOf(r), body)
+	client := s.clientOf(r)
+	pc, err := s.core.prepare(s, r.Context(), client, body)
 	if errors.Is(err, errBusy) || errors.Is(err, errLimited) {
 		hashFailed(w, err)
 		return
@@ -765,29 +770,40 @@ func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// the core answers for the commands that passed the check; the rest were rejected here
-	var outcomes []any
-	passing := 0
-	for _, r := range reasons {
-		if r == "" {
-			passing++
+	// each proof against the sender's credentials, within the client's budget
+	var verdicts []verdict
+	for _, proofs := range pc.proofs {
+		if len(proofs) == 0 {
+			continue
 		}
-	}
-	if passing > 0 {
-		res := s.request(func(reqid uint64) { s.core.submit(reqid, p, prepared) })
-		if res.status != 0 {
-			refuse(w, res)
-			return
-		}
-		v, err := mpDecodeBytes(res.buf)
+		hash, err := s.passwordHashOf(p)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		outcomes = v.([]any)
+		verdicts, err = s.prove(r.Context(), client, hash, pc.proofs, true)
+		if err != nil {
+			hashFailed(w, err)
+			return
+		}
+		if s.proved != nil {
+			s.proved()
+		}
+		break
 	}
-	merged := make([]any, 0, len(reasons))
-	for _, r := range reasons {
+
+	// the core answers for the commands that passed the check; the rest were rejected here
+	var outcomes []any
+	if len(pc.offsets) > 0 {
+		var res result
+		outcomes, res = s.decide(r.Context(), p, pc, verdicts)
+		if res.status != 0 {
+			refuse(w, res)
+			return
+		}
+	}
+	merged := make([]any, 0, len(pc.reasons))
+	for _, r := range pc.reasons {
 		if r == "" {
 			merged = append(merged, outcomes[0])
 			outcomes = outcomes[1:]
@@ -797,6 +813,46 @@ func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/msgpack")
 	w.Write(mpEncode(merged))
+}
+
+// decide submits a request's passing commands and answers their outcomes, in order.  When the
+// writer bounces the call at a proven command, because the sender's credentials changed after
+// its proof was checked, every proof from that command on is checked again against what lookup
+// answers now, and the rest of the call is submitted again, so the call's commands are still
+// decided in order.  A failure answers a result with a status, the outcomes of commands already
+// decided lost with it, as a lost reply's are.
+func (s *Server) decide(ctx context.Context, p principal, pc *prepared, verdicts []verdict) ([]any, result) {
+	var outcomes []any
+	first := 0
+	for attempt := 0; ; attempt++ {
+		// the call from its first undecided command
+		body := pc.body[pc.offsets[first]:]
+		var vs []verdict
+		if verdicts != nil {
+			vs = verdicts[first:]
+		}
+		res := s.request(func(reqid uint64) { s.core.submit(reqid, p, body, vs, attempt) })
+		if res.status != 0 {
+			return nil, res
+		}
+		v, err := mpDecodeBytes(res.buf)
+		if err != nil {
+			return nil, result{status: http.StatusInternalServerError, errmsg: err.Error()}
+		}
+		outs := v.([]any)
+		outcomes = append(outcomes, outs...)
+		if !res.bounce {
+			return outcomes, res
+		}
+
+		// the command after the outcomes bounced: check its proofs, and every later one, again
+		first += len(outs)
+		again, err := s.prove(ctx, "", res.hash, pc.proofs[first:], false)
+		if err != nil {
+			return nil, result{status: http.StatusServiceUnavailable, errmsg: err.Error()}
+		}
+		copy(verdicts[first:], again)
+	}
 }
 
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {

@@ -31,6 +31,11 @@ typedef struct pldb_item {
 typedef struct pldb_result {
     int kind;
     int status;        /* 0 ok; 401 stale token; 500 with errmsg */
+    /* an outcome that stopped at a proven command whose credentials changed after its proof was
+       checked: buf holds the outcomes of the commands before it, and hash what lookup answers
+       now, NULL for none */
+    int bounce;
+    char *hash;
     uint64_t reqid;
     uint64_t conn;
     uint64_t position; /* last committed position when this result was made */
@@ -67,10 +72,31 @@ void pldb_close(pldb *db);
 /* the id of this log instance; positions mean nothing across epochs */
 const char *pldb_epoch(pldb *db);
 
+/* A proven command's verdict: whether it carries a CommandAuth proof, and if so whether its
+   proof passed against hash, the password hash lookup answered for the sender's token when the
+   proof was checked, NULL for none. */
+enum {
+    PLDB_PROOF_NONE = 0,
+    PLDB_PROOF_PASSED = 1,
+    PLDB_PROOF_FAILED = 2,
+};
+typedef struct pldb_verdict {
+    int state;
+    const char *hash;
+} pldb_verdict;
+
+/* The writer bounces a call at most this many times; past it, a proven command whose
+   credentials changed again is rejected as a bug in lookup. */
+#define PLDB_MAX_BOUNCES 3
+
 /* Requests; answered through pldb_pop.  user NULL is anonymous; gen < 0 skips
-   the generation check. */
+   the generation check.  A submit's body is commands pldb_prepare prepared, with one verdict
+   per command, or none when nverdicts is 0, and attempt the number of times the call has
+   bounced.  The writer checks a proven command against what lookup answers when its turn comes:
+   when the hash differs from its verdict's, it stops the call there and answers a bounce, and
+   otherwise a failed verdict is rejected. */
 int pldb_submit(pldb *db, uint64_t reqid, const char *user, int64_t gen, const uint8_t *body,
-                size_t len);
+                size_t len, const pldb_verdict *verdicts, size_t nverdicts, int attempt);
 int pldb_register(pldb *db, uint64_t reqid, uint64_t conn, const char *user, int64_t gen);
 int pldb_unregister(pldb *db, uint64_t conn);
 int pldb_lookup(pldb *db, uint64_t reqid, const uint8_t *ident, size_t len);
@@ -98,16 +124,26 @@ void pldb_result_free(pldb_result *r);
    against the bundle's registry, and the fields the database prepares for precommit are
    prepared, before anything reaches the writer.  body holds the commands that passed, in
    order; reasons has one entry per command of the request, NULL for one that passed and
-   why it was rejected otherwise.  Each passing command's session is replaced by its key in the
-   session table.  arg is handed to the hash function for every password the request carries.
-   Returns 0; -1 for a request that is not a sequence of [S, n, id, data, expect?] values; or
-   PLDB_HASH_BUSY or PLDB_HASH_LIMITED when the hash function refused, which refuses the whole
-   request, so the client can retry it later under the same sessions and numbers. */
+   why it was rejected otherwise, and offsets one, the start in body of a command that passed.
+   Each passing command's session is replaced by its key in the session table.  arg is handed to
+   the hash function for every password the request carries.  A CommandAuth proof is replaced
+   by its result, and its password goes to proofs for the caller to check; a proof of any other
+   kind rejects its command.  Returns 0; -1 for a request that is not a sequence of
+   [S, n, id, data, expect?] values; or PLDB_HASH_BUSY or PLDB_HASH_LIMITED when the hash
+   function refused, which refuses the whole request, so the client can retry it later under
+   the same sessions and numbers. */
+typedef struct pldb_proof {
+    size_t command; /* its command's index in the request */
+    char *password;
+} pldb_proof;
 typedef struct pldb_prepared {
     uint8_t *body;
     size_t len;
     char **reasons;
+    size_t *offsets;
     size_t n;
+    pldb_proof *proofs;
+    size_t nproofs;
 } pldb_prepared;
 int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, pldb_prepared *out,
                  char *err, size_t errlen);

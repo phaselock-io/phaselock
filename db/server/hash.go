@@ -80,6 +80,30 @@ func (p *hashPool) do(ctx context.Context, fn func()) error {
 	}
 }
 
+// queue runs fn on a worker and waits for it, as do does, but waits for room in the queue rather
+// than answering errBusy
+func (p *hashPool) queue(ctx context.Context, fn func()) error {
+	if p.ctx.Err() != nil {
+		return errClosed
+	}
+	j := hashJob{ctx: ctx, run: fn, reply: make(chan struct{}, 1)}
+	select {
+	case p.jobs <- j:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.ctx.Done():
+		return errClosed
+	}
+	select {
+	case <-j.reply:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.ctx.Done():
+		return errClosed
+	}
+}
+
 // wait blocks until every worker has exited, after the pool's context ends
 func (p *hashPool) wait() { p.wg.Wait() }
 
@@ -153,5 +177,14 @@ func (s *Server) verifyFor(ctx context.Context, client string, check func() bool
 	}
 	var ok bool
 	err := s.hashes.do(ctx, func() { ok = check() })
+	return ok, err
+}
+
+// recheck runs a password check again after the credentials it was checked against changed:
+// outside any client's budget, since the change was not the check's doing, and waiting for room
+// on the pool, since its call may already have decided commands
+func (s *Server) recheck(ctx context.Context, check func() bool) (bool, error) {
+	var ok bool
+	err := s.hashes.queue(ctx, func() { ok = check() })
 	return ok, err
 }

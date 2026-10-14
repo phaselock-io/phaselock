@@ -144,5 +144,16 @@ globalThis.__host = (function () {
       const r = withoutRequests('lookup', () => bundle().lookup(rx, ident));
       return r == null ? -1 : (r.generation ?? 0);
     },
+    // the password hash lookup answers for a principal's token, or null for none
+    passwordHash(principal) {
+      if (principal.user === null) return null;
+      const ident = { kind: 'token', user: principal.user };
+      const r = withoutRequests('lookup', () => bundle().lookup(rx, ident));
+      if (r == null || r.passwordHash == null) return null;
+      if (typeof r.passwordHash !== 'string') {
+        throw new Error('lookup answered a passwordHash that is not a string');
+      }
+      return r.passwordHash;
+    },
   };
 })();

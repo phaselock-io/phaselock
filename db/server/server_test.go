@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1903,23 +1904,242 @@ func TestPreparedFields(t *testing.T) {
 	if o.kind != "reject" || !strings.Contains(o.reason, "$.password: expected a string") {
 		t.Fatalf("non-string password: %+v", o)
 	}
+}
 
-	// a kind the database recognizes but cannot verify yet rejects the command
+// command-time authentication ///////////////////////////////////////////////
+
+// proof is a password CommandAuth
+func proof(password string) map[string]any {
+	return map[string]any{"kind": "password", "password": password}
+}
+
+// signUp creates an account with a password, and signs in to it
+func (h *harness) signUp(user, password string) string {
+	h.t.Helper()
+	h.accept("", cmd("signup-"+user, "create-account", "user", user, "password", password))
+	return h.signIn(user, password)
+}
+
+// signIn signs in with a password, which must be right
+func (h *harness) signIn(user, password string) string {
+	h.t.Helper()
 	status, _, out := h.do("POST", "/auth/token", "", mpEncode(map[string]any{
-		"kind": "password", "identity": "ann", "password": "hunter2",
+		"kind": "password", "identity": user, "password": password,
 	}))
 	if status != 200 {
-		t.Fatalf("login: %d %s", status, out)
+		h.t.Fatalf("login as %s: %d %s", user, status, out)
 	}
-	tok := mpDecodeOne(t, out).(map[string]any)["token"].(string)
-	o = h.commands(tok, cmd("c4", "authenticated-command", "user", "ann", "check", map[string]any{"kind": "password", "password": "hunter2"}))[0]
-	if o.kind != "reject" || !strings.Contains(o.reason, "CommandAuth") {
-		t.Fatalf("unverifiable kind: %+v", o)
+	return mpDecodeOne(h.t, out).(map[string]any)["token"].(string)
+}
+
+// setPasswordWhenProved arms the server to set a user's password, as an admin and once, right
+// after the next login's password or request's proofs are checked and before the server reads
+// the credentials again; the channel answers how the change went
+func (h *harness) setPasswordWhenProved(user, password string) chan error {
+	h.t.Helper()
+	admin := h.admin()
+	done := make(chan error, 1)
+	var once sync.Once
+	h.srv.proved = func() {
+		once.Do(func() {
+			body := cmd("hook-"+password, "set-password", "user", user, "password", password).encode(nil)
+			req, _ := http.NewRequest("POST", h.web.URL+"/commands", bytes.NewReader(body))
+			req.Header.Set("Authorization", "Bearer "+admin)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				done <- err
+				return
+			}
+			out, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			v, err := mpDecodeBytes(out)
+			if err == nil && (resp.StatusCode != 200 || v.([]any)[0].([]any)[0] != "ok") {
+				err = fmt.Errorf("set-password: %d %v", resp.StatusCode, v)
+			}
+			done <- err
+		})
 	}
-	// its wire shape is still checked first
-	o = h.commands(tok, cmd("c5", "authenticated-command", "user", "ann", "check", map[string]any{"kind": "carrier-pigeon"}))[0]
+	return done
+}
+
+// changed fails the test unless the armed password change ran and was accepted
+func changed(t *testing.T, done chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatal("the password change never ran")
+	}
+}
+
+func TestAPasswordProofIsCheckedAgainstTheSendersAccount(t *testing.T) {
+	h := start(t)
+	tok := h.signUp("ann", "hunter2")
+	proven := func(id, password string) command {
+		return cmd(id, "authenticated-command", "user", "ann", "check", proof(password))
+	}
+
+	// the right password passes, and precommit sees only what it proved
+	if o := h.commands(tok, proven("c1", "hunter2"))[0]; o.kind != "ok" {
+		t.Fatalf("the right password: %+v", o)
+	}
+	tok = h.signUp("bob", "pw")
+
+	// the proof is the sender's own: ann's password proves nothing for bob
+	o := h.commands(tok, cmd("c2", "authenticated-command", "user", "bob", "check", proof("hunter2")))[0]
+	if o.kind != "reject" || o.reason != "invalid credentials" {
+		t.Fatalf("another account's password: %+v", o)
+	}
+
+	// a failed proof is rejected before its expectations are compared, so it learns no seq
+	stale := map[string]any{"account:bob": 99}
+	bobs := func(id, password string) command {
+		return cmd(id, "authenticated-command", "user", "bob", "check", proof(password))
+	}
+	if o := h.expecting(tok, bobs("c3", "wrong"), stale); o.kind != "reject" {
+		t.Fatalf("a wrong password with a stale expectation: %+v", o)
+	}
+	if o := h.expecting(tok, bobs("c4", "pw"), stale); o.kind != "conflict" {
+		t.Fatalf("the right password with a stale expectation: %+v", o)
+	}
+
+	// an account without a password, and the anonymous principal, prove nothing
+	for _, sender := range []string{h.token("p1"), ""} {
+		o := h.commands(sender, cmd("c5", "authenticated-command", "user", "p1", "check", proof("x")))[0]
+		if o.kind != "reject" || o.reason != "invalid credentials" {
+			t.Fatalf("a proof with no password to check it against: %+v", o)
+		}
+	}
+
+	// the other kinds are refused at intake, after the wire shape is checked
+	o = h.commands(tok, cmd("c6", "authenticated-command", "user", "bob", "check",
+		map[string]any{"kind": "totp", "code": "123456"}))[0]
+	if o.kind != "reject" || o.reason != "totp proofs are not supported by this database yet" {
+		t.Fatalf("a totp proof: %+v", o)
+	}
+	o = h.commands(tok, cmd("c7", "authenticated-command", "user", "bob", "check",
+		map[string]any{"kind": "carrier-pigeon"}))[0]
 	if o.kind != "reject" || !strings.Contains(o.reason, "$.check") {
-		t.Fatalf("malformed proof: %+v", o)
+		t.Fatalf("a malformed proof: %+v", o)
+	}
+}
+
+func TestAResentPasswordChangeThatLandedIsOk(t *testing.T) {
+	h := start(t)
+	tok := h.signUp("ann", "hunter2")
+	change := cmd("c1", "change-password", "user", "ann", "check", proof("hunter2"), "password", "fresh").in("s1", 1)
+
+	// the change lands, and its resend proves a password that is no longer ann's, but the resend
+	// is the decided command, so dedup answers it
+	if o := h.commands(tok, change)[0]; o.kind != "ok" {
+		t.Fatalf("the change: %+v", o)
+	}
+	if o := h.commands(tok, change)[0]; o.kind != "ok" {
+		t.Fatalf("the resend: %+v", o)
+	}
+	again := cmd("c2", "change-password", "user", "ann", "check", proof("hunter2"), "password", "x").in("s1", 2)
+	if o := h.commands(tok, again)[0]; o.kind != "reject" || o.reason != "invalid credentials" {
+		t.Fatalf("a new command proving the old password: %+v", o)
+	}
+	if status := login(h, "ann", "fresh"); status != 200 {
+		t.Fatalf("login with the changed password: %d", status)
+	}
+}
+
+func TestACallProvesThePasswordItsEarlierCommandSet(t *testing.T) {
+	h := start(t)
+	tok := h.signUp("ann", "hunter2")
+
+	// both proofs are checked against hunter2 before either runs; the second bounces when its turn
+	// comes and passes against the password the first set
+	outs := h.commands(tok,
+		cmd("c1", "change-password", "user", "ann", "check", proof("hunter2"), "password", "fresh"),
+		cmd("c2", "authenticated-command", "user", "ann", "check", proof("fresh")))
+	if outs[0].kind != "ok" || outs[1].kind != "ok" {
+		t.Fatalf("outcomes: %+v", outs)
+	}
+}
+
+func TestAProofIsCheckedAgainWhenTheCredentialsChangeBeforeItsTurn(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, cmd("p", "add-patron", "id", "ann", "name", "Ann"))
+	tok := h.signUp("ann", "hunter2")
+
+	// a proof that passed against the old password fails against the new one
+	done := h.setPasswordWhenProved("ann", "fresh")
+	o := h.commands(tok, cmd("c1", "authenticated-command", "user", "ann", "check", proof("hunter2")))[0]
+	changed(t, done)
+	if o.kind != "reject" || o.reason != "invalid credentials" {
+		t.Fatalf("the old password after a change: %+v", o)
+	}
+
+	// a proof that failed against the old password passes against the new one, and the call's
+	// commands are still decided once each, in order
+	done = h.setPasswordWhenProved("ann", "fresher")
+	call := []command{
+		cmd("c2", "rename-patron", "id", "ann", "name", "A1").in("s1", 1),
+		cmd("c3", "authenticated-command", "user", "ann", "check", proof("fresher")).in("s1", 2),
+		cmd("c4", "rename-patron", "id", "ann", "name", "A2").in("s1", 3),
+	}
+	outs := h.commands(tok, call...)
+	changed(t, done)
+	for i, o := range outs {
+		if o.kind != "ok" {
+			t.Fatalf("outcome %d: %+v", i, o)
+		}
+	}
+	if outs[0].position >= outs[2].position {
+		t.Fatalf("decided out of order: %+v", outs)
+	}
+	patron := h.snapshot(admin, "patron:ann").records["patron:ann!patron"].(map[string]any)
+	if patron["name"] != "A2" {
+		t.Fatalf("patron after the call: %v", patron)
+	}
+
+	// the proven command revoked the token, so the resend signs in again, and is answered by dedup
+	tok = h.signIn("ann", "fresher")
+	for i, o := range h.commands(tok, call...) {
+		if o.kind != "ok" {
+			t.Fatalf("resent outcome %d: %+v", i, o)
+		}
+	}
+}
+
+func TestALoginIsCheckedAgainWhenTheCredentialsChange(t *testing.T) {
+	h := start(t)
+	h.signUp("ann", "hunter2")
+
+	// the password that passed is replaced before the login is decided
+	done := h.setPasswordWhenProved("ann", "fresh")
+	if status := login(h, "ann", "hunter2"); status != 401 {
+		t.Fatalf("the old password after a change: %d", status)
+	}
+	changed(t, done)
+
+	// the password that failed becomes the account's before the login is decided
+	done = h.setPasswordWhenProved("ann", "fresher")
+	if status := login(h, "ann", "fresher"); status != 200 {
+		t.Fatalf("the new password after a change: %d", status)
+	}
+	changed(t, done)
+}
+
+func TestALookupThatChangesOnEveryReadIsABug(t *testing.T) {
+	h := start(t)
+
+	// the writer bounces the call a few times, then rejects it as lookup's bug, in full in dev
+	o := h.commands(h.token("flaky"), cmd("c1", "authenticated-command", "user", "flaky", "check", proof("x")))[0]
+	if o.kind != "reject" || !strings.Contains(o.reason, "different passwordHash on each of 5 reads") {
+		t.Fatalf("a proof against a flaky lookup: %+v", o)
+	}
+
+	// a login gives up the same way
+	if status := login(h, "flaky", "x"); status != 500 {
+		t.Fatalf("a login against a flaky lookup: %d", status)
 	}
 }
 

@@ -23,11 +23,13 @@ declare const crypto: { randomUUID(): string };
 
 /* The users the tests sign in as without creating an account first.  root is an admin, and r1 is
    audited: its every maySee run changes its view, so a test sees each run as a view frame. */
-const TEST_USERS = ['root', 'p1', 'r1', 'requester'];
+const TEST_USERS = ['root', 'p1', 'r1', 'requester', 'flaky'];
 const ROOT = 'root';
 const AUDITED = 'r1';
 // a user whose maySee makes a plugin request, which no maySee may
 const REQUESTER = 'requester';
+// a user whose lookup answers a different password hash on every read, which is lookup's bug
+const FLAKY = 'flaky';
 
 // whether the principal is root or an account flagged admin
 const isAdmin = (txn: TestDBTxn, p: Principal): boolean =>
@@ -254,6 +256,11 @@ const precommit: TestDBPrecommit<TestPlugins> = {
       event: { type: 'account-created', user: cmd.user, hash: cmd.password, admin },
     };
   },
+  changePassword: (auth, txn, cmd) => {
+    auth.authorize(isSelf(auth, cmd.user));
+    requireAccount(txn, cmd.user);
+    return { stream: `account:${cmd.user}`, event: { type: 'password-set', hash: cmd.password } };
+  },
   setPassword: (auth, txn, cmd) => {
     auth.authorize(isAdmin(txn, auth) || isSelf(auth, cmd.user));
     requireAccount(txn, cmd.user);
@@ -275,6 +282,9 @@ const precommit: TestDBPrecommit<TestPlugins> = {
     return { stream: `account:${cmd.user}`, event: { type: 'view-revoked', prefix: cmd.prefix } };
   },
   authenticatedCommand: (auth, txn, cmd) => {
+    // precommit sees what the proof proved, never the proof
+    const seen = JSON.stringify(cmd.check);
+    if (seen !== '{"kind":"password"}') throw new Reject(`precommit saw ${seen}`);
     auth.authorize(isSelf(auth, cmd.user));
     requireAccount(txn, cmd.user);
     return { stream: `account:${cmd.user}`, event: { type: 'sessions-revoked' } };
@@ -316,8 +326,9 @@ const bundle = defineTestDB<TestPlugins>({
     const user = ident.kind === 'password' ? ident.identity : ident.user;
     const a = txn.get.account(user);
     if (a !== undefined) {
-      return { user: a.user, generation: a.generation, secret: a.hash };
+      return { user: a.user, generation: a.generation, passwordHash: a.hash };
     }
+    if (user === FLAKY) return { user, generation: 0, passwordHash: crypto.randomUUID() };
     // the tests' standing users, who need no account in the log
     return TEST_USERS.includes(user) ? { user, generation: 0 } : null;
   },

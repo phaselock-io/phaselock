@@ -1020,6 +1020,8 @@ typedef struct walk {
     // the prepared fields of the top-level value: collected by a check, written by a write
     intake_list *intakes;
     const intake_list *results;
+    // whether the top-level value's prepared fields hold their results, converted as they are
+    bool prepared;
     bool top;
     char *err;
     size_t errlen;
@@ -1449,6 +1451,19 @@ static void walk_struct(walk *w, const node *n, val v) {
                 path_pop(w);
                 continue;
             }
+            if (r && r->result_kind) {
+                SINK(w, begin_obj(w->sink, 1));
+                SINK(w, key(w->sink, "kind", 4));
+                SINK(w, str(w->sink, r->result_kind, strlen(r->result_kind)));
+                SINK(w, end_obj(w->sink));
+                path_pop(w);
+                continue;
+            }
+            if (w->prepared) {
+                walk_passthrough(w, found[i]);
+                path_pop(w);
+                continue;
+            }
         }
         walk_value(w, f->type, found[i]);
         path_pop(w);
@@ -1716,6 +1731,23 @@ JSValue walk_to_js(JSContext *ctx, const schema *sc, mpack_node_t node, long typ
     jssink_init(&s, &js, ctx);
     walk w;
     walk_init(&w, sc, NULL, &s, strict, err, errlen);
+    int rc = walk_run(&w, (val){.node = node}, type);
+    JSValue out = jssink_finish(&s);
+    if (rc) {
+        if (!JS_IsUninitialized(out)) JS_FreeValue(ctx, out);
+        return JS_EXCEPTION;
+    }
+    return out;
+}
+
+JSValue walk_prepared_to_js(JSContext *ctx, const schema *sc, mpack_node_t node, long type,
+                            char *err, size_t errlen) {
+    sink s;
+    jssink js;
+    jssink_init(&s, &js, ctx);
+    walk w;
+    walk_init(&w, sc, NULL, &s, true, err, errlen);
+    w.prepared = true;
     int rc = walk_run(&w, (val){.node = node}, type);
     JSValue out = jssink_finish(&s);
     if (rc) {

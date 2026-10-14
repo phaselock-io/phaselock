@@ -36,6 +36,10 @@ typedef struct req {
     size_t len;
     size_t entry; /* a tick's cron entry */
     int64_t slot; /* a tick's slot, or an arm's minute */
+    /* a submit's verdicts, one per command of its body or none, and how often it has bounced */
+    pldb_verdict *verdicts;
+    size_t nverdicts;
+    int attempt;
     struct req *next;
 } req;
 
@@ -211,6 +215,7 @@ void pldb_result_free(pldb_result *r) {
     free_strings(r->prefixes, r->nprefixes);
     free(r->marks);
     free(r->errmsg);
+    free(r->hash);
     free(r);
 }
 
@@ -235,6 +240,8 @@ static req *req_new(int kind, uint64_t reqid, const char *user, int64_t gen) {
 static void req_free(req *q) {
     free(q->user);
     free(q->body);
+    for (size_t i = 0; i < q->nverdicts; i++) free((char *)q->verdicts[i].hash);
+    free(q->verdicts);
     free(q);
 }
 
@@ -249,11 +256,20 @@ static void enqueue(pldb *db, req *q) {
 }
 
 int pldb_submit(pldb *db, uint64_t reqid, const char *user, int64_t gen, const uint8_t *body,
-                size_t len) {
+                size_t len, const pldb_verdict *verdicts, size_t nverdicts, int attempt) {
     req *q = req_new(REQ_SUBMIT, reqid, user, gen);
     q->body = xmalloc(len);
     memcpy(q->body, body, len);
     q->len = len;
+    if (nverdicts) {
+        q->verdicts = xmalloc(sizeof *q->verdicts * nverdicts);
+        for (size_t i = 0; i < nverdicts; i++) {
+            q->verdicts[i].state = verdicts[i].state;
+            q->verdicts[i].hash = verdicts[i].hash ? xstrdup(verdicts[i].hash) : NULL;
+        }
+        q->nverdicts = nverdicts;
+    }
+    q->attempt = attempt;
     enqueue(db, q);
     return 0;
 }
@@ -778,14 +794,59 @@ static void decide(pldb *db, batch *b, mpack_writer_t *w, const uint8_t *id, JSV
     write_ok(w, db->position);
 }
 
+enum { PROOF_HOLDS, PROOF_DECIDED, PROOF_BOUNCED };
+
+/* A proven command's proof, against what lookup answers for its sender now, which is what
+   precommit would read: PROOF_HOLDS when it passed against the same hash; PROOF_DECIDED with a
+   rejection written into w when it failed against the same hash, or lookup failed; and
+   PROOF_BOUNCED with the hash lookup answers in *bounce when the hash changed after the proof
+   was checked, so that the proof is checked again against it.  A call that has bounced
+   PLDB_MAX_BOUNCES times is decided instead, since a hash that changes on every read is lookup's
+   bug. */
+static int check_proof(pldb *db, mpack_writer_t *w, const uint8_t *id, const pldb_verdict *v,
+                       int attempt, JSValueConst principal, char **bounce) {
+    char *now = NULL;
+    if (js_password_hash(&db->js, principal, &now)) {
+        char *reason = bug_reason(db, id, strf("lookup error: %s", db->js.err));
+        write_reason(w, "reject", reason);
+        free(reason);
+        return PROOF_DECIDED;
+    }
+
+    // has the hash changed since the proof was checked?
+    bool same = now && v->hash ? strcmp(now, v->hash) == 0 : now == v->hash;
+    if (!same && attempt < PLDB_MAX_BOUNCES) {
+        *bounce = now;
+        return PROOF_BOUNCED;
+    }
+    free(now);
+    if (!same) {
+        char *reason = bug_reason(db, id, strf("lookup answered a different passwordHash on each "
+                                               "of %d reads", PLDB_MAX_BOUNCES + 2));
+        write_reason(w, "reject", reason);
+        free(reason);
+        return PROOF_DECIDED;
+    }
+
+    // with the credentials unchanged, a failed verdict stands
+    if (v->state == PLDB_PROOF_FAILED) {
+        write_reason(w, "reject", "invalid credentials");
+        return PROOF_DECIDED;
+    }
+    return PROOF_HOLDS;
+}
+
 /* One command, its outcome written into w.  A command in a session passes the dedup check first,
    against the group's open transaction, so it sees every decision ahead of it in its group: a
    number at or below the session's mark was decided already, and anything else runs, an unknown
-   session included, since session rows are kept forever.  Every decision moves the mark,
-   whatever it decided. */
-static void run_command(pldb *db, batch *b, mpack_writer_t *w, const char *session, uint64_t n,
+   session included, since session rows are kept forever.  A proven command's proof is checked
+   next, before its expectations, so a failed proof never learns a stream's seq.  Every decision
+   moves the mark, whatever it decided.  Answers whether the command bounced instead, which
+   decides nothing and writes no outcome, with what lookup answers in *bounce. */
+static bool run_command(pldb *db, batch *b, mpack_writer_t *w, const char *session, uint64_t n,
                         const uint8_t *id, JSValueConst data, JSValueConst expect,
-                        JSValueConst principal) {
+                        JSValueConst principal, const pldb_verdict *v, int attempt,
+                        char **bounce) {
     // the dedup check
     if (session) {
         uint64_t hwm = 0;
@@ -793,15 +854,21 @@ static void run_command(pldb *db, batch *b, mpack_writer_t *w, const char *sessi
         if (known < 0) die("session_hwm: %s", store_err(db->w));
         if (known && n <= hwm) {
             write_ok(w, db->position);
-            return;
+            return false;
         }
     }
 
-    decide(db, b, w, id, data, expect, principal);
+    // the proof, then the command
+    int proof = v && v->state != PLDB_PROOF_NONE
+                    ? check_proof(db, w, id, v, attempt, principal, bounce)
+                    : PROOF_HOLDS;
+    if (proof == PROOF_BOUNCED) return true;
+    if (proof == PROOF_HOLDS) decide(db, b, w, id, data, expect, principal);
 
     // the decision moves the mark; a rolled-back atom has already left its savepoint
     if (session && store_session_mark(db->w, session, n, b->servertime))
         die("session_mark: %s", store_err(db->w));
+    return false;
 }
 
 static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) {
@@ -823,12 +890,13 @@ static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) 
     mpack_build_array(&w);
 
     /* walk the prepared [key, n, id, data, expect?] values, each already checked, with a
-       session's key or nil in place of the session */
+       session's key or nil in place of the session, until one bounces */
     mpack_tree_t tree;
     mpack_tree_init_data(&tree, (const char *)q->body, q->len);
     long commands = schema_commands(db->js.sc);
     char why[512];
-    for (size_t consumed = 0; consumed < q->len;) {
+    size_t k = 0;
+    for (size_t consumed = 0; consumed < q->len && !r->bounce; k++) {
         mpack_tree_parse(&tree);
         if (mpack_tree_error(&tree) != mpack_ok) die("prepared body: malformed msgpack");
         consumed += mpack_tree_size(&tree);
@@ -847,15 +915,17 @@ static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) 
         const uint8_t *id = (const uint8_t *)mpack_node_bin_data(mpack_node_array_at(c, 2));
 
         // the data and the expectations, as JS values
-        JSValue datav = walk_to_js(ctx, db->js.sc, mpack_node_array_at(c, 3), commands, true, why,
-                                   sizeof why);
+        JSValue datav = walk_prepared_to_js(ctx, db->js.sc, mpack_node_array_at(c, 3), commands,
+                                            why, sizeof why);
         JSValue expectv = JS_UNDEFINED;
         if (mpack_node_array_length(c) > 4) expectv = mpjs_decode_node(ctx, mpack_node_array_at(c, 4));
         if (JS_IsException(datav) || JS_IsException(expectv)) {
             if (JS_HasException(ctx)) JS_FreeValue(ctx, JS_GetException(ctx));
             write_reason(&w, "reject", JS_IsException(datav) ? why : "malformed expect");
         } else {
-            run_command(db, b, &w, key, n, id, datav, expectv, principal);
+            const pldb_verdict *v = k < q->nverdicts ? &q->verdicts[k] : NULL;
+            r->bounce = run_command(db, b, &w, key, n, id, datav, expectv, principal, v,
+                                    q->attempt, &r->hash);
         }
         free(key);
         JS_FreeValue(ctx, datav);
@@ -1473,25 +1543,67 @@ static void write_session_key(mpack_writer_t *w, mpack_node_t session) {
     mpack_write_str(w, hex, 2 * SHA256_BLOCK_SIZE);
 }
 
-/* Check one command's data and prepare its fields: a NewPassword is hashed; any other kind
-   cannot be verified yet.  Writes the prepared [key, n, id, data, expect?] to out, its session
-   replaced by its key, or answers why the command is rejected; a hash function's refusal sets
-   *refused instead, and answers NULL. */
-static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t c, buf *out, int *refused) {
+/* the CommandAuth proofs of a request's passing commands */
+typedef struct proof_list {
+    pldb_proof *v;
+    size_t n, cap;
+} proof_list;
+
+static void proof_push(proof_list *l, size_t command, mpack_node_t password) {
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 4;
+        l->v = realloc(l->v, l->cap * sizeof *l->v);
+        if (!l->v) die("out of memory");
+    }
+    pldb_proof *p = &l->v[l->n++];
+    p->command = command;
+    p->password = xmalloc(mpack_node_strlen(password) + 1);
+    memcpy(p->password, mpack_node_str(password), mpack_node_strlen(password));
+    p->password[mpack_node_strlen(password)] = 0;
+}
+
+static void proofs_free(pldb_proof *v, size_t n) {
+    for (size_t i = 0; i < n; i++) free(v[i].password);
+    free(v);
+}
+
+/* Check one command's data and prepare its fields: a NewPassword is hashed, and a password
+   CommandAuth is replaced by its result and its password appended to proofs, under index, the
+   command's in the request; any other kind cannot be verified yet.  Writes the prepared
+   [key, n, id, data, expect?] to out, its session replaced by its key, or answers why the
+   command is rejected; a hash function's refusal sets *refused instead, and answers NULL. */
+static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t c, size_t index, buf *out,
+                             proof_list *proofs, int *refused) {
     long commands = schema_commands(db->js.sc);
     if (commands < 0) return xstrdup("this database takes no commands");
     mpack_node_t data = mpack_node_array_at(c, 3);
     char why[512];
     intake_list il = {0};
+    size_t proofs_start = proofs->n;
     char *reason = NULL;
     if (walk_check(db->js.sc, data, commands, true, &il, why, sizeof why)) {
         reason = xstrdup(why);
         goto done;
     }
 
-    // each prepared field's result
+    // each proof, whose password the caller checks, before any hash is spent on the command
     for (size_t k = 0; k < il.n; k++) {
         intake *in = &il.v[k];
+        if (strcmp(in->kind, "CommandAuth") != 0) continue;
+        mpack_node_t kind = mpack_node_map_cstr(in->node, "kind");
+        if (mpack_node_strlen(kind) != 8 || memcmp(mpack_node_str(kind), "password", 8) != 0) {
+            reason = reasonf("%.*s proofs are not supported by this database yet",
+                             (int)mpack_node_strlen(kind), mpack_node_str(kind));
+            goto done;
+        }
+        proof_push(proofs, index, mpack_node_map_cstr(in->node, "password"));
+        in->result_kind = "password";
+    }
+
+    // each other prepared field's result
+    for (size_t k = 0; k < il.n; k++) {
+        intake *in = &il.v[k];
+        if (strcmp(in->kind, "CommandAuth") == 0) continue;
         if (strcmp(in->kind, "NewPassword") != 0) {
             reason = reasonf("%s fields are not supported by this database yet", in->kind);
             goto done;
@@ -1543,6 +1655,11 @@ static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t c, buf *out, 
 
 done:
     intake_list_free(&il);
+
+    // a command that does not pass carries no proofs
+    if (reason || *refused) {
+        while (proofs->n > proofs_start) free(proofs->v[--proofs->n].password);
+    }
     return reason;
 }
 
@@ -1572,19 +1689,25 @@ int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, pldb_
     mpack_tree_destroy(&tree);
     out->reasons = xmalloc(sizeof(char *) * (ncmds ? ncmds : 1));
     memset(out->reasons, 0, sizeof(char *) * (ncmds ? ncmds : 1));
+    out->offsets = xmalloc(sizeof(size_t) * (ncmds ? ncmds : 1));
     out->n = ncmds;
 
     // check and prepare each command; a refused hash refuses the request
     buf prepared = {0};
+    proof_list proofs = {0};
     int refused = 0;
     mpack_tree_init_data(&tree, (const char *)body, len);
     for (size_t i = 0; i < ncmds && !refused; i++) {
         mpack_tree_parse(&tree);
-        out->reasons[i] = prepare_command(db, arg, mpack_tree_root(&tree), &prepared, &refused);
+        out->offsets[i] = prepared.len;
+        out->reasons[i] = prepare_command(db, arg, mpack_tree_root(&tree), i, &prepared, &proofs,
+                                          &refused);
     }
     mpack_tree_destroy(&tree);
     out->body = prepared.p;
     out->len = prepared.len;
+    out->proofs = proofs.v;
+    out->nproofs = proofs.n;
     if (refused) {
         pldb_prepared_free(out);
         snprintf(err, errlen, "password hashing refused");
@@ -1596,6 +1719,8 @@ int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, pldb_
 void pldb_prepared_free(pldb_prepared *p) {
     for (size_t i = 0; i < p->n; i++) free(p->reasons[i]);
     free(p->reasons);
+    free(p->offsets);
     free(p->body);
+    proofs_free(p->proofs, p->nproofs);
     memset(p, 0, sizeof *p);
 }

@@ -489,24 +489,54 @@ unbounded waste of event downloads.
   and on every command; a mismatch is rejected, so a generation bump
   logs out everywhere.
 - Login and refresh call the bundle's `lookup` on the txn thread; Go
-  verifies the password hash (argon2id, in a PHC string) and mints
-  the token.  A login naming no account runs a dummy verification, one
-  argon2id hash at the current parameters, so it answers no faster
-  than a wrong password.  Go never reads the
-  store.  The generation check calls `lookup` with `{kind: "token",
-  user}`; refresh calls it
-  with `{kind: "refresh", user}`; a null result means no
-  account and fails like a moved generation, since a token speaks only
-  for an existing account, dev tokens included.
+  verifies the password against its `passwordHash` (argon2id, in a
+  PHC string) and mints the token.  A login naming no account runs a
+  dummy verification, one argon2id hash at the current parameters, so
+  it answers no faster than a wrong password.  Go never reads the
+  store.  After the check Go calls `lookup` again, and when the
+  account's user or `passwordHash` changed meanwhile, checks the
+  password again against the new answer, outside the client's budget,
+  so a login is decided against the credentials it ends with.
+  Credentials still changing after a third re-check are `lookup`
+  answering differently for the same state, a bug, which fails the
+  login with 500.  The generation check calls `lookup` with
+  `{kind: "token", user}`; refresh calls it with `{kind: "refresh",
+  user}`; a null result means no account and fails like a moved
+  generation, since a token speaks only for an existing account, dev
+  tokens included.
 - A command's `NewPassword` fields, which the registry marks, are
   hashed in the handler's cgo call, before precommit.  Precommit and
   the log see only the hash.  Password-bearing commands are `@online`
   in the model, so the generated client API never puts them in the
-  outbox.  The other prepared kinds (CommandAuth,
-  CaptchaToken, IdentityProof) are recognized, and a command carrying
-  one is rejected until their verification is built.  A registry
-  naming a kind the database does not know stops it at startup: the
-  bundle needs a newer database.
+  outbox.  The other prepared kinds (CaptchaToken, IdentityProof), and
+  `CommandAuth` proofs of any kind but `password`, are recognized, and
+  a command carrying one is rejected until their verification is
+  built.  A registry naming a kind the database does not know stops
+  it at startup: the bundle needs a newer database.
+- A `CommandAuth` proof of kind `password` proves the sender's own
+  password.  Intake writes `{kind: "password"}` in its place and sets
+  the password aside; Go asks `lookup` with `{kind: "token", user}`
+  for the sender and checks the request's proofs against its
+  `passwordHash` on the pool, within the client's budget, as a login
+  does.  The anonymous principal and an account without a hash fail.
+  Each command's verdict, with the hash it was checked against,
+  travels to the writer beside the command and never reaches the log.
+- The writer checks a proven command after the dedup check and before
+  `expect` and precommit, so a failed proof never learns a stream's
+  seq, and a resend of a command that landed is answered by dedup
+  however its proof checks now.  It calls `lookup` again in the
+  command's turn: when the hash is unchanged the verdict stands, and a
+  failed one is rejected as "invalid credentials", a decision like any
+  other.  When the hash changed, the writer bounces the call: it stops
+  at the command and answers the outcomes before it, and Go checks
+  every remaining proof against the new hash, outside the budget and
+  waiting for room on the pool, then submits the rest of the call
+  again.  The call's commands are still decided once each and in
+  order, and a call may prove a password its earlier command set.  A
+  fourth change in a row is `lookup`'s bug, and rejects the command as
+  one.  Every submit runs the generation check, so a token revoked
+  partway through a call is refused with 401, as a lost reply is, and
+  a resend dedups the commands already decided.
 - Every argon2id hash, at login and at intake, runs on a fixed pool of
   workers (`HashWorkers`, default `GOMAXPROCS`) behind a queue of twice
   that, so hashing's memory stays at the pool's size times one hash's.
@@ -610,7 +640,7 @@ app's slots:
       reducers: { family: { reducer(txn, events, stream, pending),
                             template, keys } },
       maySee(txn, principal) → [ref...],
-      lookup(txn, ident) → null | { user, generation, secret },
+      lookup(txn, ident) → null | { user, generation, passwordHash },
       bootstrap(ctx),           // optional; see Bootstrap
       plugins: { name: { kind, config, run(txn, cmd) → [output...] } },
       dev,                      // the skeleton's DEV
@@ -619,7 +649,10 @@ app's slots:
 
 - `data` is the command's data; `principal` is `{user}` with `user` null
   for anonymous; `ident` is `{kind: "password", identity}` at
-  login and the `token`/`refresh` shapes above otherwise.
+  login and the `token`/`refresh` shapes above otherwise.  The `token`
+  shape also answers for a `CommandAuth` proof, and the writer reads
+  its `passwordHash` again in the command's turn, so its answer should
+  change only when the account's credentials do.
 - The `txn` of precommit, maySee, lookup, and a plugin's `run` also
   has `emit(outputs)`, which plugin code calls to add outputs to the
   command running.  A command's atom is what was emitted while
