@@ -1,0 +1,6 @@
+phaselockdb
+data/
+testdata/node_modules/
+testdata/bundle.js
+testdata/bundle.prod.js
+testdata/model.gen.ts

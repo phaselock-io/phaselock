@@ -62,6 +62,13 @@ TypeSpec tooling (`cd typespec`):
 - `pnpm --filter @phaselock/typespec-tests test:py` / `test:go` —
   emitted-Python / emitted-Go checker suites
 
+Database (`cd db`; Go 1.25+ and a C compiler):
+
+- `make` — build `db/phaselockdb` (plain `go build` with
+  `CGO_CFLAGS_ALLOW=-fwrapv`; no other build steps)
+- `make test` — rebuild the test bundle, run the Go tests
+- `make check` — the core's own C, warnings as errors
+
 Todo examples (`cd examples/todo-basic` or `todo-thin`):
 
 - `pnpm i` then `pnpm gen` — install, regenerate from the `.tsp` model
@@ -106,11 +113,12 @@ example to regenerate.
   keyof-based `useQuery.ts`) are library-quality; `usePhaseLock.ts` is
   app-specific by design — clarity over generality.
 - Wrap new documentation files at 80 columns.
-- Vendored third-party code lives under a `vendor/` directory, each file
-  headed with its origin, version, commit, any modification, SPDX id,
-  and full license text (see `client/ts/src/vendor/`), and gets an entry
-  in the root `NOTICE`, mirrored in the `NOTICE` of any package that
-  ships it.
+- Vendored third-party code lives under a `vendor/` directory
+  (`db/third_party/` in the database's Go module, where Go reserves
+  `vendor/`), each file headed with its origin, version, commit, any
+  modification, SPDX id, and full license text (see
+  `client/ts/src/vendor/`), and gets an entry in the root `NOTICE`,
+  mirrored in the `NOTICE` of any package that ships it.
 - If a result contradicts your model of the system, stop and ask rather
   than iterating on guesses; this codebase has few but sharp invariants,
   and the user usually spots the mismatch immediately.

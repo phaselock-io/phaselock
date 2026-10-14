@@ -1,4 +1,4 @@
-// Drives the connector against the v0 server.  Skipped unless db/pldb has been built.
+// Drives the connector against the v0 server.  Skipped unless db/phaselockdb has been built.
 
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -16,16 +16,16 @@ function cmd(name: string, n: number, data: unknown): Command<Uint8Array> {
   const id = `00000000-0000-0000-0000-${name.padStart(12, '0')}`;
   return { id, session: 'e2e', n, data: encode(data) };
 }
-const binary = join(db, 'pldb');
+const binary = join(db, 'phaselockdb');
 
-describe.skipIf(!existsSync(binary))('against pldb', () => {
+describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
   let proc: ChildProcess;
   let data: string;
   let url: string;
   let token: string;
 
   beforeAll(async () => {
-    data = mkdtempSync(join(tmpdir(), 'pldb-'));
+    data = mkdtempSync(join(tmpdir(), 'phaselockdb-'));
     const port = 18000 + Math.floor(Math.random() * 1000);
     url = `http://127.0.0.1:${port}`;
     proc = spawn(
@@ -55,7 +55,7 @@ describe.skipIf(!existsSync(binary))('against pldb', () => {
         await new Promise((r) => setTimeout(r, 100));
       }
     }
-    throw new Error('pldb did not start');
+    throw new Error('phaselockdb did not start');
   });
 
   afterAll(() => {

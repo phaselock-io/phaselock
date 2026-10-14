@@ -1,4 +1,0 @@
--std=gnu11
--Ivendor/mpack
--I../../examples/library/relay/quickjs
--DMPACK_EXTENSIONS=1

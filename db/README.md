@@ -733,36 +733,60 @@ app's slots:
 
 ### Layout and build
 
-    db/core/      the C core (libpldb.a): pldb.c txn loop, queues, and
-                  the command check, store.c SQLite, scan.c key
-                  patterns and their walk, walk.c the conversion
-                  kernel, names.c stream names and keys against their
+The database is one Go module, `phaselock.io/phaselockdb`, rooted at
+`db/`, and one package: cgo compiles a package's C only from its own
+directory, and calls C only in its own package, so the C core and the
+Go layer sit side by side.
+
+    db/*.c, *.h   the C core: pldb.c txn loop, queues, and the
+                  command check, store.c SQLite, scan.c key patterns
+                  and their walk, walk.c the conversion kernel,
+                  names.c stream names and keys against their
                   templates, mpjs.c untyped msgpack<->JS, js.c QuickJS
-                  host, host.js the JS glue, scantest.c the scan
-                  conformance test's hold on the walk, vendor/mpack,
-                  vendor/sha256
-    db/server/    the Go layer: core.go cgo binding, server.go HTTP,
-                  auth.go tokens and passwords, cron.go the cron
-                  scheduler, mp.go msgpack codec, server_test.go
-                  feature tests, plugins_test.go plugins and cron
-                  ticks, cron_test.go the scheduler, scan_test.go the
-                  scans, scantest.go their test-only binding
-    db/server/testdata/
-                  the test bundle: model.tsp and db.ts, generated into
+                  host, host.js the JS glue (embedded by Go), os.c the
+                  calls that differ by platform, scantest.c the scan
+                  conformance test's hold on the walk
+    db/*.go       the Go layer: core.go cgo binding and build flags,
+                  server.go HTTP, auth.go tokens and passwords, keys.go
+                  token keys, cron.go the cron scheduler, mp.go
+                  msgpack codec, server_test.go feature tests,
+                  plugins_test.go plugins and cron ticks, cron_test.go
+                  the scheduler, scan_test.go the scans, scantest.go
+                  their test-only binding
+    db/internal/  one Go package per vendored C library, so the
+                  build cache keeps its object code across edits to
+                  the core: lib_*.c wraps each vendored C file,
+                  setting the defines its own build passes
+    db/third_party/
+                  QuickJS, SQLite's amalgamation, MPack, and SHA-256,
+                  each file headed with its origin and license;
+                  update.py vendors a new QuickJS or SQLite and
+                  regenerates its wrappers and NOTICE entry
+    db/testdata/  the test bundle: model.tsp and db.ts, generated into
                   bundle.js (dev, with an inline source map) and
                   bundle.prod.js by the TypeScript emitter and esbuild,
                   with @phaselock/plugins from plugins/
 
-QuickJS objects come from the library example's checkout
-(`examples/library/relay/quickjs`, built by its Makefile); SQLite is
-the system library.  The Go side depends on `golang.org/x/crypto` for
+Building needs only Go 1.25 or newer and a C compiler: GCC or Clang on
+Linux and macOS, MinGW-w64 on Windows, which is the only toolchain
+cgo supports there.  QuickJS needs `-fwrapv`, which is outside cgo's
+default flag allowlist, so a build sets `CGO_CFLAGS_ALLOW=-fwrapv`;
+the makefile does.  The Go side depends on `golang.org/x/crypto` for
 argon2id and `github.com/robfig/cron/v3` for cron specs.  The tests
-need pnpm: `make -C db test` rebuilds the typespec workspace,
-`plugins/`, and the test bundle on every run.
+need pnpm: `make -C db test` rebuilds the test bundle on every run,
+from the emitter's and `plugins/`'s sources.  cgo compiles C without
+warnings, so `make -C db check` compiles the core's own C with them,
+as errors.
 
-    make -C db          build core and the pldb binary
-    make -C db test     build core and the test bundle, run the Go tests
-    ./db/pldb --bundle db/server/testdata/bundle.js --dev-auth
+    CGO_CFLAGS_ALLOW=-fwrapv go install phaselock.io/phaselockdb@latest
+    make -C db          build db/phaselockdb
+    make -C db test     build the test bundle, run the Go tests
+    make -C db check    the core's C, warnings as errors
+    ./db/phaselockdb --bundle db/testdata/bundle.js --dev-auth
+
+`go install` resolves `phaselock.io/phaselockdb` through a `go-import`
+page on phaselock.io naming this repository's `db` directory, so the
+module's versions are the repository's `db/v*` tags.
 
 Reader-side calls (history, list, snapshot) share one SQLite reader
 connection behind a mutex rather than a dedicated thread; each runs in

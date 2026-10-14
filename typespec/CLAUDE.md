@@ -56,10 +56,10 @@ layout, build commands, and the test suite.
   decision tree inside each union node, and a `Schema` per engine and database naming the
   identities a Registry answers for (`{engine}Schema`, `{database}Schema`).  A host converts by
   walking it, reading and writing, checked against the schema both ways: `client/ts`'s
-  `buildRegistry` in JS, `db/core/walk.c` in C.  A new type kind is a new node kind, handled in
+  `buildRegistry` in JS, `db/walk.c` in C.  A new type kind is a new node kind, handled in
   every walker.
 - **`skeleton.ts` has no library dependencies.**  It is pure logic: every codec, transport, and
-  store with outside dependencies comes from the host (`client/ts`, `db/core`), reaching the
+  store with outside dependencies comes from the host (`client/ts`, `db/`), reaching the
   Engine through the `Registry`, `ConnectorFactory`, and `Store` interfaces.  A user's model may
   bring in whatever it likes.
 - **The type registry's identities and walk rules.**  A named type's identity is its name, an

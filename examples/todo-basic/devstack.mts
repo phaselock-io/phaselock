@@ -20,10 +20,21 @@ main({
     G: "pnpm gen",
   },
   stages: {
-    // build the database and the bundle it runs, then run it over ./data
+    // build the database's image and the bundle it runs, then run it over ./data, as this user so
+    // the files there stay ours
     db: {
-      pre: [exec("make", "-C", "../../db"), exec("pnpm", "--dir", "model", "bundle")],
-      cmd: ["../../db/pldb", "--bundle", "model/bundle.js", "--data", "data"],
+      pre: [
+        exec("docker", "build", "-t", "phaselockdb", "../../db"),
+        exec("pnpm", "--dir", "model", "bundle"),
+        exec("mkdir", "-p", "data"),
+      ],
+      containerName: "todo-basic-db",
+      image: "phaselockdb",
+      dockerArgs: [
+        "-p=127.0.0.1:8080:8080",
+        `-v=${process.cwd()}/model/bundle.js:/bundle.js:ro`,
+      ],
+      cmd: ["--bundle", "/bundle.js"],
       post: connCheck(8080),
     },
     // then run the ui

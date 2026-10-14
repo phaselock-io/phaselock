@@ -1,0 +1,9 @@
+-std=gnu11
+-DMPACK_EXTENSIONS=1
+-Ithird_party/mpack
+-Ithird_party/sha256
+-Ithird_party/quickjs
+-Ithird_party/sqlite
+-Wall
+-Wextra
+-Wno-unused-parameter

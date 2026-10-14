@@ -2,7 +2,7 @@ __pycache__
 node_modules
 build/
 dist/
-quickjs/
+examples/library/relay/quickjs/
 *.so
 .claude
 *.gen.ts
