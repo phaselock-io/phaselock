@@ -4,8 +4,6 @@
     "devDependencies": {
         "@phaselock/typespec-core": "link:../../../typespec/core",
         "@phaselock/typespec-ts": "link:../../../typespec/ts",
-        "@phaselock/typespec-py": "link:../../../typespec/py",
-        "@phaselock/typespec-go": "link:../../../typespec/go",
         "@typespec/compiler": "^1.0.0",
         "@types/jest": "^30.0.0",
         "dts-bundle-generator": "^9.5.1",

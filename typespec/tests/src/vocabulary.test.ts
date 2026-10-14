@@ -58,7 +58,7 @@ function show(o: POutput): string {
     case 'event':
       return o.type.name!;
     case 'death':
-      return 'death';
+      return o.erase ? 'erasure' : 'death';
     case 'oneOf':
       return `oneOf(${o.options.map(show).join(', ')})`;
     case 'all':
@@ -452,12 +452,15 @@ describe('commands', () => {
       model Try { type: "try"; id: string; }
       @command([Noted, Death, Closed[]])
       model Leave { type: "leave"; patron: string; }
+      @command([Erasure, Noted])
+      model Forget { type: "forget"; patron: string; }
     `);
     expect(codes(l)).toEqual([]);
     expect(show(command(l.lowered, 'Try').output)).toBe(
       'oneOf(all(Opened, Joined), all(Opened, Joined, Closed, Noted), Noted)',
     );
     expect(show(command(l.lowered, 'Leave').output)).toBe('all(Noted, death, many(Closed))');
+    expect(show(command(l.lowered, 'Forget').output)).toBe('all(erasure, Noted)');
   });
 
   it('labels an output event with every slice that folds it', async () => {
@@ -517,12 +520,13 @@ describe('commands', () => {
     expect(l.lowered.commands.map((c) => c.name)).toEqual(['Open', 'Close', 'Join']);
   });
 
-  it('rejects Death anywhere but a command output', async () => {
+  it('rejects Death and Erasure anywhere but a command output', async () => {
     const l = await lower(`
       ${BOOK}
       model Gone { type: "gone"; death: Death; }
+      model Forgotten { type: "forgotten"; erasure: Erasure; }
     `);
-    expect(codes(l)).toContain('death-placement');
+    expect(codes(l)).toEqual(['death-placement', 'death-placement']);
   });
 });
 
@@ -720,7 +724,7 @@ describe('the library example', () => {
       'LoginSlice',
     ]);
     expect(show(command(l.lowered, 'DeleteAccount').output)).toBe(
-      'all(LoginDeleted, death, many(HoldClosed))',
+      'all(LoginDeleted, erasure, many(HoldClosed))',
     );
   });
 });

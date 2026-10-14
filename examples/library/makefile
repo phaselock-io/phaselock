@@ -10,9 +10,9 @@ all: model relay decider ui
 
 # all generated sources
 .PHONY: gen
-gen: model/model.gen.ts relay/relay.js relay/model.py decider/decider.js decider/model/model.go ui/src/model.js ui/src/model.d.ts
+gen: model/model.gen.ts relay/relay.js decider/decider.js ui/src/model.js ui/src/model.d.ts
 
-model/model.gen.ts relay/model.py decider/model/model.go &: model/model.tsp model/tspconfig.yaml
+model/model.gen.ts: model/model.tsp model/tspconfig.yaml
 	cd model && pnpm exec tsp compile model.tsp
 
 .PHONY: model

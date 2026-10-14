@@ -182,14 +182,8 @@ model CancelHold {
   patron: Uuid;
 }
 
-// sent by the Tick, once it exists
-@command([HoldClosed, PatronHoldClosed])
-model ExpireHold {
-  type: "expire-hold";
-  id: Uuid;
-  patron: Uuid;
-}
-
+// closes a hold, whether cancelled, fulfilled by a checkout, closed with its patron's account, or
+// expired by the daily sheet
 model HoldClosed {
   type: "hold-closed";
   id: Uuid;
@@ -235,15 +229,7 @@ model CheckoutEnded {
   timestamp: utcDateTime;
 }
 
-// sent by the Tick, once it exists
-@command([CheckoutOverdue, PatronCheckoutOverdue])
-model OverdueCheckout {
-  type: "overdue-checkout";
-  checkout: Uuid;
-  patron: Uuid;
-  timestamp: utcDateTime;
-}
-
+// the daily sheet marks a checkout overdue once its expiry has passed
 model CheckoutOverdue {
   type: "checkout-overdue";
   id: Uuid;
@@ -270,6 +256,8 @@ model Patron {
   id: Uuid;
   name: string;
   researcher: boolean;
+  // when the patron last changed their password, so a client learns from sync that it landed
+  passwordChanged?: utcDateTime;
 }
 
 model PatronHold {
@@ -294,6 +282,7 @@ union PatronEvents {
   PatronCheckoutOpened,
   PatronCheckoutEnded,
   PatronCheckoutOverdue,
+  PatronPasswordChanged,
   PatronDismissNotice,
 }
 
@@ -357,6 +346,12 @@ model PatronCheckoutOverdue {
   id: Uuid;
 }
 
+// the patron's own record of a password change, which precommit stamps
+model PatronPasswordChanged {
+  type: "patron-password-changed";
+  timestamp: utcDateTime;
+}
+
 // a patron dismisses one of their own notices, or a librarian dismisses it for them
 @command(PatronDismissNotice)
 model PatronDismissNotice {
@@ -403,9 +398,12 @@ model DismissNotice {
 /////////////////
 
 // Credentials, which the database keeps for itself and never syncs: a hash in a browser cache
-// can be cracked offline.  `lookup` reads a login by name to sign someone in.  A login's user
-// is the patron it belongs to, except for the one `admin` login every librarian shares, which
-// the bundle's bootstrap seeds.
+// can be cracked offline.  `lookup` reads a login by name to sign someone in, and by user to
+// check a token and a command's proof.  A login's user is the patron it belongs to, except for
+// the one `admin` login every librarian shares, which the bundle's bootstrap seeds.  A login
+// name fills a key parameter, so precommit rejects one holding a separator of the key templates.
+// The slice's history keeps every login name and superseded hash, which only a retention
+// policy trims.
 
 interface LoginSlice extends Slice<"login", LoginEvents, LoginStore> {}
 
@@ -427,12 +425,13 @@ union LoginEvents {
   LoginDeleted,
 }
 
-// sent with a plain fetch() before signing in, since no Engine exists until someone has
+// Sent anonymously before signing in, outside any Engine, since no token exists until the
+// account does.  Precommit mints the new patron's id, so no id is ever reused; signing in
+// answers it.
 @online
 @command([LoginCreated, PatronCreated])
 model CreateAccount {
   type: "create-account";
-  patron: Uuid;
   login: string;
   name: string;
   password: NewPassword;
@@ -447,11 +446,11 @@ model LoginCreated {
 
 // changes the sender's own password
 @online
-@command(PasswordChanged)
+@command([PasswordChanged, PatronPasswordChanged])
 model ChangePassword {
   type: "change-password";
-  // CommandAuth could be the existing password, or the TOTP token, or something,
-  // but Go has to match it against what lookup() returns or it will be rejected.
+  // proves a credential the account has registered, which the database verifies before
+  // precommit sees the command
   check: CommandAuth;
   new: NewPassword;
 }
@@ -463,9 +462,9 @@ model PasswordChanged {
 }
 
 // deletes the sender's own account; rejected while they have open checkouts, their open holds
-// close with the account, and their patron stream ends
+// close with the account, and their patron stream ends with its history erased
 @online
-@command([LoginDeleted, Death, HoldClosed[]])
+@command([LoginDeleted, Erasure, HoldClosed[]])
 model DeleteAccount {
   type: "delete-account";
   check: CommandAuth;
@@ -482,7 +481,7 @@ model LoginDeleted {
 ////////////////////////
 
 // A patron has very limited write capabilities.  Each of these commands may be sent only for
-// their own patron_uuid.
+// their own patron.
 union UserCommands {
   RenamePatron,
   TryHold,
@@ -494,10 +493,10 @@ union UserCommands {
 
 interface UserEngine extends Engine<[BookSlice, PatronSlice], UserCommands> {}
 
-// An admin (the librarian at the front desk) has most of the write capabilities in the system,
-// except they cannot create decider-specific events.
+// An admin (the librarian at the front desk) has every command but the database's own,
+// CreateAccount.
 union AdminCommands {
-  // admin can create UserCommands with whatever patron_uuid they want
+  // admin can send UserCommands for whatever patron they want
   UserCommands,
   AddEdition,
   UpdateEditionTitle,
@@ -519,20 +518,11 @@ interface AdminEngine extends Engine<[BookSlice, PatronSlice, AdminSlice], Admin
 /* The DB holds all slices and its precommit function handles all commands,
    and it may declare additional slices and commands that no Engine handles.
    Additional slices are maintained for internal use (precommit, maySee, and
-   lookup), but are not synced to any client. */
-interface LibraryDB extends Database<
-  [UserEngine, AdminEngine],
-  [LoginSlice],
-  DatabaseCommands
-> {}
-
-union DatabaseCommands {
-  // the daily sweep, sent by the Tick once it exists
-  ExpireHold,
-  OverdueCheckout,
-  // sent before signing in, when there is no Engine to send them
-  CreateAccount,
-}
+   lookup), but are not synced to any client.  Its one command of its own is
+   sent before signing in, when there is no Engine to send it.  The daily
+   sheet is a cron hook of the bundle, which writes its events as a command's
+   handler does. */
+interface LibraryDB extends Database<[UserEngine, AdminEngine], [LoginSlice], CreateAccount> {}
 
 /////////////////
 // Query Layer //

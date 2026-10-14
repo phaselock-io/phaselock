@@ -53,12 +53,6 @@ importers:
       '@phaselock/typespec-core':
         specifier: link:../../../typespec/core
         version: link:../../../typespec/core
-      '@phaselock/typespec-go':
-        specifier: link:../../../typespec/go
-        version: link:../../../typespec/go
-      '@phaselock/typespec-py':
-        specifier: link:../../../typespec/py
-        version: link:../../../typespec/py
       '@phaselock/typespec-ts':
         specifier: link:../../../typespec/ts
         version: link:../../../typespec/ts
