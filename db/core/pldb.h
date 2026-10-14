@@ -16,6 +16,7 @@ enum {
     PLDB_R_LOOKUP = 4,  /* reqid, buf: msgpack of lookup's return, len 0 for null */
     PLDB_R_ARM = 5,     /* reqid, marks: every cron entry's mark, in entry order */
     PLDB_R_TICK = 6,    /* reqid; status 500 with errmsg when the tick's hook failed */
+    PLDB_R_KEY = 7,     /* reqid: a token key and its sweep are durable */
 };
 
 /* One event as the wire sees it: data is the encoded [envelope, data] value, and atom the first
@@ -115,6 +116,21 @@ typedef struct pldb_cron_entry {
 size_t pldb_cron_entries(pldb *db, const pldb_cron_entry **out);
 int pldb_cron_arm(pldb *db, uint64_t reqid, int64_t minute);
 int pldb_cron_tick(pldb *db, uint64_t reqid, size_t i, int64_t slot);
+
+/* Token keys: the public keys tokens are verified against, each with its id and the Unix
+   milliseconds it was minted.  pldb_keys reads every key, oldest first, on the caller's thread;
+   pldb_key_add stores one and deletes the keys sweep names, in one commit on the writer, and
+   answers a PLDB_R_KEY once both are durable. */
+typedef struct pldb_key {
+    char *kid;
+    uint8_t *pub;
+    size_t len;
+    int64_t minted;
+} pldb_key;
+int pldb_keys(pldb *db, pldb_key **out, size_t *n);
+void pldb_keys_free(pldb_key *keys, size_t n);
+int pldb_key_add(pldb *db, uint64_t reqid, const pldb_key *key, const char *const *sweep,
+                 size_t nsweep);
 
 /* Blocks until a result is available.  The caller frees it. */
 pldb_result *pldb_pop(pldb *db);

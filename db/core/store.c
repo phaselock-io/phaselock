@@ -1,4 +1,4 @@
-/* SQLite storage: the KV store, the log, the session table, and the
+/* SQLite storage: the KV store, the log, the session table, the token keys, and the
    known-streams table live in one database file. */
 
 #include "internal.h"
@@ -11,7 +11,8 @@ struct store {
         *max_pos, *session_hwm, *session_mark, *stream_live, *stream_birth, *stream_death,
         *stream_erase, *stream_bytes, *stream_seq,
         *live_streams, *live_streams_all, *live_stream, *kv_len, *stream_state, *stream_state_zero, *stream_stats,
-        *read_stream_asc, *read_stream_desc, *read_prefix_asc, *read_prefix_desc;
+        *read_stream_asc, *read_stream_desc, *read_prefix_asc, *read_prefix_desc,
+        *keys, *key_add, *key_del;
     // the kv cursor's statement, positioned at its key, or NULL past the end of its walk
     sqlite3_stmt *cursor;
 };
@@ -26,6 +27,8 @@ static const char *SCHEMA =
     "CREATE INDEX IF NOT EXISTS log_stream ON log(stream, position);"
     "CREATE TABLE IF NOT EXISTS sessions (key TEXT PRIMARY KEY, hwm INTEGER NOT NULL,"
     "  time INTEGER NOT NULL) WITHOUT ROWID;"
+    "CREATE TABLE IF NOT EXISTS token_keys (kid TEXT PRIMARY KEY, public BLOB NOT NULL,"
+    "  minted INTEGER NOT NULL) WITHOUT ROWID;"
     "CREATE TABLE IF NOT EXISTS streams (name TEXT PRIMARY KEY, birth INTEGER NOT NULL,"
     "  death INTEGER, seq INTEGER NOT NULL,"
     "  event_bytes INTEGER NOT NULL DEFAULT 0, state_bytes INTEGER NOT NULL DEFAULT 0)"
@@ -124,7 +127,10 @@ int store_open(const char *path, bool writer, store **out, char *err, size_t err
                   " AND death IS NULL ORDER BY name") ||
              prep(s, &s->live_streams_all,
                   "SELECT name, seq FROM streams WHERE death IS NULL ORDER BY name") ||
-             prep(s, &s->live_stream, "SELECT seq FROM streams WHERE name = ?1 AND death IS NULL");
+             prep(s, &s->live_stream, "SELECT seq FROM streams WHERE name = ?1 AND death IS NULL") ||
+             prep(s, &s->keys, "SELECT kid, public, minted FROM token_keys ORDER BY minted, kid") ||
+             prep(s, &s->key_add, "INSERT INTO token_keys (kid, public, minted) VALUES (?1, ?2, ?3)") ||
+             prep(s, &s->key_del, "DELETE FROM token_keys WHERE kid = ?1");
     if (rc) {
         snprintf(err, errlen, "%s", s->err);
         store_close(s);
@@ -146,7 +152,7 @@ void store_close(store *s) {
                              s->kv_len,
                              s->stream_state, s->stream_state_zero, s->stream_stats,
                              s->read_stream_asc, s->read_stream_desc, s->read_prefix_asc,
-                             s->read_prefix_desc};
+                             s->read_prefix_desc, s->keys, s->key_add, s->key_del};
     for (size_t i = 0; i < sizeof stmts / sizeof *stmts; i++) sqlite3_finalize(stmts[i]);
     sqlite3_close(s->db);
     free(s);
@@ -449,6 +455,34 @@ int store_session_mark(store *s, const char *key, uint64_t n, int64_t time) {
     sqlite3_bind_int64(s->session_mark, 2, (sqlite3_int64)n);
     sqlite3_bind_int64(s->session_mark, 3, time);
     return step_done(s, s->session_mark, "session_mark");
+}
+
+int store_keys(store *s, store_key_fn fn, void *arg) {
+    int rc, out = 0;
+    while ((rc = sqlite3_step(s->keys)) == SQLITE_ROW) {
+        const char *kid = (const char *)sqlite3_column_text(s->keys, 0);
+        const uint8_t *pub = sqlite3_column_blob(s->keys, 1);
+        size_t len = (size_t)sqlite3_column_bytes(s->keys, 1);
+        if (fn(arg, kid, pub, len, sqlite3_column_int64(s->keys, 2)) != 0) {
+            out = -1;
+            break;
+        }
+    }
+    if (out == 0 && rc != SQLITE_DONE) out = fail(s, "keys");
+    sqlite3_reset(s->keys);
+    return out;
+}
+
+int store_key_add(store *s, const char *kid, const uint8_t *pub, size_t len, int64_t minted) {
+    sqlite3_bind_text(s->key_add, 1, kid, -1, SQLITE_STATIC);
+    sqlite3_bind_blob(s->key_add, 2, pub, (int)len, SQLITE_STATIC);
+    sqlite3_bind_int64(s->key_add, 3, minted);
+    return step_done(s, s->key_add, "key_add");
+}
+
+int store_key_del(store *s, const char *kid) {
+    sqlite3_bind_text(s->key_del, 1, kid, -1, SQLITE_STATIC);
+    return step_done(s, s->key_del, "key_del");
 }
 
 int store_stream_live(store *s, const char *name) {

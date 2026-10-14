@@ -83,6 +83,7 @@ const (
 	rLookup   = C.PLDB_R_LOOKUP
 	rArm      = C.PLDB_R_ARM
 	rTick     = C.PLDB_R_TICK
+	rKey      = C.PLDB_R_KEY
 )
 
 func bytesReader(b []byte) *bytes.Reader { return bytes.NewReader(b) }
@@ -205,6 +206,39 @@ func (c *core) cronEntries() []cronEntry {
 		out[i] = cronEntry{C.GoString(e.install), C.GoString(e.entry), C.GoString(e.spec)}
 	}
 	return out
+}
+
+// keys reads every stored token key, oldest first
+func (c *core) keys() ([]tokenKey, error) {
+	var arr *C.pldb_key
+	var n C.size_t
+	if C.pldb_keys(c.db, &arr, &n) != 0 {
+		return nil, errors.New("reading the token keys failed")
+	}
+	defer C.pldb_keys_free(arr, n)
+	out := make([]tokenKey, int(n))
+	if n > 0 {
+		for i, k := range unsafe.Slice(arr, int(n)) {
+			out[i] = tokenKey{
+				kid:    C.GoString(k.kid),
+				pub:    C.GoBytes(unsafe.Pointer(k.pub), C.int(k.len)),
+				minted: time.UnixMilli(int64(k.minted)),
+			}
+		}
+	}
+	return out, nil
+}
+
+// addKey stores a token key and deletes the keys sweep names, in one commit on the writer
+func (c *core) addKey(reqid uint64, k tokenKey, sweep []string) {
+	kid := C.CString(k.kid)
+	defer C.free(unsafe.Pointer(kid))
+	pub := C.CBytes(k.pub)
+	defer C.free(pub)
+	ck := C.pldb_key{kid: kid, pub: (*C.uint8_t)(pub), len: C.size_t(len(k.pub)), minted: C.int64_t(k.minted.UnixMilli())}
+	csweep := cstrings(sweep)
+	defer freeStrings(csweep, len(sweep))
+	C.pldb_key_add(c.db, C.uint64_t(reqid), &ck, csweep, C.size_t(len(sweep)))
 }
 
 func (c *core) cronArm(reqid uint64, minute time.Time) {

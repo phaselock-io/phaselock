@@ -88,6 +88,14 @@ int store_max_position(store *s, uint64_t *out);
    at least and stamps the session's last decision. */
 int store_session_hwm(store *s, const char *key, uint64_t *hwm);
 int store_session_mark(store *s, const char *key, uint64_t n, int64_t time);
+/* The token keys: each public key tokens are verified against, by id, with the Unix
+   milliseconds it was minted.  store_keys walks them oldest first, stopping when fn answers
+   nonzero. */
+typedef int (*store_key_fn)(void *arg, const char *kid, const uint8_t *pub, size_t len,
+                            int64_t minted);
+int store_keys(store *s, store_key_fn fn, void *arg);
+int store_key_add(store *s, const char *kid, const uint8_t *pub, size_t len, int64_t minted);
+int store_key_del(store *s, const char *kid);
 int store_stream_live(store *s, const char *name);
 int store_stream_birth(store *s, const char *name, uint64_t pos);
 int store_stream_death(store *s, const char *name, uint64_t pos);

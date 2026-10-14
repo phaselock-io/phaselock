@@ -1,14 +1,13 @@
 package main
 
-// Tokens and passwords.  Tokens are HS256 JWTs signed with the database
-// secret; passwords are argon2id hashes in a PHC string, which carries
+// Tokens and passwords.  Tokens are EdDSA JWTs signed with the token keys
+// (keys.go); passwords are argon2id hashes in a PHC string, which carries
 // the parameters they were made with.
 
 import (
 	"context"
-	"crypto/hmac"
+	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -46,17 +45,30 @@ type claims struct {
 
 var b64 = base64.RawURLEncoding
 
-func (s *Server) mint(user string, gen int64) (string, int64) {
-	now := time.Now()
+// header is a token's JOSE header
+type header struct {
+	Alg string `json:"alg"`
+	Typ string `json:"typ"`
+	Kid string `json:"kid"`
+}
+
+// mint signs a token for an account at its generation, answering it and its expiry
+func (s *Server) mint(user string, gen int64) (string, int64, error) {
+	s.keys.signMu.Lock()
+	defer s.keys.signMu.Unlock()
+	now := s.now()
+	k, private, err := s.signer(now)
+	if err != nil {
+		return "", 0, err
+	}
 	jti := make([]byte, 8)
 	rand.Read(jti)
 	c := claims{Sub: user, Gen: gen, Iat: now.Unix(), Exp: now.Add(tokenLifetime).Unix(), Jti: fmt.Sprintf("%x", jti)}
-	header := b64.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	h, _ := json.Marshal(header{Alg: "EdDSA", Typ: "JWT", Kid: k.kid})
 	payload, _ := json.Marshal(c)
-	signing := header + "." + b64.EncodeToString(payload)
-	mac := hmac.New(sha256.New, s.secret)
-	mac.Write([]byte(signing))
-	return signing + "." + b64.EncodeToString(mac.Sum(nil)), c.Exp
+	signing := b64.EncodeToString(h) + "." + b64.EncodeToString(payload)
+	sig := ed25519.Sign(private, []byte(signing))
+	return signing + "." + b64.EncodeToString(sig), c.Exp, nil
 }
 
 func (s *Server) verify(token string) (*claims, error) {
@@ -64,12 +76,29 @@ func (s *Server) verify(token string) (*claims, error) {
 	if len(parts) != 3 {
 		return nil, errors.New("malformed token")
 	}
-	mac := hmac.New(sha256.New, s.secret)
-	mac.Write([]byte(parts[0] + "." + parts[1]))
+
+	// the key the header names, which signs only EdDSA
+	raw, err := b64.DecodeString(parts[0])
+	if err != nil {
+		return nil, errors.New("malformed token")
+	}
+	var h header
+	if err := json.Unmarshal(raw, &h); err != nil {
+		return nil, errors.New("malformed token")
+	}
+	if h.Alg != "EdDSA" {
+		return nil, errors.New("unsupported token algorithm")
+	}
+	k := s.keys.key(h.Kid)
+	if k == nil {
+		return nil, errors.New("unknown token key")
+	}
 	sig, err := b64.DecodeString(parts[2])
-	if err != nil || !hmac.Equal(sig, mac.Sum(nil)) {
+	if err != nil || !ed25519.Verify(k.pub, []byte(parts[0]+"."+parts[1]), sig) {
 		return nil, errors.New("bad signature")
 	}
+
+	// the claims, until they expire
 	payload, err := b64.DecodeString(parts[1])
 	if err != nil {
 		return nil, errors.New("malformed token")
@@ -78,7 +107,7 @@ func (s *Server) verify(token string) (*claims, error) {
 	if err := json.Unmarshal(payload, &c); err != nil {
 		return nil, errors.New("malformed token")
 	}
-	if c.Exp < time.Now().Unix() {
+	if c.Exp < s.now().Unix() {
 		return nil, errors.New("token expired")
 	}
 	return &c, nil
@@ -413,7 +442,11 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown kind", http.StatusBadRequest)
 		return
 	}
-	token, exp := s.mint(user, gen)
+	token, exp, err := s.mint(user, gen)
+	if err != nil {
+		signFailed(w, err)
+		return
+	}
 	w.Header().Set("Content-Type", "application/msgpack")
 	w.Write(mpEncode(map[string]any{"token": token, "user": user, "exp": exp}))
 }

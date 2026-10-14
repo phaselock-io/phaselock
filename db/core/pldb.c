@@ -12,7 +12,7 @@
 #include "internal.h"
 #include "sha256.h"
 
-enum { REQ_SUBMIT = 1, REQ_REGISTER, REQ_UNREGISTER, REQ_LOOKUP, REQ_ARM, REQ_TICK };
+enum { REQ_SUBMIT = 1, REQ_REGISTER, REQ_UNREGISTER, REQ_LOOKUP, REQ_ARM, REQ_TICK, REQ_KEY };
 
 /* a formatted string, malloc'd */
 static char *strf(const char *fmt, ...) {
@@ -40,6 +40,10 @@ typedef struct req {
     pldb_verdict *verdicts;
     size_t nverdicts;
     int attempt;
+    /* a token key to add, its public key in body, and the ids of the keys it sweeps */
+    char *kid;
+    int64_t minted;
+    strlist sweep;
     struct req *next;
 } req;
 
@@ -242,6 +246,8 @@ static void req_free(req *q) {
     free(q->body);
     for (size_t i = 0; i < q->nverdicts; i++) free((char *)q->verdicts[i].hash);
     free(q->verdicts);
+    free(q->kid);
+    strlist_free(&q->sweep);
     free(q);
 }
 
@@ -306,6 +312,19 @@ int pldb_cron_arm(pldb *db, uint64_t reqid, int64_t minute) {
     if (minute <= 0) return -1;
     req *q = req_new(REQ_ARM, reqid, NULL, -1);
     q->slot = minute;
+    enqueue(db, q);
+    return 0;
+}
+
+int pldb_key_add(pldb *db, uint64_t reqid, const pldb_key *key, const char *const *sweep,
+                 size_t nsweep) {
+    req *q = req_new(REQ_KEY, reqid, NULL, -1);
+    q->kid = xstrdup(key->kid);
+    q->body = xmalloc(key->len ? key->len : 1);
+    memcpy(q->body, key->pub, key->len);
+    q->len = key->len;
+    q->minted = key->minted;
+    for (size_t i = 0; i < nsweep; i++) strlist_push(&q->sweep, sweep[i]);
     enqueue(db, q);
     return 0;
 }
@@ -1024,6 +1043,20 @@ static void handle_tick(pldb *db, batch *b, req *q, pldb_result **after_tail) {
         die("session_mark: %s", store_err(db->w));
 }
 
+/* add a token key and delete the keys it sweeps, answered once the batch commits */
+static void handle_key(pldb *db, req *q, pldb_result **after_tail) {
+    if (store_key_add(db->w, q->kid, q->body, q->len, q->minted)) {
+        die("key_add: %s", store_err(db->w));
+    }
+    for (size_t i = 0; i < q->sweep.n; i++) {
+        if (store_key_del(db->w, q->sweep.v[i])) die("key_del: %s", store_err(db->w));
+    }
+    pldb_result *r = result_new(PLDB_R_KEY);
+    r->reqid = q->reqid;
+    (*after_tail)->next = r;
+    *after_tail = r;
+}
+
 static void run_batch(pldb *db, req *head) {
     batch b = {0};
     b.servertime = now_ms();
@@ -1050,6 +1083,9 @@ static void run_batch(pldb *db, req *head) {
             break;
         case REQ_TICK:
             handle_tick(db, &b, q, &after_tail);
+            break;
+        case REQ_KEY:
+            handle_key(db, q, &after_tail);
             break;
         }
     }
@@ -1333,6 +1369,49 @@ static int read_cb(void *arg, uint64_t position, uint64_t atom, const char *stre
     read_ctx *rc = arg;
     item_set(items_push(&rc->it), position, atom, stream, seq, commandid, servertime, data, len);
     return 0;
+}
+
+typedef struct key_list {
+    pldb_key *v;
+    size_t n, cap;
+} key_list;
+
+static int key_cb(void *arg, const char *kid, const uint8_t *pub, size_t len, int64_t minted) {
+    key_list *l = arg;
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 8;
+        l->v = realloc(l->v, l->cap * sizeof *l->v);
+        if (!l->v) die("out of memory");
+    }
+    pldb_key *k = &l->v[l->n++];
+    k->kid = xstrdup(kid);
+    k->pub = xmalloc(len ? len : 1);
+    memcpy(k->pub, pub, len);
+    k->len = len;
+    k->minted = minted;
+    return 0;
+}
+
+int pldb_keys(pldb *db, pldb_key **out, size_t *n) {
+    key_list l = {0};
+    pthread_mutex_lock(&db->rmu);
+    int rc = store_keys(db->r, key_cb, &l);
+    pthread_mutex_unlock(&db->rmu);
+    if (rc) {
+        pldb_keys_free(l.v, l.n);
+        return -1;
+    }
+    *out = l.v;
+    *n = l.n;
+    return 0;
+}
+
+void pldb_keys_free(pldb_key *keys, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        free(keys[i].kid);
+        free(keys[i].pub);
+    }
+    free(keys);
 }
 
 int pldb_read_log(pldb *db, uint64_t from, uint64_t to, pldb_item **items, size_t *n) {

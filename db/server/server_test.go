@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,8 +42,7 @@ func startIn(t *testing.T, dir string) *harness {
 }
 
 // startWith opens a server under ctx with the test defaults filled into o: the dev test bundle
-// unless o names another, dev auth, a fixed secret, and an attempt budget no test of other
-// features runs out of.
+// unless o names another, dev auth, and an attempt budget no test of other features runs out of.
 func startWith(t *testing.T, ctx context.Context, o Options) *harness {
 	t.Helper()
 	if o.DataDir == "" {
@@ -51,7 +52,6 @@ func startWith(t *testing.T, ctx context.Context, o Options) *harness {
 		o.Bundle = filepath.Join("testdata", "bundle.js")
 	}
 	o.DevAuth = true
-	o.Secret = []byte("test-secret")
 	if o.AuthBurst == 0 {
 		o.AuthBurst = 1000
 	}
@@ -1218,9 +1218,175 @@ func TestPasswordAuth(t *testing.T) {
 	h.accept(boss, cmd("c10", "add-book", "id", "b1", "title", "Dune"))
 }
 
+// token keys ////////////////////////////////////////////////////////////////
+
+// clock is a settable time, for the token keys' tests
+type clock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *clock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *clock) set(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = t
+}
+
+// tokenParts is a token's header and claims, decoded
+func tokenParts(t *testing.T, token string) (header, map[string]any) {
+	t.Helper()
+	parts := strings.Split(token, ".")
+	var h header
+	var c map[string]any
+	for i, v := range []any{&h, &c} {
+		raw, err := b64.DecodeString(parts[i])
+		if err != nil || json.Unmarshal(raw, v) != nil {
+			t.Fatalf("token part %d: %q", i, parts[i])
+		}
+	}
+	return h, c
+}
+
+// kids is the ids of the stored token keys, oldest first
+func (h *harness) kids() []string {
+	h.t.Helper()
+	keys, err := h.srv.core.keys()
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	var out []string
+	for _, k := range keys {
+		out = append(out, k.kid)
+	}
+	return out
+}
+
+// works answers whether a token is accepted for a command
+func (h *harness) works(token string) bool {
+	h.t.Helper()
+	status, _ := h.commandsStatus(token, cmd("w-"+token[len(token)-8:], "rename-patron", "id", "nobody", "name", "x"))
+	return status == 200
+}
+
+func TestTokensAreEd25519AndNameTheirKey(t *testing.T) {
+	h := start(t)
+	tok := h.admin()
+	hd, claims := tokenParts(t, tok)
+	if hd.Alg != "EdDSA" || hd.Typ != "JWT" || len(hd.Kid) != 32 || claims["sub"] != "root" {
+		t.Fatalf("token: %+v %v", hd, claims)
+	}
+	if !h.works(tok) || !slices.Equal(h.kids(), []string{hd.Kid}) {
+		t.Fatalf("the token's key: %v", h.kids())
+	}
+
+	// a token naming another algorithm, another key, or other claims is refused
+	parts := strings.Split(tok, ".")
+	reheader := func(v header) string {
+		b, _ := json.Marshal(v)
+		return b64.EncodeToString(b) + "." + parts[1] + "." + parts[2]
+	}
+	forged := map[string]string{
+		"HS256":        reheader(header{Alg: "HS256", Typ: "JWT", Kid: hd.Kid}),
+		"none":         reheader(header{Alg: "none", Typ: "JWT", Kid: hd.Kid}),
+		"unknown kid":  reheader(header{Alg: "EdDSA", Typ: "JWT", Kid: strings.Repeat("0", 32)}),
+		"other claims": parts[0] + "." + b64.EncodeToString([]byte(`{"sub":"p1","gen":0,"exp":9999999999}`)) + "." + parts[2],
+	}
+	for name, f := range forged {
+		if status, _ := h.commandsStatus(f, cmd("f", "rename-patron", "id", "x", "name", "x")); status != 401 {
+			t.Fatalf("a token with %s: %d", name, status)
+		}
+	}
+}
+
+func TestATokenOutlivesItsProcess(t *testing.T) {
+	dir := t.TempDir()
+	h := startIn(t, dir)
+	before := h.admin()
+	h.stop()
+
+	// the new process verifies the old token by its stored key, and signs with a key of its own
+	h = startIn(t, dir)
+	if !h.works(before) {
+		t.Fatalf("a token from before the restart is refused")
+	}
+	after := h.admin()
+	old, _ := tokenParts(t, before)
+	fresh, _ := tokenParts(t, after)
+	if old.Kid == fresh.Kid || !slices.Equal(h.kids(), []string{old.Kid, fresh.Kid}) {
+		t.Fatalf("keys after a restart: %s then %s, stored %v", old.Kid, fresh.Kid, h.kids())
+	}
+}
+
+func TestTokenKeysRotateAndAreSwept(t *testing.T) {
+	dir := t.TempDir()
+	t0 := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	clk := &clock{t: t0}
+	h := startWith(t, t.Context(), Options{DataDir: dir, now: clk.now})
+	kid := func(token string) string {
+		hd, _ := tokenParts(t, token)
+		return hd.Kid
+	}
+
+	// a key signs for a day
+	tok1 := h.admin()
+	k1 := kid(tok1)
+	clk.set(t0.Add(23 * time.Hour))
+	if kid(h.admin()) != k1 {
+		t.Fatalf("rotated within a day")
+	}
+	clk.set(t0.Add(25 * time.Hour))
+	k2 := kid(h.admin())
+	if k2 == k1 || !h.works(tok1) {
+		t.Fatalf("after a day: %s then %s", k1, k2)
+	}
+
+	// a key retired for longer than a token lives, plus the grace, is swept when the next key is
+	// minted; the key it retired stays
+	clk.set(t0.Add(25*time.Hour + tokenLifetime + keyGrace + time.Minute))
+	k3 := kid(h.admin())
+	if got := h.kids(); !slices.Equal(got, []string{k2, k3}) {
+		t.Fatalf("after the sweep: %v, want %s %s", got, k2, k3)
+	}
+
+	// across a restart, a past process's newest key is retired by the new process's start
+	h.stop()
+	restart := clk.now().Add(tokenLifetime + keyGrace + time.Minute)
+	clk.set(restart)
+	h = startWith(t, t.Context(), Options{DataDir: dir, now: clk.now})
+	k4 := kid(h.admin())
+	if got := h.kids(); !slices.Equal(got, []string{k3, k4}) {
+		t.Fatalf("after a restart's sweep: %v, want %s %s", got, k3, k4)
+	}
+}
+
+func TestTheGraceKeepsAKeyAcrossAClockSteppedBack(t *testing.T) {
+	dir := t.TempDir()
+	t0 := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	clk := &clock{t: t0}
+	h := startWith(t, t.Context(), Options{DataDir: dir, now: clk.now})
+	tok := h.admin()
+	h.stop()
+
+	// the next process starts on a clock twelve hours behind, so the old key's retirement is
+	// recorded before its last signature; near the token's expiry a new key's sweep keeps it
+	clk.set(t0.Add(-12 * time.Hour))
+	h = startWith(t, t.Context(), Options{DataDir: dir, now: clk.now})
+	clk.set(t0.Add(tokenLifetime - time.Minute))
+	h.admin()
+	if !h.works(tok) {
+		t.Fatalf("a live token's key was swept")
+	}
+}
+
 func TestDevAuthCanBeDisabled(t *testing.T) {
 	dir := t.TempDir()
-	srv, err := Open(t.Context(), Options{DataDir: dir, Bundle: filepath.Join("testdata", "bundle.js"), Secret: []byte("s")})
+	srv, err := Open(t.Context(), Options{DataDir: dir, Bundle: filepath.Join("testdata", "bundle.js")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1278,7 +1444,7 @@ func TestRestartKeepsEverything(t *testing.T) {
 	if status != 200 {
 		t.Fatalf("login after restart: %d", status)
 	}
-	// the data directory holds one sqlite database and the token secret
+	// the data directory holds the store
 	entries, _ := os.ReadDir(dir)
 	var names []string
 	for _, e := range entries {
@@ -2156,7 +2322,7 @@ func TestUnknownIntakeKindRefusesToStart(t *testing.T) {
 	if err := os.WriteFile(bundle, bytes.ReplaceAll(src, []byte(`"NewPassword"`), []byte(`"NewThing"`)), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err = Open(t.Context(), Options{DataDir: filepath.Join(dir, "data"), Bundle: bundle, Secret: []byte("s")})
+	_, err = Open(t.Context(), Options{DataDir: filepath.Join(dir, "data"), Bundle: bundle})
 	if err == nil || !strings.Contains(err.Error(), "NewThing") {
 		t.Fatalf("expected a refusal naming the kind, got %v", err)
 	}
@@ -2407,7 +2573,10 @@ func TestDevSignInIsAnExistingAccount(t *testing.T) {
 
 func TestATokenForNoAccountIsRefusedEverywhere(t *testing.T) {
 	h := start(t)
-	ghost, _ := h.srv.mint("ghost", 0)
+	ghost, _, err := h.srv.mint("ghost", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if status, _ := h.commandsStatus(ghost, cmd("c1", "add-book", "id", "b1", "title", "Dune")); status != 401 {
 		t.Fatalf("commands: %d", status)
@@ -2481,7 +2650,6 @@ func TestABootstrapThatFailsStopsTheOpen(t *testing.T) {
 	_, err := Open(t.Context(), Options{
 		DataDir:      t.TempDir(),
 		Bundle:       filepath.Join("testdata", "bundle.js"),
-		Secret:       []byte("s"),
 		BootstrapEnv: []string{"BOOTSTRAP_ADMIN"},
 	})
 	if err == nil || !strings.Contains(err.Error(), "bootstrap") {

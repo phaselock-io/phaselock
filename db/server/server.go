@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -15,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -31,7 +29,6 @@ type Options struct {
 	DataDir string
 	Bundle  string
 	DevAuth bool
-	Secret  []byte // generated and stored in DataDir when nil
 	// password hashing: the workers, each holding one argon2id hash's memory while it runs
 	// (default GOMAXPROCS), and each client's budget of hashes, a burst regained at a rate per
 	// second (default 10, at 1 per second)
@@ -44,6 +41,9 @@ type Options struct {
 	// CF-Connecting-IP; trusted from every request, so set only when nothing but the proxy can
 	// reach the server
 	ClientIPHeader string
+
+	// tests only: the clock tokens and their keys are minted and checked by, time.Now when nil
+	now func() time.Time
 }
 
 type Server struct {
@@ -52,7 +52,8 @@ type Server struct {
 	cancel context.CancelFunc
 
 	core    *core
-	secret  []byte
+	keys    *keyring
+	now     func() time.Time
 	devAuth bool
 	epoch   string
 	hashes  *hashPool
@@ -121,16 +122,19 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 	if err := os.MkdirAll(o.DataDir, 0o755); err != nil {
 		return nil, err
 	}
-	secret := o.Secret
-	if secret == nil {
-		var err error
-		secret, err = loadSecret(filepath.Join(o.DataDir, "secret"))
-		if err != nil {
-			return nil, err
-		}
-	}
 	c, err := openCore(o.DataDir, o.Bundle, o.BootstrapEnv)
 	if err != nil {
+		return nil, err
+	}
+
+	// the token keys, every one minted before this process started
+	now := o.now
+	if now == nil {
+		now = time.Now
+	}
+	stored, err := c.keys()
+	if err != nil {
+		c.close()
 		return nil, err
 	}
 
@@ -167,7 +171,8 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 		hashes:         newHashPool(ctx, workers, 2*workers),
 		limit:          newLimiter(rate, burst),
 		core:           c,
-		secret:         secret,
+		keys:           newKeyring(stored, now()),
+		now:            now,
 		devAuth:        o.DevAuth,
 		clientIPHeader: o.ClientIPHeader,
 		epoch:          c.epoch(),
@@ -218,18 +223,6 @@ func (s *Server) fireCron(i int, slot time.Time) {
 		e := s.cron[i]
 		log.Printf("cron entry %s of %s at %s: %s", e.name, e.install, slot.Format(time.RFC3339), r.errmsg)
 	}
-}
-
-func loadSecret(path string) ([]byte, error) {
-	if b, err := os.ReadFile(path); err == nil && len(b) >= 32 {
-		return b, nil
-	}
-	b := make([]byte, 32)
-	rand.Read(b)
-	if err := os.WriteFile(path, b, 0o600); err != nil {
-		return nil, err
-	}
-	return b, nil
 }
 
 // Close ends the server: its context, then the cron scheduler and the hash workers once their
@@ -292,7 +285,7 @@ func (s *Server) dispatch() {
 			}
 			s.mu.Unlock()
 			return
-		case rOutcome, rLookup, rArm, rTick:
+		case rOutcome, rLookup, rArm, rTick, rKey:
 			s.reply(r)
 		case rView:
 			s.mu.Lock()

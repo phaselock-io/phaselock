@@ -483,11 +483,27 @@ unbounded waste of event downloads.
   accepted only when the server runs with `--dev-auth`, signing in as
   an existing account with no credential.  No Authorization header is
   the anonymous principal.
-- Tokens are HS256 JWTs signed with a per-database secret, claims
-  `sub`, `gen`, `iat`, `exp`, `jti`.  Refresh is re-issue.  The
-  token's `gen` is compared to the account's generation on stream open
-  and on every command; a mismatch is rejected, so a generation bump
-  logs out everywhere.
+- Tokens are EdDSA JWTs over Ed25519 keys, claims `sub`, `gen`,
+  `iat`, `exp`, `jti`, with the signing key's id as the header's
+  `kid`; a token naming any other algorithm is refused.  Refresh is
+  re-issue.  The token's `gen` is compared to the account's generation
+  on stream open and on every command; a mismatch is rejected, so a
+  generation bump logs out everywhere.
+- A private key lives only in the memory of the process that signs
+  with it.  The first signature after startup mints one, and so does
+  the first signature once the current key has signed for a day, so
+  every restart is a rotation and an idle server mints nothing.  A
+  key's public half is committed to the store's token key table, in a
+  writer batch, before anything it signed leaves the process; Go
+  reads the table once, at startup, and verifies a token by the
+  stored key its `kid` names, so tokens outlive their process.
+- A key stops signing when its successor is minted, or, for the
+  newest key of a past process, by this process's start.  Minting a
+  key sweeps, in the same commit, every key retired for longer than
+  the token lifetime plus a day of grace, after which every token it
+  signed has expired.  The grace covers a clock stepped back between a
+  key's last signature and its successor's minting, as restoring a VM
+  snapshot can.
 - Login and refresh call the bundle's `lookup` on the txn thread; Go
   verifies the password against its `passwordHash` (argon2id, in a
   PHC string) and mints the token.  A login naming no account runs a
