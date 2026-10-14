@@ -837,8 +837,10 @@ function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: 
   d.print(`const context = create${txnType}();\n`);
   d.print('return {\n');
   d.indent('  ');
+  // a single stream's name has no parameters to parse, so its reducer leaves it unread
+  const stream = n === 0 ? '_stream' : 'stream';
   d.print(
-    'reducer($txn: ReducerTxn, events: unknown[], stream: string, pending: boolean): void {\n',
+    `reducer($txn: ReducerTxn, events: unknown[], ${stream}: string, pending: boolean): void {\n`,
   );
   d.indent('  ');
   if (n > 1) d.print(`const parts = stream.slice(${skip}).split(",");\n`);

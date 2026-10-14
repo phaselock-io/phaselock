@@ -2,16 +2,16 @@
     "name": "@todo-basic/model",
     "type": "module",
     "scripts": {
-        "gen": "tsp compile model.tsp"
+        "gen": "tsp compile model.tsp",
+        "bundle": "esbuild db.ts --bundle --format=iife --log-level=warning --define:process.env.NODE_ENV=\\\"development\\\" --outfile=bundle.js"
     },
     "exports": {
-        "./ui": "./ui.ts",
-        "./server": "./server.ts"
+        "./ui": "./ui.ts"
     },
     "devDependencies": {
         "@phaselock/typespec-core": "link:../../../typespec/core",
         "@phaselock/typespec-ts": "link:../../../typespec/ts",
-        "@phaselock/typespec-go": "link:../../../typespec/go",
-        "@typespec/compiler": "^1.0.0"
+        "@typespec/compiler": "^1.0.0",
+        "esbuild": "^0.25.0"
     }
 }

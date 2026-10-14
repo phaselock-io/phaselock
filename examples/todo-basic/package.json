@@ -4,7 +4,7 @@
         "gen": "cd model && pnpm gen",
         "dev": "./devstack.mts",
         "check": "pnpm check:tsc && pnpm check:lint && pnpm check:fmt",
-        "check:tsc": "tsc -p model && tsc -p server && tsc -p ui",
+        "check:tsc": "tsc -p model && tsc -p ui",
         "check:lint": "eslint .",
         "check:fmt": "prettier --check \"**/*.{ts,tsx}\"",
         "fmt": "prettier --write \"**/*.{ts,tsx}\" && eslint --fix ."

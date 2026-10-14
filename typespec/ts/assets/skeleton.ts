@@ -2574,7 +2574,9 @@ export type Backfill = {
 /** One delivery of a backfill: the blob's whole length in bytes, when its response states one;
     the blob's header (its cut position and the seq of every stream in it); a batch of values with
     the byte offset after them; a page of tail events with the position its scan reached; or the
-    end of either half.  The length and the scan feed the Engine's progress status alone. */
+    end of either half.  The length and the scan feed the Engine's progress status alone.  A
+    download without a resume pushes its header before anything else but its length, since the
+    header is what the rest is parked against. */
 export type BackfillItem =
   | { length: number }
   | { header: { position: number; seqs: Record<string, number> } }
@@ -4006,6 +4008,13 @@ export class Engine<QX, FX, C, N = never> {
       } else {
         // otherwise the stream loses its state to the blob
         markDirty(dirty, txn.delPrefix(`${stream}!`));
+
+        // a stream no blob names was dead or unborn at the cut, so it leaves the streams table;
+        // its parked events, if any, hold it again as they reduce
+        if (!(stream in header)) {
+          this.#streams.delete(stream);
+          txn.del(`!seq:${stream}`);
+        }
       }
     }
 

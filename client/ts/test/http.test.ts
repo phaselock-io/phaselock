@@ -774,6 +774,32 @@ describe('backfill', () => {
     await expect(run(conn, 'patron:*', 40)).rejects.toThrow(new RegExp(what));
   });
 
+  test("a fresh blob's header is pushed before anything of the tail, however slow its body", async () => {
+    stub.routes.set('/snapshot/', (_req, _body, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'PhaseLock-Position': '40',
+      });
+      // the headers go at once, and the body starts well after the tail has answered
+      res.flushHeaders();
+      setTimeout(() => res.end(Buffer.from(built.bytes)), 100);
+    });
+    serveTail();
+    const order: string[] = [];
+    await conn.backfill({
+      ref: 'patron:*',
+      until: 45,
+      resume: null,
+      signal: new AbortController().signal,
+      push: async (item) => {
+        order.push(Object.keys(item)[0]);
+      },
+    });
+    const header = order.indexOf('header');
+    expect(header).toBeGreaterThanOrEqual(0);
+    expect(order.findIndex((k) => k === 'events' || k === 'eventsDone')).toBeGreaterThan(header);
+  });
+
   test('a position in the blob header that disagrees with the origin is an error', async () => {
     serveBlob(built.bytes, 41);
     serveTail();
@@ -787,8 +813,8 @@ describe('backfill', () => {
         'Content-Type': 'application/octet-stream',
         'PhaseLock-Position': '40',
       });
-      // trickle the blob so the tail failure lands mid-download
-      res.write(Buffer.from(built.bytes.subarray(0, 100)));
+      // trickle the blob past its header and first record, so the tail failure lands mid-download
+      res.write(Buffer.from(built.bytes.subarray(0, built.recordEnds[0])));
       req.on('close', () => (blobAborted = true));
     });
     stub.routes.set('/events/', (_req, _body, res) => {

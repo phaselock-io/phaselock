@@ -20,22 +20,11 @@ main({
     G: "pnpm gen",
   },
   stages: {
-    // run KurrentDB in a docker container
+    // build the database and the bundle it runs, then run it over ./data
     db: {
-      containerName: "todo-basic-db",
-      dockerArgs: ["-p=2113:2113"],
-      image: "docker.kurrent.io/kurrent-latest/kurrentdb:26.0.3",
-      cmd: [
-        "--insecure",
-        "--run-projections=System",
-        "--enable-atom-pub-over-http",
-      ],
-      post: httpCheck("http://localhost:2113/health/live?liveCode=200"),
-    },
-    // then run the server with tsx, for hot reloading
-    server: {
-      cmd: ["server/node_modules/.bin/tsx", "watch", "server/main.ts"],
-      post: connCheck(3001),
+      pre: [exec("make", "-C", "../../db"), exec("pnpm", "--dir", "model", "bundle")],
+      cmd: ["../../db/pldb", "--bundle", "model/bundle.js", "--data", "data"],
+      post: connCheck(8080),
     },
     // then run the ui
     ui: {

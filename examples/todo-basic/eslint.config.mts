@@ -14,7 +14,7 @@ export default [
   pluginTs.configs['flat/eslint-recommended'],
   pluginImport.flatConfigs.recommended,
   pluginReactRefresh.configs.recommended,
-  { ignores: ['**/dist/', 'model/*.gen.ts', '**/*.mts'] },
+  { ignores: ['**/dist/', 'model/*.gen.ts', 'model/bundle.js', '**/*.mts'] },
   {
     ...pluginReact.configs.flat.recommended,
     files: ['**/*.{ts,tsx}'],

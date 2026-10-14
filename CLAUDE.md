@@ -28,7 +28,7 @@ typespec/         The product: TypeSpec vocabulary (core/), emitters
                   ({ts,py,go}/ with runtime skeletons in assets/), and
                   their tests. See typespec/CLAUDE.md and typespec/README.md.
 examples/
-  todo-basic/     Smallest loop: browser engine + minimal TS relay server.
+  todo-basic/     Smallest loop: browser engines + the v0 database (db/).
   todo-thin/      Same app, engine in the server, clients get query results.
   library/        Full architecture: Python relay, Go decider, forecasts,
                   per-audience stores. Root also has populate.py seed data.
@@ -65,8 +65,10 @@ TypeSpec tooling (`cd typespec`):
 Todo examples (`cd examples/todo-basic` or `todo-thin`):
 
 - `pnpm i` then `pnpm gen` — install, regenerate from the `.tsp` model
-- `pnpm check` — tsc + eslint + prettier across model/server/ui
-- `pnpm dev` — run the stack (docker KurrentDB + server + vite UI)
+- `pnpm check` — tsc + eslint + prettier across the example's packages
+- `pnpm dev` — run the stack: todo-basic builds and runs the v0 database
+  with its bundle beside the vite UI; todo-thin runs docker KurrentDB +
+  server + vite UI
 
 Library example (`cd examples/library`):
 
@@ -90,6 +92,13 @@ example to regenerate.
 - Generated files (`*.gen.ts`, generated `model.py`, `model.go`,
   `ui/src/model.*`) are never hand-edited; change the `.tsp` or the
   emitter and regenerate.
+- A model package (the `.tsp`, its generated code, its reducers, and its
+  database's bundle source) depends on no host library: not
+  `@phaselock/client`, nor whatever runtime a client or the database
+  brings, since one model serves every client app and the database.
+  `@phaselock/plugins` is allowed, for the bundle source's plugin
+  installs.  Our code holds to this; for users' code it is a
+  recommendation.
 - Demo code is meant to be read: high quality, simple, and it
   intentionally omits things (auth, users, subscription sharing).
   Don't "fix" an omission without asking; the omissions are the design.

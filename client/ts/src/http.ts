@@ -31,6 +31,10 @@ const sendRetryDelay = 100;
 
 type BlobHeader = { position: number; streams: Record<string, number> };
 
+// a blob body opened past its header: the reader at its first record, whether the download is
+// fresh, and the content hash so far, which only a fresh download checks
+type BlobReading = { br: ByteReader; fresh: boolean; fnv: Fnv64 };
+
 // a blob response's whole length: a full response's Content-Length, or a range response's
 // Content-Range total; null when it states neither, or is encoded, which makes the stated length
 // the encoded one
@@ -102,9 +106,12 @@ export class HTTPConnector implements Connector {
       const q = new URLSearchParams({ since: String(since) });
       if (view !== null) q.set('view', view);
       for (const w of wants) q.append('want', w);
+      // a stream never ends, so it bypasses the HTTP cache, which would otherwise hold back an
+      // identical request until this one finished
       const resp = await fetch(`${this.#url}/stream?${q}`, {
         signal: this.#signal,
         headers: this.#headers(),
+        cache: 'no-store',
       });
       if (resp.status !== 200 || !resp.body) {
         this.#end(resp.status, await resp.text());
@@ -181,7 +188,10 @@ export class HTTPConnector implements Connector {
       position = Number(first.headers.get('PhaseLock-Position'));
       if (!Number.isSafeInteger(position)) throw new Error(`snapshot ${b.ref}: no position`);
       if (skip > 0 && position !== r!.position) return 'stale';
-      snapshot = this.#blob(b, blob, position, skip, signal);
+
+      // a fresh blob's header reaches the Engine before anything of the tail
+      const reading = await this.#blobOpen(b, blob, position, skip);
+      if (reading !== null) snapshot = this.#blobRecords(b, reading);
     }
 
     // the tail half, unless a previous attempt finished it
@@ -197,17 +207,18 @@ export class HTTPConnector implements Connector {
     return 'done';
   }
 
-  async #blob(
+  /* Open a blob's body: push its length, and for a fresh download check and push its header.
+     Answers where its records start, or null for a resumed blob that was already complete. */
+  async #blobOpen(
     b: Backfill,
     resp: Response,
     position: number,
     skip: number,
-    _signal: AbortSignal,
-  ): Promise<void> {
+  ): Promise<BlobReading | null> {
     if (resp.status === 416) {
       // skip is the end: every value was delivered already
       await b.push({ valuesDone: true });
-      return;
+      return null;
     }
     if (!resp.body) throw new Error(`snapshot ${b.ref}: no body`);
 
@@ -235,7 +246,11 @@ export class HTTPConnector implements Connector {
       if (header.position !== position) throw new Error(`snapshot ${b.ref}: position mismatch`);
       await b.push({ header: { position, seqs: header.streams ?? {} } });
     }
+    return { br, fresh, fnv };
+  }
 
+  // a blob's records and footer, from where #blobOpen left its body
+  async #blobRecords(b: Backfill, { br, fresh, fnv }: BlobReading): Promise<void> {
     let batch: [string, Uint8Array][] = [];
     let bytes = 0;
     let count = 0;

@@ -450,6 +450,18 @@ describe('landing', () => {
     expect(keys(r.data(), '!backfill')).toEqual([]);
   });
 
+  test('a stream its blob does not name is unknown after the land, so its birth chains', async () => {
+    const r = rig();
+    await bootstrap(r, ['patron:p1'], { 'patron:p1': { position: 10, seqs: {}, values: [] } });
+    expect(seq(r.data(), 'patron:p1')).toBeUndefined();
+    r.server.events(birth('patron:p1', 1, 11), ev('patron:p1', 2, 11));
+    await settle();
+    expect(state(r.data(), 'patron:p1')).toEqual({ count: 1, fields: {} });
+    expect(log(r.data(), 'patron:p1')).toEqual(['bump']);
+    expect(seq(r.data(), 'patron:p1')).toBe(2);
+    expect(keys(r.data(), '!park-ev:')).toEqual([]);
+  });
+
   test('a parked run that breaks mid-way is a break, and nothing of it reaches a reducer', async () => {
     const r = await held();
     const hold = r.server.hold('book:*');

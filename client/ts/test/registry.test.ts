@@ -413,6 +413,13 @@ function rejects(fn: () => unknown, message: string | RegExp): void {
   else expect((error as Error).message).toMatch(message);
 }
 
+describe('the schema', () => {
+  test('a kind of node this library does not know refuses to build', () => {
+    const bad = { ...schema, nodes: [...schema.nodes, ['decimal'] as unknown as SchemaNode] };
+    expect(() => buildRegistry(bad)).toThrow('schema: unknown node kind "decimal"');
+  });
+});
+
 describe('scalars', () => {
   test('strings, ints of every width, bools, and literals round-trip', () => {
     const ints = [0, 1, 127, 128, 255, 256, 65535, 65536, 2 ** 32, 2 ** 53 - 1];

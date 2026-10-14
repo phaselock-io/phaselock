@@ -721,6 +721,9 @@ function compile(schema: Schema): Plan[] {
         p.k = INTAKE;
         p.child = plans[n[2]];
         break;
+      default:
+        // a kind of node from an emitter newer than this library
+        throw new Error(`schema: unknown node kind ${JSON.stringify((n as unknown[])[0])}`);
     }
   });
   return plans;
