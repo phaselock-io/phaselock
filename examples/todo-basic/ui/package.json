@@ -14,7 +14,7 @@
     },
     "dependencies": {
         "@ant-design/icons": "^6.1.1",
-        "@phaselock/client": "link:../../../client/ts",
+        "@phaselock/client": "^0.2.0",
         "@todo-basic/model": "workspace:*",
         "antd": "^6.2.1",
         "react": "^19.2.3",

@@ -32,7 +32,7 @@ describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
       binary,
       [
         '--bundle',
-        join(db, 'server/testdata/bundle.js'),
+        join(db, 'testdata/bundle.js'),
         '--dev-auth',
         '--listen',
         `127.0.0.1:${port}`,

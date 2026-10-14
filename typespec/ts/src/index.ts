@@ -3,11 +3,11 @@ import { fileURLToPath } from 'node:url';
 import { lowerProgram } from '@phaselock/typespec-core';
 import { type EmitContext, emitFile, resolvePath } from '@typespec/compiler';
 
-import { generateTs } from './emitter.js';
-import { $lib, type TsEmitterOptions } from './lib.js';
+import { generateTs } from './emitter.ts';
+import { $lib, type TsEmitterOptions } from './lib.ts';
 
 export { $lib };
-export { generateTs } from './emitter.js';
+export { generateTs } from './emitter.ts';
 
 /**
  * The skeleton is the runtime support code (Engine base class, store helpers, decoders'
@@ -15,7 +15,7 @@ export { generateTs } from './emitter.js';
  * skeleton is always included: the packaged default unless the `skeleton` option overrides it.
  * The default ships as assets/skeleton.ts so users can copy it as the basis for an override.
  */
-const DEFAULT_SKELETON = fileURLToPath(new URL('../../assets/skeleton.ts', import.meta.url));
+const DEFAULT_SKELETON = fileURLToPath(new URL('../assets/skeleton.ts', import.meta.url));
 
 export async function $onEmit(context: EmitContext<TsEmitterOptions>) {
   const program = context.program;

@@ -1,0 +1,19 @@
+packages:
+  - typespec
+  - typespec/core
+  - typespec/ts
+  - typespec/py
+  - typespec/go
+  - typespec/tests
+  - client/ts
+  - plugins
+  - db/testdata
+  - examples/todo-basic
+  - examples/todo-basic/model
+  - examples/todo-basic/ui
+
+linkWorkspacePackages: true
+
+allowBuilds:
+  esbuild: true
+  unrs-resolver: true

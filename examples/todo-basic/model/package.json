@@ -9,8 +9,8 @@
         "./ui": "./ui.ts"
     },
     "devDependencies": {
-        "@phaselock/typespec-core": "link:../../../typespec/core",
-        "@phaselock/typespec-ts": "link:../../../typespec/ts",
+        "@phaselock/typespec-core": "^0.2.0",
+        "@phaselock/typespec-ts": "^0.2.0",
         "@typespec/compiler": "^1.0.0",
         "esbuild": "^0.25.0"
     }

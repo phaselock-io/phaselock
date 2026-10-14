@@ -42,9 +42,9 @@ tests/    Vitest suite for the tooling (see "Tests" below).
 ## Build and generate
 
 ```
+pnpm install        # from the repo root, whose workspace holds these packages
 cd typespec
-pnpm install
-pnpm -r build       # tsc for core + all three emitters
+pnpm build          # tsc for core and the TypeScript emitter, for publishing
 ```
 
 ## Tests

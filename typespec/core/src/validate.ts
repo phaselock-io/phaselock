@@ -7,8 +7,8 @@
 
 import { NoTarget, type Program, type Type } from '@typespec/compiler';
 
-import { reportDiagnostic } from './lib.js';
-import { type LoweredProgram, lowerProgram } from './lower.js';
+import { reportDiagnostic } from './lib.ts';
+import { type LoweredProgram, lowerProgram } from './lower.ts';
 import {
   PArray,
   type PCommand,
@@ -21,8 +21,8 @@ import {
   PTuple,
   type PType,
   PUnion,
-} from './ptypes.js';
-import { solveUnion } from './solver.js';
+} from './ptypes.ts';
+import { solveUnion } from './solver.ts';
 
 export function $onValidate(program: Program): void {
   // checker errors (unknown identifiers etc.) produce error types that would only cascade into

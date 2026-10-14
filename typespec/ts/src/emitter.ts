@@ -19,7 +19,7 @@ import {
   GetField,
   GetIndex,
   HasField,
-  LoweredProgram,
+  type LoweredProgram,
   Match,
   PArray,
   PBool,
@@ -45,7 +45,7 @@ import {
   PType,
   PTypeRegistry,
   PUnion,
-  Solution,
+  type Solution,
   solveUnion,
 } from '@phaselock/typespec-core';
 
@@ -253,8 +253,11 @@ class NodeTable {
   // apart from its other members by, the first union to name one winning
   readonly #solutions = new Map<PUnion, Solution>();
   readonly #discriminators = new Map<PType, string>();
+  private readonly registry: PTypeRegistry;
 
-  constructor(private readonly registry: PTypeRegistry) {}
+  constructor(registry: PTypeRegistry) {
+    this.registry = registry;
+  }
 
   /** the index of a type's node, visiting its children first; a result is its base's node */
   visit(t: PType): number {

@@ -7,7 +7,7 @@
  */
 
 import {
-  LitValue,
+  type LitValue,
   members,
   PArray,
   PLiteral,
@@ -15,21 +15,30 @@ import {
   PTuple,
   PType,
   PTypeRegistry,
-} from './ptypes.js';
+} from './ptypes.ts';
 
 /** Match means there is only one option remaining. */
 export class Match {
-  constructor(readonly typ: PType) {}
+  readonly typ: PType;
+  constructor(typ: PType) {
+    this.typ = typ;
+  }
 }
 
 /** CheckJsonType means check the json type and proceed with solution = options.get(json_type). */
 export class CheckJsonType {
-  constructor(readonly options: Map<string, Solution>) {}
+  readonly options: Map<string, Solution>;
+  constructor(options: Map<string, Solution>) {
+    this.options = options;
+  }
 }
 
 /** CheckLiteral means you should check the value and proceed with solution = options.get(value). */
 export class CheckLiteral {
-  constructor(readonly options: Map<LitValue, Solution>) {}
+  readonly options: Map<LitValue, Solution>;
+  constructor(options: Map<LitValue, Solution>) {
+    this.options = options;
+  }
 }
 
 /**
@@ -38,33 +47,39 @@ export class CheckLiteral {
  */
 export class CheckLength {
   readonly default: Solution | null;
-  constructor(
-    readonly options: Map<number, Solution>,
-    dflt: Solution | null = null,
-  ) {
+  readonly options: Map<number, Solution>;
+  constructor(options: Map<number, Solution>, dflt: Solution | null = null) {
+    this.options = options;
     this.default = dflt;
   }
 }
 
 /** GetIndex means you should select the index from the array and feed that to the solution. */
 export class GetIndex {
-  constructor(
-    readonly i: number,
-    readonly solution: Solution,
-  ) {}
+  readonly i: number;
+  readonly solution: Solution;
+  constructor(i: number, solution: Solution) {
+    this.i = i;
+    this.solution = solution;
+  }
 }
 
 /** GetField means you should select the field from the struct and feed that to the solution. */
 export class GetField {
-  constructor(
-    readonly key: string,
-    readonly solution: Solution,
-  ) {}
+  readonly key: string;
+  readonly solution: Solution;
+  constructor(key: string, solution: Solution) {
+    this.key = key;
+    this.solution = solution;
+  }
 }
 
 /** HasField means you should check for each field in order, and pick the corresponding solution. */
 export class HasField {
-  constructor(readonly solutions: readonly (readonly [string, Solution])[]) {}
+  readonly solutions: readonly (readonly [string, Solution])[];
+  constructor(solutions: readonly (readonly [string, Solution])[]) {
+    this.solutions = solutions;
+  }
 }
 
 export type Solution =

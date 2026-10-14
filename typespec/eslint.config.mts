@@ -45,7 +45,8 @@ export default [
         { considerDefaultExhaustiveForUnions: true },
       ],
       'eqeqeq': ['error', 'smart'],
-      'import/extensions': ['warn', { ts: 'never' }],
+      // core and ts run under Node's type stripping, which loads each import by its real extension
+      'import/extensions': ['warn', 'ignorePackages', { ts: 'always' }],
       'import/order': [
         'error',
         {

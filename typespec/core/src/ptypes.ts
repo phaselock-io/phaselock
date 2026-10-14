@@ -69,8 +69,10 @@ export class PJson extends PType {
 
 export class PLiteral extends PType {
   readonly jsonType: JsonType;
-  constructor(readonly value: LitValue) {
+  readonly value: LitValue;
+  constructor(value: LitValue) {
     super();
+    this.value = value;
     if (typeof value === 'boolean') this.jsonType = 'boolean';
     else if (typeof value === 'string') this.jsonType = 'string';
     else if (Number.isInteger(value)) this.jsonType = 'int';
@@ -107,8 +109,10 @@ export class PStruct extends PType {
 
 export class PObject extends PType {
   readonly jsonType = 'object';
-  constructor(readonly valueType: PType) {
+  readonly valueType: PType;
+  constructor(valueType: PType) {
     super();
+    this.valueType = valueType;
   }
   toString() {
     return this.name ?? `Object[${this.valueType}]`;
@@ -117,8 +121,10 @@ export class PObject extends PType {
 
 export class PArray extends PType {
   readonly jsonType = 'array';
-  constructor(readonly itemType: PType) {
+  readonly itemType: PType;
+  constructor(itemType: PType) {
     super();
+    this.itemType = itemType;
   }
   lengthRange(): [number, number] {
     return [0, Infinity];
@@ -133,8 +139,10 @@ export class PArray extends PType {
 
 export class PTuple extends PType {
   readonly jsonType = 'array';
-  constructor(readonly itemTypes: readonly PType[]) {
+  readonly itemTypes: readonly PType[];
+  constructor(itemTypes: readonly PType[]) {
     super();
+    this.itemTypes = itemTypes;
   }
   lengthRange(): [number, number] {
     return [this.itemTypes.length, this.itemTypes.length];
@@ -169,11 +177,12 @@ export class PUnion extends PType {
  * vocabulary type, and the value travels as its base type.
  */
 export class PResult extends PType {
-  constructor(
-    readonly kind: string,
-    readonly base: PType,
-  ) {
+  readonly kind: string;
+  readonly base: PType;
+  constructor(kind: string, base: PType) {
     super();
+    this.kind = kind;
+    this.base = base;
   }
   get jsonType(): JsonType {
     return this.base.jsonType;
@@ -188,12 +197,14 @@ export class PResult extends PType {
  * `wire`, and precommit sees `result`.  `kind` names the vocabulary type, e.g. 'NewPassword'.
  */
 export class PIntake extends PType {
-  constructor(
-    readonly kind: string,
-    readonly wire: PType,
-    readonly result: PResult,
-  ) {
+  readonly kind: string;
+  readonly wire: PType;
+  readonly result: PResult;
+  constructor(kind: string, wire: PType, result: PResult) {
     super();
+    this.kind = kind;
+    this.wire = wire;
+    this.result = result;
   }
   get jsonType(): JsonType {
     const kinds = new Set(members(this.wire).map((t) => t.jsonType));
@@ -315,14 +326,25 @@ export class PTypeRegistry {
 const TPL_PATTERN = /\{([^}]*)\}/g;
 
 export class PStoreItem {
+  readonly tpl: string;
+  readonly type: PType;
+  readonly name: string;
+  /** there is always one more chunk than params */
+  readonly chunks: readonly string[];
+  readonly params: readonly string[];
   private constructor(
-    readonly tpl: string,
-    readonly type: PType,
-    readonly name: string,
-    /** there is always one more chunk than params */
-    readonly chunks: readonly string[],
-    readonly params: readonly string[],
-  ) {}
+    tpl: string,
+    type: PType,
+    name: string,
+    chunks: readonly string[],
+    params: readonly string[],
+  ) {
+    this.tpl = tpl;
+    this.type = type;
+    this.name = name;
+    this.chunks = chunks;
+    this.params = params;
+  }
 
   static fromSpec(tpl: string, type: PType): PStoreItem {
     const name = tpl.split(':')[0];
@@ -380,14 +402,25 @@ export class PStore {
  * the family template: `"chat:{org},{channel}"` is family 'chat' with params ['org', 'channel'].
  */
 export class PSlice {
+  readonly name: string;
+  readonly family: string;
+  readonly params: readonly string[];
+  /** the named events union */
+  readonly events: PType;
+  readonly store: PStore;
   constructor(
-    readonly name: string,
-    readonly family: string,
-    readonly params: readonly string[],
-    /** the named events union */
-    readonly events: PType,
-    readonly store: PStore,
-  ) {}
+    name: string,
+    family: string,
+    params: readonly string[],
+    events: PType,
+    store: PStore,
+  ) {
+    this.name = name;
+    this.family = family;
+    this.params = params;
+    this.events = events;
+    this.store = store;
+  }
 
   /** the family template, e.g. 'patron:{patron}' */
   get template(): string {
@@ -416,23 +449,36 @@ export type POutput =
 
 /** A model carrying `@command`: its type, its declared output, and whether it is `@online`. */
 export class PCommand {
-  constructor(
-    readonly name: string,
-    readonly type: PType,
-    readonly output: POutput,
-    readonly online: boolean,
-  ) {}
+  readonly name: string;
+  readonly type: PType;
+  readonly output: POutput;
+  readonly online: boolean;
+  constructor(name: string, type: PType, output: POutput, online: boolean) {
+    this.name = name;
+    this.type = type;
+    this.output = output;
+    this.online = online;
+  }
 }
 
 /** One audience's view of the database: the slices it syncs and the commands it may send. */
 export class PEngine {
+  readonly name: string;
+  readonly slices: readonly PSlice[];
+  /** the named commands union, or the one named command */
+  readonly commandType: PType;
+  readonly commands: readonly PCommand[];
   constructor(
-    readonly name: string,
-    readonly slices: readonly PSlice[],
-    /** the named commands union, or the one named command */
-    readonly commandType: PType,
-    readonly commands: readonly PCommand[],
-  ) {}
+    name: string,
+    slices: readonly PSlice[],
+    commandType: PType,
+    commands: readonly PCommand[],
+  ) {
+    this.name = name;
+    this.slices = slices;
+    this.commandType = commandType;
+    this.commands = commands;
+  }
 }
 
 /** The database: its engines, and the slices and commands it keeps for itself. */
@@ -442,12 +488,20 @@ export class PDatabase {
   /** every command of every engine, then the database's own, each once */
   readonly commands: readonly PCommand[];
 
+  readonly name: string;
+  readonly engines: readonly PEngine[];
+  readonly extraSlices: readonly PSlice[];
+  readonly extraCommands: readonly PCommand[];
   constructor(
-    readonly name: string,
-    readonly engines: readonly PEngine[],
-    readonly extraSlices: readonly PSlice[],
-    readonly extraCommands: readonly PCommand[],
+    name: string,
+    engines: readonly PEngine[],
+    extraSlices: readonly PSlice[],
+    extraCommands: readonly PCommand[],
   ) {
+    this.name = name;
+    this.engines = engines;
+    this.extraSlices = extraSlices;
+    this.extraCommands = extraCommands;
     this.slices = [...new Set([...engines.flatMap((e) => e.slices), ...extraSlices])];
     this.commands = [...new Set([...engines.flatMap((e) => e.commands), ...extraCommands])];
   }
@@ -455,14 +509,20 @@ export class PDatabase {
 
 /** One query declaration: its name, arguments, and result type. */
 export class PQuery {
-  constructor(
-    readonly name: string,
-    readonly args: readonly PField[],
-    readonly result: PType,
-  ) {}
+  readonly name: string;
+  readonly args: readonly PField[];
+  readonly result: PType;
+  constructor(name: string, args: readonly PField[], result: PType) {
+    this.name = name;
+    this.args = args;
+    this.result = result;
+  }
 }
 
 export class PQueries {
   name: string | null = null;
-  constructor(readonly queries: readonly PQuery[]) {}
+  readonly queries: readonly PQuery[];
+  constructor(queries: readonly PQuery[]) {
+    this.queries = queries;
+  }
 }

@@ -47,13 +47,13 @@ import type {
   Union,
 } from '@typespec/compiler';
 
-import { getCommandOutput, isOnline } from './decorators.js';
-import { reportDiagnostic } from './lib.js';
+import { getCommandOutput, isOnline } from './decorators.ts';
+import { reportDiagnostic } from './lib.ts';
 import {
   PCommand,
   PDatabase,
   PEngine,
-  PField,
+  type PField,
   type POutput,
   PQueries,
   PQuery,
@@ -62,7 +62,7 @@ import {
   PStore,
   PType,
   PTypeRegistry,
-} from './ptypes.js';
+} from './ptypes.ts';
 
 export interface LoweredProgram {
   registry: PTypeRegistry;

@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "build": "pnpm -r --filter '!@phaselock/typespec-py' --filter '!@phaselock/typespec-go' build",
+    "build": "pnpm --filter @phaselock/typespec-core --filter @phaselock/typespec-ts build",
     "test": "pnpm build && pnpm --filter @phaselock/typespec-tests gen && pnpm --filter @phaselock/typespec-tests test",
     "check": "pnpm check:tsc && pnpm check:lint && pnpm check:fmt",
     "check:tsc": "pnpm build && tsc -p tests",

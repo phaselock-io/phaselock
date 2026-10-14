@@ -55,9 +55,35 @@ the `Bundle`, or the store interface starts in the skeleton.
 
 ## Build and check
 
+Setup is `pnpm install`, anywhere in the repo: one pnpm workspace, with
+one lockfile, holds the tooling, the client, the plugins, `db/testdata`,
+and each example ported to PhaseLockDB.  Nothing needs building first.
+
+The ported examples depend on the tooling by version range (`^0.2.0`),
+as a copy outside this repo would, and the workspace links those ranges
+to the local packages; a version bump moves the examples' ranges with
+it.  Examples not yet ported keep their own workspace and `link:` the
+tooling.
+
+Inside the repo, `typespec/core`, `typespec/ts`, `client/ts`, and
+`plugins` load from their TypeScript source: each package's `exports`
+names `src/`, and its `publishConfig` names the compiled `dist/`, which
+pnpm swaps in when packing.  So:
+
+- Publish with `pnpm publish`; `npm publish` would ship the `src/`
+  entry points without the sources.
+- The TypeSpec compiler runs `typespec/core` and `typespec/ts` under
+  Node's type stripping (Node 22.18+): their relative imports name
+  `.ts` files, and their syntax is erasable (`erasableSyntaxOnly`), so
+  no parameter properties or enums.
+- `typespec/core/lib/src.tsp` and `lib/dist.tsp` load the vocabulary's
+  decorators from source or from `dist/`; the `typespec` export picks
+  one, and both import `lib/main.tsp`.
+
 TypeSpec tooling (`cd typespec`):
 
-- `pnpm install && pnpm -r build` — build vocabulary + emitters
+- `pnpm build` — compile the vocabulary and the TypeScript emitter to
+  `dist/`, which only publishing uses
 - `pnpm test` — regenerate fixtures, run the vitest suite
 - `pnpm --filter @phaselock/typespec-tests test:py` / `test:go` —
   emitted-Python / emitted-Go checker suites
@@ -71,7 +97,8 @@ Database (`cd db`; Go 1.25+ and a C compiler):
 
 Todo examples (`cd examples/todo-basic` or `todo-thin`):
 
-- `pnpm i` then `pnpm gen` — install, regenerate from the `.tsp` model
+- `pnpm gen` — regenerate from the `.tsp` model (todo-thin, outside the
+  workspace, first needs its own `pnpm i`)
 - `pnpm check` — tsc + eslint + prettier across the example's packages
 - `pnpm dev` — run the stack: todo-basic builds and runs the v0 database
   with its bundle beside the vite UI; todo-thin runs docker KurrentDB +
@@ -88,11 +115,10 @@ After changing any `.tsp` model or any codegen in `typespec/`, regenerate
 and read the regenerated files rather than assuming their shape.
 
 The example build files are meant for external readers, so their gen
-steps don't depend on the contents of the tooling changing.  The tooling
-also doesn't have a proper build system.  When you work on `typespec/` and
-want to test an example, manually `(cd typespec && pnpm build)` and then
-`touch examples/library/model/model.tsp` (or equivalent) to force the
-example to regenerate.
+steps don't depend on the contents of the tooling changing.  When you
+work on `typespec/` and want to test an example, `touch
+examples/library/model/model.tsp` (or equivalent) to force the example to
+regenerate; it picks up the tooling's source as it stands.
 
 ## Conventions
 

@@ -1,6 +1,6 @@
 {
   "name": "@phaselock/typespec-go",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Go emitter for PhaseLock TypeSpec models",
   "license": "Apache-2.0",
   "publishConfig": {

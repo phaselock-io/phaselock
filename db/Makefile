@@ -7,19 +7,16 @@ all:
 	go build -o phaselockdb .
 
 # the test bundle: the test model through the TypeScript emitter, bundled with its user code and
-# @phaselock/plugins.  It is rebuilt on every test run, the emitter and the plugins with it, so it
-# never lags their sources.
+# @phaselock/plugins.  It is rebuilt on every test run from the emitter's and the plugins' sources,
+# so it never lags them.
 BUNDLE = testdata/bundle.js
 
-testdata/node_modules: testdata/package.json
-	cd testdata && pnpm install --prefer-offline && touch node_modules
+# the test bundle's package and the workspace packages it depends on, from the repo's workspace
+testdata/node_modules: testdata/package.json ../plugins/package.json
+	cd testdata && pnpm install --prefer-offline --filter '@phaselock/phaselockdb-testdata...' \
+	  && touch node_modules
 
-../plugins/node_modules: ../plugins/package.json
-	cd ../plugins && pnpm install --prefer-offline && touch node_modules
-
-bundle: testdata/node_modules ../plugins/node_modules
-	cd ../typespec && pnpm build
-	cd ../plugins && pnpm build
+bundle: testdata/node_modules
 	cd testdata && pnpm gen
 
 test: bundle

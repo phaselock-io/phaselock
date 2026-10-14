@@ -5,7 +5,7 @@
 
 import type { DecoratorContext, Model, Program, Type } from '@typespec/compiler';
 
-import { $lib } from './lib.js';
+import { $lib } from './lib.ts';
 
 const commandKey = $lib.createStateSymbol('command');
 const onlineKey = $lib.createStateSymbol('online');
