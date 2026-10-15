@@ -454,7 +454,9 @@ Every frame is an array whose first element is a tag.
 
 Msgpack values are the JSON projection, with one extension: a date,
 the envelope's server time included, is the msgpack timestamp
-extension, at millisecond precision.  Uuids are strings; there is no
+extension, at millisecond precision, and within a JS Date's range,
+±8.64e15 ms of the epoch; a value holding a timestamp outside it fails
+its check.  Uuids are strings; there is no
 other ext, and the only bin is a command's id, in the command and in
 its envelopes.  Command data and event data are the same values the
 browser engine produces and consumes.

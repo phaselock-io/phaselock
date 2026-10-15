@@ -1142,6 +1142,9 @@ static uint64_t be(const uint8_t *p, int n) {
     return x;
 }
 
+/* the furthest a JS Date reaches either side of the epoch, in milliseconds */
+#define DATE_MAX_MS 8.64e15
+
 /* a timestamp's milliseconds since the epoch; false for a malformed timestamp extension */
 static bool v_date(walk *w, val v, double *ms) {
     if (w->tb) {
@@ -1311,8 +1314,14 @@ static void walk_scalar(walk *w, val v) {
         SINK(w, str(w->sink, s, len));
         break;
     case PL_DATE:
-        if (!v_date(w, v, &ms)) walk_fail(w, "malformed timestamp");
-        else SINK(w, date(w->sink, ms));
+        // a time a Date cannot hold, an invalid Date's NaN among them, has no timestamp to write
+        if (!v_date(w, v, &ms)) {
+            walk_fail(w, "malformed timestamp");
+        } else if (!(fabs(ms) <= DATE_MAX_MS)) {
+            walk_fail(w, "a timestamp outside the range of a Date");
+        } else {
+            SINK(w, date(w->sink, ms));
+        }
         break;
     default: walk_fail(w, "%s is not allowed", v_name(w, v));
     }

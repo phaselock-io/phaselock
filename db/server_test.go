@@ -2166,6 +2166,23 @@ func TestTypedValues(t *testing.T) {
 		t.Fatalf("string date: %+v", o)
 	}
 
+	// a date reaches as far as a JS Date does either side of the epoch, and no further
+	for i, ms := range []int64{8.64e15, -8.64e15} {
+		id := fmt.Sprintf("e%d", i)
+		h.accept(admin, cmd(id, "add-book", "id", id, "title", "Emma", "added", time.UnixMilli(ms)))
+		stored := h.snapshot(admin, "book").records["book!book:"+id].(map[string]any)["added"]
+		if got, ok := stored.(time.Time); !ok || got.UnixMilli() != ms {
+			t.Fatalf("date at %d ms: %v", ms, stored)
+		}
+	}
+	for i, ms := range []int64{8.64e15 + 1, -8.64e15 - 1, 1 << 62} {
+		id := fmt.Sprintf("f%d", i)
+		o := h.commands(admin, cmd(id, "add-book", "id", id, "title", "Emma", "added", time.UnixMilli(ms)))[0]
+		if o.kind != "reject" || o.reason != "$.added: a timestamp outside the range of a Date" {
+			t.Fatalf("date at %d ms: %+v", ms, o)
+		}
+	}
+
 	// an optional field left out stays out
 	h.accept(admin, cmd("c3", "add-book", "id", "b3", "title", "Emma"))
 	if _, ok := h.snapshot(admin, "book").records["book!book:b3"].(map[string]any)["added"]; ok {
