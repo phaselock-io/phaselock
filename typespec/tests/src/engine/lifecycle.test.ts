@@ -2,7 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
-import type { Backfill, Connector } from '../../../ts/assets/skeleton.ts';
+import type { Backfill, Session } from '../../../ts/assets/skeleton.ts';
 
 import {
   type Blob,
@@ -30,13 +30,13 @@ async function held(server?: FakeServer): Promise<Rig> {
   return r;
 }
 
-/** a server whose connectors record every Backfill object they are handed */
+/** a server whose connections record every Backfill object they are handed */
 function recording(): { server: FakeServer; backfills: Backfill[] } {
   const server = new FakeServer();
   const backfills: Backfill[] = [];
-  const inner = server.factory;
-  server.factory = (since, view, wants, signal, hooks) => {
-    const c: Connector = inner(since, view, wants, signal, hooks);
+  const inner = server.connect.bind(server);
+  server.connect = (since, view, wants, signal, hooks, session) => {
+    const c = inner(since, view, wants, signal, hooks, session);
     return {
       backfill: (b) => {
         backfills.push(b);
@@ -86,6 +86,25 @@ describe('connector lifecycle', () => {
     expect(r.server.conns.length).toBe(2);
     expect(r.server.conn.since).toBe(10);
     expect(r.server.conn.view).toBe('t1');
+  });
+
+  test('every connection is handed the Engine session', async () => {
+    const session: Session = { token: 't', user: 'ann', exp: 0, ended: false };
+    const r = rig({ session });
+    await bootstrap(r, ['patron:*'], { 'patron:*': patrons });
+    r.server.end();
+    r.engine.reconnectNow();
+    await settle();
+    expect(r.server.conns.map((c) => c.session)).toEqual([session, session]);
+  });
+
+  test('a fatal end ends the Engine with its error, and nothing reconnects', async () => {
+    const r = await held();
+    const refused = new Error('session refused');
+    r.server.end(401, 'token rejected', refused);
+    await expect(settle()).rejects.toBe(refused);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(r.server.conns.length).toBe(1);
   });
 
   test('reconnectNow cancels the timer and calls the factory at once', async () => {

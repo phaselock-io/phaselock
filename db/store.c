@@ -1,4 +1,4 @@
-/* SQLite storage: the KV store, the log, the session table, the token keys, and the
+/* SQLite storage: the KV store, the log, the series table, the token keys, and the
    known-streams table live in one database file. */
 
 #include "internal.h"
@@ -8,7 +8,7 @@ struct store {
     char err[512];
     sqlite3_stmt *get, *set, *del, *scan, *scan_all, *del_prefix, *append, *read_log,
         *seek_ge, *seek_gt, *seek_le, *seek_lt, *seek_first, *seek_last,
-        *max_pos, *session_hwm, *session_mark, *stream_live, *stream_birth, *stream_death,
+        *max_pos, *series_hwm, *series_mark, *stream_live, *stream_birth, *stream_death,
         *stream_erase, *stream_bytes, *stream_seq,
         *live_streams, *live_streams_all, *live_stream, *kv_len, *stream_state, *stream_state_zero, *stream_stats,
         *read_stream_asc, *read_stream_desc, *read_prefix_asc, *read_prefix_desc,
@@ -25,7 +25,7 @@ static const char *SCHEMA =
     "  stream TEXT NOT NULL, seq INTEGER NOT NULL, commandid BLOB NOT NULL,"
     "  servertime INTEGER NOT NULL, data BLOB NOT NULL);"
     "CREATE INDEX IF NOT EXISTS log_stream ON log(stream, position);"
-    "CREATE TABLE IF NOT EXISTS sessions (key TEXT PRIMARY KEY, hwm INTEGER NOT NULL,"
+    "CREATE TABLE IF NOT EXISTS series (key TEXT PRIMARY KEY, hwm INTEGER NOT NULL,"
     "  time INTEGER NOT NULL) WITHOUT ROWID;"
     "CREATE TABLE IF NOT EXISTS token_keys (kid TEXT PRIMARY KEY, public BLOB NOT NULL,"
     "  minted INTEGER NOT NULL) WITHOUT ROWID;"
@@ -98,9 +98,9 @@ int store_open(const char *path, bool writer, store **out, char *err, size_t err
                   " NOT INDEXED WHERE position > ?1 AND position < ?2"
                   " AND stream >= ?3 AND stream < ?4 ORDER BY position DESC LIMIT ?5") ||
              prep(s, &s->max_pos, "SELECT COALESCE(MAX(position), 0) FROM log") ||
-             prep(s, &s->session_hwm, "SELECT hwm FROM sessions WHERE key = ?1") ||
-             prep(s, &s->session_mark,
-                  "INSERT INTO sessions (key, hwm, time) VALUES (?1, ?2, ?3)"
+             prep(s, &s->series_hwm, "SELECT hwm FROM series WHERE key = ?1") ||
+             prep(s, &s->series_mark,
+                  "INSERT INTO series (key, hwm, time) VALUES (?1, ?2, ?3)"
                   " ON CONFLICT (key) DO UPDATE SET hwm = MAX(hwm, excluded.hwm),"
                   " time = excluded.time") ||
              prep(s, &s->stream_live, "SELECT death IS NULL FROM streams WHERE name = ?1") ||
@@ -145,7 +145,7 @@ void store_close(store *s) {
     sqlite3_stmt *stmts[] = {s->get, s->set, s->del, s->scan, s->scan_all, s->del_prefix,
                              s->seek_ge, s->seek_gt, s->seek_le, s->seek_lt, s->seek_first,
                              s->seek_last,
-                             s->append, s->read_log, s->max_pos, s->session_hwm, s->session_mark,
+                             s->append, s->read_log, s->max_pos, s->series_hwm, s->series_mark,
                              s->stream_live, s->stream_birth, s->stream_death, s->stream_erase,
                              s->stream_bytes, s->stream_seq, s->live_streams,
                              s->live_streams_all, s->live_stream,
@@ -433,28 +433,28 @@ int store_max_position(store *s, uint64_t *out) {
     return 0;
 }
 
-int store_session_hwm(store *s, const char *key, uint64_t *hwm) {
-    sqlite3_bind_text(s->session_hwm, 1, key, -1, SQLITE_STATIC);
-    int rc = sqlite3_step(s->session_hwm);
+int store_series_hwm(store *s, const char *key, uint64_t *hwm) {
+    sqlite3_bind_text(s->series_hwm, 1, key, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(s->series_hwm);
     int out;
     if (rc == SQLITE_ROW) {
-        *hwm = (uint64_t)sqlite3_column_int64(s->session_hwm, 0);
+        *hwm = (uint64_t)sqlite3_column_int64(s->series_hwm, 0);
         out = 1;
     } else if (rc == SQLITE_DONE) {
         out = 0;
     } else {
-        out = fail(s, "session_hwm");
+        out = fail(s, "series_hwm");
     }
-    sqlite3_reset(s->session_hwm);
-    sqlite3_clear_bindings(s->session_hwm);
+    sqlite3_reset(s->series_hwm);
+    sqlite3_clear_bindings(s->series_hwm);
     return out;
 }
 
-int store_session_mark(store *s, const char *key, uint64_t n, int64_t time) {
-    sqlite3_bind_text(s->session_mark, 1, key, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(s->session_mark, 2, (sqlite3_int64)n);
-    sqlite3_bind_int64(s->session_mark, 3, time);
-    return step_done(s, s->session_mark, "session_mark");
+int store_series_mark(store *s, const char *key, uint64_t n, int64_t time) {
+    sqlite3_bind_text(s->series_mark, 1, key, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(s->series_mark, 2, (sqlite3_int64)n);
+    sqlite3_bind_int64(s->series_mark, 3, time);
+    return step_done(s, s->series_mark, "series_mark");
 }
 
 int store_keys(store *s, store_key_fn fn, void *arg) {

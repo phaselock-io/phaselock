@@ -142,13 +142,13 @@ void pldb_result_free(pldb_result *r);
    prepared, before anything reaches the writer.  body holds the commands that passed, in
    order; reasons has one entry per command of the request, NULL for one that passed and
    why it was rejected otherwise, and offsets one, the start in body of a command that passed.
-   Each passing command's session is replaced by its key in the session table.  arg is handed to
+   Each passing command's series is replaced by its key in the series table.  arg is handed to
    the hash function for every password the request carries.  A CommandAuth proof is replaced
    by its result, and its password goes to proofs for the caller to check; a proof of any other
    kind rejects its command.  Returns 0; -1 for a request that is not a sequence of
    [S, n, id, data, expect?] values; or PLDB_HASH_BUSY or PLDB_HASH_LIMITED when the hash
    function refused, which refuses the whole request, so the client can retry it later under
-   the same sessions and numbers. */
+   the same series and numbers. */
 typedef struct pldb_proof {
     size_t command; /* its command's index in the request */
     char *password;

@@ -14,7 +14,7 @@ collaborative clients would do.
 The logical flow of information is circular:
 
 - PhaseLockDB stores events in a log.
-- The connector streams events from PhaseLockDB to Engine.
+- The transport streams events from PhaseLockDB to Engine.
 - The Engine processes events with reducers to populate the store.
 - The app submits queries to read the store.
 - The app feeds live query results to a reactive UI.
@@ -40,7 +40,7 @@ The logical flow of information is circular:
 |         |                     |          |
 |   ______|_____________________v_______   |
 |  |                                    |  |
-|  |           connector [5]            |  |
+|  |           transport [5]            |  |
 |  |____________________________________|  |
 |_________^_____________________|__________|
           |                     |
@@ -59,7 +59,7 @@ The logical flow of information is circular:
 - [2] model/reducers.ts defines reducer functions that build state from events
 - [3] ui/src/Window.tsx defines queries in-line with the UI components
 - [4] ui/src/useLocalQuery.ts defines the React hook for queries
-- [5] ui/src/engines.ts starts an Engine+Connector pair that manages sync
+- [5] ui/src/engines.ts starts an Engine+Transport pair that manages sync
 - [6] model/db.ts defines the precommit function for processing commands
 
 ## Run the example

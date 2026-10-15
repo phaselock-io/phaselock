@@ -120,12 +120,12 @@ func (h *harness) token(identity string) string {
 func (h *harness) admin() string { return h.token("root") }
 func (h *harness) epoch() string { return h.srv.epoch }
 
-// command is one command to post: sessionless unless in names its session and number.
+// command is one command to post: unnumbered unless in names its series and number.
 type command struct {
-	id      string
-	session string
-	n       int64
-	data    map[string]any
+	id     string
+	series string
+	n      int64
+	data   map[string]any
 }
 
 func cmd(id, typ string, kv ...any) command {
@@ -136,9 +136,9 @@ func cmd(id, typ string, kv ...any) command {
 	return command{id: id, data: data}
 }
 
-// in sends the command as number n of a session.
-func (c command) in(session string, n int64) command {
-	c.session = session
+// in sends the command as number n of a series.
+func (c command) in(series string, n int64) command {
+	c.series = series
 	c.n = n
 	return c
 }
@@ -153,11 +153,11 @@ func label(id string) []byte {
 
 // encode is the command as the wire carries it, with expect when it is not nil.
 func (c command) encode(expect map[string]any) []byte {
-	var session, n any
-	if c.session != "" {
-		session, n = c.session, c.n
+	var series, n any
+	if c.series != "" {
+		series, n = c.series, c.n
 	}
-	v := []any{session, n, label(c.id), c.data}
+	v := []any{series, n, label(c.id), c.data}
 	if expect != nil {
 		v = append(v, expect)
 	}
@@ -476,7 +476,7 @@ func TestCommandsOkReject(t *testing.T) {
 	}
 }
 
-func TestSessionDedup(t *testing.T) {
+func TestSeriesDedup(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
 	dune := func(id string) command { return cmd(id, "add-book", "id", "b1", "title", "Dune") }
@@ -524,20 +524,20 @@ func TestSessionDedup(t *testing.T) {
 		t.Fatalf("the book stream: %+v", evs)
 	}
 
-	// an unknown session runs from whatever number it starts at, and the numbers below it are
+	// an unknown series runs from whatever number it starts at, and the numbers below it are
 	// then decided already
 	h.accept(admin, cmd("c7", "add-book", "id", "b7", "title", "Emma").in("s2", 5))
 	if o := h.commands(admin, cmd("c8", "add-book", "id", "b8", "title", "Sanditon").in("s2", 1))[0]; o.kind != "ok" {
-		t.Fatalf("a number below an unknown session's first: %+v", o)
+		t.Fatalf("a number below an unknown series' first: %+v", o)
 	}
 	if o := h.commands(admin, dune("c8").in("s2", 6))[0]; o.kind != "reject" {
-		t.Fatalf("the next number of a session that started past 1: %+v", o)
+		t.Fatalf("the next number of a series that started past 1: %+v", o)
 	}
 
-	// a sessionless command runs every time it is sent
+	// an unnumbered command runs every time it is sent
 	for range 2 {
 		if o := h.commands(admin, dune("c9"))[0]; o.kind != "reject" || o.reason != "book exists" {
-			t.Fatalf("a sessionless command: %+v", o)
+			t.Fatalf("an unnumbered command: %+v", o)
 		}
 	}
 }
@@ -1990,10 +1990,10 @@ func TestCommandCheck(t *testing.T) {
 	for name, c := range map[string][]any{
 		"a string":           {"just a string"},
 		"the old pair":       {"c9", data},
-		"a session, no n":    {"s1", nil, label("c9"), data},
-		"an n, no session":   {nil, int64(3), label("c9"), data},
-		"an empty session":   {"", int64(3), label("c9"), data},
-		"a long session":     {strings.Repeat("s", 65), int64(3), label("c9"), data},
+		"a series, no n":     {"s1", nil, label("c9"), data},
+		"an n, no series":    {nil, int64(3), label("c9"), data},
+		"an empty series":    {"", int64(3), label("c9"), data},
+		"a long series":      {strings.Repeat("s", 65), int64(3), label("c9"), data},
 		"a zero n":           {"s1", int64(0), label("c9"), data},
 		"an n past 2^53 - 1": {"s1", int64(1) << 53, label("c9"), data},
 		"a string id":        {nil, nil, "c9", data},
@@ -2007,10 +2007,10 @@ func TestCommandCheck(t *testing.T) {
 			t.Fatalf("%s: %d", name, status)
 		}
 	}
-	// a session of the longest length and the largest n are well-formed
+	// a series id of the longest length and the largest n are well-formed
 	big := []any{strings.Repeat("s", 64), int64(1)<<53 - 1, label("c9"), data}
 	if status, _, out := h.do("POST", "/commands", admin, mpEncode(big)); status != 200 || decodeOutcomes(t, out)[0].kind != "ok" {
-		t.Fatalf("the largest session and n: %d %s", status, out)
+		t.Fatalf("the largest series id and n: %d %s", status, out)
 	}
 }
 

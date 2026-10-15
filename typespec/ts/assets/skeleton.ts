@@ -31,7 +31,7 @@ export function setdefault<T>(obj: Record<string, T>, key: string, dfault: T): T
 
 const NIBBLE = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'];
 
-/** A cancellation signal, as the Engine and its connectors use one: whether it has fired and why,
+/** A cancellation signal, as the Engine and its connections use one: whether it has fired and why,
     and a listener for when it does.  A browser's or Node's AbortSignal is one. */
 export interface Signal {
   readonly aborted: boolean;
@@ -46,8 +46,8 @@ export type SignalController = { readonly signal: Signal; abort(reason?: unknown
 /** What the Engine needs from its host beyond ES2022, read from globalThis.  A browser and Node
     provide all of it.  A host embedding a JS engine (QuickJS, goja, JavaScriptCore) installs it:
     timers that run their callback on the JS thread; an AbortController whose signals, and those
-    AbortSignal.any combines, are of the host's own kind, for its connectors to use as they are,
-    each firing its abort listeners on the JS thread; and randomness for command ids and sessions,
+    AbortSignal.any combines, are of the host's own kind, for its transports to use as they are,
+    each firing its abort listeners on the JS thread; and randomness for command ids and series,
     as crypto.getRandomValues or a generateUuid of its own.  An Engine checks for them when
     built. */
 export type HostGlobals = {
@@ -80,7 +80,7 @@ function checkHost(): void {
 }
 
 // a fresh command id: the host's own uuid when it mints them, else a version 4 uuid from its
-// randomness; lower-case, as the id a connector decodes from an envelope is
+// randomness; lower-case, as the id a connection decodes from an envelope is
 function generateUuid(): string {
   if (host.generateUuid !== undefined) return host.generateUuid().toLowerCase();
 
@@ -105,9 +105,9 @@ function generateUuid(): string {
 
 const BASE64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 
-// a fresh session: 16 random bytes as 22 base64url characters, or the host's own uuid when it has
-// no randomness to give
-function generateSession(): string {
+// a fresh series id: 16 random bytes as 22 base64url characters, or the host's own uuid when it
+// has no randomness to give
+function generateSeries(): string {
   if (host.crypto === undefined) return generateUuid();
   const values = host.crypto.getRandomValues(new Uint8Array(16));
   let bits = 0;
@@ -473,7 +473,7 @@ export type Rep = typeof JS | typeof HOST | typeof MSGPACK;
 
 /** Registry converts between representations of typed values and names the types the store
     holds.  Types are model names from the TypeSpec, plus three reserved names: `.json` for the
-    Engine's own shapes; `.command` for the outbox envelope, `{id, session, n, data}` with `data`
+    Engine's own shapes; `.command` for the outbox envelope, `{id, series, n, data}` with `data`
     already the command's wire bytes, so it needs no vocabulary to read; and `.event` for a parked
     event, the wire pair `[env, data]` in `msgpack` and a DbEvent in `js`, its `data` converted
     through the union of the stream's slice. */
@@ -635,6 +635,9 @@ export interface Store {
   write<T>(fn: (txn: WTxn) => T): T;
   read<T>(fn: (txn: RTxn) => T): T;
 }
+
+/** makes an Engine's store, once, from the Registry the Engine built for its model */
+export type StoreFactory = (reg: Registry) => Store;
 
 // key patterns ///////////////////////////////////////////////////////////////
 
@@ -2544,7 +2547,7 @@ export class RemoteQueries {
   }
 }
 
-// connectors ////////////////////////////////////////////////////////////////////
+// transports ////////////////////////////////////////////////////////////////////
 
 export type Backfill = {
   // what ref are we backfilling (stream name or prefix)
@@ -2565,7 +2568,7 @@ export type Backfill = {
     snapshotDone: boolean;
     tailDone: boolean;
   };
-  // cancels this backfill alone; the connector's own signal cancels everything
+  // cancels this backfill alone; the connection's own signal cancels everything
   signal: Signal;
   // one call per delivery, resolved once the Engine has committed it
   push(item: BackfillItem): Promise<void>;
@@ -2599,15 +2602,15 @@ export type CommandResult =
 // and the Engine may retry with resume as persisted.
 export type BackfillOutcome = 'done' | 'stale';
 
-export interface Connector {
+export interface Connection {
   backfill(backfill: Backfill): Promise<BackfillOutcome>;
   // Calls are applied in call order, and within a call, array order.  A call that fails also
   // fails every call behind it, unsent, and ends the connection, so the next connection's resend
-  // keeps the Engine's order.  Retrying before giving up is the connector's choice.
+  // keeps the Engine's order.  Retrying before giving up is the connection's choice.
   sendCommands(commands: Command<Uint8Array>[]): Promise<CommandResult[]>;
 }
 
-export interface ConnectorHooks {
+export interface ConnectionHooks {
   // first, once per connection, before any frame: from the response headers, the epoch, the log
   // every position on this connection belongs to, and the head, the log's position as the
   // connection opened
@@ -2620,28 +2623,67 @@ export interface ConnectorHooks {
   // history done; live from here (sent once per connection)
   onLive(position: number): void;
   onVouch(position: number): void;
-  onEnd(code: number, reason: string): void;
+  // the connection is over; fatal is the error that ends the Engine, when no later connection
+  // can succeed, such as the database refusing the session
+  onEnd(code: number, reason: string, fatal?: unknown): void;
 }
 
-// One Connector per connection: calling the factory is the connect attempt, since is the
-// Engine's checkpoint (-1 to bootstrap), and the connector reports exactly one onEnd.  The signal
-// is its lifetime; aborting it ends the connection and rejects any backfill or send in flight.
-export type ConnectorFactory = (
-  since: number,
-  view: string | null, // the Engine's stored view token; null to bootstrap
-  wants: string[],
-  signal: Signal,
-  hooks: ConnectorHooks,
-) => Connector;
+/** Who an Engine or a post speaks for: a signed-in user, as the host library that signed them in
+    represents one.  The library owns its shape and keeps it current, refreshing its token in
+    place, so everyone holding it sees the refresh; the Engine and the post never read a session,
+    and only hand it back to the transport.  A host whose bridge into JS cannot carry an object of
+    its own passes a handle instead, and maps it back. */
+export type Session = object;
+
+/** A Transport is how a host reaches one database: the host's Registry, built from generated
+    registry data; one connection per connect attempt; and commands posted outside any
+    connection.  It keeps no identity: each call names the session it speaks for, or null for
+    anonymous. */
+export interface Transport {
+  buildRegistry(schema: Schema): Registry;
+  // One Connection per attempt: since is the Engine's checkpoint (-1 to bootstrap), and the
+  // connection reports exactly one onEnd.  The signal is its lifetime; aborting it ends the
+  // connection and rejects any backfill or send in flight.
+  connect(
+    since: number,
+    view: string | null, // the Engine's stored view token; null to bootstrap
+    wants: string[],
+    signal: Signal,
+    hooks: ConnectionHooks,
+    session: Session | null,
+  ): Connection;
+  // One request of commands outside any connection, answered with their outcomes in order.  A
+  // transport may retry a failed request when every command in it is numbered, since the
+  // database answers a resend of one that landed as decided, and never retries one that is not.
+  post(commands: Command<Uint8Array>[], session?: Session | null): Promise<CommandResult[]>;
+}
+
+// each transport's Registry for each schema, built once and shared by every Engine and post
+const registries = new WeakMap<Transport, WeakMap<Schema, Registry>>();
+
+/** the transport's Registry for the schema, built on first use */
+function registryFor(transport: Transport, schema: Schema): Registry {
+  let bySchema = registries.get(transport);
+  if (bySchema === undefined) {
+    bySchema = new WeakMap();
+    registries.set(transport, bySchema);
+  }
+  let reg = bySchema.get(schema);
+  if (reg === undefined) {
+    reg = transport.buildRegistry(schema);
+    bySchema.set(schema, reg);
+  }
+  return reg;
+}
 
 // engines ////////////////////////////////////////////////////////////////////
 
 /** Command wraps command data T with the client-minted id it will carry through the log, and
-    the session and number the database dedups it by: a sender numbers its commands in a session
-    it mints, and the database runs each number once.  A sessionless command has neither. */
+    the series and number the database dedups it by: an Engine numbers its commands in a series
+    it mints, and the database runs each number once.  An unnumbered command has neither. */
 export type Command<T> = {
   id: string;
-  session: string | null;
+  series: string | null;
   n: number | null;
   data: T;
 };
@@ -2658,7 +2700,7 @@ export type DbEvent<T> = {
   servertime: Date;
 };
 
-/** WireEvent is an event as a connector delivers it: the envelope decoded for routing, data as
+/** WireEvent is an event as a connection delivers it: the envelope decoded for routing, data as
     the bytes the server sent, and the whole wire pair `[env, data]` so if needs to be parked, the
     full msgpack format is readily available. */
 export type WireEvent = DbEvent<Uint8Array> & { raw: Uint8Array };
@@ -2716,7 +2758,7 @@ function newBackfillEntry(record: BackfillRecord, parent: string | null): Backfi
   };
 }
 
-// a backfill's status, from its record and what its connector has reported
+// a backfill's status, from its record and what its connection has reported
 function backfillStatus(ref: string, entry: BackfillEntry): BackfillStatus {
   const r = entry.record.resume;
   const snapshot = {
@@ -2766,7 +2808,7 @@ type Submission<C, N> =
   | { outbox: C }
   | { online: N; resolve: (result: CommandResult) => void; reject: (e: unknown) => void };
 
-/** an @online command handed to a connector and not yet settled: its promise's resolvers, the
+/** an @online command handed to a connection and not yet settled: its promise's resolvers, the
     database's ok once it arrives, and whether an event carrying its id has been reduced */
 type OnlineCommand = {
   resolve: (result: CommandResult) => void;
@@ -2982,19 +3024,20 @@ type Episode = {
   confirmed: boolean;
 };
 
-/** what the connector delivered, in arrival order */
+/** what the connection delivered, in arrival order */
 type Inbound =
   | { open: { epoch: string; head: number } }
   | { view: ViewRecord }
   | { events: WireEvent[] }
   | { vouch: number }
   | { live: number }
-  | { end: { code: number; reason: string } };
+  | { end: { code: number; reason: string; fatal: unknown } };
 
-/** Engine builds a sync engine out of a ConnectorFactory, a Store, a user's reducers, and
-    optionally a user's forecasters.  The Engine is responsible for managing connection status, the
-    synchronization protocol, and the flow of events and commands, ultimately keeping the Store as
-    up-to-date with the PhaseLockDB server as possible.
+/** Engine builds a sync engine out of a Transport, a Store, a user's reducers, and optionally a
+    user's forecasters, syncing as one session or as anonymous for its whole life.  The Engine is
+    responsible for managing connection status, the synchronization protocol, and the flow of
+    events and commands, ultimately keeping the Store as up-to-date with the PhaseLockDB server as
+    possible.
 
     An application interacts with the Engine primarily through newQuery(), which returns a
     subscribable stream of results, and sendCommand(), which sends commands back to PhaseLockDB.
@@ -3024,7 +3067,7 @@ type Inbound =
         |   |     |               | G   |   |     | E          |
         |       __|__________     |     |       __v___         |
         |   |  |             | I  |     |   |  |      |        |
-        |      |  connector  |<---+-----+------| *UI  |        |
+        |      |  transport  |<---+-----+------| *UI  |        |
         |   |  |_____________|            F |  |______|        |
         |           ^                                          |
         |   |_ _ _ _|_ _ _ _ _ _ _ _ _ _ _ _|                  |
@@ -3036,9 +3079,9 @@ type Inbound =
               | PhaseLockDB |
               |_____________|
 
-        A: connector talks to PhaseLockDB, reading events and writing commands
+        A: transport talks to PhaseLockDB, reading events and writing commands
 
-        B: events received by connector are passed to reducers
+        B: events received by transport are passed to reducers
 
         C: reducers process incoming batches, updating store
 
@@ -3052,7 +3095,7 @@ type Inbound =
 
         H: new commands are also stored in an outbox in the store
 
-        I: new commands are also sent through the connector
+        I: new commands are also sent through the transport
 
     Engine-owned store keys.  Slice state lives at `{stream}!{local key}`; everything the Engine
     keeps for itself lives in the nameless stream, which no stream name can reach, so its keys
@@ -3067,7 +3110,7 @@ type Inbound =
         !seq:{stream}              the stream's last held seq, or 'backfill' while a backfill
                                    covering it is in flight
         !command:{ordinal}         Command<Uint8Array> (`.command`): the outbox, in send order,
-                                   each command's data as its wire bytes, under the session and
+                                   each command's data as its wire bytes, under the series and
                                    number it was minted with; ordinal zero-padded to 20 digits so
                                    a scan walks the outbox in order
         !backfill:{ref}            BackfillRecord: an in-flight backfill's until, resume, replacing,
@@ -3085,7 +3128,9 @@ type Inbound =
 export class Engine<QX, FX, C, N = never> {
   #store: Store;
   #reg: Registry;
-  #connect: ConnectorFactory;
+  #transport: Transport;
+  // who the Engine syncs as, handed to every connection; null for anonymous
+  #session: Session | null;
   #reducers: Record<string, SliceReducer>;
   // the pattern of each reducer's stream names, by stream prefix
   #streamPatterns: Record<string, RegExp>;
@@ -3104,10 +3149,10 @@ export class Engine<QX, FX, C, N = never> {
   // an advancer pass threw or the signal fired, so nothing runs again
   #ended: boolean = false;
 
-  // the live connection: one connector per attempt, its lifetime (replaced as soon as it is
+  // the live connection: one connection per attempt, its lifetime (replaced as soon as it is
   // spent), and the backoff between attempts
-  #connector: Connector | null = null;
-  #connectorAbort: SignalController;
+  #connection: Connection | null = null;
+  #connectionAbort: SignalController;
   #attempt: number = 0;
   #retryTimer: unknown = null;
   #nextAttemptAt: number | null = null;
@@ -3135,16 +3180,16 @@ export class Engine<QX, FX, C, N = never> {
   // the outbox in send order: command id to its ordinal in !command:{ordinal}
   #outbox: Map<string, number> = new Map();
   #nextOrdinal: number = 0;
-  // the session new commands are minted in, and the number the next one takes.  Neither touches
-  // the disk: a stored outbox resends under the sessions it was minted in, and new commands go in
-  // a session of this Engine's own, so two Engines over one copied store never share one.
-  readonly #session: string;
+  // the series new commands are numbered in, and the number the next one takes.  Neither touches
+  // the disk: a stored outbox resends under the series it was numbered in, and new commands go in
+  // a series of this Engine's own, so two Engines over one copied store never share one.
+  readonly #series: string;
   #nextN: number = 1;
   // outbox commands handed to the current connection with no outcome yet, and those acked, with
   // the position they landed at, waiting for the checkpoint to reach it
   #sent: Set<string> = new Set();
   #acked: Map<string, number> = new Map();
-  // @online commands handed to a connector and not yet settled, by id
+  // @online commands handed to a connection and not yet settled, by id
   #online: Map<string, OnlineCommand> = new Map();
   // set by a release inside a transaction, read by the refresh after its commit
   #outboxChanged: boolean = false;
@@ -3153,15 +3198,15 @@ export class Engine<QX, FX, C, N = never> {
   // at or below it is in the base, events or none
   #reduced: number = -1;
 
-  // the connector has delivered `live`
+  // the connection has delivered `live`
   #live: boolean = false;
   // the log this connection's positions belong to, from its first hook; null between connections
   #epoch: string | null = null;
   #replacing: number = 0;
 
-  // work received from the connector, in arrival order
+  // work received from the connection, in arrival order
   #inbox: Inbound[] = [];
-  // backfill progress from the connector's hooks; each item resolves its promise after commit
+  // backfill progress from the connection's hooks; each item resolves its promise after commit
   #backfillWork: BackfillWork[] = [];
   // how each backfill() call ended, and on which connection
   #backfillOutcomes: {
@@ -3184,19 +3229,23 @@ export class Engine<QX, FX, C, N = never> {
     // forecast reads, the slices alone; each over a read transaction
     queryContext: (txn: ReadTxn) => QX,
     forecastContext: (txn: ReadTxn) => FX,
-    // if store is null, InMemStore is used
-    store: Store | null,
-    reg: Registry,
-    connect: ConnectorFactory,
-    callbacks: {
+    // injected by generated subclass: the engine's registry data, which the transport builds the
+    // Registry from
+    schema: Schema,
+    transport: Transport,
+    options: {
+      // who the Engine syncs as, or null for anonymous
+      session: Session | null;
       // injected by generated subclass: each slice's reducer and scoped context, by stream prefix
       reducers: Record<string, SliceReducer>;
       // injected by generated subclass: the refs of the shards the engine declares
       wants: string[];
+      // optional: makes the Engine's store from its Registry; without it, an InMemStore
+      store?: StoreFactory;
       // optional: forecast what the database will do with a command, reading the state the
       // earlier outbox commands leave
       forecaster?: Forecaster<FX, C>;
-      // optional: ends the Engine, its connector, and every backfill
+      // optional: ends the Engine, its connection, and every backfill
       signal?: Signal;
       // optional: receives the error that ended the Engine; without it the error is thrown out
       // of the timer callback that ran the advancer
@@ -3204,22 +3253,24 @@ export class Engine<QX, FX, C, N = never> {
     },
   ) {
     checkHost();
-    this.#session = generateSession();
+    this.#series = generateSeries();
     this.#forecastContext = forecastContext;
-    this.#store = store ?? new InMemStore(reg);
+    const reg = registryFor(transport, schema);
+    this.#store = options.store === undefined ? new InMemStore(reg) : options.store(reg);
     this.#reg = reg;
-    this.#connect = connect;
-    this.#reducers = callbacks.reducers;
+    this.#transport = transport;
+    this.#session = options.session;
+    this.#reducers = options.reducers;
     this.#streamPatterns = {};
-    for (const [family, slice] of Object.entries(callbacks.reducers)) {
+    for (const [family, slice] of Object.entries(options.reducers)) {
       this.#streamPatterns[family] = streamPattern(slice.template);
     }
-    this.#wants = callbacks.wants;
-    this.#forecaster = callbacks.forecaster ?? null;
-    this.#signal = callbacks.signal ?? new host.AbortController().signal;
-    this.#connectorAbort = new host.AbortController();
+    this.#wants = options.wants;
+    this.#forecaster = options.forecaster ?? null;
+    this.#signal = options.signal ?? new host.AbortController().signal;
+    this.#connectionAbort = new host.AbortController();
     this.#onError =
-      callbacks.onError ??
+      options.onError ??
       ((e) => {
         throw e;
       });
@@ -3234,7 +3285,7 @@ export class Engine<QX, FX, C, N = never> {
 
   //// public api ////
 
-  /** After forecasting and saving to the outbox, the command is sent through the connector, in
+  /** After forecasting and saving to the outbox, the command is sent through the connection, in
       order with every command submitted before it.  It is given in rich format (Date, Maps, and
       Sets intact). */
   sendCommand(command: C): void {
@@ -3243,12 +3294,12 @@ export class Engine<QX, FX, C, N = never> {
   }
 
   /** Sends an @online command behind every command submitted before it, in the Engine's
-      session, and settles with the database's answer.  A reject or a conflict settles at once.
+      series, and settles with the database's answer.  A reject or a conflict settles at once.
       An ok settles on the round trip, once the queries have run over the base the position it
       names reached; it means the command was decided, so a resend of a rejected one settles ok
       too, and the app reads the outcome from state.  It rejects when there is no connection to
       send it on, when its call fails, and when the Engine ends.  It is never persisted or
-      forecast, and the connector's retry of its call is the only resend. */
+      forecast, and the connection's retry of its call is the only resend. */
   sendOnlineCommand(command: N): Promise<CommandResult> {
     return new Promise((resolve, reject) => {
       if (this.#ended || this.#signal.aborted) {
@@ -3412,7 +3463,7 @@ export class Engine<QX, FX, C, N = never> {
 
     while (true) {
       if (this.#signal.aborted) {
-        // the app ended us: end the connector and every backfill, and nothing runs after that
+        // the app ended us: end the connection and every backfill, and nothing runs after that
         this.#shutdown();
         this.#ended = true;
         return;
@@ -3420,7 +3471,7 @@ export class Engine<QX, FX, C, N = never> {
 
       if (this.#submitted.length > 0 || this.#resend) {
         // the tightest loop we serve: write to the outbox, forecast, and the UI sees the
-        // optimistic update; then send through the connector in submission order
+        // optimistic update; then send through the connection in submission order
         this.#onSubmitted();
         continue;
       }
@@ -3453,15 +3504,15 @@ export class Engine<QX, FX, C, N = never> {
 
       if (this.#backfillWork.length > 0) {
         // header, values, events, and done marks from in-flight backfills, parked in one
-        // transaction that also lands whatever they completed, each resolving the connector's
+        // transaction that also lands whatever they completed, each resolving the connection's
         // promise after commit.  Background work: it orders against nothing above, and the
-        // connector waits on it while the app is busy.
+        // connection waits on it while the app is busy.
         this.#onBackfillWork();
         continue;
       }
 
-      if (this.#connector === null && (this.#connectNow || this.#retryTimer === null)) {
-        // one attempt: a new connector from the factory, or the next one after backoff
+      if (this.#connection === null && (this.#connectNow || this.#retryTimer === null)) {
+        // one attempt: a new connection from the transport, or the next one after backoff
         this.#onConnect();
         continue;
       }
@@ -3473,17 +3524,17 @@ export class Engine<QX, FX, C, N = never> {
   }
 
   /* The app's submissions, sent in submission order.  A new connection first resends every outbox
-     command it has not been handed, in ordinal order, each under the session and number it was
-     minted with.  Then each submission in turn takes the next number of the Engine's session: an
+     command it has not been handed, in ordinal order, each under the series and number it was
+     minted with.  Then each submission in turn takes the next number of the Engine's series: an
      outbox command goes into the outbox and joins the current call, and an @online command goes
      in a call of its own.  So numbers reach the database in the order they were minted, which is
-     what lets it answer a number at or below one it decided as decided already.  The connector
-     fails every call behind a failed one, which keeps that order.  Without a connector the outbox
+     what lets it answer a number at or below one it decided as decided already.  The connection
+     fails every call behind a failed one, which keeps that order.  Without a connection the outbox
      waits for the next connection, and every @online command rejects. */
   #onSubmitted(): void {
     const submitted = this.#submitted.splice(0);
-    const connector = this.#connector;
-    const resend = this.#resend && connector !== null;
+    const connection = this.#connection;
+    const resend = this.#resend && connection !== null;
     this.#resend = false;
 
     // the calls in order: runs of outbox commands, and each @online command alone between them
@@ -3508,7 +3559,7 @@ export class Engine<QX, FX, C, N = never> {
           if ('online' in s) {
             const data = this.#reg.convert(this.#reg.commands, s.online, JS, MSGPACK) as Uint8Array;
             const online = { resolve: s.resolve, reject: s.reject, ack: null, seen: false };
-            const command = { id: generateUuid(), session: this.#session, n: this.#nextN++, data };
+            const command = { id: generateUuid(), series: this.#series, n: this.#nextN++, data };
             calls.push({ wire: [command], online }, { wire: [], online: null });
             continue;
           }
@@ -3516,7 +3567,7 @@ export class Engine<QX, FX, C, N = never> {
           // an outbox command takes the next ordinal
           const command: Command<Uint8Array> = {
             id: generateUuid(),
-            session: this.#session,
+            series: this.#series,
             n: this.#nextN++,
             data: this.#reg.convert(this.#reg.commands, s.outbox, JS, MSGPACK) as Uint8Array,
           };
@@ -3536,7 +3587,7 @@ export class Engine<QX, FX, C, N = never> {
     this.#refresh({});
 
     // no connection, so every @online command rejects at once
-    if (connector === null) {
+    if (connection === null) {
       const e = new Error('no connection');
       for (const { online } of calls) online?.reject(e);
       return;
@@ -3551,7 +3602,7 @@ export class Engine<QX, FX, C, N = never> {
       } else {
         for (const id of ids) this.#sent.add(id);
       }
-      connector.sendCommands(wire).then(
+      connection.sendCommands(wire).then(
         (results) => {
           this.#commandOutcomes.push({ ids, results });
           this.#schedule();
@@ -3574,16 +3625,16 @@ export class Engine<QX, FX, C, N = never> {
       this.#retryTimer = null;
     }
 
-    // hooks queue for the advancer; a hook from a connector we have since replaced is dropped
-    const abort = this.#connectorAbort;
+    // hooks queue for the advancer; a hook from a connection we have since replaced is dropped
+    const abort = this.#connectionAbort;
     const push = (item: Inbound) => {
-      if (this.#connectorAbort !== abort) return;
+      if (this.#connectionAbort !== abort) return;
       this.#inbox.push(item);
       this.#schedule();
     };
     this.#since = this.#checkpoint?.position ?? -1;
     this.#confirmed = false;
-    this.#connector = this.#connect(
+    this.#connection = this.#transport.connect(
       this.#since,
       this.#view?.token ?? null,
       this.#wants,
@@ -3594,8 +3645,9 @@ export class Engine<QX, FX, C, N = never> {
         onEvents: (events) => push({ events }),
         onLive: (position) => push({ live: position }),
         onVouch: (position) => push({ vouch: position }),
-        onEnd: (code, reason) => push({ end: { code, reason } }),
+        onEnd: (code, reason, fatal) => push({ end: { code, reason, fatal } }),
       },
+      this.#session,
     );
 
     // restart the downloads; one in backoff starts when its timer fires
@@ -3605,7 +3657,7 @@ export class Engine<QX, FX, C, N = never> {
     this.#resend = true;
   }
 
-  /* every queued push in one transaction, and the land of whatever they completed; each connector
+  /* every queued push in one transaction, and the land of whatever they completed; each connection
      promise resolves after the commit, which is the backpressure */
   #onBackfillWork(): void {
     const pushes: BackfillWork[] = [];
@@ -3709,7 +3761,7 @@ export class Engine<QX, FX, C, N = never> {
 
         // an outcome from a connection that has ended means nothing; the next connection
         // restarts the download
-        if (conn !== this.#connectorAbort) continue;
+        if (conn !== this.#connectionAbort) continue;
 
         // was the backfill dropped while its outcome was queued?
         const entry = this.#backfills.get(ref);
@@ -3746,16 +3798,16 @@ export class Engine<QX, FX, C, N = never> {
     });
   }
 
-  // one backfill() call on the current connector; its pushes and its outcome come back through
-  // the advancer's queues.  Without a connector nothing starts, and the next connection restarts
+  // one backfill() call on the current connection; its pushes and its outcome come back through
+  // the advancer's queues.  Without a connection nothing starts, and the next connection restarts
   // every backfill that is still downloading.
   #startBackfill(ref: string): void {
     const entry = this.#backfills.get(ref)!;
-    if (this.#connector === null) return;
-    const conn = this.#connectorAbort;
+    if (this.#connection === null) return;
+    const conn = this.#connectionAbort;
     entry.status = 'downloading';
 
-    // the connector's cancellation is ours or the connection's
+    // the backfill's cancellation is its own or the connection's
     const backfill: Backfill = {
       ref,
       until: entry.record.until,
@@ -3769,7 +3821,7 @@ export class Engine<QX, FX, C, N = never> {
     };
 
     // the outcome is tagged with its connection, so a late one from an ended connection is known
-    this.#connector.backfill(backfill).then(
+    this.#connection.backfill(backfill).then(
       (outcome) => {
         this.#backfillOutcomes.push({ ref, outcome, conn });
         this.#schedule();
@@ -4258,7 +4310,10 @@ export class Engine<QX, FX, C, N = never> {
   // operation and is handled on its own
   #onInbox(): void {
     if ('end' in this.#inbox[0]) {
-      this.#inbox.shift();
+      const { end } = this.#inbox.shift() as { end: { fatal: unknown } };
+
+      // an end no reconnect can mend, such as a refused session, ends the Engine with its error
+      if (end.fatal !== undefined) throw end.fatal;
       this.#onEnd();
       return;
     }
@@ -4618,9 +4673,9 @@ export class Engine<QX, FX, C, N = never> {
   // the connection ended.  Every call in flight on it is dead: backfills wait for the next
   // connection to restart them, and commands handed to it are unsent again for the next resend.
   #onEnd(): void {
-    this.#connector = null;
-    this.#connectorAbort.abort();
-    this.#connectorAbort = new host.AbortController();
+    this.#connection = null;
+    this.#connectionAbort.abort();
+    this.#connectionAbort = new host.AbortController();
     this.#sent.clear();
     this.#live = false;
     this.#epoch = null;
@@ -4717,7 +4772,7 @@ export class Engine<QX, FX, C, N = never> {
   #connectionStatus(): ConnectionStatus {
     // between attempts, opening, replaying history, or past it
     let state: ConnectionStatus['state'];
-    if (this.#connector === null) {
+    if (this.#connection === null) {
       state = this.#connectNow ? 'connecting' : 'offline';
     } else if (this.#epoch === null) {
       state = 'connecting';
@@ -4779,7 +4834,7 @@ export class Engine<QX, FX, C, N = never> {
     let kind: Episode['kind'];
     if (this.#reduced < 0) {
       kind = 'boot';
-    } else if (this.#connector !== null && !this.#live) {
+    } else if (this.#connection !== null && !this.#live) {
       kind = 'resync';
     } else if (this.#backfills.size > 0) {
       kind = 'backfill';
@@ -4940,8 +4995,8 @@ export class Engine<QX, FX, C, N = never> {
     }
 
     // the connection, and with it every backfill call in flight
-    this.#connectorAbort.abort();
-    this.#connector = null;
+    this.#connectionAbort.abort();
+    this.#connection = null;
     for (const entry of this.#backfills.values()) {
       if (entry.retryTimer !== null) host.clearTimeout(entry.retryTimer);
     }
@@ -4954,6 +5009,26 @@ export class Engine<QX, FX, C, N = never> {
     // the @online commands, which can never settle now
     this.#rejectOnline(reason);
   }
+}
+
+/** Posts one command of a database outside any Engine, given in rich format (Date, Maps, and Sets
+    intact), as the session or as anonymous, and answers with the database's outcome.  The command
+    is numbered in a series of its own, so the transport may retry a failed request, and the
+    database answers a resend of one that landed as decided.  A request that fails for good
+    rejects, and the command may or may not have run.  Generated code calls it as
+    post{Database}Command, with the database's registry data. */
+export async function postWithSchema(
+  schema: Schema,
+  transport: Transport,
+  command: unknown,
+  options: { session?: Session | null },
+): Promise<CommandResult> {
+  checkHost();
+  const reg = registryFor(transport, schema);
+  const data = reg.convert(reg.commands, command, JS, MSGPACK) as Uint8Array;
+  const wire = { id: generateUuid(), series: generateSeries(), n: 1, data };
+  const [result] = await transport.post([wire], options.session ?? null);
+  return result;
 }
 
 // end of skeleton ////////////////////////////////////////////////////////////

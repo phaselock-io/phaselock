@@ -83,7 +83,7 @@ struct pldb {
     reg *regs;
 
     pldb_cron_entry *cron;
-    char **cron_keys; /* each entry's session key, $cron:<install>,<entry> */
+    char **cron_keys; /* each entry's series key, $cron:<install>,<entry> */
     size_t ncron;
 };
 
@@ -852,22 +852,22 @@ static int check_proof(pldb *db, mpack_writer_t *w, const uint8_t *id, const pld
     return PROOF_HOLDS;
 }
 
-/* One command, its outcome written into w.  A command in a session passes the dedup check first,
+/* One command, its outcome written into w.  A command in a series passes the dedup check first,
    against the group's open transaction, so it sees every decision ahead of it in its group: a
-   number at or below the session's mark was decided already, and anything else runs, an unknown
-   session included, since session rows are kept forever.  A proven command's proof is checked
+   number at or below the series' mark was decided already, and anything else runs, an unknown
+   series included, since series rows are kept forever.  A proven command's proof is checked
    next, before its expectations, so a failed proof never learns a stream's seq.  Every decision
    moves the mark, whatever it decided.  Answers whether the command bounced instead, which
    decides nothing and writes no outcome, with what lookup answers in *bounce. */
-static bool run_command(pldb *db, batch *b, mpack_writer_t *w, const char *session, uint64_t n,
+static bool run_command(pldb *db, batch *b, mpack_writer_t *w, const char *series, uint64_t n,
                         const uint8_t *id, JSValueConst data, JSValueConst expect,
                         JSValueConst principal, const pldb_verdict *v, int attempt,
                         char **bounce) {
     // the dedup check
-    if (session) {
+    if (series) {
         uint64_t hwm = 0;
-        int known = store_session_hwm(db->w, session, &hwm);
-        if (known < 0) die("session_hwm: %s", store_err(db->w));
+        int known = store_series_hwm(db->w, series, &hwm);
+        if (known < 0) die("series_hwm: %s", store_err(db->w));
         if (known && n <= hwm) {
             write_ok(w, db->position);
             return false;
@@ -882,8 +882,8 @@ static bool run_command(pldb *db, batch *b, mpack_writer_t *w, const char *sessi
     if (proof == PROOF_HOLDS) decide(db, b, w, id, data, expect, principal);
 
     // the decision moves the mark; a rolled-back atom has already left its savepoint
-    if (session && store_session_mark(db->w, session, n, b->servertime))
-        die("session_mark: %s", store_err(db->w));
+    if (series && store_series_mark(db->w, series, n, b->servertime))
+        die("series_mark: %s", store_err(db->w));
     return false;
 }
 
@@ -906,7 +906,7 @@ static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) 
     mpack_build_array(&w);
 
     /* walk the prepared [key, n, id, data, expect?] values, each already checked, with a
-       session's key or nil in place of the session, until one bounces */
+       series' key or nil in place of the series, until one bounces */
     mpack_tree_t tree;
     mpack_tree_init_data(&tree, (const char *)q->body, q->len);
     long commands = schema_commands(db->js.sc);
@@ -918,7 +918,7 @@ static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) 
         consumed += mpack_tree_size(&tree);
         mpack_node_t c = mpack_tree_root(&tree);
 
-        // the session's key and the command's number, or none for a sessionless command
+        // the series' key and the command's number, or none for an unnumbered command
         mpack_node_t keyn = mpack_node_array_at(c, 0);
         char *key = NULL;
         uint64_t n = 0;
@@ -979,12 +979,12 @@ static void handle_arm(pldb *db, batch *b, req *q, pldb_result **after_tail) {
     r->nmarks = db->ncron;
     for (size_t i = 0; i < db->ncron; i++) {
         uint64_t mark = 0;
-        int known = store_session_hwm(db->w, db->cron_keys[i], &mark);
-        if (known < 0) die("session_hwm: %s", store_err(db->w));
+        int known = store_series_hwm(db->w, db->cron_keys[i], &mark);
+        if (known < 0) die("series_hwm: %s", store_err(db->w));
         if (!known) {
             mark = (uint64_t)q->slot;
-            if (store_session_mark(db->w, db->cron_keys[i], mark, b->servertime))
-                die("session_mark: %s", store_err(db->w));
+            if (store_series_mark(db->w, db->cron_keys[i], mark, b->servertime))
+                die("series_mark: %s", store_err(db->w));
         }
         r->marks[i] = (int64_t)mark;
     }
@@ -1006,8 +1006,8 @@ static void handle_tick(pldb *db, batch *b, req *q, pldb_result **after_tail) {
 
     // the dedup check
     uint64_t mark = 0;
-    int known = store_session_hwm(db->w, key, &mark);
-    if (known < 0) die("session_hwm: %s", store_err(db->w));
+    int known = store_series_hwm(db->w, key, &mark);
+    if (known < 0) die("series_hwm: %s", store_err(db->w));
     if (known && (uint64_t)q->slot <= mark) return;
 
     // the hook, and the streams it emitted to
@@ -1036,8 +1036,8 @@ static void handle_tick(pldb *db, batch *b, req *q, pldb_result **after_tail) {
     }
 
     // the decision moves the mark
-    if (store_session_mark(db->w, key, (uint64_t)q->slot, b->servertime))
-        die("session_mark: %s", store_err(db->w));
+    if (store_series_mark(db->w, key, (uint64_t)q->slot, b->servertime))
+        die("series_mark: %s", store_err(db->w));
 }
 
 /* add a token key and delete the keys it sweeps, answered once the batch commits */
@@ -1235,7 +1235,7 @@ static bool cron_name(const char *s) {
     return true;
 }
 
-/* Read the bundle's cron entries, each with the session key that holds its mark.  An install's
+/* Read the bundle's cron entries, each with the series key that holds its mark.  An install's
    name is a JS identifier without $, which the bundle's plugin set checks, and an entry's name
    must be fit for the key too. */
 static int load_cron(pldb *db, char *err, size_t errlen) {
@@ -1569,8 +1569,8 @@ static char *reasonf(const char *fmt, ...) {
     return xstrdup(msg);
 }
 
-/* the longest session a command may carry, in bytes */
-#define SESSION_MAX 64
+/* the longest series id a command may carry, in bytes */
+#define SERIES_MAX 64
 
 /* whether a msgpack integer is a command number: from 1 to 2^53 - 1, so that every client's
    numbers are exact */
@@ -1583,20 +1583,20 @@ static bool is_number(mpack_node_t n) {
            mpack_node_i64(n) < (1ll << 53);
 }
 
-/* Whether a parsed request element is [S, n, id, data, expect?]: S a string of 1 to SESSION_MAX
+/* Whether a parsed request element is [S, n, id, data, expect?]: S a string of 1 to SERIES_MAX
    bytes and n a command number, or both nil, and id ID_LEN bytes of bin.  Elements a later
    protocol appends are ignored. */
 static bool is_command(mpack_node_t c) {
     if (mpack_node_type(c) != mpack_type_array || mpack_node_array_length(c) < 4) return false;
 
-    // the session and the number
-    mpack_node_t session = mpack_node_array_at(c, 0), n = mpack_node_array_at(c, 1);
-    if (mpack_node_type(session) == mpack_type_nil) {
+    // the series and the number
+    mpack_node_t series = mpack_node_array_at(c, 0), n = mpack_node_array_at(c, 1);
+    if (mpack_node_type(series) == mpack_type_nil) {
         if (mpack_node_type(n) != mpack_type_nil) return false;
     } else {
-        if (mpack_node_type(session) != mpack_type_str) return false;
-        size_t slen = mpack_node_strlen(session);
-        if (slen < 1 || slen > SESSION_MAX || !is_number(n)) return false;
+        if (mpack_node_type(series) != mpack_type_str) return false;
+        size_t slen = mpack_node_strlen(series);
+        if (slen < 1 || slen > SERIES_MAX || !is_number(n)) return false;
     }
 
     // the id
@@ -1604,13 +1604,13 @@ static bool is_command(mpack_node_t c) {
     return mpack_node_type(id) == mpack_type_bin && mpack_node_bin_size(id) == ID_LEN;
 }
 
-/* write a command's session as its key in the session table: the hex SHA-256 of its bytes, so
-   that nothing the database stores lets its reader send under a live session */
-static void write_session_key(mpack_writer_t *w, mpack_node_t session) {
+/* write a command's series as its key in the series table: the hex SHA-256 of its bytes, so
+   that nothing the database stores lets its reader send under a live series */
+static void write_series_key(mpack_writer_t *w, mpack_node_t series) {
     SHA256_CTX sha;
     BYTE digest[SHA256_BLOCK_SIZE];
     sha256_init(&sha);
-    sha256_update(&sha, (const BYTE *)mpack_node_str(session), mpack_node_strlen(session));
+    sha256_update(&sha, (const BYTE *)mpack_node_str(series), mpack_node_strlen(series));
     sha256_final(&sha, digest);
     char hex[2 * SHA256_BLOCK_SIZE + 1];
     for (int i = 0; i < SHA256_BLOCK_SIZE; i++) snprintf(hex + 2 * i, 3, "%02x", digest[i]);
@@ -1644,7 +1644,7 @@ static void proofs_free(pldb_proof *v, size_t n) {
 /* Check one command's data and prepare its fields: a NewPassword is hashed, and a password
    CommandAuth is replaced by its result and its password appended to proofs, under index, the
    command's in the request; any other kind cannot be verified yet.  Writes the prepared
-   [key, n, id, data, expect?] to out, its session replaced by its key, or answers why the
+   [key, n, id, data, expect?] to out, its series replaced by its key, or answers why the
    command is rejected; a hash function's refusal sets *refused instead, and answers NULL. */
 static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t c, size_t index, buf *out,
                              proof_list *proofs, int *refused) {
@@ -1703,13 +1703,13 @@ static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t c, size_t ind
     mpack_writer_t w;
     mpack_writer_init_growable(&w, &bytes, &size);
     size_t len = mpack_node_array_length(c) > 4 ? 5 : 4;
-    mpack_node_t session = mpack_node_array_at(c, 0), id = mpack_node_array_at(c, 2);
+    mpack_node_t series = mpack_node_array_at(c, 0), id = mpack_node_array_at(c, 2);
     mpack_start_array(&w, (uint32_t)len);
-    if (mpack_node_type(session) == mpack_type_nil) {
+    if (mpack_node_type(series) == mpack_type_nil) {
         mpack_write_nil(&w);
         mpack_write_nil(&w);
     } else {
-        write_session_key(&w, session);
+        write_series_key(&w, series);
         mpack_write_u64(&w, (uint64_t)mpack_node_i64(mpack_node_array_at(c, 1)));
     }
     mpack_write_bin(&w, mpack_node_bin_data(id), ID_LEN);

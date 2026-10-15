@@ -1,6 +1,6 @@
 // A skeleton-only harness for the Engine: an in-memory store, a registry whose "msgpack" is
 // UTF-8 JSON (the Engine never looks inside the bytes), two families with reducers that log what
-// they applied, and a scripted connector the test drives frame by frame.
+// they applied, and a scripted transport the test drives frame by frame.
 
 import { vi } from 'vitest';
 
@@ -9,10 +9,9 @@ import {
   type BackfillOutcome,
   type Command,
   type CommandResult,
+  type Connection,
+  type ConnectionHooks,
   type ConnectionStatus,
-  type Connector,
-  type ConnectorFactory,
-  type ConnectorHooks,
   type DbEvent,
   Engine,
   type Forecaster as EngineForecaster,
@@ -28,10 +27,13 @@ import {
   type Registry,
   type Rep,
   scanAll,
+  type Schema,
+  type Session,
   type Signal,
   type SliceReducer,
   type Store,
   storeTypeOf,
+  type Transport,
   type WireEvent,
 } from '../../../ts/assets/skeleton.ts';
 
@@ -229,7 +231,8 @@ export class FakeConn {
     public view: string | null,
     public wants: string[],
     public signal: Signal,
-    public hooks: ConnectorHooks,
+    public hooks: ConnectionHooks,
+    public session: Session | null,
   ) {}
 }
 
@@ -250,8 +253,24 @@ export class FakeServer {
   /** a backfill of the ref fails once with this error */
   failOnce = new Map<string, unknown>();
 
-  factory: ConnectorFactory = (since, view, wants, signal, hooks) => {
-    const conn = new FakeConn(since, view, wants, signal, hooks);
+  /** the transport the Engine is handed: the harness's registry for any schema, and connections
+      to this server */
+  transport: Transport = {
+    buildRegistry: () => registry,
+    connect: (since, view, wants, signal, hooks, session) =>
+      this.connect(since, view, wants, signal, hooks, session),
+    post: () => Promise.reject(new Error('the Engine never posts')),
+  };
+
+  connect(
+    since: number,
+    view: string | null,
+    wants: string[],
+    signal: Signal,
+    hooks: ConnectionHooks,
+    session: Session | null,
+  ): Connection {
+    const conn = new FakeConn(since, view, wants, signal, hooks, session);
     this.conns.push(conn);
     signal.addEventListener('abort', () => {
       if (!conn.ended) {
@@ -259,16 +278,14 @@ export class FakeServer {
         hooks.onEnd(0, 'aborted');
       }
     });
-    const server = this;
-    const connector: Connector = {
-      backfill: (b) => server.#backfill(conn, b),
+    return {
+      backfill: (b) => this.#backfill(conn, b),
       sendCommands: (cmds) => {
-        server.sends.push(cmds);
-        return raceAbort(signal, server.onSend(cmds));
+        this.sends.push(cmds);
+        return raceAbort(signal, this.onSend(cmds));
       },
     };
-    return connector;
-  };
+  }
 
   /** the current connection */
   get conn(): FakeConn {
@@ -291,11 +308,11 @@ export class FakeServer {
   vouch(position: number): void {
     this.conn.hooks.onVouch(position);
   }
-  end(code = 0, reason = 'closed'): void {
+  end(code = 0, reason = 'closed', fatal?: unknown): void {
     const conn = this.conn;
     if (conn.ended) return;
     conn.ended = true;
-    conn.hooks.onEnd(code, reason);
+    conn.hooks.onEnd(code, reason, fatal);
   }
 
   /** hold every backfill of the ref at its start until released */
@@ -378,6 +395,9 @@ export function engineError(): unknown {
 
 // the engine ////////////////////////////////////////////////////////////////
 
+// the registry data the Engine hands its transport, which answers with the harness's registry
+const schema: Schema = { nodes: [], ids: {}, commands: 'cmd', eventTypes: {}, storeTypes: {} };
+
 /** the harness's forecast context is the read transaction itself, and its query context the read
     transaction with the Engine's status */
 export type Forecaster = EngineForecaster<ReadTxn, unknown>;
@@ -402,6 +422,7 @@ export function rig(
     reducers?: Record<string, SliceReducer>;
     wants?: string[];
     server?: FakeServer;
+    session?: Session | null;
   } = {},
 ): Rig {
   errors.length = 0;
@@ -411,10 +432,11 @@ export function rig(
   const engine = new Engine<QueryTxn, ReadTxn, unknown, unknown>(
     (txn) => Object.assign(txn, { status: engineStatus({ txn }) }),
     (txn) => txn,
-    store,
-    registry,
-    server.factory,
+    schema,
+    server.transport,
     {
+      session: opts.session ?? null,
+      store: () => store,
       reducers: opts.reducers ?? reducers,
       wants: opts.wants ?? ['*'],
       forecaster: opts.forecaster,

@@ -82,11 +82,11 @@ int store_read_stream(store *s, const char *stream, uint64_t from, uint64_t to, 
 int store_read_prefix(store *s, const char *prefix, uint64_t from, uint64_t to, bool reverse,
                       size_t limit, store_log_fn fn, void *arg);
 int store_max_position(store *s, uint64_t *out);
-/* The session table, keyed by the hex SHA-256 of a session.  store_session_hwm answers 1 and
-   the session's mark if the session is known, 0 if not; store_session_mark raises the mark to n
-   at least and stamps the session's last decision. */
-int store_session_hwm(store *s, const char *key, uint64_t *hwm);
-int store_session_mark(store *s, const char *key, uint64_t n, int64_t time);
+/* The series table, keyed by the hex SHA-256 of a series.  store_series_hwm answers 1 and
+   the series' mark if the series is known, 0 if not; store_series_mark raises the mark to n
+   at least and stamps the series' last decision. */
+int store_series_hwm(store *s, const char *key, uint64_t *hwm);
+int store_series_mark(store *s, const char *key, uint64_t n, int64_t time);
 /* The token keys: each public key tokens are verified against, by id, with the Unix
    milliseconds it was minted.  store_keys walks them oldest first, stopping when fn answers
    nonzero. */

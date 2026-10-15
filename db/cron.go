@@ -2,7 +2,7 @@ package main
 
 // The cron scheduler, which ticks the bundle's cron entries.  It is pure Go over an injected
 // fire and clock, so its tests run on a fake one; the server's fire hands each tick to the core,
-// whose session table holds each entry's mark.
+// whose series table holds each entry's mark.
 
 import (
 	"context"

@@ -50,7 +50,7 @@ pnpm build          # tsc for core and the TypeScript emitter, for publishing
 ## Tests
 
 ```
-pnpm test        # from typespec: build all packages, regenerate fixtures, run the vitest suite
+pnpm test        # from typespec: regenerate fixtures, run the vitest suite
 pnpm --filter @phaselock/typespec-tests test:py   # emitted-Python checker suite (stdlib only)
 pnpm --filter @phaselock/typespec-tests test:go   # emitted-Go checker suite
 ```

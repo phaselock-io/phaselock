@@ -651,13 +651,13 @@ describe('the reserved identities', () => {
   test('.json and .command pass values through, bytes included', () => {
     const record = { epoch: 'e', position: 3, reduced: -1, when: added };
     expect(toJs('.json', toBytes('.json', record))).toEqual(record);
-    const command = { id: C1, session: 's1', n: 2, data: encode({ type: 'noted' }) };
+    const command = { id: C1, series: 's1', n: 2, data: encode({ type: 'noted' }) };
     const back = toJs('.command', toBytes('.command', command)) as Command<Uint8Array>;
-    expect([back.id, back.session, back.n]).toEqual([C1, 's1', 2]);
+    expect([back.id, back.series, back.n]).toEqual([C1, 's1', 2]);
     expect(decode(back.data)).toEqual({ type: 'noted' });
-    const sessionless = { ...command, session: null, n: null };
-    const again = toJs('.command', toBytes('.command', sessionless)) as Command<Uint8Array>;
-    expect([again.session, again.n]).toEqual([null, null]);
+    const unnumbered = { ...command, series: null, n: null };
+    const again = toJs('.command', toBytes('.command', unnumbered)) as Command<Uint8Array>;
+    expect([again.series, again.n]).toEqual([null, null]);
   });
 
   test(".event reads the wire pair into a DbEvent, typing its data by the stream's family", () => {

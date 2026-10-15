@@ -60,8 +60,10 @@ layout, build commands, and the test suite.
   every walker.
 - **`skeleton.ts` has no library dependencies.**  It is pure logic: every codec, transport, and
   store with outside dependencies comes from the host (`client/ts`, `db/`), reaching the
-  Engine through the `Registry`, `ConnectorFactory`, and `Store` interfaces.  A user's model may
-  bring in whatever it likes.
+  Engine through the `Registry`, `Transport`, and `Store` interfaces.  A session is opaque here:
+  the host library that signed the user in owns its shape and refreshes it in place, and
+  generated code only hands it back to the transport.  A user's model may bring in whatever it
+  likes.
 - **The type registry's identities and walk rules.**  A named type's identity is its name, an
   intake result's its vocabulary kind, an unnamed store value's `family/name` (`catalog/count`),
   a database's command union when it has no name `{Database}Command`, and a query's result its
@@ -110,6 +112,13 @@ layout, build commands, and the test suite.
   shape that no command may carry.  A command with such a field gets `{Command}ForPrecommit`,
   with each field replaced by its result.  Outward-facing text says the database prepares the
   command for precommit; "intake" is an internal word.
+- **A database's commands can be posted outside any Engine.**  A database with commands gets
+  `post{Name}Command(transport, command, { session? })`, its name with a trailing `DB` or
+  `Database` trimmed (`LibraryDB` gives `postLibraryCommand`), taking any of its commands: an
+  account's creation before anyone has signed in, or a script's.  Each command goes alone under
+  a fresh id, numbered 1 in a series of its own, so the transport may retry it, as a session or
+  as anonymous.  The Engine and the post share the skeleton's registry cache, one Registry per
+  transport and schema.
 - **`@online` routing.**  The generated engine takes `@online` commands through
   `sendOnlineCommand` and every other command through `sendCommand`, and passing one to the
   other is a compile error.  An online command is a web form: sent once, behind every command

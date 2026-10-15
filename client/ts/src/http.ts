@@ -1,24 +1,25 @@
-// The HTTP connector.
+// The HTTP transport: logins and sessions, connections, and commands posted outside them.
 
 import type {
   Backfill,
   BackfillOutcome,
   Command,
   CommandResult,
-  Connector,
-  ConnectorFactory,
-  ConnectorHooks,
+  Connection,
+  ConnectionHooks,
+  Registry,
+  Schema,
   Signal,
+  Transport,
   WireEvent,
 } from './contract.js';
 import { be, decodeAny, utf8, Writer } from './msgpack.js';
 import { crc32c, Fnv64, sameBytes } from './checksum.js';
 import { ByteReader } from './bytes.js';
 import { frames } from './frames.js';
+import { buildRegistry } from './registry.js';
+import { AuthError, claims, Session } from './session.js';
 import { uuidBytes } from './uuid.js';
-
-/** TokenSource supplies the bearer token for each request, or null for anonymous */
-export type TokenSource = () => string | null;
 
 const pageSize = 1000;
 const batchRecords = 1000;
@@ -28,6 +29,8 @@ const maxRecord = 16 * 1024 * 1024;
 // this long before the first retry and twice as long before each one after
 const sendRetries = 3;
 const sendRetryDelay = 100;
+// a session is refreshed once it has lived this share of its lifetime
+const refreshAfter = 0.5;
 
 type BlobHeader = { position: number; streams: Record<string, number> };
 
@@ -54,11 +57,178 @@ function readU32(b: Uint8Array): number {
   return be(b, 0, 4);
 }
 
-export class HTTPConnector implements Connector {
+/** What a login presents: a password, or an account's identity alone, which only a database run
+    with --dev-auth accepts */
+export type Credentials =
+  { kind: 'password'; identity: string; password: string } | { kind: 'dev'; identity: string };
+
+/** The Transport to a database over HTTP, at its URL.  It signs in and refreshes sessions, and
+    refreshes a session it is handed once the session has lived half its lifetime. */
+export class HTTPTransport implements Transport {
   #url: string;
-  #token: TokenSource;
+  // each schema's Registry, built once and shared by every Engine and client over it
+  #registries = new WeakMap<Schema, Registry>();
+  // each session's refresh in flight, which every caller that wants it refreshed meanwhile shares
+  #refreshes = new WeakMap<Session, Promise<void>>();
+
+  constructor(url: string) {
+    this.#url = url;
+  }
+
+  buildRegistry(schema: Schema): Registry {
+    let reg = this.#registries.get(schema);
+    if (reg === undefined) {
+      reg = buildRegistry(schema);
+      this.#registries.set(schema, reg);
+    }
+    return reg;
+  }
+
+  connect(
+    since: number,
+    view: string | null,
+    wants: string[],
+    signal: Signal,
+    hooks: ConnectionHooks,
+    session: Session | null,
+  ): Connection {
+    ours(session);
+    const ready = () => (session === null ? Promise.resolve() : this.#fresh(session));
+    return new HTTPConnection(this.#url, session, ready, since, view, wants, signal, hooks);
+  }
+
+  /** One request of commands outside any connection, as the session or as anonymous, answered
+      with their outcomes in order.  A request of numbered commands that fails for a reason that
+      may not recur is tried again a few times under the same ids, which the database's dedup
+      makes safe; a request with an unnumbered command is tried once.  A 4xx stands at once, and
+      a refused session ends, and the request rejects with an AuthError. */
+  async post(
+    commands: Command<Uint8Array>[],
+    session: Session | null = null,
+  ): Promise<CommandResult[]> {
+    ours(session);
+    if (session !== null) await this.#fresh(session);
+    const numbered = commands.every((c) => c.series !== null && c.n !== null);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await postCommands(this.#url, authorization(session), commands);
+      } catch (e: unknown) {
+        const clientError = e instanceof StatusError && e.status >= 400 && e.status < 500;
+        if (!numbered || clientError || attempt === sendRetries) throw refusal(e, session);
+        await sleep(sendRetryDelay * 2 ** attempt, new AbortController().signal);
+      }
+    }
+  }
+
+  /** Signs in, answering a new session.  A login the database refuses, for any reason, rejects
+      with an AuthError naming the response's status. */
+  async login(credentials: Credentials): Promise<Session> {
+    try {
+      const reply = await this.#authToken(credentials, null);
+      return new Session(reply.token);
+    } catch (e: unknown) {
+      if (e instanceof StatusError) throw new AuthError(e.status, e.message);
+      throw e;
+    }
+  }
+
+  /** Re-issues the session's token in place, then calls its onRefresh.  Refreshes of one session
+      while one is in flight share it.  A session the database refuses is ended, and the refresh
+      rejects with an AuthError. */
+  refresh(session: Session): Promise<void> {
+    ours(session);
+    let pending = this.#refreshes.get(session);
+    if (pending === undefined) {
+      pending = this.#reissue(session).finally(() => this.#refreshes.delete(session));
+      this.#refreshes.set(session, pending);
+    }
+    return pending;
+  }
+
+  async #reissue(session: Session): Promise<void> {
+    if (session.ended) throw new AuthError(401, 'the session has ended');
+    let reply: { token: string; exp: number };
+    try {
+      reply = await this.#authToken({ kind: 'refresh' }, session.token);
+    } catch (e: unknown) {
+      throw refusal(e, session);
+    }
+    session.token = reply.token;
+    session.exp = reply.exp;
+    session.onRefresh?.(session);
+  }
+
+  /* The session ready to present: refreshed first once it has lived refreshAfter of its lifetime.
+     A refresh that fails for any reason but a refusal leaves a token that has not expired to be
+     presented as it is, since it is still good. */
+  async #fresh(session: Session): Promise<void> {
+    if (session.ended) throw new AuthError(401, 'the session has ended');
+    const { iat, exp } = claims(session.token);
+    const now = Date.now() / 1000;
+    if (now < iat + (exp - iat) * refreshAfter) return;
+    try {
+      await this.refresh(session);
+    } catch (e: unknown) {
+      if (e instanceof AuthError || now >= exp) throw e;
+    }
+  }
+
+  // one POST to /auth/token, answered with the token it signs; any status but 200 rejects
+  async #authToken(
+    body: Record<string, string>,
+    token: string | null,
+  ): Promise<{ token: string; exp: number }> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/msgpack' };
+    if (token !== null) headers.Authorization = `Bearer ${token}`;
+    const w = new Writer();
+    w.any(body);
+    const resp = await fetch(`${this.#url}/auth/token`, {
+      method: 'POST',
+      headers,
+      body: w.bytes(),
+    });
+    if (resp.status !== 200) {
+      throw new StatusError(resp.status, `auth: ${resp.status} ${(await resp.text()).trim()}`);
+    }
+    const reply = decodeAny(new Uint8Array(await resp.arrayBuffer())) as Record<string, unknown>;
+    if (typeof reply.token !== 'string' || typeof reply.exp !== 'number') {
+      throw new Error('auth: malformed reply');
+    }
+    return { token: reply.token, exp: reply.exp };
+  }
+}
+
+// a session this library made, since the Engine hands back whatever object it was given; any
+// other object fails here rather than as a malformed token
+function ours(session: Session | null): void {
+  if (session !== null && !(session instanceof Session)) {
+    throw new TypeError('not a session from @phaselock/client: sign in with HTTPTransport.login');
+  }
+}
+
+// the Authorization header of a request as the session, or none for anonymous
+function authorization(session: Session | null): Record<string, string> {
+  return session === null ? {} : { Authorization: `Bearer ${session.token}` };
+}
+
+// the error a failed auth or command request rejects with: a 401 is the database refusing the
+// session, which ends it; any other failure is itself
+function refusal(e: unknown, session: Session | null): unknown {
+  if (!(e instanceof StatusError) || e.status !== 401) return e;
+  if (session !== null) session.ended = true;
+  return new AuthError(401, e.message);
+}
+
+/* One connection over HTTP: the live stream, the backfills and command sends that ride on it, and
+   the session they all present.  Before it opens the stream and before each send it readies the
+   session, which refreshes it when due; a 401 from any of them is the database refusing the
+   session, which ends the connection fatally. */
+class HTTPConnection implements Connection {
+  #url: string;
+  #session: Session | null;
+  #ready: () => Promise<void>;
   #signal: AbortSignal;
-  #hooks: ConnectorHooks;
+  #hooks: ConnectionHooks;
   #ended = false;
   // ends the connection from inside, when a send fails
   #stop = new AbortController();
@@ -74,35 +244,46 @@ export class HTTPConnector implements Connector {
 
   constructor(
     url: string,
-    token: TokenSource,
+    session: Session | null,
+    ready: () => Promise<void>,
     since: number,
     view: string | null,
     wants: string[],
     signal: Signal,
-    hooks: ConnectorHooks,
+    hooks: ConnectionHooks,
   ) {
     this.#url = url;
-    this.#token = token;
+    this.#session = session;
+    this.#ready = ready;
     this.#signal = AbortSignal.any([nativeSignal(signal), this.#stop.signal]);
     this.#hooks = hooks;
     void this.#run(since, view, wants);
   }
 
   #headers(extra: Record<string, string> = {}): Record<string, string> {
-    const t = this.#token();
-    return t === null ? extra : { ...extra, Authorization: `Bearer ${t}` };
+    return { ...extra, ...authorization(this.#session) };
   }
 
   // the one onEnd: server end frames pass their code through; transport-level ends carry the
   // HTTP status, and local ends (abort, closed body) carry 0
-  #end(code: number, reason: string): void {
+  #end(code: number, reason: string, fatal?: AuthError): void {
     if (this.#ended) return;
     this.#ended = true;
-    this.#hooks.onEnd(code, reason);
+    this.#hooks.onEnd(code, reason, fatal);
+  }
+
+  // the database refused the session: it ends for good, and so does this connection, fatally
+  #refuse(message: string): AuthError {
+    if (this.#session !== null) this.#session.ended = true;
+    const err = new AuthError(401, message);
+    this.#end(401, message, err);
+    this.#stop.abort();
+    return err;
   }
 
   async #run(since: number, view: string | null, wants: string[]): Promise<void> {
     try {
+      await this.#ready();
       const q = new URLSearchParams({ since: String(since) });
       if (view !== null) q.set('view', view);
       for (const w of wants) q.append('want', w);
@@ -113,6 +294,10 @@ export class HTTPConnector implements Connector {
         headers: this.#headers(),
         cache: 'no-store',
       });
+      if (resp.status === 401) {
+        this.#refuse(await resp.text());
+        return;
+      }
       if (resp.status !== 200 || !resp.body) {
         this.#end(resp.status, await resp.text());
         return;
@@ -150,7 +335,8 @@ export class HTTPConnector implements Connector {
       });
       this.#end(0, 'stream closed');
     } catch (e: unknown) {
-      this.#end(0, e instanceof Error ? e.message : String(e));
+      const reason = e instanceof Error ? e.message : String(e);
+      this.#end(e instanceof AuthError ? e.status : 0, reason, fatalOf(e));
     }
   }
 
@@ -173,6 +359,7 @@ export class HTTPConnector implements Connector {
         headers: this.#headers(range),
       });
       const okStatus = (r: Response) => r.status === 200 || r.status === 206 || r.status === 416;
+      if (first.status === 401) throw this.#refuse(await first.text());
       if (!okStatus(first))
         throw new Error(`snapshot ${b.ref}: ${first.status} ${first.statusText}`);
       let blob = first;
@@ -327,6 +514,7 @@ export class HTTPConnector implements Connector {
         signal,
         headers: this.#headers(),
       });
+      if (resp.status === 401) throw this.#refuse(await resp.text());
       if (resp.status !== 200 || !resp.body) {
         throw new Error(`events ${b.ref}: ${resp.status} ${resp.statusText}`);
       }
@@ -384,6 +572,7 @@ export class HTTPConnector implements Connector {
      A 4xx answer is the client's own doing and stands at once; so does any failure once the
      stream has ended or the connection was aborted, since the next connection resends. */
   async #post(commands: Command<Uint8Array>[]): Promise<CommandResult[]> {
+    await this.#ready();
     for (let attempt = 0; ; attempt++) {
       try {
         return await postCommands(this.#url, this.#headers(), commands, this.#signal);
@@ -397,8 +586,12 @@ export class HTTPConnector implements Connector {
   }
 
   // a send that failed ends the connection: the one onEnd carries the response's status, or 0
-  // when no response arrived, and the stream stops
+  // when no response arrived, and the stream stops; a refused session ends it fatally
   #failed(e: unknown): void {
+    if (e instanceof AuthError || (e instanceof StatusError && e.status === 401)) {
+      this.#refuse(e.message);
+      return;
+    }
     const code = e instanceof StatusError ? e.status : 0;
     this.#end(code, e instanceof Error ? e.message : String(e));
     this.#stop.abort();
@@ -458,11 +651,11 @@ async function postCommands(
   const w = new Writer();
   for (const c of commands) {
     w.arrayHeader(4);
-    if (c.session === null || c.n === null) {
+    if (c.series === null || c.n === null) {
       w.nil();
       w.nil();
     } else {
-      w.str(c.session);
+      w.str(c.series);
       w.int(c.n);
     }
     w.bin(uuidBytes(c.id));
@@ -492,11 +685,11 @@ async function postCommands(
   });
 }
 
-/** Sends one command outside any Engine, such as one that creates an account before there is a
-    token to connect with, and answers with its outcome.  The command is the wire envelope: an id
-    the caller mints, the command's wire bytes, and a session and number, or null for both to send
-    it sessionless.  The token is null for an anonymous request.  A failed request rejects, and
-    nothing is retried. */
+/** Posts one command to the database at url and answers with its outcome: the request beneath
+    HTTPTransport.post, for a transport of the app's own.  The command is the wire envelope: an id
+    the caller mints, the command's wire bytes, and a series and number, or null for both to send
+    it unnumbered.  The token is a session's, or null for an anonymous request.  A failed request
+    rejects, and nothing is retried. */
 export async function postCommand(
   url: string,
   command: Command<Uint8Array>,
@@ -508,7 +701,7 @@ export async function postCommand(
   return result;
 }
 
-export function NewHTTPConnector(url: string, token: TokenSource = () => null): ConnectorFactory {
-  return (since, view, wants, signal, hooks) =>
-    new HTTPConnector(url, token, since, view, wants, signal, hooks);
+// the error a connection ends fatally with: a refused session, and nothing else
+function fatalOf(e: unknown): AuthError | undefined {
+  return e instanceof AuthError ? e : undefined;
 }

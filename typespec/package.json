@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "scripts": {
     "build": "pnpm --filter @phaselock/typespec-core --filter @phaselock/typespec-ts build",
-    "test": "pnpm build && pnpm --filter @phaselock/typespec-tests gen && pnpm --filter @phaselock/typespec-tests test",
+    "test": "pnpm --filter @phaselock/typespec-tests gen && pnpm --filter @phaselock/typespec-tests test",
     "check": "pnpm check:tsc && pnpm check:lint && pnpm check:fmt",
-    "check:tsc": "pnpm build && tsc -p tests",
+    "check:tsc": "tsc -p core --noEmit && tsc -p ts --noEmit && tsc -p tests",
     "check:lint": "eslint .",
     "check:fmt": "prettier --check \"**/*.ts\"",
     "fmt": "prettier --write \"**/*.ts\" && eslint --fix ."

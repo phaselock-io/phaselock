@@ -32,9 +32,10 @@ examples/
   todo-thin/      Same app, engine in the server, clients get query results.
   library/        Full architecture: Python relay, Go decider, forecasts,
                   per-audience stores. Root also has populate.py seed data.
-client/ts/        @phaselock/client: the JS host's connector over HTTP,
-                  its msgpack cursor, and the Registry that walks the
-                  generated type registry.
+client/ts/        @phaselock/client: the JS host's transport over HTTP
+                  (logins, sessions, connections), its msgpack cursor,
+                  and the Registry that walks the generated type
+                  registry.
 plugins/          @phaselock/plugins: the plugins we ship, as a
                   database's bundle installs them; cron so far.
 db/               The v0 database: a C core (QuickJS, SQLite, the

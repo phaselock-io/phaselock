@@ -3,7 +3,7 @@
 A client library is the half of a PhaseLock engine that needs a real
 host: sockets, streams, msgpack, cancellation.  The other half, the
 Engine, is the generated skeleton and runs anywhere, including hosts
-with none of those.  The two meet at the connector contract described
+with none of those.  The two meet at the transport contract described
 here.  This document is the blueprint for every client we write; the
 TypeScript client is the canonical implementation and supplies the
 examples.  Cross-language details are deliberately thin; they have not
@@ -30,8 +30,15 @@ generated unions are already named `*Events`.  This is the only per-
 language naming deviation.
 
 ```ts
-/** command data T with the client-minted id it carries through the log */
-export type Command<T> = { id: string; data: T };
+/** command data T with the client-minted id it carries through the log,
+    and the series and number the database dedups it by, or null for both
+    in an unnumbered command */
+export type Command<T> = {
+  id: string;
+  series: string | null;
+  n: number | null;
+  data: T;
+};
 
 /** event data T with the envelope the DB stamped on it when committed;
     the id is the command's */
@@ -41,16 +48,16 @@ export type DbEvent<T> = {
   position: number;
   stream: string;
   seq: number;
-  servertime: number;
+  servertime: Date;
 };
 ```
 
 A command is the client's until precommit turns it into events, so it
-has no stream; an event is the DB's.  Connectors deliver a `WireEvent`:
+has no stream; an event is the DB's.  Connections deliver a `WireEvent`:
 the envelope decoded for routing, `data` as the raw msgpack bytes the
 server sent, and `raw`, the whole wire pair, so the Engine can park an
 event as a slice with no conversion.  They take command data as bytes
-the same way, `Command<Uint8Array>`.  A connector
+the same way, `Command<Uint8Array>`.  A connection
 never decodes or encodes a payload and never sees a registry: the
 Engine converts bytes to rich values through the host's registry when
 it reduces, and parks bytes untouched when it parks.  How a host turns
@@ -59,33 +66,45 @@ values plus the generated lift; perhaps a generated one-walk decoder
 over a msgpack cursor later) is an Engine and emitter decision the
 contract does not depend on.
 
-## One connector per connection
+## Transports and connections
 
 ```ts
-export type ConnectorFactory = (
-  since: number,        // the Engine's checkpoint, -1 to bootstrap
-  view: string | null,  // the Engine's stored view token, null to bootstrap
-  wants: string[],      // refs the server cuts the view down to
-  signal: AbortSignal,  // the connector's lifetime
-  hooks: ConnectorHooks,
-) => Connector;
+export interface Transport {
+  buildRegistry(schema: Schema): Registry;
+  connect(
+    since: number,            // the Engine's checkpoint, -1 to bootstrap
+    view: string | null,      // the Engine's stored view token, null to bootstrap
+    wants: string[],          // refs the server cuts the view down to
+    signal: Signal,           // the connection's lifetime
+    hooks: ConnectionHooks,
+    session: Session | null,  // who the Engine syncs as, null for anonymous
+  ): Connection;
+  post(commands: Command<Uint8Array>[], session?: Session | null): Promise<CommandResult[]>;
+}
 ```
 
-Calling the factory is the connect attempt.  A connector lives for
-exactly one connection and reports exactly one `onEnd`, whether the
+A transport is how a host reaches one database, and it keeps no
+identity: every connect and post names the session it speaks for, so
+one transport serves any number of Engines and identities.
+`buildRegistry` is the host's registry builder.  An Engine hands it the
+generated schema it was built for, so an app never handles a schema or
+a registry; the HTTP transport builds each schema once.
+
+Calling `connect` is the connect attempt.  A connection lives for
+exactly one attempt and reports exactly one `onEnd`, whether the
 handshake was refused, the stream dropped, or the Engine aborted the
-signal.  There is no `connect()` and no connected-or-not state inside a
-connector.  Consequences:
+signal.  There is no connected-or-not state inside a connection.
+Consequences:
 
 - Every attempt gets the current checkpoint as an argument, so a stale
   `since` cannot happen.
-- Backfills and command sends are scoped to the connector.  When it
+- Backfills and command sends are scoped to the connection.  When it
   ends, its signal aborts them and their promises reject.  That is
   slightly wasteful when only the stream dropped, and worth it: one
   lifetime, one signal, one end.
-- Configuration lives in the factory's closure.  The TypeScript
-  `NewHTTPConnector(url)` captures the URL and whatever supplies auth
-  tokens; the contract never sees either.
+- Configuration lives in the transport.  The TypeScript
+  `new HTTPTransport(url)` holds the URL; identity arrives as a session
+  on each call.
 
 `wants` is the engine's compile-time mask: the refs of the shards the
 generated engine declares (`"book"`, `"patron:{id}"` lower to `book`,
@@ -100,24 +119,24 @@ until there is a use for one.
 ## Hooks: the live stream
 
 ```ts
-export interface ConnectorHooks {
-  onOpen(epoch: string): void;
+export interface ConnectionHooks {
+  onOpen(epoch: string, head: number): void;
   onView(token: string, position: number, refs: string[]): void;
   onEvents(events: WireEvent[]): void;
   onLive(position: number): void;
   onVouch(position: number): void;
-  onEnd(code: number, reason: string): void;
+  onEnd(code: number, reason: string, fatal?: unknown): void;
 }
 ```
 
 - `onOpen` comes first, once per connection, before any frame, with
-  `PhaseLock-Epoch` from the response headers: an opaque id for the log
-  every position on this connection belongs to.  The Engine writes no
-  checkpoint
-  without it, and a connection whose epoch differs from the stored
-  checkpoint's is a replaced log.
+  `PhaseLock-Epoch` from the response headers, an opaque id for the log
+  every position on this connection belongs to, and `PhaseLock-Position`,
+  the log's head as the connection opened.  The Engine writes no
+  checkpoint without it, and a connection whose epoch differs from the
+  stored checkpoint's is a replaced log.
 - `onView` is the whole view: the token, the position it is the view
-  at, and the full set of refs.  The connector sends the Engine's
+  at, and the full set of refs.  The connection sends the Engine's
   stored token as `view`; when it is current no view frame comes at
   all, and when it is not the server's first frame is the view, ahead
   of any history.  Every later change is another view frame, ahead of
@@ -148,7 +167,7 @@ export interface ConnectorHooks {
 
 Refs use the wire grammar from `db/README.md`: a stream name, a
 wildcard over a family or its leading parameters (`chat:*`,
-`chat:acme,*`), or `*`.  A connector puts a ref into a URL path as it
+`chat:acme,*`), or `*`.  A connection puts a ref into a URL path as it
 is.  Every allowed character, `:` and `,` included, is legal unencoded in
 a path, and `*` too, so there is no escaping and no
 `encodeURIComponent`; a `want` query parameter is form-encoded like any
@@ -167,27 +186,28 @@ export type Backfill = {
     snapshotDone: boolean;
     tailDone: boolean;
   };
-  signal: AbortSignal;
+  signal: Signal;
   push(item: BackfillItem): Promise<void>;
 };
 
 export type BackfillItem =
+  | { length: number }
   | { header: { position: number; seqs: Record<string, number> } }
   | { values: [string, Uint8Array][]; skip: number }
   | { valuesDone: true }
-  | { events: WireEvent[] }
+  | { events: WireEvent[]; scanned: number }
   | { eventsDone: true };
 
 export type BackfillOutcome = 'done' | 'stale';
 
-export interface Connector {
+export interface Connection {
   backfill(backfill: Backfill): Promise<BackfillOutcome>;
   sendCommands(commands: Command<Uint8Array>[]): Promise<CommandResult[]>;
 }
 ```
 
 A backfill loads one ref: a snapshot blob, then the events between the
-blob's position and `until`.  The connector runs the two downloads
+blob's position and `until`.  The connection runs the two downloads
 concurrently.
 
 **The snapshot.**  `GET /snapshot/<ref>` answers either the blob inline
@@ -196,12 +216,12 @@ gives the cut position and the seq of every stream in the blob; deliver
 it as one `header` item.  Then stream the records.
 
 **Memory.**  Snapshots need not fit in memory.  The blob's outer
-framing is length-prefixed binary, so the connector needs a byte cursor
+framing is length-prefixed binary, so the connection needs a byte cursor
 over the response body ("give me exactly n bytes, spanning chunks"), not
-a streaming msgpack decoder.  Values are never decoded by the connector:
+a streaming msgpack decoder.  Values are never decoded by the connection:
 a `values` item hands the Engine raw bytes, which the store keeps in msgpack
 form.  `/events` pages and `/stream` are back-to-back msgpack values,
-and the connector frames them with a small msgpack cursor of its own
+and the connection frames them with a small msgpack cursor of its own
 (array and map headers, strings, ints, and skip): it decodes the tag
 and each envelope, skips over `data` to find its extent, and slices the
 bytes out.  The stock library decodes only whole small values: the blob
@@ -211,7 +231,7 @@ header map and command results.
 the Engine has committed that item, not when it has queued it.  One
 method carries the whole protocol, which is one method to implement in
 every language.  The
-connector batches records (a few hundred KB or a thousand records),
+connection batches records (a few hundred KB or a thousand records),
 allows one batch in flight at the Engine while it parses the next, and
 does not read the body further until the earlier batch resolves.  Not
 calling `read()` is what pushes back on the network.  Bounded memory is
@@ -255,45 +275,81 @@ Engine discards the values it parked, keeps the parked tail events, and
 retries with `skipBytes: 0` and `fromPosition` intact.  Any other
 failure rejects, and everything delivered before it is still valid.
 
-**The connector never retries.**  Not on 404, not on a dropped
+**The connection never retries.**  Not on 404, not on a dropped
 connection.  It makes one attempt, returns or rejects, and the Engine
 owns every retry and every backoff.  When one of the two downloads
-fails the connector aborts the other; that is the only `AbortController`
+fails the connection aborts the other; that is the only `AbortController`
 it keeps, and it is not a retry mechanism.
+
+## Sessions
+
+A session is who a request speaks for: the token the database signed
+at login, the user it names, its expiry, an `ended` flag, and an
+optional `onRefresh`.  It is this library's own object: the skeleton
+takes a session as opaque, and an Engine or a post only hands it back
+to the transport, so a session from any other source is refused.  An Engine syncs as one session, or as anonymous,
+for its whole life; signing in or out means building a new Engine.  The
+TypeScript client makes sessions with `HTTPTransport.login`, which
+takes a password or, against a database run with `--dev-auth`, an
+identity alone, and with `restoreSession(token)` for a token the app
+saved.
+
+- The transport refreshes a session it is handed once the session has
+  lived half its lifetime, in place, so every Engine and post sharing
+  it presents the new token.  Refreshes of one session in flight
+  together share one request, and `onRefresh` is the app's cue to save
+  the token.  `refresh(session)` forces one, which is how an app checks
+  a restored session before building an Engine.
+- A 401 is the database refusing the session.  The transport ends the
+  session; a connection reports an `AuthError` as `onEnd`'s `fatal`,
+  which ends the Engine through `onError` instead of reconnecting; and a
+  post rejects with it.  A refused login rejects with an `AuthError`
+  naming the status.
+- Commands sent outside any Engine, such as account creation before
+  anyone has signed in, go through the generated `post{Name}Command`,
+  which posts any of a database's commands, each under a fresh id and
+  numbered 1 in a series of its own, as a session or as anonymous.  A
+  transport retries a failed request of numbered commands under the
+  same ids, which the database's dedup makes safe, and tries one with
+  an unnumbered command once.  `postCommand` is the bare request
+  beneath, for a transport of the app's own.
 
 ## Commands
 
 ```ts
 export type CommandResult =
-  | { kind: 'ack'; position: number }
-  | { kind: 'dup'; position: number }
+  | { kind: 'ok'; position: number }
   | { kind: 'reject'; reason: string }
   | { kind: 'conflict'; current: Record<string, number> };
 ```
 
-`sendCommands` mirrors the wire outcomes one for one.  `expect` has no
-place on `Command` yet.
+`sendCommands` and `post` mirror the wire outcomes one for one.  `ok`
+means the command was decided at or before `position`, so a client that
+has reduced that far reads the outcome from its state.  A reject's
+reason and a conflict's current seqs come only in the first answer to
+a decision; a resend of either is answered `ok` (DEDUP.md).  `expect`
+has no place on `Command` yet.
 
-**Ordering is the connector's guarantee.**  Calls are applied in call
+**Ordering is the connection's guarantee.**  Calls are applied in call
 order, and within a call, array order.  A call that fails also fails
 every call behind it, unsent, and ends the connection, so the next
 connection's resend keeps the Engine's outbox order.  Retrying before
-giving up is the connector's choice.  The HTTP connector retries a
+giving up is the connection's choice.  The HTTP connection retries a
 failure that may not recur, a network failure or a 5xx, a few times
 within a second under the same ids, which dedup makes safe; a 4xx
 stands at once.  Then it gives up with the response's status as the
 end code, and the Engine's reconnect with backoff takes over.  The
 Engine writes to that rule without awaiting between calls.  How a
-connector delivers it is its own business: the HTTP connector
+connection delivers it is its own business: the HTTP connection
 serializes, one request in flight, because two requests have no
-ordering between them; a WebSocket connector sends every call down its
+ordering between them; a WebSocket transport sends every call down its
 one ordered stream at once and matches replies to calls, so the Engine
 gets pipelining wherever the transport can give it.  Batching stays
 the Engine's lever, since one call is one request.
 
 ## What the Engine does with all this
 
-Connectors never interpret seqs; they are numbers.  The Engine owns:
+Connections never interpret seqs; they are numbers.  The Engine owns:
 
 - **Lazy gap detection.**  The blob header gives every member's seq at
   the cut, every event carries its seq, and a stream whose chain breaks,
@@ -323,7 +379,7 @@ Connectors never interpret seqs; they are numbers.  The Engine owns:
   after the moves.  Landing uses the store's `delPrefix` and `move`,
   which rekey without lifting values into the host language and report
   the keys they touched for query invalidation.
-- **`caughtUp` is a conjunction**: the connector delivered `live` and
+- **`caughtUp` is a conjunction**: the connection delivered `live` and
   no replacing backfill is in flight.  It can go false mid-session.
   Each replacing backfill is complete when its snapshot and its event
   tail are fully downloaded and no seq gap is observed (including across
@@ -348,8 +404,6 @@ Connectors never interpret seqs; they are numbers.  The Engine owns:
 
 ## Undecided
 
-- Who supplies and refreshes the auth token, beyond "the factory's
-  closure".
 - Whether the Engine, on a single-stream gap, may cut (drop the stream
   and treat its backfill as additive) instead of freezing.  Freeze is
   the rule; cut is a possible exception if the pause proves annoying.

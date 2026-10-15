@@ -22,7 +22,7 @@ export type CronConfig = { entries: { name: string; spec: string }[] };
 // the command the database hands cron's run: one tick of one entry
 type TickCommand = { entry: string; slot: Date; now: Date };
 
-// an entry's name, at most 64 bytes, part of the session key that holds its mark
+// an entry's name, at most 64 bytes, part of the series key that holds its mark
 const ENTRY_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 /** The built-in plugin that runs hooks on a schedule, so a database runs its own daily sheets and

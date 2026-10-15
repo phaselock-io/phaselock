@@ -1,13 +1,16 @@
-// The connector contract and the envelope types.  These are declared in the generated
+// The transport contract and the envelope types.  These are declared in the generated
 // skeleton too, which has no imports; they are duplicated here verbatim, and structural typing
-// lines the two up.  Changing them costs a change in every client in every language.
+// lines the two up.  Changing them costs a change in every client in every language.  The
+// skeleton takes a session as an opaque object; this library's is its Session class.
+
+import type { Session } from './session.js';
 
 /** Command wraps command data T with the client-minted id it will carry through the log, and
-    the session and number the database dedups it by: a sender numbers its commands in a session
-    it mints, and the database runs each number once.  A sessionless command has neither. */
+    the series and number the database dedups it by: an Engine numbers its commands in a series
+    it mints, and the database runs each number once.  An unnumbered command has neither. */
 export type Command<T> = {
   id: string;
-  session: string | null;
+  series: string | null;
   n: number | null;
   data: T;
 };
@@ -24,11 +27,11 @@ export type DbEvent<T> = {
   servertime: Date;
 };
 
-/** WireEvent is an event as a connector delivers it: the envelope decoded for routing, data as
+/** WireEvent is an event as a connection delivers it: the envelope decoded for routing, data as
     the bytes the server sent, and the whole wire pair `[env, data]` so parking it is a slice. */
 export type WireEvent = DbEvent<Uint8Array> & { raw: Uint8Array };
 
-/** A cancellation signal, as the Engine and its connectors use one: whether it has fired and why,
+/** A cancellation signal, as the Engine and its connections use one: whether it has fired and why,
     and a listener for when it does.  A browser's or Node's AbortSignal is one. */
 export interface Signal {
   readonly aborted: boolean;
@@ -56,7 +59,7 @@ export type Backfill = {
     snapshotDone: boolean;
     tailDone: boolean;
   };
-  // cancels this backfill alone; the connector's own signal cancels everything
+  // cancels this backfill alone; the connection's own signal cancels everything
   signal: Signal;
   // one call per delivery, resolved once the Engine has committed it
   push(item: BackfillItem): Promise<void>;
@@ -90,15 +93,15 @@ export type CommandResult =
 // and the Engine may retry with resume as persisted.
 export type BackfillOutcome = 'done' | 'stale';
 
-export interface Connector {
+export interface Connection {
   backfill(backfill: Backfill): Promise<BackfillOutcome>;
   // Calls are applied in call order, and within a call, array order.  A call that fails also
   // fails every call behind it, unsent, and ends the connection, so the next connection's resend
-  // keeps the Engine's order.  Retrying before giving up is the connector's choice.
+  // keeps the Engine's order.  Retrying before giving up is the connection's choice.
   sendCommands(commands: Command<Uint8Array>[]): Promise<CommandResult[]>;
 }
 
-export interface ConnectorHooks {
+export interface ConnectionHooks {
   // first, once per connection, before any frame: from the response headers, the epoch, the log
   // every position on this connection belongs to, and the head, the log's position as the
   // connection opened
@@ -111,19 +114,33 @@ export interface ConnectorHooks {
   // history done; live from here (sent once per connection)
   onLive(position: number): void;
   onVouch(position: number): void;
-  onEnd(code: number, reason: string): void;
+  // the connection is over; fatal is the error that ends the Engine, when no later connection
+  // can succeed, such as the database refusing the session
+  onEnd(code: number, reason: string, fatal?: unknown): void;
 }
 
-// One Connector per connection: calling the factory is the connect attempt, since is the
-// Engine's checkpoint (-1 to bootstrap), and the connector reports exactly one onEnd.  The signal
-// is its lifetime; aborting it ends the connection and rejects any backfill or send in flight.
-export type ConnectorFactory = (
-  since: number,
-  view: string | null, // the Engine's stored view token; null to bootstrap
-  wants: string[],
-  signal: Signal,
-  hooks: ConnectorHooks,
-) => Connector;
+/** A Transport is how a host reaches one database: the host's Registry, built from generated
+    registry data; one connection per connect attempt; and commands posted outside any
+    connection.  It keeps no identity: each call names the session it speaks for, or null for
+    anonymous. */
+export interface Transport {
+  buildRegistry(schema: Schema): Registry;
+  // One Connection per attempt: since is the Engine's checkpoint (-1 to bootstrap), and the
+  // connection reports exactly one onEnd.  The signal is its lifetime; aborting it ends the
+  // connection and rejects any backfill or send in flight.
+  connect(
+    since: number,
+    view: string | null, // the Engine's stored view token; null to bootstrap
+    wants: string[],
+    signal: Signal,
+    hooks: ConnectionHooks,
+    session: Session | null,
+  ): Connection;
+  // One request of commands outside any connection, answered with their outcomes in order.  A
+  // transport may retry a failed request when every command in it is numbered, since the
+  // database answers a resend of one that landed as decided, and never retries one that is not.
+  post(commands: Command<Uint8Array>[], session?: Session | null): Promise<CommandResult[]>;
+}
 
 // the store's value bundles and the Registry, with the registry data a host builds one from
 

@@ -9,6 +9,7 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 
 import {
+  type Command,
   InMemStore,
   JS,
   type ReadTxn,
@@ -16,6 +17,8 @@ import {
   type RTxn,
   scanAll,
   type ScanRequest,
+  type Schema,
+  type Session,
   type WTxn,
 } from '../../../ts/assets/skeleton.ts';
 import { bootstrap, FakeServer, registry, settle } from '../engine/harness.ts';
@@ -416,24 +419,54 @@ const SNIPPETS: Record<string, string> = {
   engines: `
     import {
       type CatalogSliceReducers,
-      type ConnectorFactory,
       type InboxSliceReducers,
-      type Registry,
       type SecretSliceReducers,
+      type Session,
+      type StoreFactory,
+      type Transport,
       WriterEngine,
     } from './model.gen.ts';
 
     declare const catalog: CatalogSliceReducers;
     declare const inbox: InboxSliceReducers;
     declare const secret: SecretSliceReducers;
-    declare const reg: Registry;
-    declare const connect: ConnectorFactory;
+    declare const transport: Transport;
+    declare const session: Session;
+    declare const store: StoreFactory;
 
-    export const engine = new WriterEngine(null, reg, connect, { reducers: { catalog, inbox } });
+    export const engine = new WriterEngine(transport, { session, reducers: { catalog, inbox } });
+    export const anonymous = new WriterEngine(transport, {
+      session: null,
+      reducers: { catalog, inbox },
+      store,
+    });
+    // @ts-expect-error the session is required, null for anonymous
+    new WriterEngine(transport, { reducers: { catalog, inbox } });
     // @ts-expect-error every slice of the engine needs its reducers
-    new WriterEngine(null, reg, connect, { reducers: { catalog } });
+    new WriterEngine(transport, { session, reducers: { catalog } });
     // @ts-expect-error a slice the engine does not sync
-    new WriterEngine(null, reg, connect, { reducers: { catalog, inbox, secret } });
+    new WriterEngine(transport, { session, reducers: { catalog, inbox, secret } });
+  `,
+
+  posting: `
+    import {
+      type AddItem,
+      type CommandResult,
+      postAppCommand,
+      type Session,
+      type SignUp,
+      type Transport,
+    } from './model.gen.ts';
+
+    declare const transport: Transport;
+    declare const session: Session;
+    declare const signUp: SignUp;
+    declare const add: AddItem;
+
+    export const anonymous: Promise<CommandResult> = postAppCommand(transport, signUp);
+    export const signedIn: Promise<CommandResult> = postAppCommand(transport, add, { session });
+    // @ts-expect-error only the database's commands
+    void postAppCommand(transport, { type: 'not-a-command' });
   `,
 
   database: `
@@ -1213,7 +1246,41 @@ describe('sending commands', () => {
     compiles('sending');
   });
 
-  it.todo("gives the database's own commands a direct-send helper, for use before sign-in");
+  it("posts any of the database's commands outside any Engine, each in a series of its own", async () => {
+    compiles('posting');
+
+    // the registry is built once for the transport, from the database's registry data, and each
+    // command goes alone under a fresh id, numbered 1 in a fresh series
+    const schemas: unknown[] = [];
+    const posts: [Command<Uint8Array>[], unknown][] = [];
+    const transport = {
+      buildRegistry: (schema: Schema) => (schemas.push(schema), registry),
+      connect: () => {
+        throw new Error('a post never connects');
+      },
+      post: (commands: Command<Uint8Array>[], session?: Session | null) => {
+        posts.push([commands, session]);
+        return Promise.resolve([{ kind: 'ok' as const, position: 3 }]);
+      },
+    };
+    const session = { token: 't', user: 'ann', exp: 0, ended: false };
+    expect(await M.postAppCommand(transport, { type: 'sweep', id: 'i1' }, { session })).toEqual({
+      kind: 'ok',
+      position: 3,
+    });
+    await M.postAppCommand(transport, { type: 'add-item', id: 'i2', title: 'T', added });
+    expect(schemas).toEqual([M.appDBSchema]);
+    const [[[first], signedIn], [[second], anonymous]] = posts;
+    expect(signedIn).toBe(session);
+    expect(anonymous).toBeNull();
+    for (const c of [first, second]) {
+      expect(c.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4/);
+      expect(c.series).toMatch(/^[A-Za-z0-9_-]{22}$/);
+      expect(c.n).toBe(1);
+    }
+    expect(first.series).not.toBe(second.series);
+    expect(JSON.parse(new TextDecoder().decode(first.data))).toEqual({ type: 'sweep', id: 'i1' });
+  });
 });
 
 describe('plugins', () => {
@@ -1390,7 +1457,9 @@ describe('schema and bundle', () => {
     const server = new FakeServer();
     const reg = { ...registry, storeTypes: { 'catalog/item': 'Item', 'catalog/count': 'count' } };
     const abort = new AbortController();
-    const engine = new M.WriterEngine(null, reg, server.factory, {
+    const transport = { ...server.transport, buildRegistry: () => reg };
+    const engine = new M.WriterEngine(transport, {
+      session: null,
       reducers: {
         catalog: {
           itemAdded: (txn: any, e: any) => txn.set.item(e.id, { id: e.id, title: e.title }),

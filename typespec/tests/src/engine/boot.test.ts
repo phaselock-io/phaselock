@@ -230,11 +230,11 @@ describe('boot', () => {
   test('the outbox is rebuilt in ordinal order, flushed on connect, and the next ordinal continues', async () => {
     const data = {
       ...persisted(),
-      [commandKey(3)]: { id: 'c3', session: 'old', n: 4, data: bytes({ type: 'bump', id: 'p1' }) },
-      [commandKey(5)]: { id: 'c5', session: 'old', n: 6, data: bytes({ type: 'bump', id: 'p1' }) },
+      [commandKey(3)]: { id: 'c3', series: 'old', n: 4, data: bytes({ type: 'bump', id: 'p1' }) },
+      [commandKey(5)]: { id: 'c5', series: 'old', n: 6, data: bytes({ type: 'bump', id: 'p1' }) },
       [commandKey(10)]: {
         id: 'c10',
-        session: null,
+        series: null,
         n: null,
         data: bytes({ type: 'bump', id: 'p1' }),
       },
@@ -243,8 +243,8 @@ describe('boot', () => {
     await settle();
     expect(r.server.sends.length).toBe(1);
     expect(r.server.sends[0].map((c) => c.id)).toEqual(['c3', 'c5', 'c10']);
-    // the resend is under the sessions and numbers the rows were minted with
-    expect(r.server.sends[0].map((c) => [c.session, c.n])).toEqual([
+    // the resend is under the series and numbers the rows were minted with
+    expect(r.server.sends[0].map((c) => [c.series, c.n])).toEqual([
       ['old', 4],
       ['old', 6],
       [null, null],
@@ -263,10 +263,10 @@ describe('boot', () => {
     });
     expect(r.server.sends.length).toBe(2);
     expect(r.server.sends[1].length).toBe(1);
-    // a new command is minted in a fresh session of the Engine's own, never a loaded one
+    // a new command is numbered in a fresh series of the Engine's own, never a loaded one
     const fresh = r.server.sends[1][0];
-    expect(fresh.session).not.toBe('old');
-    expect(fresh.session).toMatch(/^[A-Za-z0-9_-]{22}$/);
+    expect(fresh.series).not.toBe('old');
+    expect(fresh.series).toMatch(/^[A-Za-z0-9_-]{22}$/);
     expect(fresh.n).toBe(1);
   });
 

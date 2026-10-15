@@ -83,7 +83,7 @@ plan above take precedence over it.
   sent, events come out of C as encoded `[envelope, data]` values, and
   Go writes only container headers around them.  The auth endpoints
   are Go-owned and decode their own small request bodies.
-- SQLite for everything in C: the log, the KV store, the session
+- SQLite for everything in C: the log, the KV store, the series
   table, the known-streams table.  One write transaction per group
   commit, WAL mode, synchronous=FULL.
 - Threads in C: the txn loop (owns QuickJS, SQLite writer connection,
@@ -203,15 +203,15 @@ plan above take precedence over it.
 
 ### Command dedup
 
-Sessions with one mark each, and no frames in the log; a fuller
+Series with one mark each, and no frames in the log; a fuller
 write-up of the dedup design is coming.
 
-- A command carries a session `S`, an opaque string of at most 64
+- A command carries a series `S`, an opaque string of at most 64
   bytes, and a number `n`, an integer from 1 to 2^53 - 1 that
-  increases within the session.  A command whose `S` and `n` are both
-  nil is sessionless: it runs with no dedup and leaves no session
+  increases within the series.  A command whose `S` and `n` are both
+  nil is unnumbered: it runs with no dedup and leaves no series
   state.
-- The session table has one row per session: the hex SHA-256 of `S`,
+- The series table has one row per series: the hex SHA-256 of `S`,
   `hwm`, the highest `n` decided, and `time`, the server time of its
   last decision.  Rows are kept forever: v0 has no horizon.  Cron's
   marks share the table (Cron).
@@ -222,12 +222,12 @@ write-up of the dedup design is coming.
 
   | Case                     | Answer                               |
   |--------------------------|--------------------------------------|
-  | sessionless              | run; nothing recorded                |
+  | unnumbered               | run; nothing recorded                |
   | `n <= hwm`               | `ok` at the head                     |
   | otherwise                | run; `hwm = n`; the decision's reply |
 
-  An unknown session runs from whatever number it arrives with: rows
-  are never pruned, so a session the table does not hold has decided
+  An unknown series runs from whatever number it arrives with: rows
+  are never pruned, so a series the table does not hold has decided
   nothing.
 
 - Every decision moves the mark: an accept, a precommit's `Reject`, a
@@ -240,7 +240,7 @@ write-up of the dedup design is coming.
   the first reply; a resend of a rejected command gets `ok`.
 - The id is a label: the core checks its length, stamps it on the
   atom's envelopes, and keys nothing on it.
-- The log carries no frames.  A session row commits in the
+- The log carries no frames.  A series row commits in the
   transaction of the group that decided it, so it is as durable as
   the log, and v0 has no retention that would need them; the final DB
   will record each decision as a frame.
@@ -359,10 +359,10 @@ Every frame is an array whose first element is a tag.
         and id 16 bytes of bin; nothing can be answered for such a
         body, command by command
 
-- Sessions, numbers, and the outcomes are under Command dedup.
+- Series, numbers, and the outcomes are under Command dedup.
 - A command whose data fails the check gets `["reject", reason]`, the
   reason naming the path (`$.title: missing required field`).  It
-  never reached dedup, so it is not a decision and its session's mark
+  never reached dedup, so it is not a decision and its series' mark
   does not move.
 - `expect` is optional concurrency control: a map from exact stream
   name to the seq of the stream's last event as the client knows it
@@ -373,7 +373,7 @@ Every frame is an array whose first element is a tag.
   after the dedup check and before precommit; any
   mismatch answers `conflict` listing the actual seq of every
   mismatched stream, and the command never reaches user code or the
-  log.  A conflict is a decision, and moves its session's mark like
+  log.  A conflict is a decision, and moves its series' mark like
   any other.  seq is the stream's clock, position the log's.  A conflict
   means refresh and re-decide, where a reject is final.  It is opt-in
   per command; offline-queued work should not carry expectations.
@@ -620,7 +620,7 @@ unbounded waste of event downloads.
   whole minute, with a notice in the log.  A name or spec that fails
   stops startup.
 - An entry's mark, the last of its slots decided, is its row in the
-  session table, under the key `$cron:<install>,<entry>` as it is,
+  series table, under the key `$cron:<install>,<entry>` as it is,
   with `hwm` the slot in Unix seconds.  A client's key is hex, so the
   two never meet.
 - At startup, once the specs parse, one request on the txn loop gives

@@ -1,6 +1,6 @@
-// What the UI needs from the model: the Engine, its schema, its reducers, and the types its
-// queries and commands use.
-export { TodoEngine, todoEngineSchema } from './model.gen';
+// What the UI needs from the model: the Engine, its reducers, and the types its queries and
+// commands use.
+export { TodoEngine } from './model.gen';
 export type {
   ConnectionStatus,
   Query,

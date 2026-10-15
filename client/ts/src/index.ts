@@ -1,8 +1,10 @@
 // @phaselock/client: the PhaseLock client library for JS-native hosts.
 
 export * from './contract.js';
-export { HTTPConnector, NewHTTPConnector, postCommand } from './http.js';
-export type { TokenSource } from './http.js';
+export { HTTPTransport, postCommand } from './http.js';
+export type { Credentials } from './http.js';
+export { AuthError, restoreSession } from './session.js';
+export type { Session } from './session.js';
 export { measure, Reader, Writer } from './msgpack.js';
 export { crc32c, Fnv64 } from './checksum.js';
 export { ByteReader } from './bytes.js';

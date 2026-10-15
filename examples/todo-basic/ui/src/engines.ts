@@ -1,22 +1,19 @@
-import { buildRegistry, NewHTTPConnector } from '@phaselock/client';
-import { TodoEngine, todoEngineSchema, todoReducers } from '@todo-basic/model/ui';
+import { HTTPTransport } from '@phaselock/client';
+import { TodoEngine, todoReducers } from '@todo-basic/model/ui';
 
-// the dev server proxies the database's routes (vite.config.ts)
-const SERVER_URL = window.location.origin;
-
-// the types the Engines convert commands and synced state through, built once
-const registry = buildRegistry(todoEngineSchema);
+// the database, which every Engine here reaches through the dev server's proxy (vite.config.ts)
+const transport = new HTTPTransport(window.location.origin);
 
 // every Engine here lives as long as the page, or until a hot reload replaces this module
 const controller = new AbortController();
 import.meta.hot?.dispose(() => controller.abort());
 
-/** An Engine connected to the database, which keeps its state in memory, so every page load syncs
-    afresh. */
+/** connect() returns an Engine that syncs database state to an in-memory store */
 function connect(): TodoEngine {
-  // no forecasters: a command shows in the UI when the database's event for it arrives (the
-  // library example forecasts, for optimistic updates)
-  return new TodoEngine(null, registry, NewHTTPConnector(SERVER_URL), {
+  // this demo has no forecasters, so it doesn't do optimistic updates
+  return new TodoEngine(transport, {
+    // this demo has no users, so every Engine syncs as anonymous
+    session: null,
     reducers: { todo: todoReducers },
     signal: controller.signal,
     onError: (err) => console.error('the engine ended:', err),

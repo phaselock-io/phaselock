@@ -278,7 +278,7 @@ describe('outbox rows and sends', () => {
     ]);
   });
 
-  test('acks are memory only: acked before a crash, resent under its session, ok again, dropped the same way', async () => {
+  test('acks are memory only: acked before a crash, resent under its series, ok again, dropped the same way', async () => {
     const r = await held();
     const calls = sendControl(r.server);
     r.engine.sendCommand({ field: 'a' });
@@ -295,8 +295,8 @@ describe('outbox rows and sends', () => {
     await settle();
     expect(server.sends.length).toBe(1);
     expect(server.sends[0].map((c) => parse(c.data))).toEqual([{ field: 'a' }]);
-    expect(server.sends[0].map((c) => [c.session, c.n])).toEqual(
-      r.server.sends[0].map((c) => [c.session, c.n]),
+    expect(server.sends[0].map((c) => [c.series, c.n])).toEqual(
+      r.server.sends[0].map((c) => [c.series, c.n]),
     );
     calls2[0].resolve([ok(15)]);
     await settle();
@@ -308,8 +308,8 @@ describe('outbox rows and sends', () => {
   });
 });
 
-describe('sessions', () => {
-  test('outbox and @online commands take consecutive numbers of one session, in submission order', async () => {
+describe('series', () => {
+  test('outbox and @online commands take consecutive numbers of one series, in submission order', async () => {
     const r = await held();
     sendControl(r.server);
     r.engine.sendCommand({ field: 'a' });
@@ -318,13 +318,13 @@ describe('sessions', () => {
     await settle();
     const sent = r.server.sends.flat();
     expect(sent.map((c) => c.n)).toEqual([1, 2, 3]);
-    expect(new Set(sent.map((c) => c.session)).size).toBe(1);
-    expect(sent[0].session).toMatch(/^[A-Za-z0-9_-]{22}$/);
-    // the outbox rows keep the session and number they were minted with
+    expect(new Set(sent.map((c) => c.series)).size).toBe(1);
+    expect(sent[0].series).toMatch(/^[A-Za-z0-9_-]{22}$/);
+    // the outbox rows keep the series and number they were minted with
     const rows = keys(r.data(), '!command:').map((k) => r.data()[k] as Command<Uint8Array>);
-    expect(rows.map((c) => [c.session, c.n])).toEqual([
-      [sent[0].session, 1],
-      [sent[0].session, 3],
+    expect(rows.map((c) => [c.series, c.n])).toEqual([
+      [sent[0].series, 1],
+      [sent[0].series, 3],
     ]);
   });
 });

@@ -1,14 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { decode, decodeMulti, encode } from '@msgpack/msgpack';
-import { NewHTTPConnector, postCommand } from '../src/http.js';
+import { HTTPTransport, postCommand } from '../src/http.js';
+import { AuthError, restoreSession, type Session } from '../src/session.js';
 import { uuidString } from '../src/uuid.js';
 import type {
   Backfill,
   BackfillOutcome,
-  Connector,
-  ConnectorHooks,
-  DbEvent,
+  Connection,
+  ConnectionHooks,
+  Schema,
 } from '../src/contract.js';
 import { blob } from './blob.js';
 import { crc32c } from '../src/checksum.js';
@@ -85,7 +86,7 @@ class Stub {
   }
 }
 
-function hooks(log: unknown[][]): ConnectorHooks {
+function hooks(log: unknown[][]): ConnectionHooks {
   return {
     onOpen: (epoch, head) => log.push(['open', epoch, head]),
     onView: (token, position, refs) => log.push(['view', token, position, refs]),
@@ -98,6 +99,25 @@ function hooks(log: unknown[][]): ConnectorHooks {
 }
 
 const settle = () => new Promise((r) => setTimeout(r, 50));
+
+// an unsigned token with the claims a session reads, issued at iat with the lifetime given in
+// seconds; only the database verifies its tokens, so the client never checks the signature
+function token(sub = 'u1', iat = Math.floor(Date.now() / 1000), lifetime = 30 * 86400): string {
+  const part = (v: unknown) => Buffer.from(JSON.stringify(v)).toString('base64url');
+  return `${part({ alg: 'EdDSA' })}.${part({ sub, iat, exp: iat + lifetime })}.sig`;
+}
+const JWT = token();
+
+// a connection factory over the stub, as the session or as anonymous
+function connector(session: Session | null = null) {
+  return (
+    since: number,
+    view: string | null,
+    wants: string[],
+    signal: AbortSignal,
+    h: ConnectionHooks,
+  ): Connection => new HTTPTransport(stub.url).connect(since, view, wants, signal, h, session);
+}
 
 // a test's command id as the wire carries it: its name in 16 bytes, zero-padded
 function label(name: string): Uint8Array {
@@ -124,7 +144,7 @@ describe('the live stream', () => {
     const s = stub.stream('t1');
     const log: unknown[][] = [];
     const ctl = new AbortController();
-    NewHTTPConnector(stub.url, () => 'jwt')(-1, null, ['*', 'book'], ctl.signal, hooks(log));
+    connector(restoreSession(JWT))(-1, null, ['*', 'book'], ctl.signal, hooks(log));
     await s.opened;
     s.push(['live', 0]);
     s.push(['events', [[[1, 'book', 1, label('c1'), new Date(5)], { $sys: 'birth' }]]]);
@@ -144,7 +164,7 @@ describe('the live stream', () => {
     ]);
     const req = stub.requests[0];
     expect(req.path).toBe('/stream');
-    expect(req.headers.authorization).toBe('Bearer jwt');
+    expect(req.headers.authorization).toBe(`Bearer ${JWT}`);
     expect(new URL(stub.url + stub.requests[0].path + '?' + '')).toBeTruthy();
   });
 
@@ -152,13 +172,7 @@ describe('the live stream', () => {
     const s = stub.stream();
     const seen: string[] = [];
     stub.server.on('request', (req) => seen.push(req.url!));
-    NewHTTPConnector(stub.url)(
-      42,
-      'stored',
-      ['book', 'patron:*'],
-      new AbortController().signal,
-      hooks([]),
-    );
+    connector()(42, 'stored', ['book', 'patron:*'], new AbortController().signal, hooks([]));
     await s.opened;
     expect(seen[0]).toBe('/stream?since=42&view=stored&want=book&want=patron%3A*');
     expect(stub.requests[0].headers.authorization).toBeUndefined();
@@ -167,7 +181,7 @@ describe('the live stream', () => {
   test('a view frame first when the presented token was stale', async () => {
     const s = stub.stream('t9', 7);
     const log: unknown[][] = [];
-    NewHTTPConnector(stub.url)(5, 'stale', ['*'], new AbortController().signal, hooks(log));
+    connector()(5, 'stale', ['*'], new AbortController().signal, hooks(log));
     await s.opened;
     s.push(['view', 't9', 7, ['book', 'patron:*']]);
     s.push(['live', 7]);
@@ -184,7 +198,7 @@ describe('the live stream', () => {
   test('a closed body without an end frame ends with code 0', async () => {
     const s = stub.stream();
     const log: unknown[][] = [];
-    NewHTTPConnector(stub.url)(-1, null, ['*'], new AbortController().signal, hooks(log));
+    connector()(-1, null, ['*'], new AbortController().signal, hooks(log));
     await s.opened;
     s.push(['live', 9]);
     s.end();
@@ -202,7 +216,7 @@ describe('the live stream', () => {
       res.end();
     });
     const log: unknown[][] = [];
-    NewHTTPConnector(stub.url)(-1, null, ['*'], new AbortController().signal, hooks(log));
+    connector()(-1, null, ['*'], new AbortController().signal, hooks(log));
     await settle();
     expect(log).toEqual([['end', 200, 'stream: no epoch']]);
   });
@@ -213,7 +227,7 @@ describe('the live stream', () => {
       res.end();
     });
     const log: unknown[][] = [];
-    NewHTTPConnector(stub.url)(-1, null, ['*'], new AbortController().signal, hooks(log));
+    connector()(-1, null, ['*'], new AbortController().signal, hooks(log));
     await settle();
     expect(log).toEqual([['end', 200, 'stream: no position']]);
   });
@@ -224,7 +238,7 @@ describe('the live stream', () => {
       res.end('token rejected');
     });
     const log: unknown[][] = [];
-    NewHTTPConnector(stub.url)(-1, null, ['*'], new AbortController().signal, hooks(log));
+    connector()(-1, null, ['*'], new AbortController().signal, hooks(log));
     await settle();
     expect(log).toEqual([['end', 401, 'token rejected']]);
   });
@@ -233,7 +247,7 @@ describe('the live stream', () => {
     const s = stub.stream();
     const log: unknown[][] = [];
     const ctl = new AbortController();
-    NewHTTPConnector(stub.url)(-1, null, ['*'], ctl.signal, hooks(log));
+    connector()(-1, null, ['*'], ctl.signal, hooks(log));
     await s.opened;
     ctl.abort();
     await settle();
@@ -246,7 +260,7 @@ describe('the live stream', () => {
 });
 
 describe('sendCommands', () => {
-  let conn: Connector;
+  let conn: Connection;
   let stream: ReturnType<Stub['stream']>;
   let seen: string[];
   // how many requests fail, with what status; 0 destroys the socket instead of answering
@@ -281,7 +295,7 @@ describe('sendCommands', () => {
         res.end(Buffer.from(encode([['ok', seen.length]])));
       }, delay);
     });
-    conn = NewHTTPConnector(stub.url, () => 'jwt')(
+    conn = connector(restoreSession(JWT))(
       -1,
       null,
       ['*'],
@@ -291,7 +305,7 @@ describe('sendCommands', () => {
   });
   const ends = () => log.filter((entry) => entry[0] === 'end');
   const send = (id: string) =>
-    conn.sendCommands([{ id: uuidOf(id), session: 's1', n: 1, data: encode({ type: 'noop' }) }]);
+    conn.sendCommands([{ id: uuidOf(id), series: 's1', n: 1, data: encode({ type: 'noop' }) }]);
 
   test('calls are applied in call order even when the first is slow', async () => {
     const [a, b, c] = await Promise.all([send('a'), send('b'), send('c')]);
@@ -306,7 +320,7 @@ describe('sendCommands', () => {
     expect(decode(req.body)).toEqual(['s1', 1, label('a'), { type: 'noop' }]);
   });
 
-  test('a 5xx is retried under the same sessions and numbers, and the call succeeds', async () => {
+  test('a 5xx is retried under the same series and numbers, and the call succeeds', async () => {
     failures = 1;
     failStatus = 503;
     expect((await send('a'))[0]).toEqual({ kind: 'ok', position: 2 });
@@ -373,7 +387,7 @@ describe('sendCommands', () => {
         ),
       );
     });
-    const sessions: [string | null, number | null][] = [
+    const series: [string | null, number | null][] = [
       ['s1', 1],
       ['s1', 2],
       [null, null],
@@ -382,8 +396,8 @@ describe('sendCommands', () => {
     const r = await conn.sendCommands(
       ['a', 'b', 'c', 'd'].map((id, i) => ({
         id: uuidOf(id),
-        session: sessions[i][0],
-        n: sessions[i][1],
+        series: series[i][0],
+        n: series[i][1],
         data: encode({}),
       })),
     );
@@ -396,6 +410,212 @@ describe('sendCommands', () => {
   });
 });
 
+describe('HTTPTransport', () => {
+  // an /auth/token that signs tokens for the user it was asked about, or refuses with status
+  function auth(refuse?: number): { bodies: unknown[] } {
+    const bodies: unknown[] = [];
+    stub.routes.set('/auth/token', (_req, body, res) => {
+      const req = decode(body) as { identity?: string };
+      bodies.push(req);
+      if (refuse !== undefined) {
+        res.writeHead(refuse);
+        res.end('no such account');
+        return;
+      }
+      const t = token(req.identity ?? 'u1', Math.floor(Date.now() / 1000) + bodies.length);
+      res.writeHead(200);
+      res.end(Buffer.from(encode({ token: t, user: req.identity ?? 'u1', exp: 99 })));
+    });
+    return { bodies };
+  }
+
+  // a /commands that answers every command ok, or refuses with status
+  function commands(refuse?: number): void {
+    stub.routes.set('/commands', (_req, body, res) => {
+      if (refuse !== undefined) {
+        res.writeHead(refuse);
+        res.end('token rejected');
+        return;
+      }
+      res.writeHead(200);
+      res.end(Buffer.from(encode([...decodeMulti(body)].map(() => ['ok', 7]))));
+    });
+  }
+
+  test('a login answers a session for the user its token names', async () => {
+    const { bodies } = auth();
+    const s = await new HTTPTransport(stub.url).login({ kind: 'dev', identity: 'ann' });
+    expect(bodies).toEqual([{ kind: 'dev', identity: 'ann' }]);
+    expect(s.user).toBe('ann');
+    expect(s.ended).toBe(false);
+  });
+
+  test('a refused login rejects with an AuthError naming the status', async () => {
+    auth(401);
+    const login = new HTTPTransport(stub.url).login({ kind: 'dev', identity: 'nobody' });
+    await expect(login).rejects.toThrow(AuthError);
+    await expect(login).rejects.toMatchObject({ status: 401 });
+  });
+
+  test('a session past half its lifetime is refreshed in place before it is presented', async () => {
+    const { bodies } = auth();
+    commands();
+    const old = token('ann', Math.floor(Date.now() / 1000) - 100, 150);
+    const s = restoreSession(old);
+    const seen: string[] = [];
+    s.onRefresh = (r) => seen.push(r.token);
+    const command = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
+    const t = new HTTPTransport(stub.url);
+
+    // two posts at once share one refresh, and both present the new token
+    await Promise.all([t.post([command], s), t.post([command], s)]);
+    expect(bodies).toEqual([{ kind: 'refresh' }]);
+    const refresh = stub.requests.find((r) => r.path === '/auth/token')!;
+    expect(refresh.headers.authorization).toBe(`Bearer ${old}`);
+    expect(seen).toEqual([s.token]);
+    expect(s.token).not.toBe(old);
+    expect(s.exp).toBe(99);
+    const posts = stub.requests.filter((r) => r.path === '/commands');
+    expect(posts.map((r) => r.headers.authorization)).toEqual([
+      `Bearer ${s.token}`,
+      `Bearer ${s.token}`,
+    ]);
+  });
+
+  test('a session in the first half of its lifetime is presented as it is', async () => {
+    const { bodies } = auth();
+    commands();
+    const s = restoreSession(JWT);
+    const command = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
+    expect(await new HTTPTransport(stub.url).post([command], s)).toEqual([
+      { kind: 'ok', position: 7 },
+    ]);
+    expect(bodies).toEqual([]);
+    expect(s.token).toBe(JWT);
+  });
+
+  test('a refused post ends its session, and a post with an ended session sends nothing', async () => {
+    commands(401);
+    const s = restoreSession(JWT);
+    const t = new HTTPTransport(stub.url);
+    const command = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
+    await expect(t.post([command], s)).rejects.toThrow(AuthError);
+    expect(s.ended).toBe(true);
+    await expect(t.post([command], s)).rejects.toThrow(AuthError);
+    expect(stub.requests.length).toBe(1);
+  });
+
+  test('a refused stream ends the connection fatally and ends its session', async () => {
+    stub.routes.set('/stream', (_req, _body, res) => {
+      res.writeHead(401);
+      res.end('token rejected');
+    });
+    const s = restoreSession(JWT);
+    let fatal: unknown;
+    const h = hooks([]);
+    connector(s)(-1, null, ['*'], new AbortController().signal, {
+      ...h,
+      onEnd: (_code, _reason, f) => (fatal = f),
+    });
+    await settle();
+    expect(fatal).toBeInstanceOf(AuthError);
+    expect(s.ended).toBe(true);
+  });
+
+  test('a refused command send ends the connection fatally', async () => {
+    const st = stub.stream();
+    commands(401);
+    const s = restoreSession(JWT);
+    const log: unknown[][] = [];
+    let fatal: unknown;
+    const conn = connector(s)(-1, null, ['*'], new AbortController().signal, {
+      ...hooks(log),
+      onEnd: (code, reason, f) => {
+        log.push(['end', code, reason]);
+        fatal = f;
+      },
+    });
+    await st.opened;
+    const command = { id: uuidOf('c1'), series: 's', n: 1, data: encode({}) };
+    await expect(conn.sendCommands([command])).rejects.toThrow();
+    expect(log.at(-1)).toEqual(['end', 401, 'commands: 401 Unauthorized']);
+    expect(fatal).toBeInstanceOf(AuthError);
+    expect(s.ended).toBe(true);
+  });
+
+  test('an ended session fails its connection before it opens the stream', async () => {
+    const s = restoreSession(JWT);
+    s.ended = true;
+    let end: unknown[] = [];
+    connector(s)(-1, null, ['*'], new AbortController().signal, {
+      ...hooks([]),
+      onEnd: (code, _reason, fatal) => (end = [code, fatal]),
+    });
+    await settle();
+    expect(end[0]).toBe(401);
+    expect(end[1]).toBeInstanceOf(AuthError);
+    expect(stub.requests).toEqual([]);
+  });
+
+  // a /commands that fails with each status in turn, then answers every command ok
+  function flaky(...statuses: number[]): void {
+    stub.routes.set('/commands', (_req, body, res) => {
+      const status = statuses.shift();
+      if (status !== undefined) {
+        res.writeHead(status);
+        res.end('no');
+        return;
+      }
+      res.writeHead(200);
+      res.end(Buffer.from(encode([...decodeMulti(body)].map(() => ['ok', 7]))));
+    });
+  }
+
+  test('a numbered post that fails for a reason that may not recur is retried under the same ids', async () => {
+    flaky(503, 502);
+    const command = { id: uuidOf('c1'), series: 's1', n: 1, data: encode({}) };
+    expect(await new HTTPTransport(stub.url).post([command])).toEqual([
+      { kind: 'ok', position: 7 },
+    ]);
+    expect(stub.requests.length).toBe(3);
+    const bodies = stub.requests.map((r) => [...decodeMulti(r.body)]);
+    expect(bodies[2]).toEqual(bodies[0]);
+  });
+
+  test('an unnumbered post is tried once', async () => {
+    flaky(503);
+    const command = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
+    await expect(new HTTPTransport(stub.url).post([command])).rejects.toThrow('commands: 503');
+    expect(stub.requests.length).toBe(1);
+  });
+
+  test('a 4xx stands at once, numbered or not', async () => {
+    flaky(400);
+    const command = { id: uuidOf('c1'), series: 's1', n: 1, data: encode({}) };
+    await expect(new HTTPTransport(stub.url).post([command])).rejects.toThrow('commands: 400');
+    expect(stub.requests.length).toBe(1);
+  });
+
+  test('a session this library did not make is refused before anything is sent', async () => {
+    const t = new HTTPTransport(stub.url);
+    const foreign = { token: JWT, user: 'u1', exp: 0, ended: false } as unknown as Session;
+    const command = { id: uuidOf('c1'), series: 's1', n: 1, data: encode({}) };
+    await expect(t.post([command], foreign)).rejects.toThrow(/not a session from @phaselock/);
+    expect(() =>
+      t.connect(-1, null, ['*'], new AbortController().signal, hooks([]), foreign),
+    ).toThrow(TypeError);
+    expect(() => t.refresh(foreign)).toThrow(TypeError);
+    expect(stub.requests).toEqual([]);
+  });
+
+  test('builds each schema into a Registry once', () => {
+    const schema: Schema = { nodes: [], ids: {}, commands: null, eventTypes: {}, storeTypes: {} };
+    const t = new HTTPTransport(stub.url);
+    expect(t.buildRegistry(schema)).toBe(t.buildRegistry(schema));
+    expect(t.buildRegistry({ ...schema })).not.toBe(t.buildRegistry(schema));
+  });
+});
+
 describe('postCommand', () => {
   test('one command, with the token when given, answered with its outcome', async () => {
     stub.routes.set('/commands', (_req, _body, res) => {
@@ -404,17 +624,17 @@ describe('postCommand', () => {
     });
     const command = {
       id: uuidOf('c1'),
-      session: null,
+      series: null,
       n: null,
       data: encode({ type: 'create-account' }),
     };
-    expect(await postCommand(stub.url, command, 'jwt')).toEqual({
+    expect(await postCommand(stub.url, command, JWT)).toEqual({
       kind: 'reject',
       reason: 'taken',
     });
     expect(await postCommand(stub.url, command)).toEqual({ kind: 'reject', reason: 'taken' });
     const [signed, anonymous] = stub.requests;
-    expect(signed.headers.authorization).toBe('Bearer jwt');
+    expect(signed.headers.authorization).toBe(`Bearer ${JWT}`);
     expect(signed.headers['content-type']).toBe('application/msgpack');
     expect(decode(signed.body)).toEqual([null, null, label('c1'), { type: 'create-account' }]);
     expect(anonymous.headers.authorization).toBeUndefined();
@@ -425,7 +645,7 @@ describe('postCommand', () => {
       res.writeHead(503);
       res.end('busy');
     });
-    const command = { id: uuidOf('c1'), session: null, n: null, data: encode({}) };
+    const command = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
     await expect(postCommand(stub.url, command)).rejects.toThrow('commands: 503');
     expect(stub.requests.length).toBe(1);
   });
@@ -452,7 +672,7 @@ describe('backfill', () => {
   };
 
   async function run(
-    conn: Connector,
+    conn: Connection,
     ref: string,
     until: number,
     resume: Backfill['resume'] = null,
@@ -531,16 +751,10 @@ describe('backfill', () => {
     });
   }
 
-  let conn: Connector;
+  let conn: Connection;
   beforeEach(() => {
     stub.stream();
-    conn = NewHTTPConnector(stub.url, () => 'jwt')(
-      -1,
-      null,
-      ['*'],
-      new AbortController().signal,
-      hooks([]),
-    );
+    conn = connector(restoreSession(JWT))(-1, null, ['*'], new AbortController().signal, hooks([]));
   });
 
   test('header, batched values with record-boundary skips, checksums, and an empty tail', async () => {
@@ -564,7 +778,7 @@ describe('backfill', () => {
     expect(r.done.sort()).toEqual(['events', 'values']);
     const reqs = stub.requests.filter((q) => q.path.startsWith('/events/'));
     expect(reqs).toHaveLength(1);
-    expect(reqs[0].headers.authorization).toBe('Bearer jwt');
+    expect(reqs[0].headers.authorization).toBe(`Bearer ${JWT}`);
   });
 
   test('the tail pages forward from the blob position to until and stops on a short page', async () => {

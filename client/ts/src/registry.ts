@@ -10,6 +10,7 @@ import {
   type Registry,
   type Rep,
   type Schema,
+  type SchemaNode,
   type SchemaSolution,
 } from './contract.js';
 import { decodeAny, encodeAny, Reader, setEntry, Writer } from './msgpack.js';
@@ -729,36 +730,36 @@ function compile(schema: Schema): Plan[] {
   return plans;
 }
 
-/* An outbox row, `.command`, is [id, session, n, command], the session and n nil for a
-   sessionless command and the command nested as the msgpack value its wire bytes are, so a row
+/* An outbox row, `.command`, is [id, series, n, command], the series and n nil for an
+   unnumbered command and the command nested as the msgpack value its wire bytes are, so a row
    reads back as those bytes with no vocabulary. */
 
 function readCommand(bytes: Uint8Array): Command<Uint8Array> {
   const r = new Reader(bytes);
   if (r.arrayHeader() !== 4) throw new Error('malformed outbox row');
   const id = r.str();
-  let session: string | null = null;
+  let series: string | null = null;
   let n: number | null = null;
   if (r.tryNil()) {
     r.nil();
   } else {
-    session = r.str();
+    series = r.str();
     n = r.int();
   }
   const data = r.raw();
   if (!r.done) throw new Error('malformed outbox row');
-  return { id, session, n, data };
+  return { id, series, n, data };
 }
 
 function writeCommand(c: Command<Uint8Array>): Uint8Array {
   const w = new Writer();
   w.arrayHeader(4);
   w.str(c.id);
-  if (c.session === null || c.n === null) {
+  if (c.series === null || c.n === null) {
     w.nil();
     w.nil();
   } else {
-    w.str(c.session);
+    w.str(c.series);
     w.int(c.n);
   }
   w.raw(c.data);
@@ -780,6 +781,10 @@ function isSystemEvent(r: Reader): boolean {
   return sys;
 }
 
+// each node table's plans, compiled once and shared by every Registry over it, since every schema
+// of one model shares one node table
+const compiled = new WeakMap<readonly SchemaNode[], Plan[]>();
+
 class Registry_ implements Registry {
   readonly commands: string;
   readonly eventTypes: Record<string, string>;
@@ -795,7 +800,11 @@ class Registry_ implements Registry {
     this.commands = schema.commands ?? '';
     this.eventTypes = schema.eventTypes;
     this.storeTypes = schema.storeTypes;
-    const plans = compile(schema);
+    let plans = compiled.get(schema.nodes);
+    if (plans === undefined) {
+      plans = compile(schema);
+      compiled.set(schema.nodes, plans);
+    }
     for (const [id, i] of Object.entries(schema.ids)) this.#plans.set(id, plans[i]);
   }
 

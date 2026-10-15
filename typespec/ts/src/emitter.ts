@@ -1007,30 +1007,34 @@ function generateEngine(d: Denter, annos: Annos, registry: PTypeRegistry, e: PEn
 /** the Engine of ${e.name}, syncing ${names} */
 export class ${e.name} extends Engine<${queryTxnType}, ${txnType}, ${C}, ${N}> {
   constructor(
-    // if store is null, InMemStore is used
-    store: Store | null,
-    reg: Registry,
-    connect: ConnectorFactory,
-    callbacks: {
+    transport: Transport,
+    options: {
+      // who the Engine syncs as, or null for anonymous
+      session: Session | null;
       // each slice's reducer handlers, by family
       reducers: ${reducersAnno(e.slices)};
       // optional: forecast what the database will do with a command
       forecasters?: ${tableType};
-      // optional: ends the Engine, its connector, and every backfill
+      // optional: makes the Engine's store from its Registry; without it, an InMemStore
+      store?: StoreFactory;
+      // optional: ends the Engine, its connection, and every backfill
       signal?: Signal;
       // optional: receives the error that ended the Engine
       onError?: (e: unknown) => void;
     },
   ) {
-    const forecasters = callbacks.forecasters;
+    const forecasters = options.forecasters;
     const queries = create${queryTxnType}();
     const forecasts = create${txnType}();
-    super((txn) => queries.bind(txn), (txn) => forecasts.bind(txn), store, reg, connect, {
-      reducers: ${reducersValue(e.slices, 'callbacks.reducers')},
+    const schema = ${lowerFirst(e.name)}Schema;
+    super((txn) => queries.bind(txn), (txn) => forecasts.bind(txn), schema, transport, {
+      session: options.session,
+      reducers: ${reducersValue(e.slices, 'options.reducers')},
       wants: ${JSON.stringify(wants)},
+      store: options.store,
       forecaster: forecasters === undefined ? undefined : ${lowerFirst(e.name)}Forecaster(forecasters),
-      signal: callbacks.signal,
-      onError: callbacks.onError,
+      signal: options.signal,
+      onError: options.onError,
     });
   }
 }
@@ -1155,6 +1159,22 @@ export function define${db.name}<P = {}>(slots: ${slotsType}<P>): Bundle {
   };
   (globalThis as { __bundle?: Bundle }).__bundle = bundle;
   return bundle;
+}
+`);
+
+  // a post of any of the database's commands outside any Engine, named for the database without
+  // a trailing DB or Database
+  if (commandUnion === undefined) return;
+  const post = `post${db.name.replace(/(db|database)$/i, '')}Command`;
+  d.print(`
+/** Posts one of ${db.name}'s commands outside any Engine, such as one sent before anyone has
+    signed in, as the session or as anonymous, and answers with the database's outcome */
+export function ${post}(
+  transport: Transport,
+  command: ${annos.get(commandUnion)!},
+  options: { session?: Session | null } = {},
+): Promise<CommandResult> {
+  return postWithSchema(${lowerFirst(db.name)}Schema, transport, command, options);
 }
 `);
 }
