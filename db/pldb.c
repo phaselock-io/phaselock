@@ -626,14 +626,72 @@ static void family_of(const char *stream, char *out, size_t cap) {
 #define EXPECT_MAX 1024
 
 /* one command: returns the outcome as an mpack write into w */
+/* write an outcome of a kind and a reason */
+static void write_reason(mpack_writer_t *w, const char *kind, const char *reason) {
+    mpack_start_array(w, 2);
+    mpack_write_cstr(w, kind);
+    mpack_write_cstr(w, reason);
+    mpack_finish_array(w);
+}
+
+/* whether a view, maySee's refs in wire form, covers a stream: a wildcard the names that begin
+   with its text before the star, and a name itself */
+static bool view_covers(const strlist *view, const char *stream) {
+    for (size_t i = 0; i < view->n; i++) {
+        const char *ref = view->v[i];
+        bool wild = is_wildcard(ref);
+        if (wild && strncmp(stream, ref, strlen(ref) - 1) == 0) return true;
+        if (!wild && strcmp(stream, ref) == 0) return true;
+    }
+    return false;
+}
+
 /* The OCC check: every expected stream's seq must be exactly what the client names (0 for never
    born).  expect is the command's map as the intake checked it, or NULL for a command without
-   one.  Writes a conflict outcome listing each mismatched stream's actual seq and returns true
-   when any differs. */
-static bool check_expect(pldb *db, mpack_writer_t *w, const mpack_node_t *expect) {
+   one.  An expectation answers a stream's seq, so the sender may name only streams its maySee
+   covers when the command's turn comes; naming another rejects the command, whether or not the
+   stream exists.  Writes the reject, or a conflict outcome listing each mismatched stream's
+   actual seq, and returns true when either is written. */
+static bool check_expect(pldb *db, mpack_writer_t *w, const uint8_t *id,
+                         const mpack_node_t *expect, JSValueConst principal) {
     if (!expect) return false;
     size_t n = mpack_node_map_count(*expect);
     if (n > EXPECT_MAX) die("prepared expect: %zu streams", n);
+    if (n == 0) return false;
+
+    // what the sender may see; a maySee that fails grants nothing
+    strlist view = {0};
+    int rc = js_maysee(&db->js, principal, &view);
+    for (size_t i = 0; rc == 0 && i < view.n; i++) {
+        if (!normalize_bundle_ref(&db->js, view.v[i])) rc = -1;
+    }
+    if (rc) {
+        strlist_free(&view);
+        char *reason = bug_reason(db, id, strf("maySee failed: %s", db->js.err));
+        write_reason(w, "reject", reason);
+        free(reason);
+        return true;
+    }
+
+    // every expected stream inside it
+    buf name = {0};
+    bool hidden = false;
+    for (size_t i = 0; i < n && !hidden; i++) {
+        mpack_node_t k = mpack_node_map_key_at(*expect, i);
+        name.len = 0;
+        buf_append(&name, mpack_node_str(k), mpack_node_strlen(k));
+        buf_append(&name, "", 1);
+        if (view_covers(&view, (const char *)name.p)) continue;
+        char *reason = strf("expect: %s is not a stream the sender may see", (char *)name.p);
+        write_reason(w, "reject", reason);
+        free(reason);
+        hidden = true;
+    }
+    strlist_free(&view);
+    if (hidden) {
+        buf_free(&name);
+        return true;
+    }
 
     // the streams whose seq differs from what the client named, with their seq
     struct conflict {
@@ -641,7 +699,6 @@ static bool check_expect(pldb *db, mpack_writer_t *w, const mpack_node_t *expect
         uint64_t seq;
     } conflicts[EXPECT_MAX];
     size_t nconflicts = 0;
-    buf name = {0};
     for (size_t i = 0; i < n; i++) {
         mpack_node_t k = mpack_node_map_key_at(*expect, i);
         name.len = 0;
@@ -753,14 +810,6 @@ static char *apply_outputs(pldb *db, batch *b, const uint8_t *id, pc_result *pc)
     return NULL;
 }
 
-/* write an outcome of a kind and a reason */
-static void write_reason(mpack_writer_t *w, const char *kind, const char *reason) {
-    mpack_start_array(w, 2);
-    mpack_write_cstr(w, kind);
-    mpack_write_cstr(w, reason);
-    mpack_finish_array(w);
-}
-
 /* write an ok outcome: the command was decided at or before position */
 static void write_ok(mpack_writer_t *w, uint64_t position) {
     mpack_start_array(w, 2);
@@ -774,7 +823,7 @@ static void write_ok(mpack_writer_t *w, uint64_t position) {
 static void decide(pldb *db, batch *b, mpack_writer_t *w, const uint8_t *id, JSValueConst data,
                    const mpack_node_t *expect, JSValueConst principal) {
     // the client's expectations of its streams
-    if (check_expect(db, w, expect)) return;
+    if (check_expect(db, w, id, expect, principal)) return;
 
     // precommit, and the streams it emitted to
     char *reason = NULL;
@@ -1808,13 +1857,13 @@ done:
     return reason;
 }
 
-int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, pldb_prepared *out,
-                 char *err, size_t errlen) {
+int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, size_t max,
+                 pldb_prepared *out, char *err, size_t errlen) {
     memset(out, 0, sizeof *out);
     mpack_tree_t tree;
 
-    // the request is a sequence of [S, n, id, data, expect?] values: count them, refusing the
-    // whole request when any is not one, since nothing can be answered for it
+    // the request is a sequence of at most max [S, n, id, data, expect?] values: count them,
+    // refusing the whole request when any is not one, since nothing can be answered for it
     size_t ncmds = 0;
     mpack_tree_init_data(&tree, (const char *)body, len);
     for (size_t consumed = 0; consumed < len; ncmds++) {
@@ -1829,6 +1878,11 @@ int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, pldb_
             snprintf(err, errlen, "command must be [S, n, id, data, expect?]");
             mpack_tree_destroy(&tree);
             return -1;
+        }
+        if (ncmds == max) {
+            snprintf(err, errlen, "a request carries at most %zu commands", max);
+            mpack_tree_destroy(&tree);
+            return PLDB_TOO_MANY;
         }
     }
     mpack_tree_destroy(&tree);

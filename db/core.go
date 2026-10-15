@@ -342,19 +342,24 @@ type prepared struct {
 	proofs  [][]string
 }
 
+var errTooMany = errors.New("the request carries more commands than the database takes in one")
+
 // prepare checks every command of a request against the bundle's registry and prepares the
 // fields the database replaces before precommit, hashing passwords on the pool for client under
 // ctx, and setting each CommandAuth proof's password aside for the caller to check.  It returns
-// errBusy or errLimited when a hash was refused, which refuses the whole request.
-func (c *core) prepare(s *Server, ctx context.Context, client string, body []byte) (*prepared, error) {
+// errTooMany for a request of more than max commands, checking none of them, and errBusy or
+// errLimited when a hash was refused, which refuses the whole request.
+func (c *core) prepare(s *Server, ctx context.Context, client string, body []byte, max int) (*prepared, error) {
 	call := cgo.NewHandle(&hashCall{s: s, ctx: ctx, client: client})
 	defer call.Delete()
 	ptr, l := cbytes(body)
 	var out C.pldb_prepared
 	errbuf := make([]byte, 512)
-	rc := C.pldb_prepare(c.db, C.uintptr_t(call), ptr, l, &out, (*C.char)(unsafe.Pointer(&errbuf[0])), C.size_t(len(errbuf)))
+	rc := C.pldb_prepare(c.db, C.uintptr_t(call), ptr, l, C.size_t(max), &out, (*C.char)(unsafe.Pointer(&errbuf[0])), C.size_t(len(errbuf)))
 	switch rc {
 	case 0:
+	case C.PLDB_TOO_MANY:
+		return nil, errTooMany
 	case C.PLDB_HASH_BUSY:
 		return nil, errBusy
 	case C.PLDB_HASH_LIMITED:

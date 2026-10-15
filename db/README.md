@@ -358,8 +358,15 @@ Every frame is an array whose first element is a tag.
         expect?] values with S a string and n an integer, or both nil,
         and id 16 bytes of bin; nothing can be answered for such a
         body, command by command
+      → 413 when the body carries more commands than the request's
+        limit, refused before any is checked, with the limit in a
+        PhaseLock-Max-Commands header
 
 - Series, numbers, and the outcomes are under Command dedup.
+- A request carries at most 128 commands, and one without a session
+  at most 8 (`--max-commands`, `--max-anonymous-commands`).  A client
+  sends more as several requests, one after another, splitting again
+  under the limit a 413 names.
 - A command whose data fails the check gets `["reject", reason]`, the
   reason naming the path (`$.title: missing required field`).  It
   never reached dedup, so it is not a decision and its series' mark
@@ -380,6 +387,10 @@ Every frame is an array whose first element is a tag.
 - `expect` names at most 1024 streams, each once, with seqs from 0 to
   2^53 - 1.  One that breaks this is checked with the data: the
   command gets `["reject", reason]` and is not a decision.
+- An expectation answers a stream's seq, so it may name only streams
+  the sender's maySee covers when the command's turn comes.  Naming
+  any other rejects the command, alike whether or not the stream
+  exists; the reject is a decision.
 
     GET /snapshot/<ref>          ref = stream, wildcard, or *
       → application/octet-stream: the blob (below), inline, with its

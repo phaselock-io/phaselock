@@ -18,6 +18,9 @@ func main() {
 	devAuth := flag.Bool("dev-auth", false, "sign in as any existing account with no credential at /auth/token")
 	clientIPHeader := flag.String("client-ip-header", "", "the header a proxy sets to the client's address, "+
 		"such as CF-Connecting-IP; set only when nothing but the proxy can reach the listen address")
+	maxCommands := flag.Int("max-commands", 128, "the most commands one request may carry")
+	maxAnonymousCommands := flag.Int("max-anonymous-commands", 8,
+		"the most commands one request without a session may carry")
 	var bootstrapEnv []string
 	flag.Func("bootstrap-env", "an environment variable the bundle's bootstrap may read (repeatable)", func(name string) error {
 		bootstrapEnv = append(bootstrapEnv, name)
@@ -34,7 +37,7 @@ func main() {
 	defer stop()
 
 	srv, err := Open(ctx, Options{DataDir: *data, Bundle: *bundle, DevAuth: *devAuth, BootstrapEnv: bootstrapEnv,
-		ClientIPHeader: *clientIPHeader})
+		ClientIPHeader: *clientIPHeader, MaxCommands: *maxCommands, MaxAnonymousCommands: *maxAnonymousCommands})
 	if err != nil {
 		log.Fatal(err)
 	}

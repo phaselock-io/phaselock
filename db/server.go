@@ -41,6 +41,10 @@ type Options struct {
 	// CF-Connecting-IP; trusted from every request, so set only when nothing but the proxy can
 	// reach the server
 	ClientIPHeader string
+	// the most commands one POST /commands may carry (default 128), and one without a session
+	// (default 8)
+	MaxCommands          int
+	MaxAnonymousCommands int
 
 	// tests only: the clock tokens and their keys are minted and checked by, time.Now when nil
 	now func() time.Time
@@ -60,6 +64,8 @@ type Server struct {
 	limit   *limiter
 	// the header naming each request's client, if any
 	clientIPHeader string
+	// the most commands a request may carry, and an anonymous one
+	maxCommands, maxAnonymousCommands int
 
 	mu       sync.Mutex
 	pending  map[uint64]chan result
@@ -164,23 +170,32 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 	if rate <= 0 {
 		rate = 1
 	}
+	maxCommands, maxAnonymous := o.MaxCommands, o.MaxAnonymousCommands
+	if maxCommands <= 0 {
+		maxCommands = 128
+	}
+	if maxAnonymous <= 0 {
+		maxAnonymous = 8
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Server{
-		ctx:            ctx,
-		cancel:         cancel,
-		hashes:         newHashPool(ctx, workers, 2*workers),
-		limit:          newLimiter(rate, burst),
-		core:           c,
-		keys:           newKeyring(stored, now()),
-		now:            now,
-		devAuth:        o.DevAuth,
-		clientIPHeader: o.ClientIPHeader,
-		epoch:          c.epoch(),
-		pending:        map[uint64]chan result{},
-		conns:          map[uint64]*conn{},
-		done:           make(chan struct{}),
-		cron:           entries,
-		cronDone:       make(chan struct{}),
+		ctx:                  ctx,
+		cancel:               cancel,
+		hashes:               newHashPool(ctx, workers, 2*workers),
+		limit:                newLimiter(rate, burst),
+		core:                 c,
+		keys:                 newKeyring(stored, now()),
+		now:                  now,
+		devAuth:              o.DevAuth,
+		clientIPHeader:       o.ClientIPHeader,
+		maxCommands:          maxCommands,
+		maxAnonymousCommands: min(maxAnonymous, maxCommands),
+		epoch:                c.epoch(),
+		pending:              map[uint64]chan result{},
+		conns:                map[uint64]*conn{},
+		done:                 make(chan struct{}),
+		cron:                 entries,
+		cronDone:             make(chan struct{}),
 	}
 	go s.dispatch()
 
@@ -753,7 +768,17 @@ func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	client := s.clientOf(r)
-	pc, err := s.core.prepare(s, r.Context(), client, body)
+	limit := s.maxCommands
+	if p.anonymous {
+		limit = s.maxAnonymousCommands
+	}
+	pc, err := s.core.prepare(s, r.Context(), client, body, limit)
+	if errors.Is(err, errTooMany) {
+		// the limit this request was held to, which the client splits its commands under
+		w.Header().Set("PhaseLock-Max-Commands", strconv.Itoa(limit))
+		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+		return
+	}
 	if errors.Is(err, errBusy) || errors.Is(err, errLimited) {
 		hashFailed(w, err)
 		return

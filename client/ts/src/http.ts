@@ -32,6 +32,10 @@ const sendRetryDelay = 100;
 // a session is refreshed once it has lived this share of its lifetime
 const refreshAfter = 0.5;
 
+// the most commands one request carries, with a session and without one: the database's
+// defaults, until a 413 names the database's own
+type CommandLimits = { session: number; anonymous: number };
+
 type BlobHeader = { position: number; streams: Record<string, number> };
 
 // a blob body opened past its header: the reader at its first record, whether the download is
@@ -70,6 +74,8 @@ export class HTTPTransport implements Transport {
   #registries = new WeakMap<Schema, Registry>();
   // each session's refresh in flight, which every caller that wants it refreshed meanwhile shares
   #refreshes = new WeakMap<Session, Promise<void>>();
+  // shared with every connection, so a limit one request learns holds for all of them
+  #limits: CommandLimits = { session: 128, anonymous: 8 };
 
   constructor(url: string) {
     this.#url = url;
@@ -94,30 +100,43 @@ export class HTTPTransport implements Transport {
   ): Connection {
     ours(session);
     const ready = () => (session === null ? Promise.resolve() : this.#fresh(session));
-    return new HTTPConnection(this.#url, session, ready, since, view, wants, signal, hooks);
+    return new HTTPConnection(
+      this.#url,
+      session,
+      ready,
+      this.#limits,
+      since,
+      view,
+      wants,
+      signal,
+      hooks,
+    );
   }
 
-  /** One request of commands outside any connection, as the session or as anonymous, answered
-      with their outcomes in order.  A request of numbered commands that fails for a reason that
+  /** Commands outside any connection, as the session or as anonymous, answered with their
+      outcomes in order, in as many requests as the database's limit on commands per request
+      calls for, one after another.  A request of numbered commands that fails for a reason that
       may not recur is tried again a few times under the same ids, which the database's dedup
       makes safe; a request with an unnumbered command is tried once.  A 4xx stands at once, and
-      a refused session ends, and the request rejects with an AuthError. */
+      a refused session ends, and the post rejects with an AuthError. */
   async post(
     commands: Command<Uint8Array>[],
     session: Session | null = null,
   ): Promise<CommandResult[]> {
     ours(session);
     if (session !== null) await this.#fresh(session);
-    const numbered = commands.every((c) => c.series !== null && c.n !== null);
-    for (let attempt = 0; ; attempt++) {
-      try {
-        return await postCommands(this.#url, authorization(session), commands);
-      } catch (e: unknown) {
-        const clientError = e instanceof StatusError && e.status >= 400 && e.status < 500;
-        if (!numbered || clientError || attempt === sendRetries) throw refusal(e, session);
-        await sleep(sendRetryDelay * 2 ** attempt, new AbortController().signal);
+    return inRequests(commands, this.#limits, session === null, async (request) => {
+      const numbered = request.every((c) => c.series !== null && c.n !== null);
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await postCommands(this.#url, authorization(session), request);
+        } catch (e: unknown) {
+          const clientError = e instanceof StatusError && e.status >= 400 && e.status < 500;
+          if (!numbered || clientError || attempt === sendRetries) throw refusal(e, session);
+          await sleep(sendRetryDelay * 2 ** attempt, new AbortController().signal);
+        }
       }
-    }
+    });
   }
 
   /** Signs in, answering a new session.  A login the database refuses, for any reason, rejects
@@ -227,6 +246,7 @@ class HTTPConnection implements Connection {
   #url: string;
   #session: Session | null;
   #ready: () => Promise<void>;
+  #limits: CommandLimits;
   #signal: AbortSignal;
   #hooks: ConnectionHooks;
   #ended = false;
@@ -246,6 +266,7 @@ class HTTPConnection implements Connection {
     url: string,
     session: Session | null,
     ready: () => Promise<void>,
+    limits: CommandLimits,
     since: number,
     view: string | null,
     wants: string[],
@@ -255,6 +276,7 @@ class HTTPConnection implements Connection {
     this.#url = url;
     this.#session = session;
     this.#ready = ready;
+    this.#limits = limits;
     this.#signal = AbortSignal.any([nativeSignal(signal), this.#stop.signal]);
     this.#hooks = hooks;
     void this.#run(since, view, wants);
@@ -567,22 +589,27 @@ class HTTPConnection implements Connection {
     this.#sending = false;
   }
 
-  /* One call, as up to one request plus the retries.  A retry repeats the request under the same
-     ids, which the database's dedup makes safe: a command the first attempt committed answers dup.
-     A 4xx answer is the client's own doing and stands at once; so does any failure once the
-     stream has ended or the connection was aborted, since the next connection resends. */
+  /* One call, as the requests the database's limit calls for, each with its retries.  A retry
+     repeats the request under the same ids, which the database's dedup makes safe: a command the
+     first attempt committed answers dup.  A 4xx answer is the client's own doing and stands at
+     once; so does any failure once the stream has ended or the connection was aborted, since the
+     next connection resends. */
   async #post(commands: Command<Uint8Array>[]): Promise<CommandResult[]> {
     await this.#ready();
-    for (let attempt = 0; ; attempt++) {
-      try {
-        return await postCommands(this.#url, this.#headers(), commands, this.#signal);
-      } catch (e: unknown) {
-        const clientError = e instanceof StatusError && e.status >= 400 && e.status < 500;
-        if (attempt === sendRetries || clientError || this.#ended || this.#signal.aborted) throw e;
-        await sleep(sendRetryDelay * 2 ** attempt, this.#signal);
-        if (this.#ended) throw e;
+    return inRequests(commands, this.#limits, this.#session === null, async (request) => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await postCommands(this.#url, this.#headers(), request, this.#signal);
+        } catch (e: unknown) {
+          const clientError = e instanceof StatusError && e.status >= 400 && e.status < 500;
+          if (attempt === sendRetries || clientError || this.#ended || this.#signal.aborted) {
+            throw e;
+          }
+          await sleep(sendRetryDelay * 2 ** attempt, this.#signal);
+          if (this.#ended) throw e;
+        }
       }
-    }
+    });
   }
 
   // a send that failed ends the connection: the one onEnd carries the response's status, or 0
@@ -640,8 +667,44 @@ class StatusError extends Error {
   }
 }
 
+/** a 413: the request carried more commands than the database takes in one, max */
+class TooManyCommands extends StatusError {
+  max: number;
+  constructor(max: number, message: string) {
+    super(413, message);
+    this.max = max;
+  }
+}
+
+/* Commands in requests of at most the sender's limit each, one after another so that a series'
+   commands reach the database in order, answered with their outcomes in order.  send makes one
+   request, with whatever retries its caller wants.  A 413 names the limit the database held the
+   request to, which the commands not yet answered are split again under; the database refuses
+   such a request before checking any of its commands, so nothing in it was decided. */
+async function inRequests(
+  commands: Command<Uint8Array>[],
+  limits: CommandLimits,
+  anonymous: boolean,
+  send: (request: Command<Uint8Array>[]) => Promise<CommandResult[]>,
+): Promise<CommandResult[]> {
+  const sender = anonymous ? 'anonymous' : 'session';
+  const results: CommandResult[] = [];
+  while (results.length < commands.length) {
+    const request = commands.slice(results.length, results.length + limits[sender]);
+    try {
+      results.push(...(await send(request)));
+    } catch (e: unknown) {
+      // a limit that would not split the request is the database's mistake, and stands
+      if (!(e instanceof TooManyCommands) || e.max >= request.length) throw e;
+      limits[sender] = e.max;
+    }
+  }
+  return results;
+}
+
 /* One POST of commands, answered with their outcomes in order.  Any status but 200 rejects, since
-   such a response answers no command. */
+   such a response answers no command; a 413 naming the database's limit rejects with
+   TooManyCommands. */
 async function postCommands(
   url: string,
   headers: Record<string, string>,
@@ -668,7 +731,12 @@ async function postCommands(
     body: w.bytes(),
   });
   if (resp.status !== 200) {
-    throw new StatusError(resp.status, `commands: ${resp.status} ${resp.statusText}`);
+    const message = `commands: ${resp.status} ${resp.statusText}`;
+    const max = Number(resp.headers.get('PhaseLock-Max-Commands'));
+    if (resp.status === 413 && Number.isSafeInteger(max) && max > 0) {
+      throw new TooManyCommands(max, message);
+    }
+    throw new StatusError(resp.status, message);
   }
   const outcomes = decodeAny(new Uint8Array(await resp.arrayBuffer())) as unknown[][];
   return outcomes.map((o): CommandResult => {

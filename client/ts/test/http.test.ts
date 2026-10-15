@@ -320,6 +320,31 @@ describe('sendCommands', () => {
     expect(decode(req.body)).toEqual(['s1', 1, label('a'), { type: 'noop' }]);
   });
 
+  test('a call past the limit goes in requests under it, in order', async () => {
+    stub.routes.set('/commands', (_req, body, res) => {
+      const cmds = [...decodeMulti(body)] as unknown[][];
+      seen.push(...cmds.map((c) => nameOf(c[2] as Uint8Array)));
+      if (cmds.length > 4) {
+        res.writeHead(413, { 'PhaseLock-Max-Commands': '4' });
+        res.end('too many');
+        return;
+      }
+      res.writeHead(200);
+      res.end(Buffer.from(encode(cmds.map((c) => ['ok', c[1]]))));
+    });
+    const ids = Array.from({ length: 10 }, (_, i) => `k${i}`);
+    const results = await conn.sendCommands(
+      ids.map((id, i) => ({ id: uuidOf(id), series: 's1', n: i + 1, data: encode({}) })),
+    );
+    expect(results.map((r) => (r.kind === 'ok' ? r.position : null))).toEqual(
+      ids.map((_, i) => i + 1),
+    );
+    const posts = stub.requests.filter((r) => r.path === '/commands');
+    expect(posts.map((r) => [...decodeMulti(r.body)].length)).toEqual([10, 4, 4, 2]);
+    expect(seen.slice(10)).toEqual(ids);
+    expect(ends()).toEqual([]);
+  });
+
   test('a 5xx is retried under the same series and numbers, and the call succeeds', async () => {
     failures = 1;
     failStatus = 503;
@@ -594,6 +619,49 @@ describe('HTTPTransport', () => {
     const command = { id: uuidOf('c1'), series: 's1', n: 1, data: encode({}) };
     await expect(new HTTPTransport(stub.url).post([command])).rejects.toThrow('commands: 400');
     expect(stub.requests.length).toBe(1);
+  });
+
+  // a /commands that takes at most max commands a request, refusing more with a 413 that names
+  // max, and answers each command it takes ok at its number
+  function limited(max: number): void {
+    stub.routes.set('/commands', (_req, body, res) => {
+      const cmds = [...decodeMulti(body)] as unknown[][];
+      if (cmds.length > max) {
+        res.writeHead(413, { 'PhaseLock-Max-Commands': String(max) });
+        res.end('too many');
+        return;
+      }
+      res.writeHead(200);
+      res.end(Buffer.from(encode(cmds.map((c) => ['ok', c[1]]))));
+    });
+  }
+  const numbered = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      id: uuidOf(`c${i}`),
+      series: 's1',
+      n: i + 1,
+      data: encode({}),
+    }));
+  const sizes = () =>
+    stub.requests.filter((r) => r.path === '/commands').map((r) => [...decodeMulti(r.body)].length);
+  const positions = (rs: { kind: string; position?: number }[]) => rs.map((r) => r.position);
+
+  test('a post goes in requests of 8 commands without a session, and of 128 with one', async () => {
+    limited(128);
+    const t = new HTTPTransport(stub.url);
+    const anonymous = await t.post(numbered(20));
+    const signedIn = await t.post(numbered(300), restoreSession(JWT));
+    expect(sizes()).toEqual([8, 8, 4, 128, 128, 44]);
+    expect(positions(anonymous)).toEqual(numbered(20).map((c) => c.n));
+    expect(positions(signedIn)).toEqual(numbered(300).map((c) => c.n));
+  });
+
+  test('a 413 naming a lower limit splits the rest of the post under it, and later posts start there', async () => {
+    limited(3);
+    const t = new HTTPTransport(stub.url);
+    expect(positions(await t.post(numbered(10)))).toEqual(numbered(10).map((c) => c.n));
+    expect(positions(await t.post(numbered(5)))).toEqual(numbered(5).map((c) => c.n));
+    expect(sizes()).toEqual([8, 3, 3, 3, 1, 3, 2]);
   });
 
   test('a session this library did not make is refused before anything is sent', async () => {

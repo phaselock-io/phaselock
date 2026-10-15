@@ -1551,7 +1551,7 @@ func TestBootstrapDeliversEverythingAboveTheViewPosition(t *testing.T) {
 }
 
 func TestColdReplayKeepsAtomsWhole(t *testing.T) {
-	h := start(t)
+	h := startWith(t, t.Context(), Options{MaxCommands: coldBatch})
 	admin := h.admin()
 
 	// a one-event atom shifts the two-event atoms after it off the window grid, so one of them
@@ -1597,7 +1597,7 @@ func TestColdReplayKeepsAtomsWhole(t *testing.T) {
 }
 
 func TestLongCatchupNoOverflow(t *testing.T) {
-	h := start(t)
+	h := startWith(t, t.Context(), Options{MaxCommands: 1500})
 	admin := h.admin()
 	name := strings.Repeat("x", 2000)
 	var cmds []command
@@ -1752,13 +1752,26 @@ func TestExpectAndConflict(t *testing.T) {
 	}
 
 	// a hashed command keeps its expectation through intake
-	o = h.expecting("", cmd("c7", "create-account", "user", "p1", "password", "pw"), map[string]any{"account:p1": 1})
+	o = h.expecting(admin, cmd("c7", "create-account", "user", "p1", "password", "pw"), map[string]any{"account:p1": 1})
 	if o.kind != "conflict" || o.current["account:p1"] != 0 {
 		t.Fatalf("expect survives hash intake: %+v", o)
 	}
-	o = h.expecting("", cmd("c8", "create-account", "user", "p1", "password", "pw"), map[string]any{"account:p1": 0})
+	o = h.expecting(admin, cmd("c8", "create-account", "user", "p1", "password", "pw"), map[string]any{"account:p1": 0})
 	if o.kind != "ok" {
 		t.Fatalf("hashed command with matching expect: %+v", o)
+	}
+
+	// an expectation names only streams the sender may see, so it never learns another's seq,
+	// nor whether it exists: an anonymous sender sees the book alone
+	o = h.expecting("", cmd("c8b", "create-account", "user", "p5", "password", "pw"), map[string]any{"book": h.snapshot(admin, "book").streams["book"]})
+	if o.kind != "ok" {
+		t.Fatalf("anonymous expect of a stream it may see: %+v", o)
+	}
+	for _, stream := range []string{"account:p1", "account:p6"} {
+		o = h.expecting("", cmd("c8c", "create-account", "user", "p6", "password", "pw"), map[string]any{stream: 0})
+		if o.kind != "reject" || o.reason != "expect: "+stream+" is not a stream the sender may see" {
+			t.Fatalf("anonymous expect of %s: %+v", stream, o)
+		}
 	}
 
 	// expect names at most 1024 streams
@@ -1814,6 +1827,58 @@ func TestExpectAndConflict(t *testing.T) {
 		if o := decodeOutcomes(t, out)[0]; o.kind != "reject" || o.reason != reason {
 			t.Fatalf("expect %x: %+v", expect, o)
 		}
+	}
+}
+
+// A request carries at most 128 commands, and one without a session at most 8; a request past
+// its limit is refused whole with 413 and the limit it was held to, before any command is
+// checked.  Options change both.
+func TestCommandLimits(t *testing.T) {
+	books := func(prefix string, n int) []command {
+		var cmds []command
+		for i := range n {
+			id := fmt.Sprintf("%s%d", prefix, i)
+			cmds = append(cmds, cmd(id, "add-book", "id", id, "title", "Dune"))
+		}
+		return cmds
+	}
+	post := func(h *harness, token string, cmds []command) (int, string) {
+		var body []byte
+		for _, c := range cmds {
+			body = append(body, c.encode(nil)...)
+		}
+		status, header, _ := h.do("POST", "/commands", token, body)
+		return status, header.Get("PhaseLock-Max-Commands")
+	}
+
+	// the defaults: anonymous commands are answered, if only with rejects, up to 8
+	h := start(t)
+	admin := h.admin()
+	if status, _ := post(h, admin, books("a", 128)); status != 200 {
+		t.Fatalf("128 commands: status %d", status)
+	}
+	if status, limit := post(h, admin, books("b", 129)); status != 413 || limit != "128" {
+		t.Fatalf("129 commands: status %d, limit %q", status, limit)
+	}
+	if status, _ := post(h, "", books("c", 8)); status != 200 {
+		t.Fatalf("8 anonymous commands: status %d", status)
+	}
+	if status, limit := post(h, "", books("d", 9)); status != 413 || limit != "8" {
+		t.Fatalf("9 anonymous commands: status %d, limit %q", status, limit)
+	}
+
+	// a refused request decided nothing
+	if o := h.commands(admin, books("b", 1)...)[0]; o.kind != "ok" {
+		t.Fatalf("a command of a refused request: %+v", o)
+	}
+
+	// limits of the server's own
+	h = startWith(t, t.Context(), Options{MaxCommands: 4, MaxAnonymousCommands: 2})
+	if status, limit := post(h, h.admin(), books("e", 5)); status != 413 || limit != "4" {
+		t.Fatalf("5 commands under 4: status %d, limit %q", status, limit)
+	}
+	if status, limit := post(h, "", books("f", 3)); status != 413 || limit != "2" {
+		t.Fatalf("3 anonymous commands under 2: status %d, limit %q", status, limit)
 	}
 }
 
@@ -2216,7 +2281,7 @@ func TestAPasswordProofIsCheckedAgainstTheSendersAccount(t *testing.T) {
 	}
 
 	// a failed proof is rejected before its expectations are compared, so it learns no seq
-	stale := map[string]any{"account:bob": 99}
+	stale := map[string]any{"patron:bob": 99}
 	bobs := func(id, password string) command {
 		return cmd(id, "authenticated-command", "user", "bob", "check", proof(password))
 	}

@@ -146,9 +146,11 @@ void pldb_result_free(pldb_result *r);
    the hash function for every password the request carries.  A CommandAuth proof is replaced
    by its result, and its password goes to proofs for the caller to check; a proof of any other
    kind rejects its command.  Returns 0; -1 for a request that is not a sequence of
-   [S, n, id, data, expect?] values; or PLDB_HASH_BUSY or PLDB_HASH_LIMITED when the hash
-   function refused, which refuses the whole request, so the client can retry it later under
-   the same series and numbers. */
+   [S, n, id, data, expect?] values; PLDB_TOO_MANY for one of more than max commands, refused
+   before any is checked; or PLDB_HASH_BUSY or PLDB_HASH_LIMITED when the hash function refused,
+   which refuses the whole request, so the client can retry it later under the same series and
+   numbers. */
+enum { PLDB_TOO_MANY = 3 };
 typedef struct pldb_proof {
     size_t command; /* its command's index in the request */
     char *password;
@@ -162,8 +164,8 @@ typedef struct pldb_prepared {
     pldb_proof *proofs;
     size_t nproofs;
 } pldb_prepared;
-int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, pldb_prepared *out,
-                 char *err, size_t errlen);
+int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, size_t max,
+                 pldb_prepared *out, char *err, size_t errlen);
 void pldb_prepared_free(pldb_prepared *p);
 
 /* Reader side: any thread, serialized internally. */

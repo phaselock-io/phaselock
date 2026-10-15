@@ -136,9 +136,10 @@ export interface Transport {
     hooks: ConnectionHooks,
     session: Session | null,
   ): Connection;
-  // One request of commands outside any connection, answered with their outcomes in order.  A
-  // transport may retry a failed request when every command in it is numbered, since the
-  // database answers a resend of one that landed as decided, and never retries one that is not.
+  // Commands outside any connection, answered with their outcomes in order, in as many requests
+  // as the database's limit on commands per request calls for, one after another.  A transport
+  // may retry a failed request when every command in it is numbered, since the database answers
+  // a resend of one that landed as decided, and never retries one that is not.
   post(commands: Command<Uint8Array>[], session?: Session | null): Promise<CommandResult[]>;
 }
 
