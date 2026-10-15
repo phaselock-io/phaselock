@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
+import type { Query, QueryFunction } from '@library/model/ui';
+import { useEffect, useState } from 'react';
 
-import type { Query, QueryFunction } from './model';
-
+/** The latest result of a query over an Engine, or undefined until it first answers. */
 export function useLocalQuery<QX, T>(
   // structurally match QX parameter from Engine
   eng: { newQuery<X>(fn: QueryFunction<QX, X>): Query<X> },
@@ -9,18 +9,11 @@ export function useLocalQuery<QX, T>(
 ): T | undefined {
   const [state, setState] = useState<T | undefined>();
 
-  const query = useMemo(() => {
-    const q = eng.newQuery(fn);
-    q.subscribe((val: T) => setState(val));
-    return q;
+  useEffect(() => {
+    const query = eng.newQuery(fn);
+    query.subscribe((val: T) => setState(() => val));
+    return () => query.close();
   }, [eng, fn]);
-
-  useEffect(
-    () => () => {
-      query.close();
-    },
-    [query],
-  );
 
   return state;
 }

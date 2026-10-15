@@ -1,4 +1,10 @@
-import { EditOutlined, PlusOutlined } from '@ant-design/icons';
+import { EditOutlined, LoadingOutlined, PlusOutlined, ReadOutlined } from '@ant-design/icons';
+import {
+  type AdminBookInfo,
+  type AdminEngine,
+  type AdminEngineQueryTxn,
+  adminQueries,
+} from '@library/model/ui';
 import {
   Button,
   Card,
@@ -12,38 +18,16 @@ import {
   Tag,
   Typography,
 } from 'antd';
-import { useCallback, useState } from 'react';
+import { useState } from 'react';
 
 import { colorHash } from './colorhash';
-import { AdminQX, QueryGenerator } from './model';
+import type { Client } from './engines';
 import { useLocalQuery } from './useLocalQuery';
-import { usePhaseLock } from './usePhaseLock';
 import { generateUuid } from './util';
 
 const { Text } = Typography;
 
 /* ---- types ---- */
-
-type AdminBookInfo = {
-  id: string;
-  restricted: boolean;
-  state: 'open' | 'restricted' | 'held' | 'out';
-  patronId?: string;
-  holdId?: string;
-  checkoutId?: string;
-};
-
-type AdminEditionInfo = {
-  isbn: string;
-  title: string;
-  books: AdminBookInfo[];
-};
-
-type AdminPatronInfo = {
-  id: string;
-  name: string;
-  researcher: boolean;
-};
 
 type PendingAction =
   | { type: 'book'; bookId: string; restricted: boolean }
@@ -102,96 +86,49 @@ function InlineEdit({
   );
 }
 
+// the commands the Engine queues and sends, which are all those the window sends
+type Command = Parameters<AdminEngine['sendCommand']>[0];
+
+// the state of the Engine's connection, which a query reads like any other state
+function connectionQuery(qx: AdminEngineQueryTxn) {
+  return qx.status.connection().state;
+}
+
+// the tag color of each connection state
+const STATE_COLORS = {
+  connecting: 'orange',
+  syncing: 'blue',
+  live: 'green',
+  offline: 'red',
+};
+
 /* ---- main component ---- */
 
-export default function AdminWindow({ relayUrl }: { relayUrl: string }) {
-  const [enabled, setEnabled] = useState(true);
-  const [eng, connState] = usePhaseLock(relayUrl, enabled);
+export default function AdminWindow({ client }: { client: Client<AdminEngine> }) {
+  const eng = client.engine;
+  const [enabled, setEnabled] = useState(client.transport.online);
   const [pendingAction, setPendingAction] = useState<PendingAction>(null);
   const [addingEdition, setAddingEdition] = useState(false);
   const [newEditionTitle, setNewEditionTitle] = useState('');
 
   // --- queries ---
 
-  const patronsLookup = useCallback(function* (qx: AdminQX): QueryGenerator<AdminPatronInfo[]> {
-    const patrons = yield* qx.get.patrons();
-    const out: AdminPatronInfo[] = [];
-    for (const id of Object.keys(patrons).sort()) {
-      const patron = yield* qx.get.patron(id);
-      out.push({ id, name: patron.name, researcher: patron.researcher });
-    }
-    return out;
-  }, []);
-
-  const editionsLookup = useCallback(function* (qx: AdminQX): QueryGenerator<AdminEditionInfo[]> {
-    const editions = yield* qx.get.editions();
-    const out: AdminEditionInfo[] = [];
-    for (const isbn of Object.keys(editions)) {
-      const edition = yield* qx.get.edition(isbn);
-      // fetch all books and sort by timestamp (insertion order)
-      const allBooks = [];
-      for (const bookId of Object.keys(edition.books)) {
-        allBooks.push(yield* qx.get.book(bookId));
-      }
-      allBooks.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
-      const books: AdminBookInfo[] = [];
-
-      // edition-level holds: visually assign to first N unrestricted available books
-      const editionHoldIds = Object.keys(edition.holds);
-      let editionHoldIdx = 0;
-
-      for (const book of allBooks) {
-        const bookId = book.id;
-
-        if (book.status) {
-          if ('hold' in book.status) {
-            const hold = yield* qx.get.hold(book.status.hold);
-            books.push({
-              id: bookId,
-              restricted: book.restricted,
-              state: 'held',
-              patronId: hold.patron,
-              holdId: hold.id,
-            });
-          } else {
-            const checkout = yield* qx.get.checkout(book.status.checkout);
-            books.push({
-              id: bookId,
-              restricted: book.restricted,
-              state: 'out',
-              patronId: checkout.patron,
-              checkoutId: checkout.id,
-            });
-          }
-        } else if (!book.restricted && editionHoldIdx < editionHoldIds.length) {
-          const holdId = editionHoldIds[editionHoldIdx++];
-          const hold = yield* qx.get.hold(holdId);
-          books.push({
-            id: bookId,
-            restricted: book.restricted,
-            state: 'held',
-            patronId: hold.patron,
-            holdId: hold.id,
-          });
-        } else {
-          books.push({
-            id: bookId,
-            restricted: book.restricted,
-            state: book.restricted ? 'restricted' : 'open',
-          });
-        }
-      }
-
-      out.push({ isbn, title: edition.title, books });
-    }
-    out.sort((a, b) => a.title.localeCompare(b.title));
-    return out;
-  }, []);
-
-  const patrons = useLocalQuery(eng, patronsLookup);
-  const editions = useLocalQuery(eng, editionsLookup);
+  const patrons = useLocalQuery(eng, adminQueries.allPatrons);
+  const editions = useLocalQuery(eng, adminQueries.allEditions);
+  const connState = useLocalQuery(eng, connectionQuery) ?? 'connecting';
 
   // --- handlers ---
+
+  function send(command: Command) {
+    eng.sendCommand(command);
+  }
+
+  // the switch takes the window's way to the database offline, and back online at once
+  function setOnline(on: boolean) {
+    client.transport.online = on;
+    if (on) eng.reconnectNow();
+    setEnabled(on);
+  }
 
   function handleBookClick(book: AdminBookInfo) {
     switch (book.state) {
@@ -209,71 +146,64 @@ export default function AdminWindow({ relayUrl }: { relayUrl: string }) {
         });
         break;
       case 'out':
-        eng.sendCommands([
-          {
-            type: 'end-checkout',
-            checkout: book.checkoutId!,
-            timestamp: new Date(),
-          },
-        ]);
+        send({
+          type: 'end-checkout',
+          checkout: book.checkoutId!,
+          patron: book.patronId!,
+          timestamp: new Date(),
+        });
         break;
     }
   }
 
   function handleCheckout(patronId: string) {
     if (pendingAction?.type !== 'book') return;
-    eng.sendCommands([
-      {
-        type: 'try-checkout',
-        id: generateUuid(),
-        patron: patronId,
-        book: pendingAction.bookId,
-        timestamp: new Date(),
-      },
-    ]);
+    send({
+      type: 'try-checkout',
+      id: generateUuid(),
+      patron: patronId,
+      book: pendingAction.bookId,
+      timestamp: new Date(),
+    });
     setPendingAction(null);
   }
 
   function handleToggleRestricted() {
     if (!pendingAction) return;
-    eng.sendCommands([
-      {
-        type: 'update-book-restricted',
-        id: pendingAction.bookId,
-        restricted: !pendingAction.restricted,
-        timestamp: new Date(),
-      },
-    ]);
+    send({
+      type: 'update-book-restricted',
+      id: pendingAction.bookId,
+      restricted: !pendingAction.restricted,
+      timestamp: new Date(),
+    });
     setPendingAction(null);
   }
 
   function handleCancelHold() {
     if (pendingAction?.type !== 'held') return;
-    eng.sendCommands([{ type: 'cancel-hold', id: pendingAction.holdId }]);
+    send({ type: 'cancel-hold', id: pendingAction.holdId, patron: pendingAction.patronId });
     setPendingAction(null);
   }
 
   function handlePromoteHold() {
     if (pendingAction?.type !== 'held') return;
-    eng.sendCommands([
-      {
-        type: 'try-checkout',
-        id: generateUuid(),
-        patron: pendingAction.patronId,
-        book: pendingAction.bookId,
-        timestamp: new Date(),
-      },
-    ]);
+    send({
+      type: 'try-checkout',
+      id: generateUuid(),
+      patron: pendingAction.patronId,
+      book: pendingAction.bookId,
+      timestamp: new Date(),
+    });
     setPendingAction(null);
+  }
+
+  function addEdition(title: string) {
+    send({ type: 'add-edition', isbn: generateUuid(), title, timestamp: new Date() });
   }
 
   // --- render ---
 
-  const stateColor = {
-    connecting: 'orange',
-    connected: 'green',
-    disconnected: 'red',
-  }[connState];
+  const stateColor = STATE_COLORS[connState];
 
   return (
     <Card
@@ -285,7 +215,7 @@ export default function AdminWindow({ relayUrl }: { relayUrl: string }) {
           <Switch
             size="small"
             checked={enabled}
-            onChange={setEnabled}
+            onChange={setOnline}
             checkedChildren="on"
             unCheckedChildren="off"
           />
@@ -310,14 +240,7 @@ export default function AdminWindow({ relayUrl }: { relayUrl: string }) {
                   <InlineEdit
                     value={patron.name}
                     onConfirm={(name) =>
-                      eng.sendCommands([
-                        {
-                          type: 'rename-patron',
-                          id: patron.id,
-                          name,
-                          timestamp: new Date(),
-                        },
-                      ])
+                      send({ type: 'rename-patron', id: patron.id, name, timestamp: new Date() })
                     }
                   />
                 </span>
@@ -326,14 +249,12 @@ export default function AdminWindow({ relayUrl }: { relayUrl: string }) {
                   size="small"
                   checked={patron.researcher}
                   onChange={(checked) =>
-                    eng.sendCommands([
-                      {
-                        type: 'assign-patron',
-                        id: patron.id,
-                        researcher: checked,
-                        timestamp: new Date(),
-                      },
-                    ])
+                    send({
+                      type: 'assign-patron',
+                      id: patron.id,
+                      researcher: checked,
+                      timestamp: new Date(),
+                    })
                   }
                   checkedChildren="R"
                   unCheckedChildren="R"
@@ -367,14 +288,12 @@ export default function AdminWindow({ relayUrl }: { relayUrl: string }) {
                 <InlineEdit
                   value={edition.title}
                   onConfirm={(title) =>
-                    eng.sendCommands([
-                      {
-                        type: 'update-edition-title',
-                        isbn: edition.isbn,
-                        title,
-                        timestamp: new Date(),
-                      },
-                    ])
+                    send({
+                      type: 'update-edition-title',
+                      isbn: edition.isbn,
+                      title,
+                      timestamp: new Date(),
+                    })
                   }
                 />
                 <Flex gap="small" style={{ marginTop: 4 }} wrap>
@@ -384,6 +303,7 @@ export default function AdminWindow({ relayUrl }: { relayUrl: string }) {
                       <Button
                         key={book.id}
                         size="small"
+                        icon={book.pending ? <LoadingOutlined /> : <ReadOutlined />}
                         onClick={() => handleBookClick(book)}
                         style={color ? { borderColor: color, borderWidth: 2 } : undefined}>
                         {book.state}
@@ -395,15 +315,13 @@ export default function AdminWindow({ relayUrl }: { relayUrl: string }) {
                     type="text"
                     icon={<PlusOutlined />}
                     onClick={() =>
-                      eng.sendCommands([
-                        {
-                          type: 'add-book',
-                          id: generateUuid(),
-                          isbn: edition.isbn,
-                          restricted: false,
-                          timestamp: new Date(),
-                        },
-                      ])
+                      send({
+                        type: 'add-book',
+                        id: generateUuid(),
+                        isbn: edition.isbn,
+                        restricted: false,
+                        timestamp: new Date(),
+                      })
                     }
                   />
                 </Flex>
@@ -473,16 +391,7 @@ export default function AdminWindow({ relayUrl }: { relayUrl: string }) {
         open={addingEdition}
         onCancel={() => setAddingEdition(false)}
         onOk={() => {
-          if (newEditionTitle.trim()) {
-            eng.sendCommands([
-              {
-                type: 'add-edition',
-                isbn: generateUuid(),
-                title: newEditionTitle.trim(),
-                timestamp: new Date(),
-              },
-            ]);
-          }
+          if (newEditionTitle.trim()) addEdition(newEditionTitle.trim());
           setAddingEdition(false);
         }}>
         <Input
@@ -490,16 +399,7 @@ export default function AdminWindow({ relayUrl }: { relayUrl: string }) {
           value={newEditionTitle}
           onChange={(e) => setNewEditionTitle(e.target.value)}
           onPressEnter={() => {
-            if (newEditionTitle.trim()) {
-              eng.sendCommands([
-                {
-                  type: 'add-edition',
-                  isbn: generateUuid(),
-                  title: newEditionTitle.trim(),
-                  timestamp: new Date(),
-                },
-              ]);
-            }
+            if (newEditionTitle.trim()) addEdition(newEditionTitle.trim());
             setAddingEdition(false);
           }}
           autoFocus

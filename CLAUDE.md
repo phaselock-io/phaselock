@@ -30,8 +30,9 @@ typespec/         The product: TypeSpec vocabulary (core/), emitters
 examples/
   todo-basic/     Smallest loop: browser engines + the v0 database (db/).
   todo-thin/      Same app, engine in the server, clients get query results.
-  library/        Full architecture: Python relay, Go decider, forecasts,
-                  per-audience stores. Root also has populate.py seed data.
+  library/        Full architecture on the v0 database: signed-in patrons
+                  and librarians, per-audience views, forecasts, and a
+                  cron daily sheet.
 client/ts/        @phaselock/client: the JS host's transport over HTTP
                   (logins, sessions, connections), its msgpack cursor,
                   and the Registry that walks the generated type
@@ -96,36 +97,25 @@ Database (`cd db`; Go 1.25+ and a C compiler):
 - `make test` — rebuild the test bundle, run the Go tests
 - `make check` — the core's own C, warnings as errors
 
-Todo examples (`cd examples/todo-basic` or `todo-thin`):
+Examples (`cd examples/todo-basic`, `library`, or `todo-thin`):
 
 - `pnpm gen` — regenerate from the `.tsp` model (todo-thin, outside the
   workspace, first needs its own `pnpm i`)
 - `pnpm check` — tsc + eslint + prettier across the example's packages
-- `pnpm dev` — run the stack: todo-basic builds and runs the v0 database
-  with its bundle beside the vite UI; todo-thin runs docker KurrentDB +
-  server + vite UI
-
-Library example (`cd examples/library`):
-
-- `make gen` — regenerate all generated sources from model.tsp
-- `make` / `make check` — build everything / typecheck + lint + format
-- `cd model && pnpm test` — reducer tests (jest, via ReducerTester)
-- `./devstack.mts` — run the stack (KurrentDB + decider + relay + UI)
+- `pnpm dev` — run the stack: todo-basic and library build and run the v0
+  database with their bundle beside the vite UI; todo-thin runs docker
+  KurrentDB + server + vite UI
 
 After changing any `.tsp` model or any codegen in `typespec/`, regenerate
 and read the regenerated files rather than assuming their shape.
 
-The example build files are meant for external readers, so their gen
-steps don't depend on the contents of the tooling changing.  When you
-work on `typespec/` and want to test an example, `touch
-examples/library/model/model.tsp` (or equivalent) to force the example to
-regenerate; it picks up the tooling's source as it stands.
+An example's `pnpm gen` regenerates every time it runs, so after work on
+`typespec/` it picks up the tooling's source as it stands.
 
 ## Conventions
 
-- Generated files (`*.gen.ts`, generated `model.py`, `model.go`,
-  `ui/src/model.*`) are never hand-edited; change the `.tsp` or the
-  emitter and regenerate.
+- Generated files (`*.gen.ts`, generated `model.py`, `model.go`) are
+  never hand-edited; change the `.tsp` or the emitter and regenerate.
 - A model package (the `.tsp`, its generated code, its reducers, and its
   database's bundle source) depends on no host library: not
   `@phaselock/client`, nor whatever runtime a client or the database

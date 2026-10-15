@@ -85,6 +85,8 @@ model Hold {
   timestamp: utcDateTime;
   // absent for an open-ended hold
   expires?: utcDateTime;
+  // true while the hold is only a forecast, which the database has not decided yet
+  pending?: boolean;
 }
 
 model Checkout {
@@ -92,6 +94,8 @@ model Checkout {
   book: Uuid;
   expires: utcDateTime;
   overdue: boolean;
+  // true while the checkout is only a forecast, which the database has not decided yet
+  pending?: boolean;
 }
 
 union BookEvents {
@@ -136,7 +140,9 @@ model AddBook {
   timestamp: utcDateTime;
 }
 
-@command(UpdateBookRestricted)
+// Restricting a book closes a book-level hold on it by a patron who is not a researcher, and when
+// edition-level holds need the copy, the newest of them until the rest fit.
+@command((UpdateBookRestricted | HoldClosed | PatronHoldClosed)[])
 model UpdateBookRestricted {
   type: "update-book-restricted";
   id: Uuid;
@@ -144,8 +150,9 @@ model UpdateBookRestricted {
   timestamp: utcDateTime;
 }
 
-// rejected while the book is held or checked out
-@command(RemoveBook)
+// Rejected while the book is checked out.  A book-level hold on it closes, and when edition-level
+// holds need the copy, the newest of them until the rest fit.
+@command((RemoveBook | HoldClosed | PatronHoldClosed)[])
 model RemoveBook {
   type: "remove-book";
   id: Uuid;
@@ -154,9 +161,9 @@ model RemoveBook {
 
 // Hold commands + events //
 
-// the catalogue learns of the hold and the patron learns it is theirs, or the patron alone
-// learns why it failed
-@command([HoldOpened, PatronHoldOpened] | HoldFailed)
+// the catalogue learns of the hold, the patron learns it is theirs, and the librarians learn whose
+// it is, or the patron alone learns why it failed
+@command([HoldOpened, PatronHoldOpened, HoldOwner] | HoldFailed)
 model TryHold {
   type: "try-hold";
   id: Uuid;
@@ -175,7 +182,8 @@ model HoldOpened {
   expires?: utcDateTime;
 }
 
-@command([HoldClosed, PatronHoldClosed])
+// the hold closes in the catalogue, in the librarians' record of whose it was, and for its patron
+@command([HoldClosed, HoldClosed, PatronHoldClosed])
 model CancelHold {
   type: "cancel-hold";
   id: Uuid;
@@ -194,11 +202,14 @@ model HoldClosed {
 
 // a checkout that fulfills the patron's own hold also closes it; a failure is a notice to the
 // librarians, since a checkout queued offline at the desk can fail after they have moved on
-@command(
-  | [CheckoutOpened, PatronCheckoutOpened]
-  | [CheckoutOpened, PatronCheckoutOpened, HoldClosed, PatronHoldClosed]
+@command((
+  | CheckoutOpened
+  | PatronCheckoutOpened
+  | CheckoutOwner
+  | HoldClosed
+  | PatronHoldClosed
   | CheckoutFailed
-)
+)[])
 model TryCheckout {
   type: "try-checkout";
   id: Uuid;
@@ -215,7 +226,8 @@ model CheckoutOpened {
   timestamp: utcDateTime;
 }
 
-@command([CheckoutEnded, PatronCheckoutEnded])
+// the checkout ends in the catalogue, in the librarians' record of whose it was, and for its patron
+@command([CheckoutEnded, CheckoutEnded, PatronCheckoutEnded])
 model EndCheckout {
   type: "end-checkout";
   checkout: Uuid;
@@ -264,6 +276,8 @@ model PatronHold {
   id: Uuid;
   target: { book: Uuid } | { edition: Isbn };
   expires?: utcDateTime;
+  // true while the hold is only a forecast, which the database has not decided yet
+  pending?: boolean;
 }
 
 // a notice the patron or the librarians dismiss
@@ -300,8 +314,8 @@ model RenamePatron {
   timestamp: utcDateTime;
 }
 
-// grants or revokes researcher status
-@command(AssignPatron)
+// grants or revokes researcher status; revoking it closes the patron's holds on restricted books
+@command((AssignPatron | HoldClosed | PatronHoldClosed)[])
 model AssignPatron {
   type: "assign-patron";
   id: Uuid;
@@ -316,10 +330,13 @@ model PatronHoldOpened {
   expires?: utcDateTime;
 }
 
+// with notify, folded into a notice the patron dismisses, for a hold that closed without the
+// patron closing it themselves
 model PatronHoldClosed {
   type: "patron-hold-closed";
   id: Uuid;
   reason: string;
+  notify: boolean;
 }
 
 // folded into a notice the patron dismisses
@@ -364,18 +381,41 @@ model PatronDismissNotice {
 // Admin Slice //
 /////////////////
 
-// The librarians' shared inbox: notices about work that failed after it was queued.
+// The librarians' shared inbox, notices about work that failed after it was queued, and the owner
+// of every open hold and checkout, which the catalogue leaves out.  A hold or checkout that opens
+// names its owner here, and its HoldClosed or CheckoutEnded comes here too, as it does to the
+// catalogue.
 
 interface AdminSlice extends Slice<"admin", AdminEvents, AdminStore> {}
 
 alias AdminStore = {
   // one key per undismissed notice
   "admin_notice:{notice}": Notice;
+  // the patron of each open hold
+  "hold_owner:{hold}": Uuid;
+  // the patron of each open checkout
+  "checkout_owner:{checkout}": Uuid;
 };
 
 union AdminEvents {
   CheckoutFailed,
   DismissNotice,
+  HoldOwner,
+  HoldClosed,
+  CheckoutOwner,
+  CheckoutEnded,
+}
+
+model HoldOwner {
+  type: "hold-owner";
+  hold: Uuid;
+  patron: Uuid;
+}
+
+model CheckoutOwner {
+  type: "checkout-owner";
+  checkout: Uuid;
+  patron: Uuid;
 }
 
 model CheckoutFailed {
@@ -531,7 +571,9 @@ interface LibraryDB extends Database<[UserEngine, AdminEngine], [LoginSlice], Cr
 model AdminBookInfo {
   id: string;
   restricted: boolean;
-  state: "open" | "rstr" | "held" | "out";
+  state: "open" | "restricted" | "held" | "out";
+  // true while the book's hold or checkout is only a forecast
+  pending?: boolean;
   patronId?: string;
   holdId?: string;
   checkoutId?: string;

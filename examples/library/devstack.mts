@@ -17,38 +17,24 @@
 
 main({
   commands: {
-    G: ["make", "gen"],
+    G: "pnpm gen",
   },
   stages: {
-    // run KurrentDB in a docker container
     db: {
-      containerName: "todo-basic-db",
-      dockerArgs: ["-p=2113:2113"],
-      image: "docker.kurrent.io/kurrent-latest/kurrentdb:26.0.3",
-      cmd: [
-        "--insecure",
-        "--run-projections=System",
-        "--enable-atom-pub-over-http",
+      pre: [
+        // build the phaselockdb image
+        exec("docker", "build", "-t", "phaselockdb", "../../db"),
+        // build the bundle.js
+        exec("pnpm", "--dir", "model", "bundle"),
       ],
-      post: [
-        httpCheck("http://localhost:2113/health/live?liveCode=200"),
-        exec("python3", "populate.py"),
-        // a new db container means the old on-disk stores are stale
-        exec("rm", "-rf", "decider/.bbolt"),
-        exec("rm", "-rf", "relay/.lmdb"),
+      containerName: "library-db",
+      image: "phaselockdb",
+      dockerArgs: [
+        "-p=127.0.0.1:8080:8080",
+        `-v=${process.cwd()}/model/bundle.js:/bundle.js:ro`,
       ],
-    },
-    // then run the go decider
-    decider: {
-      cwd: "decider",
-      pre: exec("make", "-C", "..", "decider"),
-      cmd: ["./decider"],
-    },
-    // then run the python relay
-    relay: {
-      pre: exec("make", "relay"),
-      cmd: ["python", "-u", "relay/relay.py"],
-      post: connCheck(3001),
+      cmd: ["--bundle", "/bundle.js"],
+      post: connCheck(8080),
     },
     // then run the ui
     ui: {

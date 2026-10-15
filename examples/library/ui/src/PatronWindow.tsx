@@ -1,11 +1,17 @@
-import { EditOutlined } from '@ant-design/icons';
+import { EditOutlined, LoadingOutlined } from '@ant-design/icons';
+import {
+  type Notice,
+  type UserBookInfo,
+  type UserEngine,
+  type UserEngineQueryTxn,
+  userQueries,
+} from '@library/model/ui';
 import { Alert, Button, Card, Flex, Input, List, Space, Spin, Switch, Tag, Typography } from 'antd';
-import { useCallback, useRef, useState } from 'react';
+import { useState } from 'react';
 
 import { colorHash } from './colorhash';
-import { QueryGenerator, UserEngine, UserQX, VHold } from './model';
+import type { Client } from './engines';
 import { useLocalQuery } from './useLocalQuery';
-import { usePhaseLock } from './usePhaseLock';
 import { generateUuid } from './util';
 
 const { Text } = Typography;
@@ -58,19 +64,6 @@ function PatronName({ name, onRename }: { name: string; onRename: (newName: stri
   );
 }
 
-type BookInfo = {
-  isbn: string;
-  title: string;
-  availableNormal: number;
-  availableRestricted: string[];
-  hold: VHold | null;
-};
-
-type PatronInfo = {
-  name: string;
-  researcher: boolean;
-};
-
 function BookItem({
   book,
   researcher,
@@ -78,7 +71,7 @@ function BookItem({
   onHoldRestricted,
   onCancelHold,
 }: {
-  book: BookInfo;
+  book: UserBookInfo;
   researcher: boolean;
   onHold: (isbn: string) => void;
   onHoldRestricted: (isbn: string) => void;
@@ -96,7 +89,7 @@ function BookItem({
           {heldNormal ? (
             <Button
               size="small"
-              loading={book.hold!.forecasted}
+              icon={book.hold!.pending ? <LoadingOutlined /> : undefined}
               onClick={() => onCancelHold(book.hold!.id)}
               color={'green'}
               variant={'solid'}>
@@ -116,7 +109,7 @@ function BookItem({
           {heldRestricted ? (
             <Button
               size="small"
-              loading={book.hold!.forecasted}
+              icon={book.hold!.pending ? <LoadingOutlined /> : undefined}
               onClick={() => onCancelHold(book.hold!.id)}
               color={'green'}
               variant={'solid'}>
@@ -140,69 +133,18 @@ function BookItem({
 
 function Books({
   eng,
-  patronId,
   researcher,
   onHold,
   onHoldRestricted,
   onCancelHold,
 }: {
   eng: UserEngine;
-  patronId: string;
   researcher: boolean;
   onHold: (isbn: string) => void;
   onHoldRestricted: (bookId: string) => void;
   onCancelHold: (holdId: string) => void;
 }) {
-  const booksLookup = useCallback(
-    function* (qx: UserQX): QueryGenerator<BookInfo[]> {
-      const patron = yield* qx.get.patron(patronId);
-      // build maps of this patron's holds by target
-      const holdsByEdition: Record<string, VHold> = {};
-      const holdsByBook: Record<string, VHold> = {};
-      for (const holdId of Object.keys(patron.holds)) {
-        const hold = yield* qx.get.hold(holdId);
-        if ('edition' in hold.target) {
-          holdsByEdition[hold.target.edition] = hold;
-        } else {
-          holdsByBook[hold.target.book] = hold;
-        }
-      }
-      const editions = yield* qx.get.editions();
-      const out: BookInfo[] = [];
-      for (const isbn of Object.keys(editions)) {
-        const edition = yield* qx.get.edition(isbn);
-        let availableNormal = 0;
-        const restrictedBooks: { id: string; timestamp: Date }[] = [];
-        for (const bookId of Object.keys(edition.books)) {
-          const book = yield* qx.get.book(bookId);
-          if (book.status) continue; // held or checked out
-          if (book.restricted) {
-            restrictedBooks.push({ id: book.id, timestamp: book.timestamp });
-          } else {
-            availableNormal++;
-          }
-        }
-        restrictedBooks.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
-        const availableRestricted = restrictedBooks.map((b) => b.id);
-        // edition-level holds consume normal copies
-        availableNormal -= Object.keys(edition.holds).length;
-        // check if patron holds this edition or any book in it
-        let hold = holdsByEdition[isbn];
-        for (const bookId of Object.keys(edition.books)) {
-          if (holdsByBook[bookId]) {
-            hold = holdsByBook[bookId];
-            break;
-          }
-        }
-        out.push({ isbn, title: edition.title, availableNormal, availableRestricted, hold });
-      }
-      out.sort((a, b) => a.title.localeCompare(b.title));
-      return out;
-    },
-    [patronId],
-  );
-
-  const books = useLocalQuery(eng, booksLookup);
+  const books = useLocalQuery(eng, userQueries.allBooks);
   if (!books) return <Spin />;
 
   return (
@@ -221,49 +163,62 @@ function Books({
   );
 }
 
+// the patron's notices, each of a hold that failed
+function noticesQuery(qx: UserEngineQueryTxn): Notice[] {
+  return [...qx.scan.patron_notice()].map(([, notice]) => notice);
+}
+
+// the commands the Engine queues and sends, which are all those the window sends
+type Command = Parameters<UserEngine['sendCommand']>[0];
+
+// the state of the Engine's connection, which a query reads like any other state
+function connectionQuery(qx: UserEngineQueryTxn) {
+  return qx.status.connection().state;
+}
+
+// the tag color of each connection state
+const STATE_COLORS = {
+  connecting: 'orange',
+  syncing: 'blue',
+  live: 'green',
+  offline: 'red',
+};
+
 export default function PatronWindow({
   patronId,
-  relayUrl,
+  client,
 }: {
   patronId: string;
-  relayUrl: string;
+  client: Client<UserEngine>;
 }) {
-  const [enabled, setEnabled] = useState(true);
-  const [eng, connState] = usePhaseLock(relayUrl, enabled, patronId);
+  const eng = client.engine;
+  const [enabled, setEnabled] = useState(client.transport.online);
+  const patron = useLocalQuery(eng, userQueries.myPatron);
+  const notices = useLocalQuery(eng, noticesQuery) ?? [];
+  const connState = useLocalQuery(eng, connectionQuery) ?? 'connecting';
+  const stateColor = STATE_COLORS[connState];
 
-  const patronLookup = useCallback(
-    function* (qx: UserQX): QueryGenerator<PatronInfo> {
-      const patron = yield* qx.get.patron(patronId);
-      return { name: patron.name, researcher: patron.researcher };
-    },
-    [patronId],
-  );
-  const patron = useLocalQuery(eng, patronLookup);
-
-  const messagesLookup = useCallback(function* (qx: UserQX): QueryGenerator<string[]> {
-    return yield* qx.get.messages();
-  }, []);
-
-  // start out dismissing any messages from an older session
-  const staleMessages = useRef<number | undefined>(undefined);
-  let messages = useLocalQuery(eng, messagesLookup);
-  if (messages === undefined) {
-    messages = [];
-  } else {
-    if (staleMessages.current === undefined) {
-      staleMessages.current = messages.length;
-    }
-    messages = messages.slice(staleMessages.current);
+  function send(command: Command) {
+    eng.sendCommand(command);
   }
-  // then dismiss additional messages from this session
-  const [dismissedCount, setDismissedCount] = useState(0);
-  const visibleMessages = messages.slice(dismissedCount) ?? [];
 
-  const stateColor = {
-    connecting: 'orange',
-    connected: 'green',
-    disconnected: 'red',
-  }[connState];
+  // the switch takes the window's way to the database offline, and back online at once
+  function setOnline(on: boolean) {
+    client.transport.online = on;
+    if (on) eng.reconnectNow();
+    setEnabled(on);
+  }
+
+  function hold(target: { book: string } | { edition: string }) {
+    send({
+      type: 'try-hold',
+      id: generateUuid(),
+      patron: patronId,
+      target,
+      open: false,
+      timestamp: new Date(),
+    });
+  }
 
   return (
     <Card
@@ -279,9 +234,12 @@ export default function PatronWindow({
               <PatronName
                 name={patron.name}
                 onRename={(newName) =>
-                  eng.sendCommands([
-                    { type: 'rename-patron', id: patronId, name: newName, timestamp: new Date() },
-                  ])
+                  send({
+                    type: 'rename-patron',
+                    id: patronId,
+                    name: newName,
+                    timestamp: new Date(),
+                  })
                 }
               />
             </span>
@@ -294,7 +252,7 @@ export default function PatronWindow({
           <Switch
             size="small"
             checked={enabled}
-            onChange={setEnabled}
+            onChange={setOnline}
             checkedChildren="on"
             unCheckedChildren="off"
           />
@@ -303,43 +261,24 @@ export default function PatronWindow({
       style={{ width: '32em' }}>
       <Books
         eng={eng}
-        patronId={patronId}
         researcher={patron?.researcher ?? false}
-        onHold={(isbn) =>
-          eng.sendCommands([
-            {
-              type: 'try-hold',
-              id: generateUuid(),
-              patron: patronId,
-              target: { edition: isbn },
-              open: false,
-              timestamp: new Date(),
-            },
-          ])
-        }
-        onHoldRestricted={(bookId) =>
-          eng.sendCommands([
-            {
-              type: 'try-hold',
-              id: generateUuid(),
-              patron: patronId,
-              target: { book: bookId },
-              open: false,
-              timestamp: new Date(),
-            },
-          ])
-        }
-        onCancelHold={(holdId) => {
-          eng.sendCommands([{ type: 'cancel-hold', id: holdId }]);
-        }}
+        onHold={(isbn) => hold({ edition: isbn })}
+        onHoldRestricted={(bookId) => hold({ book: bookId })}
+        onCancelHold={(holdId) => send({ type: 'cancel-hold', id: holdId, patron: patronId })}
       />
-      {visibleMessages.length > 0 && (
+      {notices.length > 0 && (
         <div style={{ marginTop: '0.5em' }}>
           <Space direction="vertical" style={{ width: '100%' }} size="small">
-            {visibleMessages.map((msg, i) => (
-              <Alert key={dismissedCount + i} type="warning" showIcon message={msg} />
+            {notices.map((notice) => (
+              <Alert key={notice.id} type="warning" showIcon message={notice.reason} />
             ))}
-            <Button size="small" onClick={() => setDismissedCount(messages?.length ?? 0)}>
+            <Button
+              size="small"
+              onClick={() => {
+                for (const notice of notices) {
+                  send({ type: 'patron-dismiss-notice', id: notice.id, patron: patronId });
+                }
+              }}>
               Dismiss
             </Button>
           </Space>

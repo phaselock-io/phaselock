@@ -11,6 +11,9 @@ packages:
   - examples/todo-basic
   - examples/todo-basic/model
   - examples/todo-basic/ui
+  - examples/library
+  - examples/library/model
+  - examples/library/ui
 
 linkWorkspacePackages: true
 
