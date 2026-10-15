@@ -318,7 +318,14 @@ typedef enum { PLACE_MATCH, PLACE_STEP, PLACE_DONE, PLACE_SEEK } place_kind;
 typedef struct placement {
     buf target; // a seek's target; its bytes are rewritten by every placement
     bool strict;
+    size_t *ends; // the end of each value field's text so far, by field
+    size_t cap;   // the fields ends has room for
 } placement;
+
+static void placement_free(placement *pl) {
+    buf_free(&pl->target);
+    free(pl->ends);
+}
 
 /* a seek to the key's first at bytes, then tail */
 static place_kind seek_to(placement *pl, const char *key, size_t at, const char *tail, size_t n,
@@ -351,8 +358,13 @@ static place_kind place_key(const pattern *c, const char *key, size_t n, bool re
                             placement *pl) {
     if (!starts_with(key, n, c->head.p, c->head.n)) return PLACE_DONE;
 
-    // the end of each value field's text so far, by field
-    size_t ends[c->n + 1];
+    // room for each field's end
+    if (pl->cap < c->n) {
+        pl->ends = realloc(pl->ends, c->n * sizeof *pl->ends);
+        if (!pl->ends) die("out of memory");
+        pl->cap = c->n;
+    }
+    size_t *ends = pl->ends;
 
     size_t pos = c->head.n;
     for (size_t i = 0; i < c->n; i++) {
@@ -492,7 +504,7 @@ int pattern_walk(store *s, const pattern *c, bool reverse, const char *after, si
         }
     }
     store_cursor_end(s);
-    buf_free(&pl.target);
+    placement_free(&pl);
     return at < 0 || rc < 0 ? -1 : 0;
 }
 
@@ -571,7 +583,7 @@ bool span_covers(const scan_span *s, const char *key, size_t n) {
     }
     placement pl = {0};
     bool match = place_key(s->pattern, key, n, false, &pl) == PLACE_MATCH;
-    buf_free(&pl.target);
+    placement_free(&pl);
     return match;
 }
 

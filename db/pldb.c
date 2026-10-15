@@ -622,47 +622,46 @@ static void family_of(const char *stream, char *out, size_t cap) {
     out[n] = 0;
 }
 
+/* the most streams one command's expectations may name */
+#define EXPECT_MAX 1024
+
 /* one command: returns the outcome as an mpack write into w */
-/* the OCC check: every expected stream's seq must be exactly what the
-   client names (0 for never born).  Writes a conflict outcome listing each
-   mismatched stream's actual seq and returns true when any differs. */
-static bool check_expect(pldb *db, mpack_writer_t *w, JSValueConst expect) {
-    JSContext *ctx = db->js.ctx;
-    if (!JS_IsObject(expect)) return false;
-    JSPropertyEnum *tab = NULL;
-    uint32_t n = 0;
-    if (JS_GetOwnPropertyNames(ctx, &tab, &n, expect, JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        return false;
-    }
-    char *names[n ? n : 1];
-    uint64_t current[n ? n : 1];
+/* The OCC check: every expected stream's seq must be exactly what the client names (0 for never
+   born).  expect is the command's map as the intake checked it, or NULL for a command without
+   one.  Writes a conflict outcome listing each mismatched stream's actual seq and returns true
+   when any differs. */
+static bool check_expect(pldb *db, mpack_writer_t *w, const mpack_node_t *expect) {
+    if (!expect) return false;
+    size_t n = mpack_node_map_count(*expect);
+    if (n > EXPECT_MAX) die("prepared expect: %zu streams", n);
+
+    // the streams whose seq differs from what the client named, with their seq
+    struct conflict {
+        mpack_node_t name;
+        uint64_t seq;
+    } conflicts[EXPECT_MAX];
     size_t nconflicts = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        const char *name = JS_AtomToCString(ctx, tab[i].atom);
-        JSValue v = JS_GetProperty(ctx, expect, tab[i].atom);
-        int64_t want = -1;
-        JS_ToInt64(ctx, &want, v);
-        JS_FreeValue(ctx, v);
-        if (!name) continue;
+    buf name = {0};
+    for (size_t i = 0; i < n; i++) {
+        mpack_node_t k = mpack_node_map_key_at(*expect, i);
+        name.len = 0;
+        buf_append(&name, mpack_node_str(k), mpack_node_strlen(k));
+        buf_append(&name, "", 1);
         uint64_t seq = 0, eb, sb;
-        int rc = store_stream_stats(db->w, name, &seq, &eb, &sb);
+        int rc = store_stream_stats(db->w, (const char *)name.p, &seq, &eb, &sb);
         if (rc < 0) die("stream_stats: %s", store_err(db->w));
-        if ((int64_t)seq != want) {
-            names[nconflicts] = xstrdup(name);
-            current[nconflicts++] = seq;
-        }
-        JS_FreeCString(ctx, name);
+        uint64_t want = mpack_node_u64(mpack_node_map_value_at(*expect, i));
+        if (seq != want) conflicts[nconflicts++] = (struct conflict){k, seq};
     }
-    JS_FreePropertyEnum(ctx, tab, n);
+    buf_free(&name);
     if (nconflicts == 0) return false;
     mpack_start_array(w, 2);
     mpack_write_cstr(w, "conflict");
     mpack_start_map(w, (uint32_t)nconflicts);
     for (size_t i = 0; i < nconflicts; i++) {
-        mpack_write_cstr(w, names[i]);
-        mpack_write_u64(w, current[i]);
-        free(names[i]);
+        mpack_node_t k = conflicts[i].name;
+        mpack_write_str(w, mpack_node_str(k), (uint32_t)mpack_node_strlen(k));
+        mpack_write_u64(w, conflicts[i].seq);
     }
     mpack_finish_map(w);
     mpack_finish_array(w);
@@ -773,7 +772,7 @@ static void write_ok(mpack_writer_t *w, uint64_t position) {
 /* Decide one command: expect, precommit, and the append and fold of what precommit emitted.  A
    reject or a conflict leaves nothing in the log or the store. */
 static void decide(pldb *db, batch *b, mpack_writer_t *w, const uint8_t *id, JSValueConst data,
-                   JSValueConst expect, JSValueConst principal) {
+                   const mpack_node_t *expect, JSValueConst principal) {
     // the client's expectations of its streams
     if (check_expect(db, w, expect)) return;
 
@@ -860,7 +859,7 @@ static int check_proof(pldb *db, mpack_writer_t *w, const uint8_t *id, const pld
    moves the mark, whatever it decided.  Answers whether the command bounced instead, which
    decides nothing and writes no outcome, with what lookup answers in *bounce. */
 static bool run_command(pldb *db, batch *b, mpack_writer_t *w, const char *series, uint64_t n,
-                        const uint8_t *id, JSValueConst data, JSValueConst expect,
+                        const uint8_t *id, JSValueConst data, const mpack_node_t *expect,
                         JSValueConst principal, const pldb_verdict *v, int attempt,
                         char **bounce) {
     // the dedup check
@@ -930,22 +929,22 @@ static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) 
         }
         const uint8_t *id = (const uint8_t *)mpack_node_bin_data(mpack_node_array_at(c, 2));
 
-        // the data and the expectations, as JS values
+        // the data as a JS value, and the expectations
         JSValue datav = walk_prepared_to_js(ctx, db->js.sc, mpack_node_array_at(c, 3), commands,
                                             why, sizeof why);
-        JSValue expectv = JS_UNDEFINED;
-        if (mpack_node_array_length(c) > 4) expectv = mpjs_decode_node(ctx, mpack_node_array_at(c, 4));
-        if (JS_IsException(datav) || JS_IsException(expectv)) {
+        mpack_node_t expect;
+        bool expects = mpack_node_array_length(c) > 4;
+        if (expects) expect = mpack_node_array_at(c, 4);
+        if (JS_IsException(datav)) {
             if (JS_HasException(ctx)) JS_FreeValue(ctx, JS_GetException(ctx));
-            write_reason(&w, "reject", JS_IsException(datav) ? why : "malformed expect");
+            write_reason(&w, "reject", why);
         } else {
             const pldb_verdict *v = k < q->nverdicts ? &q->verdicts[k] : NULL;
-            r->bounce = run_command(db, b, &w, key, n, id, datav, expectv, principal, v,
-                                    q->attempt, &r->hash);
+            r->bounce = run_command(db, b, &w, key, n, id, datav, expects ? &expect : NULL,
+                                    principal, v, q->attempt, &r->hash);
         }
         free(key);
         JS_FreeValue(ctx, datav);
-        JS_FreeValue(ctx, expectv);
     }
     mpack_tree_destroy(&tree);
     mpack_complete_array(&w);
@@ -1604,6 +1603,77 @@ static bool is_command(mpack_node_t c) {
     return mpack_node_type(id) == mpack_type_bin && mpack_node_bin_size(id) == ID_LEN;
 }
 
+/* whether a msgpack integer is a seq an expectation may name: from 0 to 2^53 - 1 */
+static bool is_seq(mpack_node_t n) {
+    if (mpack_node_type(n) == mpack_type_uint) return mpack_node_u64(n) < (1ull << 53);
+    return mpack_node_type(n) == mpack_type_int && mpack_node_i64(n) >= 0 &&
+           mpack_node_i64(n) < (1ll << 53);
+}
+
+/* orders msgpack strings bytewise */
+static int str_cmp(const void *a, const void *b) {
+    mpack_node_t x = *(const mpack_node_t *)a, y = *(const mpack_node_t *)b;
+    size_t xn = mpack_node_strlen(x), yn = mpack_node_strlen(y);
+    int d = memcmp(mpack_node_str(x), mpack_node_str(y), xn < yn ? xn : yn);
+    return d ? d : (xn > yn) - (xn < yn);
+}
+
+/* Why a command's expectations are malformed, or NULL when they are a map from at most
+   EXPECT_MAX distinct exact stream names to seqs. */
+static char *expect_reason(pldb *db, mpack_node_t e) {
+    if (mpack_node_type(e) != mpack_type_map) return xstrdup("expect must be a map");
+    size_t n = mpack_node_map_count(e);
+    if (n > EXPECT_MAX) return reasonf("expect names %zu streams, more than %d", n, EXPECT_MAX);
+
+    // each entry an exact stream name and a seq
+    mpack_node_t names[EXPECT_MAX];
+    buf name = {0};
+    char *reason = NULL;
+    for (size_t i = 0; i < n && !reason; i++) {
+        names[i] = mpack_node_map_key_at(e, i);
+        if (mpack_node_type(names[i]) != mpack_type_str) {
+            reason = xstrdup("expect: a stream name is not a string");
+            break;
+        }
+        const char *s = mpack_node_str(names[i]);
+        size_t len = mpack_node_strlen(names[i]);
+        int shown = len < 100 ? (int)len : 100;
+        name.len = 0;
+        if (len) buf_append(&name, s, len);
+        buf_append(&name, "", 1);
+        if (memchr(s, 0, len) || !stream_fills(&db->js, (const char *)name.p)) {
+            reason = reasonf("expect: %.*s is not a stream name", shown, s);
+        } else if (!is_seq(mpack_node_map_value_at(e, i))) {
+            reason = reasonf("expect: the seq of %.*s is not an integer from 0 to 2^53 - 1", shown,
+                             s);
+        }
+    }
+    buf_free(&name);
+    if (reason) return reason;
+
+    // no stream named twice
+    qsort(names, n, sizeof *names, str_cmp);
+    for (size_t i = 1; i < n; i++) {
+        if (str_cmp(&names[i - 1], &names[i]) != 0) continue;
+        size_t len = mpack_node_strlen(names[i]);
+        return reasonf("expect: %.*s is named twice", len < 100 ? (int)len : 100,
+                       mpack_node_str(names[i]));
+    }
+    return NULL;
+}
+
+/* write a command's expectations as expect_reason passed them, each seq a u64 */
+static void write_expect(mpack_writer_t *w, mpack_node_t e) {
+    size_t n = mpack_node_map_count(e);
+    mpack_start_map(w, (uint32_t)n);
+    for (size_t i = 0; i < n; i++) {
+        mpack_node_t k = mpack_node_map_key_at(e, i);
+        mpack_write_str(w, mpack_node_str(k), (uint32_t)mpack_node_strlen(k));
+        mpack_write_u64(w, mpack_node_u64(mpack_node_map_value_at(e, i)));
+    }
+    mpack_finish_map(w);
+}
+
 /* write a command's series as its key in the series table: the hex SHA-256 of its bytes, so
    that nothing the database stores lets its reader send under a live series */
 static void write_series_key(mpack_writer_t *w, mpack_node_t series) {
@@ -1658,6 +1728,10 @@ static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t c, size_t ind
     if (walk_check(db->js.sc, data, commands, true, &il, why, sizeof why)) {
         reason = xstrdup(why);
         goto done;
+    }
+    if (mpack_node_array_length(c) > 4) {
+        reason = expect_reason(db, mpack_node_array_at(c, 4));
+        if (reason) goto done;
     }
 
     // each proof, whose password the caller checks, before any hash is spent on the command
@@ -1714,10 +1788,7 @@ static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t c, size_t ind
     }
     mpack_write_bin(&w, mpack_node_bin_data(id), ID_LEN);
     int rc = walk_write(db->js.sc, data, commands, true, &il, &w, why, sizeof why);
-    if (rc == 0 && len > 4) {
-        rc = walk_write(db->js.sc, mpack_node_array_at(c, 4), -1, false, NULL, &w, why, sizeof why);
-        if (rc) snprintf(why, sizeof why, "malformed expect");
-    }
+    if (rc == 0 && len > 4) write_expect(&w, mpack_node_array_at(c, 4));
     mpack_finish_array(&w);
     if (mpack_writer_destroy(&w) != mpack_ok && rc == 0) {
         snprintf(why, sizeof why, "encode failed");

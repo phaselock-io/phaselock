@@ -1760,6 +1760,61 @@ func TestExpectAndConflict(t *testing.T) {
 	if o.kind != "ok" {
 		t.Fatalf("hashed command with matching expect: %+v", o)
 	}
+
+	// expect names at most 1024 streams
+	many := map[string]any{}
+	for i := range 1024 {
+		many[fmt.Sprintf("patron:q%d", i)] = 0
+	}
+	o = h.expecting(admin, cmd("c9", "add-patron", "id", "p3", "name", "Cy"), many)
+	if o.kind != "ok" {
+		t.Fatalf("1024 expectations: %+v", o)
+	}
+	many["patron:q1024"] = 0
+	o = h.expecting(admin, cmd("c10", "add-patron", "id", "p4", "name", "Di"), many)
+	if o.kind != "reject" || o.reason != "expect names 1025 streams, more than 1024" {
+		t.Fatalf("1025 expectations: %+v", o)
+	}
+
+	// each an exact stream name and a seq from 0 to 2^53 - 1
+	malformed := []struct {
+		expect map[string]any
+		reason string
+	}{
+		{map[string]any{"nope:p1": 0}, "expect: nope:p1 is not a stream name"},
+		{map[string]any{"patron:p1\x00x": 0}, "expect: patron:p1 is not a stream name"},
+		{map[string]any{"patron:p1": -1}, "expect: the seq of patron:p1 is not an integer from 0 to 2^53 - 1"},
+		{map[string]any{"patron:p1": int64(1) << 53}, "expect: the seq of patron:p1 is not an integer from 0 to 2^53 - 1"},
+		{map[string]any{"patron:p1": 3.0}, "expect: the seq of patron:p1 is not an integer from 0 to 2^53 - 1"},
+	}
+	for i, m := range malformed {
+		o = h.expecting(admin, cmd(fmt.Sprintf("c11-%d", i), "rename-patron", "id", "p1", "name", "x"), m.expect)
+		if o.kind != "reject" || o.reason != m.reason {
+			t.Fatalf("expect %v: %+v", m.expect, o)
+		}
+	}
+
+	// and each named once, in a map; Go's maps cannot say either otherwise, so these are built by
+	// hand
+	rename := cmd("c12", "rename-patron", "id", "p1", "name", "x")
+	twice := append([]byte{0x82}, mpEncode("patron:p1")...)
+	twice = append(twice, 3)
+	twice = append(twice, mpEncode("patron:p1")...)
+	twice = append(twice, 3)
+	for expect, reason := range map[string]string{
+		string(twice):                "expect: patron:p1 is named twice",
+		string(mpEncode([]any{"x"})): "expect must be a map",
+	} {
+		body := rename.encode(nil)
+		body[0] = 0x95 // the command's array gains expect
+		status, _, out := h.do("POST", "/commands", admin, append(body, expect...))
+		if status != 200 {
+			t.Fatalf("commands: status %d", status)
+		}
+		if o := decodeOutcomes(t, out)[0]; o.kind != "reject" || o.reason != reason {
+			t.Fatalf("expect %x: %+v", expect, o)
+		}
+	}
 }
 
 // eventsRange reads one page of /events and returns its events and the

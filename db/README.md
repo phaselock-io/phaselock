@@ -377,6 +377,9 @@ Every frame is an array whose first element is a tag.
   any other.  seq is the stream's clock, position the log's.  A conflict
   means refresh and re-decide, where a reject is final.  It is opt-in
   per command; offline-queued work should not carry expectations.
+- `expect` names at most 1024 streams, each once, with seqs from 0 to
+  2^53 - 1.  One that breaks this is checked with the data: the
+  command gets `["reject", reason]` and is not a decision.
 
     GET /snapshot/<ref>          ref = stream, wildcard, or *
       → application/octet-stream: the blob (below), inline, with its

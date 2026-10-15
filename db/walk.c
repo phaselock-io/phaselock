@@ -1004,6 +1004,12 @@ typedef struct val {
     size_t tok;
 } val;
 
+/* a declared field of a struct being walked, and its value when the struct has it */
+typedef struct slot {
+    val v;
+    bool have;
+} slot;
+
 /* Interprets the schema over a value and drives a sink.  The first mismatch ends the walk with
    an error that names the path. */
 typedef struct walk {
@@ -1017,6 +1023,9 @@ typedef struct walk {
     size_t pathlen;
     size_t seglens[MAX_DEPTH + 2];
     size_t nseg;
+    // the structs being walked, a run of one slot per declared field each, innermost last
+    slot *slots;
+    size_t nslots, capslots;
     // the prepared fields of the top-level value: collected by a check, written by a write
     intake_list *intakes;
     const intake_list *results;
@@ -1359,19 +1368,12 @@ static const intake *result_for(walk *w, const char *key, size_t keylen) {
     return NULL;
 }
 
-static void walk_struct(walk *w, const node *n, val v) {
-    if (v_kind(w, v) != PL_BEGIN_OBJ) {
-        walk_fail(w, "expected an object, not %s", v_name(w, v));
-        return;
-    }
-    bool top = w->top;
-    w->top = false;
+/* Walk a struct's fields, found into the slots from base on, one per declared field.  Each
+   slot is read by its index, since the walk of a field's value may move the slots. */
+static void walk_fields(walk *w, const node *n, val v, size_t base, bool top) {
     size_t nf = n->nchildren;
 
     // find each declared field's value, and judge the rest
-    val found[nf ? nf : 1];
-    bool have[nf ? nf : 1];
-    memset(have, 0, sizeof have);
     size_t present = 0;
     iter it = it_begin(w, v);
     while (it.i < it.n && !w->failed) {
@@ -1393,13 +1395,12 @@ static void walk_struct(walk *w, const node *n, val v) {
                 walk_fail(w, "unknown field");
                 path_pop(w);
             }
-        } else if (have[i]) {
+        } else if (w->slots[base + i].have) {
             path_push(w, ".%.*s", (int)len, k);
             walk_fail(w, "repeated field");
             path_pop(w);
         } else {
-            found[i] = fv;
-            have[i] = true;
+            w->slots[base + i] = (slot){fv, true};
             present++;
         }
     }
@@ -1407,7 +1408,7 @@ static void walk_struct(walk *w, const node *n, val v) {
 
     // every required field is present
     for (size_t i = 0; i < nf; i++) {
-        if (have[i] || n->fields[i].optional) continue;
+        if (w->slots[base + i].have || n->fields[i].optional) continue;
         path_push(w, ".%.*s", (int)n->fields[i].keylen, n->fields[i].key);
         walk_fail(w, "missing required field");
         path_pop(w);
@@ -1426,7 +1427,7 @@ static void walk_struct(walk *w, const node *n, val v) {
             if ((int)i == n->disc) continue;
         }
         const field *f = &n->fields[i];
-        if (!have[i]) continue;
+        if (!w->slots[base + i].have) continue;
         path_push(w, ".%.*s", (int)f->keylen, f->key);
         SINK(w, key(w->sink, f->key, f->keylen));
 
@@ -1443,7 +1444,7 @@ static void walk_struct(walk *w, const node *n, val v) {
                 memset(in, 0, sizeof *in);
                 in->kind = w->sc->nodes[f->type].kind_name;
                 snprintf(in->key, sizeof in->key, "%.*s", (int)f->keylen, f->key);
-                in->node = found[i].node;
+                in->node = w->slots[base + i].v.node;
             }
             const intake *r = result_for(w, f->key, f->keylen);
             if (r && r->result) {
@@ -1460,15 +1461,36 @@ static void walk_struct(walk *w, const node *n, val v) {
                 continue;
             }
             if (w->prepared) {
-                walk_passthrough(w, found[i]);
+                walk_passthrough(w, w->slots[base + i].v);
                 path_pop(w);
                 continue;
             }
         }
-        walk_value(w, f->type, found[i]);
+        walk_value(w, f->type, w->slots[base + i].v);
         path_pop(w);
     }
     SINK(w, end_obj(w->sink));
+}
+
+static void walk_struct(walk *w, const node *n, val v) {
+    if (v_kind(w, v) != PL_BEGIN_OBJ) {
+        walk_fail(w, "expected an object, not %s", v_name(w, v));
+        return;
+    }
+    bool top = w->top;
+    w->top = false;
+
+    // a run of empty slots for the declared fields, given back once they are walked
+    size_t nf = n->nchildren, base = w->nslots;
+    if (base + nf > w->capslots) {
+        w->capslots = (base + nf) * 2;
+        w->slots = realloc(w->slots, w->capslots * sizeof *w->slots);
+        if (!w->slots) die("out of memory");
+    }
+    memset(&w->slots[base], 0, nf * sizeof *w->slots);
+    w->nslots = base + nf;
+    walk_fields(w, n, v, base, top);
+    w->nslots = base;
 }
 
 static void walk_record(walk *w, const node *n, val v) {
@@ -1686,6 +1708,8 @@ static int walk_run(walk *w, val v, long type) {
     w->top = true;
     if (type < 0) walk_passthrough(w, v);
     else walk_value(w, (uint32_t)type, v);
+    free(w->slots);
+    w->slots = NULL;
     return w->failed ? -1 : 0;
 }
 
