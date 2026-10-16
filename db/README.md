@@ -587,6 +587,15 @@ unbounded waste of event downloads.
   header is trusted from every request, so the flag is for a server
   only the proxy can reach.  `X-Forwarded-For` and `Forwarded`, which
   hold lists, are refused at startup.
+- `--tls-cert <file> --tls-key <file>` serves HTTPS, and HTTP/2 with
+  it, from a PEM certificate and key; without them the server speaks
+  plain HTTP.  The pair is reloaded when either file changes, so a
+  rotation reaches every new connection while an open one keeps the
+  certificate it shook hands with.  A handshake looks at the files at
+  most once a second, following symlinks, and a pair that does not
+  load, such as one replaced halfway, leaves the last one that loaded
+  in place.  A pair that does not load at startup stops the server
+  before it opens anything.
 
 ### Bootstrap
 

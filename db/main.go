@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -21,6 +22,9 @@ func main() {
 	maxCommands := flag.Int("max-commands", 128, "the most commands one request may carry")
 	maxAnonymousCommands := flag.Int("max-anonymous-commands", 8,
 		"the most commands one request without a session may carry")
+	tlsCert := flag.String("tls-cert", "", "serve HTTPS with the certificate in this PEM file, "+
+		"reloaded when the file changes; requires --tls-key")
+	tlsKey := flag.String("tls-key", "", "the private key of --tls-cert, in a PEM file")
 	var bootstrapEnv []string
 	flag.Func("bootstrap-env", "an environment variable the bundle's bootstrap may read (repeatable)", func(name string) error {
 		bootstrapEnv = append(bootstrapEnv, name)
@@ -30,6 +34,20 @@ func main() {
 	if *bundle == "" {
 		fmt.Fprintln(os.Stderr, errNoBundle)
 		os.Exit(2)
+	}
+	if (*tlsCert == "") != (*tlsKey == "") {
+		fmt.Fprintln(os.Stderr, "phaselockdb: --tls-cert and --tls-key go together")
+		os.Exit(2)
+	}
+
+	// a certificate pair loads before anything opens, so a wrong path or a mismatched pair fails
+	// at once
+	var certs *certFiles
+	if *tlsCert != "" {
+		var err error
+		if certs, err = loadCertFiles(*tlsCert, *tlsKey); err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	// one context for the process, ended by a signal
@@ -43,8 +61,17 @@ func main() {
 	}
 	web := &http.Server{Addr: *listen, Handler: srv.Handler(), BaseContext: srv.BaseContext}
 	served := make(chan error, 1)
-	go func() { served <- web.ListenAndServe() }()
-	log.Printf("phaselockdb listening on %s (epoch %s)", *listen, srv.epoch)
+
+	// serve HTTPS with the certificate pair, rotated by replacing its files, or else HTTP
+	scheme := "http"
+	if certs != nil {
+		web.TLSConfig = &tls.Config{GetCertificate: certs.get}
+		scheme = "https"
+		go func() { served <- web.ListenAndServeTLS("", "") }()
+	} else {
+		go func() { served <- web.ListenAndServe() }()
+	}
+	log.Printf("phaselockdb listening on %s://%s (epoch %s)", scheme, *listen, srv.epoch)
 
 	// serve until the signal, or until serving fails
 	select {
