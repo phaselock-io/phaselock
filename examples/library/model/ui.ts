@@ -13,6 +13,7 @@ export type {
   QueryFunction,
   UserBookInfo,
   UserEngineQueryTxn,
+  UserPatronInfo,
 } from './model.gen';
 export { adminForecasters, userForecasters } from './outcomes';
 export { adminQueries, userQueries } from './queries';

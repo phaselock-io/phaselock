@@ -3,7 +3,7 @@
    from here; each Engine's forecasters answer the same outcome, over what the Engine has synced,
    so the UI shows a hold or a checkout as the database will most likely decide it.
 
-   The outcomes of the commands a patron sends read only the catalogue and the patrons, which every
+   The outcomes of the commands a patron sends read only the catalog and the patrons, which every
    Engine and the database hold; a patron's Engine holds only that patron, which is all those read
    of the patrons.  The outcomes of the librarians' own commands also read the owner of a hold from
    the admin slice, which only the librarians' Engine and the database hold.  Every command names
@@ -48,7 +48,7 @@ const MAX_OVERDUE = 2;
 type Txn = UserEngineTxn;
 type AdminTxn = AdminEngineTxn;
 
-/** the streams of a room's catalogue, librarians' records, and each patron */
+/** the streams of a room's catalog, librarians' records, and each patron */
 export const bookStream = (room: string) => `book:${room}` as const;
 export const adminStream = (room: string) => `admin:${room}` as const;
 export const patronStream = (room: string, patron: string) => `patron:${room},${patron}` as const;
@@ -94,7 +94,7 @@ function titleOf(txn: Txn, room: string, target: { book: string } | { edition: s
   return txn.get.edition(room, isbn)?.title ?? isbn;
 }
 
-/** The events that close a hold: the catalogue's, the librarians' record of its owner's, and its
+/** The events that close a hold: the catalog's, the librarians' record of its owner's, and its
     patron's, which says why.  notify is whether the patron is told with a notice, as they are of
     every close they did not make. */
 export function closeHold(

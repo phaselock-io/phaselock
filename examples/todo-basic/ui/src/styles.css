@@ -33,33 +33,40 @@ h1 {
   width: 32em;
 }
 
-.list {
-  border: 1px solid #2c3a33;
-  border-radius: 6px;
-  padding: 4px;
-  margin-bottom: 8px;
+/* The lists' layout, as the library's: one spacing unit of 4px, and thin rules between the
+   rows of a list. */
+.list + .list {
+  margin-top: 20px;
 }
 
 .list-title {
-  /* extend the divider across .list's 4px padding so it reaches the border */
-  margin: 0 -4px 4px;
-  border-bottom: 1px solid #2c3a33;
+  border-bottom: 1px solid #26322c;
 }
 
 .row {
-  padding: 4px 8px;
+  padding: 6px 4px;
 }
 
-.clickable {
-  cursor: pointer;
+.item + .item {
+  border-top: 1px solid #26322c;
 }
 
-.dim {
-  opacity: 0.7;
+.add {
+  padding: 4px 0;
+}
+
+/* a new list stands apart from the last list's own add */
+.add-list {
+  margin-top: 16px;
 }
 
 .grow {
   flex: 1;
+  min-width: 0;
+}
+
+.clickable {
+  cursor: pointer;
 }
 
 .done {
@@ -73,7 +80,7 @@ h1 {
   transition: background-color 0.1s;
 }
 .hoverable:hover {
-  background-color: rgba(255, 255, 255, 0.08);
+  background-color: rgba(255, 255, 255, 0.04);
 }
 .hoverable .hover-action {
   visibility: hidden;

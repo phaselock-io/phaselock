@@ -20,7 +20,7 @@ function mark(pending: boolean) {
   return pending ? { pending } : {};
 }
 
-// a hold as its patron keeps it, which drops what only the catalogue keeps
+// a hold as its patron keeps it, which drops what only the catalog keeps
 function patronHold(e: HoldOpened | PatronHoldOpened, pending: boolean) {
   const expires = e.expires === undefined ? {} : { expires: e.expires };
   return { id: e.id, target: e.target, ...expires, ...mark(pending) };

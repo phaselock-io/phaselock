@@ -69,25 +69,6 @@ export const theme: ThemeConfig = {
   },
 };
 
-/** For controls that sit inside a patron's colored chip, such as the name's editor, where the
-    green accent would clash: light gray stands in for it, on its own and for the buttons. */
-export const neutral: ThemeConfig = {
-  token: { colorPrimary: '#c9d1cc' },
-  components: {
-    Button: {
-      colorPrimary: '#c9d1cc',
-      colorPrimaryHover: '#e8ece9',
-      colorPrimaryActive: '#aeb7b2',
-      defaultHoverBg: shade('#c9d1cc'),
-      defaultHoverColor: '#e8ece9',
-      defaultHoverBorderColor: '#c9d1cc',
-      defaultActiveBg: shade('#c9d1cc', 0.08),
-      defaultActiveColor: '#e8ece9',
-      defaultActiveBorderColor: '#c9d1cc',
-    },
-  },
-};
-
 /** the color of each state of an Engine's connection */
 export const STATE_COLORS = {
   connecting: PALETTE.amber,

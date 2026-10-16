@@ -1,182 +1,24 @@
-import { EditOutlined, LoadingOutlined } from '@ant-design/icons';
+import { LoadingOutlined } from '@ant-design/icons';
 import {
   type Notice,
   type UserBookInfo,
   type UserEngine,
   type UserEngineQueryTxn,
+  type UserPatronInfo,
   userQueries,
 } from '@library/model/ui';
-import {
-  Alert,
-  Button,
-  Card,
-  ConfigProvider,
-  Flex,
-  Input,
-  List,
-  Space,
-  Spin,
-  Switch,
-  Tag,
-  Typography,
-} from 'antd';
+import { Alert, Button, Card, Flex, Spin, Tag, Typography } from 'antd';
 import { useState } from 'react';
 
 import type { Client, Unroomed } from './engines';
-import { neutral, PALETTE, STATE_COLORS, tinted } from './theme';
+import { Connection, PatronAvatar, Rename, Section } from './parts';
+import { PALETTE, tinted } from './theme';
 import { useLocalQuery } from './useLocalQuery';
 import { generateUuid } from './util';
 
 const { Text } = Typography;
 
-function PatronName({ name, onRename }: { name: string; onRename: (newName: string) => void }) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(name);
-
-  function startEditing() {
-    setDraft(name);
-    setEditing(true);
-  }
-
-  function confirm() {
-    if (draft && draft !== name) {
-      onRename(draft);
-    }
-    setEditing(false);
-  }
-
-  function cancel() {
-    setEditing(false);
-  }
-
-  if (editing) {
-    return (
-      <Flex gap="small" align="center">
-        <Input
-          size="small"
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onPressEnter={confirm}
-          autoFocus
-        />
-        <Button size="small" type="primary" onClick={confirm}>
-          OK
-        </Button>
-        <Button size="small" onClick={cancel}>
-          Cancel
-        </Button>
-      </Flex>
-    );
-  }
-
-  return (
-    <Flex gap="small" align="center">
-      <Text strong style={{ color: 'inherit' }}>
-        {name}
-      </Text>
-      <EditOutlined onClick={startEditing} style={{ cursor: 'pointer' }} />
-    </Flex>
-  );
-}
-
-function BookItem({
-  book,
-  researcher,
-  onHold,
-  onHoldRestricted,
-  onCancelHold,
-}: {
-  book: UserBookInfo;
-  researcher: boolean;
-  onHold: (isbn: string) => void;
-  onHoldRestricted: (isbn: string) => void;
-  onCancelHold: (holdId: string) => void;
-}) {
-  const heldNormal = book.hold && 'edition' in book.hold.target;
-  // this assumes book-targeting holds are only used for restricted books, but whatever
-  const heldRestricted = book.hold && 'book' in book.hold.target;
-  return (
-    <List.Item>
-      <div style={{ width: '100%' }}>
-        <div>{book.title}</div>
-        <Flex gap="small" style={{ marginTop: 4 }}>
-          {/* hold or cancel-hold */}
-          {heldNormal ? (
-            <Button
-              size="small"
-              icon={book.hold!.pending ? <LoadingOutlined /> : undefined}
-              onClick={() => onCancelHold(book.hold!.id)}
-              type="primary">
-              Cancel Hold
-            </Button>
-          ) : (
-            <Button
-              size="small"
-              disabled={heldRestricted || book.availableNormal < 1}
-              onClick={() => onHold(book.isbn)}
-              color={'default'}
-              variant={'outlined'}>
-              Hold
-            </Button>
-          )}
-          {/* hold-restricted or cancel-hold-restricted */}
-          {heldRestricted ? (
-            <Button
-              size="small"
-              icon={book.hold!.pending ? <LoadingOutlined /> : undefined}
-              onClick={() => onCancelHold(book.hold!.id)}
-              type="primary">
-              Cancel Hold
-            </Button>
-          ) : (
-            <Button
-              size="small"
-              disabled={heldNormal || !researcher || book.availableRestricted.length === 0}
-              onClick={() => onHoldRestricted(book.availableRestricted[0])}
-              color={'default'}
-              variant={'outlined'}>
-              Hold Restricted
-            </Button>
-          )}
-        </Flex>
-      </div>
-    </List.Item>
-  );
-}
-
-function Books({
-  eng,
-  researcher,
-  onHold,
-  onHoldRestricted,
-  onCancelHold,
-}: {
-  eng: UserEngine;
-  researcher: boolean;
-  onHold: (isbn: string) => void;
-  onHoldRestricted: (bookId: string) => void;
-  onCancelHold: (holdId: string) => void;
-}) {
-  const books = useLocalQuery(eng, userQueries.allBooks);
-  if (!books) return <Spin />;
-
-  return (
-    <List
-      dataSource={books}
-      renderItem={(book) => (
-        <BookItem
-          book={book}
-          researcher={researcher}
-          onHold={onHold}
-          onHoldRestricted={onHoldRestricted}
-          onCancelHold={onCancelHold}
-        />
-      )}
-    />
-  );
-}
-
-// the patron's notices, each of a hold that failed
+// the patron's notices, each of a hold that closed or failed without them
 function noticesQuery(qx: UserEngineQueryTxn): Notice[] {
   return [...qx.scan.patron_notice()].map(([, notice]) => notice);
 }
@@ -189,6 +31,91 @@ function connectionQuery(qx: UserEngineQueryTxn) {
   return qx.status.connection().state;
 }
 
+// a date as a reader says it, such as "Oct 21"
+function day(date: Date): string {
+  return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+/** what the patron's hold on a title, or the title's unrestricted copies, come to, in a few words */
+function availability(book: UserBookInfo): string {
+  const hold = book.hold;
+  if (hold?.pending) return 'Placing a hold…';
+  if (hold) return hold.expires ? `On hold for you until ${day(hold.expires)}` : 'On hold for you';
+  if (book.availableNormal > 0) return `${book.availableNormal} available`;
+  return 'every copy is taken';
+}
+
+/** One title of the catalog: its availability and its actions, a hold or the hold's cancel.  A
+    researcher may also hold a free restricted copy, with a second button beneath the first. */
+function BookRow({
+  book,
+  researcher,
+  onHold,
+  onCancelHold,
+}: {
+  book: UserBookInfo;
+  researcher: boolean;
+  onHold: (target: { book: string } | { edition: string }) => void;
+  onCancelHold: (hold: string) => void;
+}) {
+  const hold = book.hold;
+  const restricted = book.availableRestricted[0];
+  return (
+    <Flex align="center" gap="small" className="row">
+      <Flex vertical className="grow">
+        <Text>{book.title}</Text>
+        <Text type="secondary" className="small">
+          {availability(book)}
+        </Text>
+      </Flex>
+
+      {/* a hold, pending or decided, may be canceled */}
+      {hold ? (
+        <Button
+          size="small"
+          icon={hold.pending ? <LoadingOutlined /> : undefined}
+          onClick={() => onCancelHold(hold.id)}>
+          Cancel hold
+        </Button>
+      ) : (
+        <Flex vertical gap={4} className="actions">
+          <Button
+            size="small"
+            disabled={book.availableNormal < 1}
+            onClick={() => onHold({ edition: book.isbn })}>
+            Hold
+          </Button>
+          {researcher && restricted !== undefined && (
+            <Button size="small" onClick={() => onHold({ book: restricted })}>
+              Hold restricted
+            </Button>
+          )}
+        </Flex>
+      )}
+    </Flex>
+  );
+}
+
+/** the books the patron has out, each with when it is due */
+function Checkouts({ patron }: { patron: UserPatronInfo }) {
+  return (
+    <Section title="Checked out">
+      {patron.checkouts.map((c) => (
+        <Flex key={c.id} align="center" gap="small" className="row">
+          <Text className="grow">{c.title}</Text>
+          {c.overdue ? (
+            <Tag style={tinted(PALETTE.alarm)}>overdue</Tag>
+          ) : (
+            <Text type="secondary" className="small">
+              due {day(c.expires)}
+            </Text>
+          )}
+        </Flex>
+      ))}
+    </Section>
+  );
+}
+
 export default function PatronWindow({
   patronId,
   client,
@@ -197,11 +124,11 @@ export default function PatronWindow({
   client: Client<UserEngine>;
 }) {
   const eng = client.engine;
-  const [enabled, setEnabled] = useState(client.transport.online);
+  const [online, setOnlineState] = useState(client.transport.online);
   const patron = useLocalQuery(eng, userQueries.myPatron);
+  const books = useLocalQuery(eng, userQueries.allBooks);
   const notices = useLocalQuery(eng, noticesQuery) ?? [];
   const connState = useLocalQuery(eng, connectionQuery) ?? 'connecting';
-  const stateColor = STATE_COLORS[connState];
 
   // every command names the window's room
   function send(command: Unroomed<Command>) {
@@ -212,7 +139,7 @@ export default function PatronWindow({
   function setOnline(on: boolean) {
     client.transport.online = on;
     if (on) eng.reconnectNow();
-    setEnabled(on);
+    setOnlineState(on);
   }
 
   function hold(target: { book: string } | { edition: string }) {
@@ -228,72 +155,64 @@ export default function PatronWindow({
 
   return (
     <Card
+      className="window"
       title={
         <Flex align="center" gap="small">
           {patron ? (
-            <span
-              style={{
-                // the patron's color, with the name in the dark text the green buttons use
-                backgroundColor: patron.color,
-                color: PALETTE.onAccent,
-                padding: '2px 8px',
-                borderRadius: 4,
-              }}>
-              <ConfigProvider theme={neutral}>
-                <PatronName
-                  name={patron.name}
-                  onRename={(newName) =>
-                    send({
-                      type: 'rename-patron',
-                      id: patronId,
-                      name: newName,
-                      timestamp: new Date(),
-                    })
-                  }
-                />
-              </ConfigProvider>
-            </span>
+            <>
+              <PatronAvatar name={patron.name} color={patron.color} size={24} />
+              <Text strong>{patron.name}</Text>
+              <Rename
+                value={patron.name}
+                label="Rename yourself"
+                onRename={(name) =>
+                  send({ type: 'rename-patron', id: patronId, name, timestamp: new Date() })
+                }
+              />
+              {patron.researcher && <Tag style={tinted(PALETTE.accent)}>researcher</Tag>}
+            </>
           ) : (
             <Spin size="small" />
           )}
-          {patron?.researcher && <Tag style={tinted(PALETTE.accent)}>researcher</Tag>}
-          <span style={{ flex: 1 }} />
-          <Tag style={tinted(stateColor)}>{connState}</Tag>
-          <Switch
-            size="small"
-            checked={enabled}
-            onChange={setOnline}
-            checkedChildren="on"
-            unCheckedChildren="off"
-          />
+          <span className="grow" />
+          <Connection state={connState} online={online} onOnline={setOnline} />
         </Flex>
-      }
-      style={{ width: '32em' }}>
-      <Books
-        eng={eng}
-        researcher={patron?.researcher ?? false}
-        onHold={(isbn) => hold({ edition: isbn })}
-        onHoldRestricted={(bookId) => hold({ book: bookId })}
-        onCancelHold={(holdId) => send({ type: 'cancel-hold', id: holdId, patron: patronId })}
-      />
+      }>
+      {/* holds that closed or failed without the patron, each dismissed on its own */}
       {notices.length > 0 && (
-        <div style={{ marginTop: '0.5em' }}>
-          <Space direction="vertical" style={{ width: '100%' }} size="small">
-            {notices.map((notice) => (
-              <Alert key={notice.id} type="warning" showIcon message={notice.reason} />
-            ))}
-            <Button
-              size="small"
-              onClick={() => {
-                for (const notice of notices) {
-                  send({ type: 'patron-dismiss-notice', id: notice.id, patron: patronId });
-                }
-              }}>
-              Dismiss
-            </Button>
-          </Space>
-        </div>
+        <Flex vertical gap="small" className="notices">
+          {notices.map((notice) => (
+            <Alert
+              key={notice.id}
+              type="warning"
+              showIcon
+              closable={{
+                onClose: () =>
+                  send({ type: 'patron-dismiss-notice', id: notice.id, patron: patronId }),
+              }}
+              title={notice.reason}
+            />
+          ))}
+        </Flex>
       )}
+
+      {patron !== undefined && patron.checkouts.length > 0 && <Checkouts patron={patron} />}
+
+      <Section title="Catalog">
+        {books ? (
+          books.map((book) => (
+            <BookRow
+              key={book.isbn}
+              book={book}
+              researcher={patron?.researcher ?? false}
+              onHold={hold}
+              onCancelHold={(id) => send({ type: 'cancel-hold', id, patron: patronId })}
+            />
+          ))
+        ) : (
+          <Spin />
+        )}
+      </Section>
     </Card>
   );
 }

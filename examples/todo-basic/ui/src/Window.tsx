@@ -1,8 +1,8 @@
 import type { TodoEngine, TodoEngineQueryTxn, TodoEvents } from '@todo-basic/model/ui';
-import { Card, Flex, Spin, Tag, Typography } from 'antd';
+import { Badge, Card, Flex, Spin, Typography } from 'antd';
 
 import ListView, { InlineAdd, ListData } from './ListView';
-import { STATE_COLORS, tinted } from './theme';
+import { STATE_COLORS } from './theme';
 import { useLocalQuery } from './useLocalQuery';
 import { generateUuid } from './util';
 
@@ -33,7 +33,6 @@ function connectionQuery(qx: TodoEngineQueryTxn) {
 export default function Window({ name, eng }: { name: string; eng: TodoEngine }) {
   const lists = useLocalQuery(eng, listsQuery);
   const connState = useLocalQuery(eng, connectionQuery) ?? 'connecting';
-  const stateColor = STATE_COLORS[connState];
 
   function send(command: TodoEvents) {
     eng.sendCommand(command);
@@ -75,7 +74,7 @@ export default function Window({ name, eng }: { name: string; eng: TodoEngine })
           <Text strong className="grow">
             {name}
           </Text>
-          <Tag style={tinted(stateColor)}>{connState}</Tag>
+          <Badge color={STATE_COLORS[connState]} text={<Text type="secondary">{connState}</Text>} />
         </Flex>
       }>
       {lists === undefined ? (
@@ -94,7 +93,12 @@ export default function Window({ name, eng }: { name: string; eng: TodoEngine })
               onArchiveItem={archiveItem}
             />
           ))}
-          <InlineAdd label="add list" placeholder="list name" onSubmit={addList} />
+          <InlineAdd
+            label="new list"
+            placeholder="list name"
+            className="add add-list"
+            onSubmit={addList}
+          />
         </>
       )}
     </Card>

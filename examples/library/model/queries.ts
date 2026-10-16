@@ -23,7 +23,7 @@ function booksOf(qx: UserEngineQueryTxn, room: string, isbn: string): Book[] {
   return books.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
 }
 
-/** a patron's queries; a patron's Engine syncs the catalogue and that patron alone */
+/** a patron's queries; a patron's Engine syncs the catalog and that patron alone */
 export const userQueries: UserQueryDefs<UserEngineQueryTxn> = {
   // every edition, with how many copies the patron can hold and their own hold on it, if any
   allBooks(qx) {

@@ -46,7 +46,7 @@ alias Isbn = string;
 // Book Slice //
 ////////////////
 
-// The public catalogue: editions, the books of each edition, and the state of every hold and
+// The public catalog: editions, the books of each edition, and the state of every hold and
 // checkout, with no patron named anywhere, since every user syncs this slice.  Collections are
 // key ranges that readers scan, such as `edition_book:{isbn},` for the books of one edition.
 
@@ -166,7 +166,7 @@ model RemoveBook {
 
 // Hold commands + events //
 
-// the catalogue learns of the hold, the patron learns it is theirs, and the librarians learn whose
+// the catalog learns of the hold, the patron learns it is theirs, and the librarians learn whose
 // it is, or the patron alone learns why it failed
 @command([HoldOpened, PatronHoldOpened, HoldOwner] | HoldFailed)
 model TryHold {
@@ -188,7 +188,7 @@ model HoldOpened {
   expires?: utcDateTime;
 }
 
-// the hold closes in the catalogue, in the librarians' record of whose it was, and for its patron
+// the hold closes in the catalog, in the librarians' record of whose it was, and for its patron
 @command([HoldClosed, HoldClosed, PatronHoldClosed])
 model CancelHold {
   type: "cancel-hold";
@@ -234,7 +234,7 @@ model CheckoutOpened {
   timestamp: utcDateTime;
 }
 
-// the checkout ends in the catalogue, in the librarians' record of whose it was, and for its patron
+// the checkout ends in the catalog, in the librarians' record of whose it was, and for its patron
 @command([CheckoutEnded, CheckoutEnded, PatronCheckoutEnded])
 model EndCheckout {
   type: "end-checkout";
@@ -397,9 +397,9 @@ model PatronDismissNotice {
 /////////////////
 
 // The librarians' shared inbox, notices about work that failed after it was queued, and the owner
-// of every open hold and checkout, which the catalogue leaves out.  A hold or checkout that opens
+// of every open hold and checkout, which the catalog leaves out.  A hold or checkout that opens
 // names its owner here, and its HoldClosed or CheckoutEnded comes here too, as it does to the
-// catalogue.
+// catalog.
 
 interface AdminSlice extends Slice<"admin:{room}", AdminEvents, AdminStore> {}
 
@@ -582,7 +582,7 @@ union RoomRegistryEvents {
 }
 
 // Sent anonymously by the UI for the room in its URL.  For a room that exists it writes
-// nothing; otherwise it seeds the room with the demo's catalogue, patrons, and logins.
+// nothing; otherwise it seeds the room with the demo's catalog, patrons, and logins.
 @online
 @command((
   | RoomCreated

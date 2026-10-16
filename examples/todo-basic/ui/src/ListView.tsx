@@ -1,5 +1,5 @@
 import { CloseOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons';
-import { Button, Flex, Input, Typography } from 'antd';
+import { Button, Checkbox, Flex, Input, Typography } from 'antd';
 import { useState } from 'react';
 
 const { Text } = Typography;
@@ -76,13 +76,16 @@ function ItemRow({
   }
 
   return (
-    <Flex className="row clickable hoverable" align="center" gap="small" onClick={onToggle}>
+    // the whole row toggles the item; its checkbox and buttons keep their clicks to themselves
+    <Flex className="row item hoverable clickable" align="center" gap="small" onClick={onToggle}>
+      <Checkbox checked={item.done} onChange={onToggle} onClick={(e) => e.stopPropagation()} />
       <span className={item.done ? 'grow done' : 'grow'}>{item.text}</span>
       <Button
         className="hover-action"
         size="small"
         type="text"
         icon={<EditOutlined />}
+        aria-label="edit item"
         onClick={(e) => {
           e.stopPropagation();
           setEditing(true);
@@ -93,6 +96,7 @@ function ItemRow({
         size="small"
         type="text"
         icon={<CloseOutlined />}
+        aria-label="archive item"
         onClick={(e) => {
           e.stopPropagation();
           onArchive();
@@ -105,10 +109,12 @@ function ItemRow({
 function InlineAdd({
   label,
   placeholder,
+  className = 'add',
   onSubmit,
 }: {
   label: string;
   placeholder: string;
+  className?: string;
   onSubmit: (text: string) => void;
 }) {
   const [editing, setEditing] = useState(false);
@@ -125,10 +131,11 @@ function InlineAdd({
   }
 
   return (
-    <Flex className="row clickable dim" align="center" gap="small" onClick={() => setEditing(true)}>
-      <PlusOutlined />
-      <Text type="secondary">{label}</Text>
-    </Flex>
+    <div className={className}>
+      <Button size="small" type="text" icon={<PlusOutlined />} onClick={() => setEditing(true)}>
+        {label}
+      </Button>
+    </div>
   );
 }
 
@@ -170,6 +177,7 @@ export default function ListView({
               size="small"
               type="text"
               icon={<EditOutlined />}
+              aria-label="rename list"
               onClick={() => setRenamingList(true)}
             />
             <Button
@@ -177,6 +185,7 @@ export default function ListView({
               size="small"
               type="text"
               icon={<CloseOutlined />}
+              aria-label="archive list"
               onClick={onArchiveList}
             />
           </Flex>
@@ -191,7 +200,7 @@ export default function ListView({
           onArchive={() => onArchiveItem(item.id)}
         />
       ))}
-      <InlineAdd label="add item" placeholder="item text" onSubmit={onAddItem} />
+      <InlineAdd label="item" placeholder="item text" onSubmit={onAddItem} />
     </div>
   );
 }

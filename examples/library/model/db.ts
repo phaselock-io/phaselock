@@ -88,7 +88,7 @@ function ownLogin(txn: Txn, p: Principal, room: string): { login: string; id: st
 const PASSWORD =
   '$argon2id$v=19$m=19456,t=2,p=1$Q5DUnO7oOsLNn2Dbq0onlg$BtsQQtohUlcUy4tUcXf91Cz3CrOcd1ewdp6Aplntmfk';
 
-// the seeded catalogue: two copies of each edition, one of them restricted
+// the seeded catalog: two copies of each edition, one of them restricted
 const EDITIONS = [
   ['978-1-4842-4585-9', 'Versioning in an Event Sourced System'],
   ['978-1-4842-2553-0', 'Implementing Domain-Driven Design'],
@@ -102,7 +102,7 @@ const PATRONS = [
   { login: 'bob', name: 'Bob', color: '#208fdf', researcher: false },
 ];
 
-// the demo's starting state in a room: the catalogue, the patrons, and the logins
+// the demo's starting state in a room: the catalog, the patrons, and the logins
 function seed(room: string): CreateRoomOutput {
   const out: CreateRoomOutput = [];
 
@@ -110,7 +110,7 @@ function seed(room: string): CreateRoomOutput {
   let at = Date.now();
   const next = () => new Date(at++);
 
-  // the catalogue
+  // the catalog
   for (const [isbn, title] of EDITIONS) {
     out.push({
       stream: bookStream(room),
@@ -220,7 +220,7 @@ const precommit: LibraryDBPrecommit<Plugins> = {
       throw new Reject('return every book first');
     }
 
-    /* The account's open holds close with it, in the catalogue and the librarians' record of
+    /* The account's open holds close with it, in the catalog and the librarians' record of
        their owner, and its patron stream ends with its history erased. */
     const holds = [...txn.scan.patron_hold({ room, patron: id }, { keys: true })].flatMap(
       ({ hold }) => {
@@ -344,7 +344,7 @@ const precommit: LibraryDBPrecommit<Plugins> = {
 };
 
 /* The daily sheet, at midnight UTC: closed-ended holds past their expiry close, and checkouts past
-   theirs become overdue.  It sweeps every room's catalogue for open holds and checkouts, and reads
+   theirs become overdue.  It sweeps every room's catalog for open holds and checkouts, and reads
    whose each one is from the librarians' record of their owners. */
 function dailySheet(txn: Txn, now: Date): LibraryDBOutput[] {
   const out: LibraryDBOutput[] = [];
@@ -384,7 +384,7 @@ defineLibraryDB<Plugins>({
     rooms: roomRegistryReducers,
   },
   precommit,
-  // a patron may see their room's catalogue and their own record, and a librarian everything
+  // a patron may see their room's catalog and their own record, and a librarian everything
   // synced in the room; everyone in a room sees the room's own record
   maySee: (txn, principal) => {
     const u = parseUser(principal.user);
