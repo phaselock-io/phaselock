@@ -2,6 +2,7 @@ import type { TodoEngine, TodoEngineQueryTxn, TodoEvents } from '@todo-basic/mod
 import { Card, Flex, Spin, Tag, Typography } from 'antd';
 
 import ListView, { InlineAdd, ListData } from './ListView';
+import { STATE_COLORS, tinted } from './theme';
 import { useLocalQuery } from './useLocalQuery';
 import { generateUuid } from './util';
 
@@ -28,14 +29,6 @@ function listsQuery(qx: TodoEngineQueryTxn): ListData[] {
 function connectionQuery(qx: TodoEngineQueryTxn) {
   return qx.status.connection().state;
 }
-
-// the tag color of each connection state
-const STATE_COLORS = {
-  connecting: 'orange',
-  syncing: 'blue',
-  live: 'green',
-  offline: 'red',
-};
 
 export default function Window({ name, eng }: { name: string; eng: TodoEngine }) {
   const lists = useLocalQuery(eng, listsQuery);
@@ -82,7 +75,7 @@ export default function Window({ name, eng }: { name: string; eng: TodoEngine })
           <Text strong className="grow">
             {name}
           </Text>
-          <Tag color={stateColor}>{connState}</Tag>
+          <Tag style={tinted(stateColor)}>{connState}</Tag>
         </Flex>
       }>
       {lists === undefined ? (

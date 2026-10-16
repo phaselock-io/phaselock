@@ -8,6 +8,7 @@ import {
 import {
   Button,
   Card,
+  ConfigProvider,
   Divider,
   Flex,
   Input,
@@ -20,8 +21,8 @@ import {
 } from 'antd';
 import { useState } from 'react';
 
-import { colorHash } from './colorhash';
 import type { Client, Unroomed } from './engines';
+import { neutral, PALETTE, STATE_COLORS, tinted } from './theme';
 import { useLocalQuery } from './useLocalQuery';
 import { generateUuid } from './util';
 
@@ -80,7 +81,9 @@ function InlineEdit({
 
   return (
     <Flex gap="small" align="center">
-      <Text strong>{value}</Text>
+      <Text strong style={{ color: 'inherit' }}>
+        {value}
+      </Text>
       <EditOutlined onClick={startEditing} style={{ cursor: 'pointer' }} />
     </Flex>
   );
@@ -94,14 +97,6 @@ function connectionQuery(qx: AdminEngineQueryTxn) {
   return qx.status.connection().state;
 }
 
-// the tag color of each connection state
-const STATE_COLORS = {
-  connecting: 'orange',
-  syncing: 'blue',
-  live: 'green',
-  offline: 'red',
-};
-
 /* ---- main component ---- */
 
 export default function AdminWindow({ client }: { client: Client<AdminEngine> }) {
@@ -114,6 +109,8 @@ export default function AdminWindow({ client }: { client: Client<AdminEngine> })
   // --- queries ---
 
   const patrons = useLocalQuery(eng, adminQueries.allPatrons);
+  // each patron's color, by id, for the books they hold or have out
+  const colors = new Map(patrons?.map((p) => [p.id, p.color]));
   const editions = useLocalQuery(eng, adminQueries.allEditions);
   const connState = useLocalQuery(eng, connectionQuery) ?? 'connecting';
 
@@ -212,7 +209,7 @@ export default function AdminWindow({ client }: { client: Client<AdminEngine> })
         <Flex align="center" gap="small">
           <Text strong>Admin</Text>
           <span style={{ flex: 1 }} />
-          <Tag color={stateColor}>{connState}</Tag>
+          <Tag style={tinted(stateColor)}>{connState}</Tag>
           <Switch
             size="small"
             checked={enabled}
@@ -234,16 +231,20 @@ export default function AdminWindow({ client }: { client: Client<AdminEngine> })
               <Flex gap="small" align="center" style={{ width: '100%' }}>
                 <span
                   style={{
-                    backgroundColor: `${colorHash(patron.id)}`,
+                    // the patron's color, with the name in the dark text the green buttons use
+                    backgroundColor: patron.color,
+                    color: PALETTE.onAccent,
                     padding: '2px 8px',
                     borderRadius: 4,
                   }}>
-                  <InlineEdit
-                    value={patron.name}
-                    onConfirm={(name) =>
-                      send({ type: 'rename-patron', id: patron.id, name, timestamp: new Date() })
-                    }
-                  />
+                  <ConfigProvider theme={neutral}>
+                    <InlineEdit
+                      value={patron.name}
+                      onConfirm={(name) =>
+                        send({ type: 'rename-patron', id: patron.id, name, timestamp: new Date() })
+                      }
+                    />
+                  </ConfigProvider>
                 </span>
                 <span style={{ flex: 1 }} />
                 <Switch
@@ -299,7 +300,7 @@ export default function AdminWindow({ client }: { client: Client<AdminEngine> })
                 />
                 <Flex gap="small" style={{ marginTop: 4 }} wrap>
                   {edition.books.map((book) => {
-                    const color = book.patronId ? `${colorHash(book.patronId)}` : undefined;
+                    const color = book.patronId ? colors.get(book.patronId) : undefined;
                     return (
                       <Button
                         key={book.id}
@@ -350,9 +351,7 @@ export default function AdminWindow({ client }: { client: Client<AdminEngine> })
                 key={patron.id}
                 disabled={disabled}
                 onClick={() => handleCheckout(patron.id)}
-                style={
-                  disabled ? undefined : { borderColor: `${colorHash(patron.id)}`, borderWidth: 2 }
-                }>
+                style={disabled ? undefined : { borderColor: patron.color, borderWidth: 2 }}>
                 {patron.name}
               </Button>
             );

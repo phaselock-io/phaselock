@@ -35,6 +35,12 @@ declare const crypto: { randomUUID(): string };
 
 // a login name fills a key parameter, so it holds no separator of the key templates
 const LOGIN_RE = /^[A-Za-z0-9_-]{1,64}$/;
+// a patron's color, which the UI puts in a style, so it is a plain hex color and nothing else
+const COLOR_RE = /^#[0-9a-f]{6}$/;
+
+// the colors a new patron takes in turn when their account names none, distinct from the green
+// the UI marks actions with
+const PATRON_COLORS = ['#db666e', '#208fdf', '#a36cea', '#dfab20', '#e64c87', '#677ee9'];
 
 type Plugins = { cron: CronPlugin };
 type Txn = LibraryDBTxn;
@@ -90,10 +96,10 @@ const EDITIONS = [
   ['978-0-13-709431-2', 'Designing Offline-First Web Apps with Sync Engines'],
 ];
 
-// the seeded patrons: their login names, names, and whether each is a researcher
+// the seeded patrons: their login names, names, colors, and whether each is a researcher
 const PATRONS = [
-  { login: 'alice', name: 'Alice', researcher: true },
-  { login: 'bob', name: 'Bob', researcher: false },
+  { login: 'alice', name: 'Alice', color: '#db666e', researcher: true },
+  { login: 'bob', name: 'Bob', color: '#208fdf', researcher: false },
 ];
 
 // the demo's starting state in a room: the catalogue, the patrons, and the logins
@@ -123,7 +129,7 @@ function seed(room: string): CreateRoomOutput {
   for (const p of PATRONS) {
     const id = crypto.randomUUID();
     const stream = patronStream(room, id);
-    out.push({ stream, event: { type: 'patron-created', id, name: p.name } });
+    out.push({ stream, event: { type: 'patron-created', id, name: p.name, color: p.color } });
     if (p.researcher) {
       out.push({
         stream,
@@ -295,6 +301,13 @@ const precommit: LibraryDBPrecommit<Plugins> = {
     if (txn.get.room(cmd.room) === undefined) throw new Reject('no such room');
     if (!LOGIN_RE.test(cmd.login)) throw new Reject('a login name is 1 to 64 of [A-Za-z0-9_-]');
     if (txn.get.login(cmd.room, cmd.login) !== undefined) throw new Reject('login taken');
+    if (cmd.color !== undefined && !COLOR_RE.test(cmd.color)) {
+      throw new Reject('a color is #rrggbb in lowercase hex');
+    }
+
+    // without a color of its own, the account takes the next of the patrons' colors
+    const patrons = [...txn.scan.patron({ room: cmd.room }, { keys: true })].length;
+    const color = cmd.color ?? PATRON_COLORS[patrons % PATRON_COLORS.length];
     const id = crypto.randomUUID();
     return [
       {
@@ -309,7 +322,7 @@ const precommit: LibraryDBPrecommit<Plugins> = {
       },
       {
         stream: patronStream(cmd.room, id),
-        event: { type: 'patron-created', id, name: cmd.name },
+        event: { type: 'patron-created', id, name: cmd.name, color },
       },
     ];
   },

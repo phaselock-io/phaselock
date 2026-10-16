@@ -91,7 +91,7 @@ export const bookReducers: BookSliceReducers = {
 
 export const patronReducers: PatronSliceReducers = {
   patronCreated: (txn, e) => {
-    txn.set.patron({ id: e.id, name: e.name, researcher: false });
+    txn.set.patron({ id: e.id, name: e.name, color: e.color, researcher: false });
   },
   renamePatron: (txn, e) => {
     txn.update.patron((patron) => (patron.name = e.name));

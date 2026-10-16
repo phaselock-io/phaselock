@@ -6,11 +6,24 @@ import {
   type UserEngineQueryTxn,
   userQueries,
 } from '@library/model/ui';
-import { Alert, Button, Card, Flex, Input, List, Space, Spin, Switch, Tag, Typography } from 'antd';
+import {
+  Alert,
+  Button,
+  Card,
+  ConfigProvider,
+  Flex,
+  Input,
+  List,
+  Space,
+  Spin,
+  Switch,
+  Tag,
+  Typography,
+} from 'antd';
 import { useState } from 'react';
 
-import { colorHash } from './colorhash';
 import type { Client, Unroomed } from './engines';
+import { neutral, PALETTE, STATE_COLORS, tinted } from './theme';
 import { useLocalQuery } from './useLocalQuery';
 import { generateUuid } from './util';
 
@@ -58,7 +71,9 @@ function PatronName({ name, onRename }: { name: string; onRename: (newName: stri
 
   return (
     <Flex gap="small" align="center">
-      <Text strong>{name}</Text>
+      <Text strong style={{ color: 'inherit' }}>
+        {name}
+      </Text>
       <EditOutlined onClick={startEditing} style={{ cursor: 'pointer' }} />
     </Flex>
   );
@@ -91,8 +106,7 @@ function BookItem({
               size="small"
               icon={book.hold!.pending ? <LoadingOutlined /> : undefined}
               onClick={() => onCancelHold(book.hold!.id)}
-              color={'green'}
-              variant={'solid'}>
+              type="primary">
               Cancel Hold
             </Button>
           ) : (
@@ -111,8 +125,7 @@ function BookItem({
               size="small"
               icon={book.hold!.pending ? <LoadingOutlined /> : undefined}
               onClick={() => onCancelHold(book.hold!.id)}
-              color={'green'}
-              variant={'solid'}>
+              type="primary">
               Cancel Hold
             </Button>
           ) : (
@@ -176,14 +189,6 @@ function connectionQuery(qx: UserEngineQueryTxn) {
   return qx.status.connection().state;
 }
 
-// the tag color of each connection state
-const STATE_COLORS = {
-  connecting: 'orange',
-  syncing: 'blue',
-  live: 'green',
-  offline: 'red',
-};
-
 export default function PatronWindow({
   patronId,
   client,
@@ -228,28 +233,32 @@ export default function PatronWindow({
           {patron ? (
             <span
               style={{
-                backgroundColor: colorHash(patronId),
+                // the patron's color, with the name in the dark text the green buttons use
+                backgroundColor: patron.color,
+                color: PALETTE.onAccent,
                 padding: '2px 8px',
                 borderRadius: 4,
               }}>
-              <PatronName
-                name={patron.name}
-                onRename={(newName) =>
-                  send({
-                    type: 'rename-patron',
-                    id: patronId,
-                    name: newName,
-                    timestamp: new Date(),
-                  })
-                }
-              />
+              <ConfigProvider theme={neutral}>
+                <PatronName
+                  name={patron.name}
+                  onRename={(newName) =>
+                    send({
+                      type: 'rename-patron',
+                      id: patronId,
+                      name: newName,
+                      timestamp: new Date(),
+                    })
+                  }
+                />
+              </ConfigProvider>
             </span>
           ) : (
             <Spin size="small" />
           )}
-          {patron?.researcher && <Tag color="green">researcher</Tag>}
+          {patron?.researcher && <Tag style={tinted(PALETTE.accent)}>researcher</Tag>}
           <span style={{ flex: 1 }} />
-          <Tag color={stateColor}>{connState}</Tag>
+          <Tag style={tinted(stateColor)}>{connState}</Tag>
           <Switch
             size="small"
             checked={enabled}

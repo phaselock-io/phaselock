@@ -1,15 +1,17 @@
-import { ConfigProvider, Flex, theme } from 'antd';
+import { ConfigProvider, Flex } from 'antd';
 
 import { clientA, clientB } from './engines';
+import { theme } from './theme';
 import Window from './Window';
 
 function App() {
-  const { darkAlgorithm } = theme;
-
   return (
-    <ConfigProvider theme={{ algorithm: darkAlgorithm }}>
+    <ConfigProvider theme={theme}>
       <div>
-        <h1>Todo Demo</h1>
+        <div className="brand">
+          <img className="logo" src="/logo.svg" alt="PhaseLock logo" width={48} height={48} />
+          <h1>PhaseLock To-Do Demo</h1>
+        </div>
         <Flex wrap gap="small">
           <Window name="Client A" eng={clientA} />
           <Window name="Client B" eng={clientB} />

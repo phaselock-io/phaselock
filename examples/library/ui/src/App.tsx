@@ -1,17 +1,19 @@
-import { ConfigProvider, Flex, theme } from 'antd';
+import { ConfigProvider, Flex } from 'antd';
 
 import AdminWindow from './AdminWindow';
 import { admin, alice, bob } from './engines';
 import PatronWindow from './PatronWindow';
 import RoomBanner from './RoomBanner';
+import { theme } from './theme';
 
 function App() {
-  const { darkAlgorithm } = theme;
-
   return (
-    <ConfigProvider theme={{ algorithm: darkAlgorithm }}>
+    <ConfigProvider theme={theme}>
       <div>
-        <h1>PhaseLock Demo</h1>
+        <div className="brand">
+          <img className="logo" src="/logo.svg" alt="PhaseLock logo" width={48} height={48} />
+          <h1>PhaseLock Library Demo</h1>
+        </div>
         <RoomBanner />
         <Flex wrap gap="small">
           <AdminWindow client={admin} />

@@ -66,6 +66,7 @@ export const userQueries: UserQueryDefs<UserEngineQueryTxn> = {
     for (const [{ room, patron }, p] of qx.scan.patron()) {
       return {
         name: p.name,
+        color: p.color,
         researcher: p.researcher,
         holds: [...qx.scan.patron_hold({ room, patron })].map(([, hold]) => hold),
         checkouts: [...qx.scan.patron_checkout({ room, patron })].map(([, c]) => {
@@ -75,7 +76,7 @@ export const userQueries: UserQueryDefs<UserEngineQueryTxn> = {
         }),
       };
     }
-    return { name: '', researcher: false, holds: [], checkouts: [] };
+    return { name: '', color: '', researcher: false, holds: [], checkouts: [] };
   },
 };
 

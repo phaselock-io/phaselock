@@ -1,10 +1,34 @@
-h1,
-.room {
-  color: white;
+/* PhaseLock's colors (theme.ts): a near-neutral dark ground and text, and phosphor green as the
+   one accent; the title is in whatever coding font the platform has, nothing bundled */
+body {
+  font-family: system-ui, Helvetica, Arial, sans-serif;
+  padding: 2rem;
+  color: #e8ece9;
+  background-color: #0b0f0d;
 }
 
-body {
-    font-family: Arial, sans-serif;
-    padding: 2rem;
-    background-color: #73161c;
+h1 {
+  font-family: 'DejaVu Sans Mono', Menlo, Consolas, ui-monospace, monospace;
+  color: #f2f5f3;
+}
+
+/* the logo beside the title, as phaselock.io sets them */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.brand h1 {
+  margin: 0;
+}
+
+.logo {
+  display: block;
+  flex-shrink: 0;
+}
+
+.room {
+  color: #8a9a92;
 }

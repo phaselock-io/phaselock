@@ -276,6 +276,8 @@ alias PatronStore = {
 model Patron {
   id: Uuid;
   name: string;
+  // the color the UI shows the patron in, as #rrggbb
+  color: string;
   researcher: boolean;
   // when the patron last changed their password, so a client learns from sync that it landed
   passwordChanged?: utcDateTime;
@@ -313,6 +315,7 @@ model PatronCreated {
   type: "patron-created";
   id: Uuid;
   name: string;
+  color: string;
 }
 
 @command(RenamePatron)
@@ -489,6 +492,8 @@ model CreateAccount {
   ...InRoom;
   login: string;
   name: string;
+  // as #rrggbb; without one, precommit picks the next of the demo's colors
+  color?: string;
   password: NewPassword;
 }
 
@@ -705,6 +710,7 @@ model UserBookInfo {
 // the patron profile: their current holds, and their current checkouts including overdue ones
 model UserPatronInfo {
   name: string;
+  color: string;
   researcher: boolean;
   holds: PatronHold[];
   checkouts: UserCheckoutInfo[];
