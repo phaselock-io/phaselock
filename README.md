@@ -20,7 +20,7 @@ app, your mobile apps, and your backend workers.
         | read               | written
      ___|____________________v_____
     |                              |
-    |   Backend holds event log    |
+    |         PhaseLockDB          |
     |______________________________|
 
 PhaseLock assumes you save all your **events** (like, "user X
@@ -42,17 +42,9 @@ PhaseLock is tooling around this simple architecture to unlock:
 - Live queries against current state
 - Optimistic updates without modifying reducers or UI
 - Offline-capable clients that maintain state locally
-- Thin clients that rely on server-side state
-- Hybrid clients that read server-side state while hydrating local state
 - Backend workers that watch the event log to trigger side-effects
 
 Next step: check out one of our [examples][examples].
-
-## What database do I use for PhaseLock?
-
-Today's examples run against KurrentDB, which works well for PhaseLock apps.
-
-You could also make Postgres work, though we don't have examples of that yet.
 
 ## How do I start using PhaseLock?
 

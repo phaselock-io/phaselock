@@ -44,13 +44,14 @@ layout, build commands, and the test suite.
   (`NewPassword`, `CommandAuth`, ...), which lower by identity to `PIntake` and `PResult`.
 - **Constraint validation (`@minLength`, `@pattern`, ...): decided, not implemented.**  The
   emitters currently ignore the constraint decorators entirely; the registry walk checks
-  structure only.  The decided placement, when implemented: JS-only, enforced at relay command
-  ingress — morally json-schema-at-the-API-edge.  Not at store-write time (too late: the event
-  is already durable).  Constraints are write-time ingress policy, not read-time type invariants
-  (other writers like populate.py bypass the relay; history doesn't re-validate).  Keeping them out
-  of decode/IR means they never affect type identity/interning, and the `@pattern` cross-runtime
-  regex-dialect problem disappears (JS is the only dialect).  TypeSpec's std constraint decorators +
-  compiler accessor functions (`getMinLength` etc.) mean no new vocabulary is needed.
+  structure only.  The decided placement, when implemented: JS-only, enforced at the database's
+  command intake, before precommit — morally json-schema-at-the-API-edge.  Not at store-write time
+  (too late: the event is already durable).  Constraints are write-time ingress policy, not
+  read-time type invariants (a bootstrap or a plugin hook writes events without intake, and history
+  doesn't re-validate).  Keeping them out of decode/IR means they never affect type
+  identity/interning, and the `@pattern` cross-runtime regex-dialect problem disappears (JS is the
+  only dialect).  TypeSpec's std constraint decorators + compiler accessor functions (`getMinLength`
+  etc.) mean no new vocabulary is needed.
 - **Serde is one type registry as data, walked by an interpreter in every host.**  The TS emitter
   generates no per-type codec: it emits the model's types as a node table, with the union solver's
   decision tree inside each union node, and a `Schema` per engine and database naming the
