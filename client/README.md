@@ -103,8 +103,9 @@ Consequences:
   slightly wasteful when only the stream dropped, and worth it: one
   lifetime, one signal, one end.
 - Configuration lives in the transport.  The TypeScript
-  `new HTTPTransport(url)` holds the URL; identity arrives as a session
-  on each call.
+  `new HTTPTransport(url)` holds the database's base URL, its origin
+  and path prefix, such as `https://example.com/phaselock`; identity
+  arrives as a session on each call.
 
 `wants` is the engine's compile-time mask: the refs of the shards the
 generated engine declares (`"book"`, `"patron:{id}"` lower to `book`,

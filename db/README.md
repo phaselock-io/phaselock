@@ -247,6 +247,11 @@ write-up of the dedup design is coming.
 
 ### Wire protocol
 
+Every route is under the server's path prefix, `/phaselock` unless
+`--path-prefix` names another, or `""` for the root, so an origin the
+database shares with an app routes one prefix to it; the paths below
+are relative to it.
+
 Streaming fetch, body is a sequence of msgpack values with no framing.
 Every frame is an array whose first element is a tag.
 

@@ -22,6 +22,8 @@ func main() {
 	maxCommands := flag.Int("max-commands", 128, "the most commands one request may carry")
 	maxAnonymousCommands := flag.Int("max-anonymous-commands", 8,
 		"the most commands one request without a session may carry")
+	pathPrefix := flag.String("path-prefix", "/phaselock", "the path every route is under, so an "+
+		"origin shared with an app routes one prefix to the database; \"\" for the root")
 	tlsCert := flag.String("tls-cert", "", "serve HTTPS with the certificate in this PEM file, "+
 		"reloaded when the file changes; requires --tls-key")
 	tlsKey := flag.String("tls-key", "", "the private key of --tls-cert, in a PEM file")
@@ -55,7 +57,8 @@ func main() {
 	defer stop()
 
 	srv, err := Open(ctx, Options{DataDir: *data, Bundle: *bundle, DevAuth: *devAuth, BootstrapEnv: bootstrapEnv,
-		ClientIPHeader: *clientIPHeader, MaxCommands: *maxCommands, MaxAnonymousCommands: *maxAnonymousCommands})
+		ClientIPHeader: *clientIPHeader, MaxCommands: *maxCommands, MaxAnonymousCommands: *maxAnonymousCommands,
+		PathPrefix: *pathPrefix})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -71,7 +74,7 @@ func main() {
 	} else {
 		go func() { served <- web.ListenAndServe() }()
 	}
-	log.Printf("phaselockdb listening on %s://%s (epoch %s)", scheme, *listen, srv.epoch)
+	log.Printf("phaselockdb listening on %s://%s%s (epoch %s)", scheme, *listen, *pathPrefix, srv.epoch)
 
 	// serve until the signal, or until serving fails
 	select {

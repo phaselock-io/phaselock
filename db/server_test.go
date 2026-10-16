@@ -1404,6 +1404,29 @@ func TestDevAuthCanBeDisabled(t *testing.T) {
 	}
 }
 
+// the routes answer under the path prefix and nowhere else, and a malformed prefix is refused
+func TestPathPrefix(t *testing.T) {
+	h := startWith(t, t.Context(), Options{PathPrefix: "/phaselock"})
+	body := mpEncode(map[string]any{"kind": "dev", "identity": "root"})
+	for path, want := range map[string]int{"/phaselock/auth/token": 200, "/auth/token": 404} {
+		resp, err := http.Post(h.web.URL+path, "application/msgpack", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Fatalf("%s: %d, want %d", path, resp.StatusCode, want)
+		}
+	}
+	for _, bad := range []string{"phaselock", "/phaselock/", "/"} {
+		_, err := Open(t.Context(), Options{DataDir: t.TempDir(), Bundle: filepath.Join("testdata", "bundle.js"),
+			PathPrefix: bad})
+		if err == nil {
+			t.Fatalf("path prefix %q was accepted", bad)
+		}
+	}
+}
+
 func TestRestartKeepsEverything(t *testing.T) {
 	dir := t.TempDir()
 	h := startIn(t, dir)

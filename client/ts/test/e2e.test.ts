@@ -38,7 +38,7 @@ describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
   beforeAll(async () => {
     data = mkdtempSync(join(tmpdir(), 'phaselockdb-'));
     const port = 18000 + Math.floor(Math.random() * 1000);
-    transport = new HTTPTransport(`http://127.0.0.1:${port}`);
+    transport = new HTTPTransport(`http://127.0.0.1:${port}/phaselock`);
     proc = spawn(
       binary,
       [

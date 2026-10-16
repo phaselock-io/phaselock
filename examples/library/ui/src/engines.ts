@@ -21,8 +21,9 @@ import {
   type Transport,
 } from '@phaselock/client';
 
-// the database, which every Engine here reaches through the dev server's proxy (vite.config.ts)
-const http = new HTTPTransport(window.location.origin);
+// the database, under /phaselock, which every Engine here reaches through the dev server's proxy
+// (vite.config.ts)
+const http = new HTTPTransport(`${window.location.origin}/phaselock`);
 
 // every Engine here lives as long as the page, or until a hot reload replaces this module
 const controller = new AbortController();

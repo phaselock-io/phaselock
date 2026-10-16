@@ -1,8 +1,9 @@
 import { HTTPTransport } from '@phaselock/client';
 import { TodoEngine, todoReducers } from '@todo-basic/model/ui';
 
-// the database, which every Engine here reaches through the dev server's proxy (vite.config.ts)
-const transport = new HTTPTransport(window.location.origin);
+// the database, under /phaselock, which every Engine here reaches through the dev server's proxy
+// (vite.config.ts)
+const transport = new HTTPTransport(`${window.location.origin}/phaselock`);
 
 // every Engine here lives as long as the page, or until a hot reload replaces this module
 const controller = new AbortController();

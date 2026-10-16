@@ -66,7 +66,8 @@ function readU32(b: Uint8Array): number {
 export type Credentials =
   { kind: 'password'; identity: string; password: string } | { kind: 'dev'; identity: string };
 
-/** The Transport to a database over HTTP, at its URL.  It signs in and refreshes sessions, and
+/** The Transport to a database over HTTP, at its base URL: its origin and the path its routes are
+    under, such as `https://example.com/phaselock`.  It signs in and refreshes sessions, and
     refreshes a session it is handed once the session has lived half its lifetime. */
 export class HTTPTransport implements Transport {
   #url: string;
@@ -78,7 +79,7 @@ export class HTTPTransport implements Transport {
   #limits: CommandLimits = { session: 128, anonymous: 8 };
 
   constructor(url: string) {
-    this.#url = url;
+    this.#url = baseURL(url);
   }
 
   buildRegistry(schema: Schema): Registry {
@@ -705,6 +706,12 @@ async function inRequests(
 /* One POST of commands, answered with their outcomes in order.  Any status but 200 rejects, since
    such a response answers no command; a 413 naming the database's limit rejects with
    TooManyCommands. */
+// a database's base URL, without the trailing slash that would double the one every route starts
+// with
+function baseURL(url: string): string {
+  return url.replace(/\/+$/, '');
+}
+
 async function postCommands(
   url: string,
   headers: Record<string, string>,
@@ -765,7 +772,7 @@ export async function postCommand(
 ): Promise<CommandResult> {
   const headers: Record<string, string> =
     token === null ? {} : { Authorization: `Bearer ${token}` };
-  const [result] = await postCommands(url, headers, [command]);
+  const [result] = await postCommands(baseURL(url), headers, [command]);
   return result;
 }
 

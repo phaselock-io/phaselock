@@ -45,6 +45,9 @@ type Options struct {
 	// (default 8)
 	MaxCommands          int
 	MaxAnonymousCommands int
+	// the path every route is under, such as /phaselock, so an origin the database shares with an
+	// app routes one prefix to it; "" puts the routes at the root
+	PathPrefix string
 
 	// tests only: the clock tokens and their keys are minted and checked by, time.Now when nil
 	now func() time.Time
@@ -66,6 +69,8 @@ type Server struct {
 	clientIPHeader string
 	// the most commands a request may carry, and an anonymous one
 	maxCommands, maxAnonymousCommands int
+	// the path every route is under, "" for the root
+	pathPrefix string
 
 	mu       sync.Mutex
 	pending  map[uint64]chan result
@@ -123,6 +128,9 @@ const eventsPage = 1000
 // should run under BaseContext, so that they end with it.
 func Open(ctx context.Context, o Options) (*Server, error) {
 	if err := checkClientIPHeader(o.ClientIPHeader); err != nil {
+		return nil, err
+	}
+	if err := checkPathPrefix(o.PathPrefix); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(o.DataDir, 0o755); err != nil {
@@ -188,6 +196,7 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 		now:                  now,
 		devAuth:              o.DevAuth,
 		clientIPHeader:       o.ClientIPHeader,
+		pathPrefix:           o.PathPrefix,
 		maxCommands:          maxCommands,
 		maxAnonymousCommands: min(maxAnonymous, maxCommands),
 		epoch:                c.epoch(),
@@ -256,6 +265,7 @@ func (s *Server) Close() {
 // they end with the server.
 func (s *Server) BaseContext(net.Listener) context.Context { return s.ctx }
 
+// Handler serves every route under the server's path prefix, which it strips before routing.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stream", s.handleStream)
@@ -263,7 +273,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/snapshot/", s.handleSnapshot)
 	mux.HandleFunc("/events/", s.handleEvents)
 	mux.HandleFunc("/auth/token", s.handleAuth)
-	return mux
+	if s.pathPrefix == "" {
+		return mux
+	}
+	return http.StripPrefix(s.pathPrefix, mux)
+}
+
+// checkPathPrefix refuses a path prefix that is neither "" nor a path starting with a slash and
+// ending without one
+func checkPathPrefix(prefix string) error {
+	if prefix != "" && (!strings.HasPrefix(prefix, "/") || strings.HasSuffix(prefix, "/")) {
+		return fmt.Errorf("path prefix %q must start with a slash and not end with one, or be empty",
+			prefix)
+	}
+	return nil
 }
 
 // dispatch /////////////////////////////////////////////////////////////////

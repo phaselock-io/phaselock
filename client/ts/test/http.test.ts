@@ -684,6 +684,21 @@ describe('HTTPTransport', () => {
   });
 });
 
+describe('the base URL', () => {
+  test("every route is under the base URL's path, with or without a trailing slash", async () => {
+    stub.routes.set('/phaselock/commands', (_req, _body, res) => {
+      res.writeHead(200);
+      res.end(Buffer.from(encode([['ok', 7]])));
+    });
+    const command = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
+    for (const base of [`${stub.url}/phaselock`, `${stub.url}/phaselock/`]) {
+      await new HTTPTransport(base).post([command]);
+      await postCommand(base, command);
+    }
+    expect(stub.requests.map((r) => r.path)).toEqual(Array(4).fill('/phaselock/commands'));
+  });
+});
+
 describe('postCommand', () => {
   test('one command, with the token when given, answered with its outcome', async () => {
     stub.routes.set('/commands', (_req, _body, res) => {
