@@ -10,7 +10,7 @@ import { Alert, Button, Card, Flex, Input, List, Space, Spin, Switch, Tag, Typog
 import { useState } from 'react';
 
 import { colorHash } from './colorhash';
-import type { Client } from './engines';
+import type { Client, Unroomed } from './engines';
 import { useLocalQuery } from './useLocalQuery';
 import { generateUuid } from './util';
 
@@ -198,8 +198,9 @@ export default function PatronWindow({
   const connState = useLocalQuery(eng, connectionQuery) ?? 'connecting';
   const stateColor = STATE_COLORS[connState];
 
-  function send(command: Command) {
-    eng.sendCommand(command);
+  // every command names the window's room
+  function send(command: Unroomed<Command>) {
+    eng.sendCommand({ ...command, room: client.room });
   }
 
   // the switch takes the window's way to the database offline, and back online at once

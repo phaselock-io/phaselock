@@ -1,4 +1,5 @@
-// The queries the model declares, over what each Engine syncs.
+/* The queries the model declares, over what each Engine syncs.  An Engine syncs one room, so a
+   query finds the room in the keys it scans. */
 
 import type {
   AdminBookInfo,
@@ -13,10 +14,10 @@ import type {
 } from './model.gen';
 
 // the books of an edition, in the order they were added
-function booksOf(qx: UserEngineQueryTxn, isbn: string): Book[] {
+function booksOf(qx: UserEngineQueryTxn, room: string, isbn: string): Book[] {
   const books: Book[] = [];
-  for (const { book } of qx.scan.edition_book({ isbn }, { keys: true })) {
-    const b = qx.get.book(book);
+  for (const { book } of qx.scan.edition_book({ room, isbn }, { keys: true })) {
+    const b = qx.get.book(room, book);
     if (b !== undefined) books.push(b);
   }
   return books.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
@@ -39,11 +40,11 @@ export const userQueries: UserQueryDefs<UserEngineQueryTxn> = {
 
     // each edition
     const out: UserBookInfo[] = [];
-    for (const [{ isbn }, edition] of qx.scan.edition()) {
+    for (const [{ room, isbn }, edition] of qx.scan.edition()) {
       let availableNormal = 0;
       const availableRestricted: string[] = [];
       let hold = byEdition.get(isbn) ?? null;
-      for (const book of booksOf(qx, isbn)) {
+      for (const book of booksOf(qx, room, isbn)) {
         hold = byBook.get(book.id) ?? hold;
         if (book.status !== undefined) continue;
         if (book.restricted) {
@@ -54,7 +55,7 @@ export const userQueries: UserQueryDefs<UserEngineQueryTxn> = {
       }
 
       // edition-level holds claim free unrestricted copies
-      availableNormal -= [...qx.scan.edition_hold({ isbn }, { keys: true })].length;
+      availableNormal -= [...qx.scan.edition_hold({ room, isbn }, { keys: true })].length;
       out.push({ isbn, title: edition.title, availableNormal, availableRestricted, hold });
     }
     return out.sort((a, b) => a.title.localeCompare(b.title));
@@ -62,14 +63,14 @@ export const userQueries: UserQueryDefs<UserEngineQueryTxn> = {
 
   // the patron's profile, which is empty until the patron is synced
   myPatron(qx) {
-    for (const [{ patron }, p] of qx.scan.patron()) {
+    for (const [{ room, patron }, p] of qx.scan.patron()) {
       return {
         name: p.name,
         researcher: p.researcher,
-        holds: [...qx.scan.patron_hold({ patron })].map(([, hold]) => hold),
-        checkouts: [...qx.scan.patron_checkout({ patron })].map(([, c]) => {
-          const book = qx.get.book(c.book);
-          const title = (book && qx.get.edition(book.isbn)?.title) ?? '';
+        holds: [...qx.scan.patron_hold({ room, patron })].map(([, hold]) => hold),
+        checkouts: [...qx.scan.patron_checkout({ room, patron })].map(([, c]) => {
+          const book = qx.get.book(room, c.book);
+          const title = (book && qx.get.edition(room, book.isbn)?.title) ?? '';
           return { id: c.id, book: c.book, title, expires: c.expires, overdue: c.overdue };
         }),
       };
@@ -92,31 +93,31 @@ export const adminQueries: AdminQueryDefs<AdminEngineQueryTxn> = {
   allEditions(qx) {
     // each edition
     const out: AdminEditionInfo[] = [];
-    for (const [{ isbn }, edition] of qx.scan.edition()) {
+    for (const [{ room, isbn }, edition] of qx.scan.edition()) {
       // edition-level holds are shown on the edition's first free unrestricted copies, oldest first
-      const editionHolds = [...qx.scan.edition_hold({ isbn }, { keys: true })]
-        .flatMap(({ hold }) => qx.get.hold(hold) ?? [])
+      const editionHolds = [...qx.scan.edition_hold({ room, isbn }, { keys: true })]
+        .flatMap(({ hold }) => qx.get.hold(room, hold) ?? [])
         .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
 
       // each book
       const books: AdminBookInfo[] = [];
-      for (const book of booksOf(qx, isbn)) {
+      for (const book of booksOf(qx, room, isbn)) {
         const info: AdminBookInfo = { id: book.id, restricted: book.restricted, state: 'open' };
         if (book.status !== undefined && 'hold' in book.status) {
           info.state = 'held';
           info.holdId = book.status.hold;
-          info.patronId = qx.get.hold_owner(info.holdId);
-          if (qx.get.hold(info.holdId)?.pending) info.pending = true;
+          info.patronId = qx.get.hold_owner(room, info.holdId);
+          if (qx.get.hold(room, info.holdId)?.pending) info.pending = true;
         } else if (book.status !== undefined) {
           info.state = 'out';
           info.checkoutId = book.status.checkout;
-          info.patronId = qx.get.checkout_owner(info.checkoutId);
-          if (qx.get.checkout(info.checkoutId)?.pending) info.pending = true;
+          info.patronId = qx.get.checkout_owner(room, info.checkoutId);
+          if (qx.get.checkout(room, info.checkoutId)?.pending) info.pending = true;
         } else if (!book.restricted && editionHolds.length > 0) {
           const hold = editionHolds.shift()!;
           info.state = 'held';
           info.holdId = hold.id;
-          info.patronId = qx.get.hold_owner(hold.id);
+          info.patronId = qx.get.hold_owner(room, hold.id);
           if (hold.pending) info.pending = true;
         } else if (book.restricted) {
           info.state = 'restricted';

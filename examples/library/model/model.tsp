@@ -50,7 +50,7 @@ alias Isbn = string;
 // checkout, with no patron named anywhere, since every user syncs this slice.  Collections are
 // key ranges that readers scan, such as `edition_book:{isbn},` for the books of one edition.
 
-interface BookSlice extends Slice<"book", BookEvents, BookStore> {}
+interface BookSlice extends Slice<"book:{room}", BookEvents, BookStore> {}
 
 alias BookStore = {
   "edition:{isbn}": Edition;
@@ -116,6 +116,7 @@ union BookEvents {
 @command(AddEdition)
 model AddEdition {
   type: "add-edition";
+  ...InRoom;
   isbn: Isbn;
   title: string;
   timestamp: utcDateTime;
@@ -124,6 +125,7 @@ model AddEdition {
 @command(UpdateEditionTitle)
 model UpdateEditionTitle {
   type: "update-edition-title";
+  ...InRoom;
   isbn: Isbn;
   title: string;
   timestamp: utcDateTime;
@@ -134,6 +136,7 @@ model UpdateEditionTitle {
 @command(AddBook)
 model AddBook {
   type: "add-book";
+  ...InRoom;
   id: Uuid;
   isbn: Isbn;
   restricted: boolean;
@@ -145,6 +148,7 @@ model AddBook {
 @command((UpdateBookRestricted | HoldClosed | PatronHoldClosed)[])
 model UpdateBookRestricted {
   type: "update-book-restricted";
+  ...InRoom;
   id: Uuid;
   restricted: boolean;
   timestamp: utcDateTime;
@@ -155,6 +159,7 @@ model UpdateBookRestricted {
 @command((RemoveBook | HoldClosed | PatronHoldClosed)[])
 model RemoveBook {
   type: "remove-book";
+  ...InRoom;
   id: Uuid;
   timestamp: utcDateTime;
 }
@@ -166,6 +171,7 @@ model RemoveBook {
 @command([HoldOpened, PatronHoldOpened, HoldOwner] | HoldFailed)
 model TryHold {
   type: "try-hold";
+  ...InRoom;
   id: Uuid;
   patron: Uuid;
   // can hold a specific book or just any generic one
@@ -186,6 +192,7 @@ model HoldOpened {
 @command([HoldClosed, HoldClosed, PatronHoldClosed])
 model CancelHold {
   type: "cancel-hold";
+  ...InRoom;
   id: Uuid;
   patron: Uuid;
 }
@@ -212,6 +219,7 @@ model HoldClosed {
 )[])
 model TryCheckout {
   type: "try-checkout";
+  ...InRoom;
   id: Uuid;
   patron: Uuid;
   book: Uuid;
@@ -230,6 +238,7 @@ model CheckoutOpened {
 @command([CheckoutEnded, CheckoutEnded, PatronCheckoutEnded])
 model EndCheckout {
   type: "end-checkout";
+  ...InRoom;
   checkout: Uuid;
   patron: Uuid;
   timestamp: utcDateTime;
@@ -255,7 +264,7 @@ model CheckoutOverdue {
 // Every hold and checkout change that touches a patron reaches them as an event of their own,
 // since a reducer here cannot read the book slice.
 
-interface PatronSlice extends Slice<"patron:{patron}", PatronEvents, PatronStore> {}
+interface PatronSlice extends Slice<"patron:{room},{patron}", PatronEvents, PatronStore> {}
 
 alias PatronStore = {
   "patron": Patron;
@@ -309,6 +318,7 @@ model PatronCreated {
 @command(RenamePatron)
 model RenamePatron {
   type: "rename-patron";
+  ...InRoom;
   id: Uuid;
   name: string;
   timestamp: utcDateTime;
@@ -318,6 +328,7 @@ model RenamePatron {
 @command((AssignPatron | HoldClosed | PatronHoldClosed)[])
 model AssignPatron {
   type: "assign-patron";
+  ...InRoom;
   id: Uuid;
   researcher: boolean;
   timestamp: utcDateTime;
@@ -373,6 +384,7 @@ model PatronPasswordChanged {
 @command(PatronDismissNotice)
 model PatronDismissNotice {
   type: "patron-dismiss-notice";
+  ...InRoom;
   id: Uuid;
   patron: Uuid;
 }
@@ -386,7 +398,7 @@ model PatronDismissNotice {
 // names its owner here, and its HoldClosed or CheckoutEnded comes here too, as it does to the
 // catalogue.
 
-interface AdminSlice extends Slice<"admin", AdminEvents, AdminStore> {}
+interface AdminSlice extends Slice<"admin:{room}", AdminEvents, AdminStore> {}
 
 alias AdminStore = {
   // one key per undismissed notice
@@ -430,6 +442,7 @@ model CheckoutFailed {
 @command(DismissNotice)
 model DismissNotice {
   type: "dismiss-notice";
+  ...InRoom;
   id: Uuid;
 }
 
@@ -440,15 +453,15 @@ model DismissNotice {
 // Credentials, which the database keeps for itself and never syncs: a hash in a browser cache
 // can be cracked offline.  `lookup` reads a login by name to sign someone in, and by user to
 // check a token and a command's proof.  A login's user is the patron it belongs to, except for
-// the one `admin` login every librarian shares, which the bundle's bootstrap seeds.  A login
+// the one `admin` login every librarian shares, which is flagged as a librarian's.  A login
 // name fills a key parameter, so precommit rejects one holding a separator of the key templates.
 // The slice's history keeps every login name and superseded hash, which only a retention
 // policy trims.
 
-interface LoginSlice extends Slice<"login", LoginEvents, LoginStore> {}
+interface LoginSlice extends Slice<"login:{room}", LoginEvents, LoginStore> {}
 
 alias LoginStore = {
-  // login names are globally unique and never change
+  // login names are unique and never change
   "login:{login}": Login;
   // index: the login name of each user
   "user_login:{user}": string;
@@ -457,6 +470,7 @@ alias LoginStore = {
 model Login {
   user: Uuid;
   password: PasswordHash;
+  librarian: boolean;
 }
 
 union LoginEvents {
@@ -472,6 +486,7 @@ union LoginEvents {
 @command([LoginCreated, PatronCreated])
 model CreateAccount {
   type: "create-account";
+  ...InRoom;
   login: string;
   name: string;
   password: NewPassword;
@@ -482,6 +497,7 @@ model LoginCreated {
   login: string;
   user: Uuid;
   password: PasswordHash;
+  librarian: boolean;
 }
 
 // changes the sender's own password
@@ -489,6 +505,7 @@ model LoginCreated {
 @command([PasswordChanged, PatronPasswordChanged])
 model ChangePassword {
   type: "change-password";
+  ...InRoom;
   // proves a credential the account has registered, which the database verifies before
   // precommit sees the command
   check: CommandAuth;
@@ -507,6 +524,7 @@ model PasswordChanged {
 @command([LoginDeleted, Erasure, HoldClosed[]])
 model DeleteAccount {
   type: "delete-account";
+  ...InRoom;
   check: CommandAuth;
 }
 
@@ -514,6 +532,77 @@ model LoginDeleted {
   type: "login-deleted";
   login: string;
   user: Uuid;
+}
+
+///////////
+// Rooms //
+///////////
+
+/* Room stuff, for hosting the demo with many rooms in one database.  Every
+   visitor gets a room of their own, a private copy of the library seeded with
+   the demo's data, and shares it by sharing its link.  Every family takes the
+   room as its first parameter, every command names its room, and a user id
+   is `<room>.<id>`, so a signed-in user's room is in their token.  A room
+   lives for an hour from its creation, when a cron hook erases its streams;
+   the next CreateRoom for its id seeds it afresh. */
+
+alias RoomId = Uuid;
+
+// the room a command acts in, which must be the sender's own
+model InRoom {
+  room: RoomId;
+}
+
+// The room's own record, which every Engine in the room syncs, so the UI can say when the room
+// resets.
+
+interface RoomSlice extends Slice<"room:{room}", RoomCreated, RoomStore> {}
+
+alias RoomStore = {
+  "room_created": utcDateTime;
+};
+
+// Every room, by when it was created, which the database keeps for itself to know which rooms
+// to reap.
+
+interface RoomRegistrySlice extends Slice<"rooms", RoomRegistryEvents, RoomRegistryStore> {}
+
+alias RoomRegistryStore = {
+  "room:{room}": utcDateTime;
+};
+
+union RoomRegistryEvents {
+  RoomCreated,
+  RoomDeleted,
+}
+
+// Sent anonymously by the UI for the room in its URL.  For a room that exists it writes
+// nothing; otherwise it seeds the room with the demo's catalogue, patrons, and logins.
+@online
+@command((
+  | RoomCreated
+  | AddEdition
+  | AddBook
+  | PatronCreated
+  | AssignPatron
+  | LoginCreated
+)[])
+model CreateRoom {
+  type: "create-room";
+  room: RoomId;
+}
+
+// recorded in the registry and in the room's own record
+model RoomCreated {
+  type: "room-created";
+  room: RoomId;
+  created: utcDateTime;
+}
+
+// recorded in the registry when the room is reaped
+model RoomDeleted {
+  type: "room-deleted";
+  room: RoomId;
 }
 
 ////////////////////////
@@ -531,10 +620,10 @@ union UserCommands {
   DeleteAccount,
 }
 
-interface UserEngine extends Engine<[BookSlice, PatronSlice], UserCommands> {}
+interface UserEngine extends Engine<[BookSlice, PatronSlice, RoomSlice], UserCommands> {}
 
 // An admin (the librarian at the front desk) has every command but the database's own,
-// CreateAccount.
+// CreateAccount and CreateRoom.
 union AdminCommands {
   // admin can send UserCommands for whatever patron they want
   UserCommands,
@@ -549,7 +638,8 @@ union AdminCommands {
   DismissNotice,
 }
 
-interface AdminEngine extends Engine<[BookSlice, PatronSlice, AdminSlice], AdminCommands> {}
+interface AdminEngine
+  extends Engine<[BookSlice, PatronSlice, AdminSlice, RoomSlice], AdminCommands> {}
 
 //////////////////
 // The Database //
@@ -558,11 +648,16 @@ interface AdminEngine extends Engine<[BookSlice, PatronSlice, AdminSlice], Admin
 /* The DB holds all slices and its precommit function handles all commands,
    and it may declare additional slices and commands that no Engine handles.
    Additional slices are maintained for internal use (precommit, maySee, and
-   lookup), but are not synced to any client.  Its one command of its own is
-   sent before signing in, when there is no Engine to send it.  The daily
-   sheet is a cron hook of the bundle, which writes its events as a command's
-   handler does. */
-interface LibraryDB extends Database<[UserEngine, AdminEngine], [LoginSlice], CreateAccount> {}
+   lookup), but are not synced to any client.  Its commands of its own are
+   sent before signing in, when there is no Engine to send them.  The daily
+   sheet and the reaping of rooms are cron hooks of the bundle, which write
+   their events as a command's handler does. */
+interface LibraryDB
+  extends Database<
+      [UserEngine, AdminEngine],
+      [LoginSlice, RoomRegistrySlice],
+      CreateAccount | CreateRoom
+    > {}
 
 /////////////////
 // Query Layer //

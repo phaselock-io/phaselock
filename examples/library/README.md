@@ -21,6 +21,9 @@ This example markes optimistic updates as pending, so holds requested while
 offline get a spinner until they resolve.  When `precommit` detects a conflict,
 it also surfaces a notification message to the user.
 
+This example include a concept of a "room" so it can be hosted as a shared demo
+at [demo.phaselock.io](https://demo.phaselock.io).
+
 ## Architecture
 
 In PhaseLock, optimistic updates are calculated by `forecaster` functions that

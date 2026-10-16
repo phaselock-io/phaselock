@@ -6,7 +6,8 @@
    The outcomes of the commands a patron sends read only the catalogue and the patrons, which every
    Engine and the database hold; a patron's Engine holds only that patron, which is all those read
    of the patrons.  The outcomes of the librarians' own commands also read the owner of a hold from
-   the admin slice, which only the librarians' Engine and the database hold. */
+   the admin slice, which only the librarians' Engine and the database hold.  Every command names
+   its room, and an outcome reads and writes that room alone. */
 
 import type {
   AdminEngineForecasters,
@@ -47,24 +48,29 @@ const MAX_OVERDUE = 2;
 type Txn = UserEngineTxn;
 type AdminTxn = AdminEngineTxn;
 
-function patronOf(txn: Txn, patron: string) {
-  const p = txn.get.patron(patron);
+/** the streams of a room's catalogue, librarians' records, and each patron */
+export const bookStream = (room: string) => `book:${room}` as const;
+export const adminStream = (room: string) => `admin:${room}` as const;
+export const patronStream = (room: string, patron: string) => `patron:${room},${patron}` as const;
+
+function patronOf(txn: Txn, room: string, patron: string) {
+  const p = txn.get.patron(room, patron);
   if (p === undefined) throw new Error('no such patron');
   return p;
 }
 
-function bookOf(txn: Txn, book: string) {
-  const b = txn.get.book(book);
+function bookOf(txn: Txn, room: string, book: string) {
+  const b = txn.get.book(room, book);
   if (b === undefined) throw new Error('no such book');
   return b;
 }
 
 // a patron's open holds and checkouts, and how many of those checkouts are overdue
-function loadOf(txn: Txn, patron: string) {
-  const holds = [...txn.scan.patron_hold({ patron }, { keys: true })].length;
+function loadOf(txn: Txn, room: string, patron: string) {
+  const holds = [...txn.scan.patron_hold({ room, patron }, { keys: true })].length;
   let checkouts = 0;
   let overdue = 0;
-  for (const [, checkout] of txn.scan.patron_checkout({ patron })) {
+  for (const [, checkout] of txn.scan.patron_checkout({ room, patron })) {
     checkouts++;
     if (checkout.overdue) overdue++;
   }
@@ -73,19 +79,19 @@ function loadOf(txn: Txn, patron: string) {
 
 /** the copies of an edition an edition-level hold can still claim: those unrestricted and free,
     less the edition-level holds already open */
-export function freeCopies(txn: Txn, isbn: string): number {
+export function freeCopies(txn: Txn, room: string, isbn: string): number {
   let free = 0;
-  for (const { book } of txn.scan.edition_book({ isbn }, { keys: true })) {
-    const b = txn.get.book(book);
+  for (const { book } of txn.scan.edition_book({ room, isbn }, { keys: true })) {
+    const b = txn.get.book(room, book);
     if (b !== undefined && b.status === undefined && !b.restricted) free++;
   }
-  return free - [...txn.scan.edition_hold({ isbn }, { keys: true })].length;
+  return free - [...txn.scan.edition_hold({ room, isbn }, { keys: true })].length;
 }
 
 // the title of what a hold targets, which names it in a patron's notices
-function titleOf(txn: Txn, target: { book: string } | { edition: string }): string {
-  const isbn = 'book' in target ? bookOf(txn, target.book).isbn : target.edition;
-  return txn.get.edition(isbn)?.title ?? isbn;
+function titleOf(txn: Txn, room: string, target: { book: string } | { edition: string }): string {
+  const isbn = 'book' in target ? bookOf(txn, room, target.book).isbn : target.edition;
+  return txn.get.edition(room, isbn)?.title ?? isbn;
 }
 
 /** The events that close a hold: the catalogue's, the librarians' record of its owner's, and its
@@ -93,64 +99,66 @@ function titleOf(txn: Txn, target: { book: string } | { edition: string }): stri
     every close they did not make. */
 export function closeHold(
   txn: Txn,
+  room: string,
   hold: string,
   patron: string,
   why: string,
   notify: boolean,
 ): [
-  { stream: 'book'; event: HoldClosed },
-  { stream: 'admin'; event: HoldClosed },
-  { stream: `patron:${string}`; event: PatronHoldClosed },
+  { stream: `book:${string}`; event: HoldClosed },
+  { stream: `admin:${string}`; event: HoldClosed },
+  { stream: `patron:${string},${string}`; event: PatronHoldClosed },
 ] {
-  const h = txn.get.hold(hold);
+  const h = txn.get.hold(room, hold);
   if (h === undefined) throw new Error('no such hold');
-  const reason = `Your hold on ${titleOf(txn, h.target)} closed: ${why}`;
+  const reason = `Your hold on ${titleOf(txn, room, h.target)} closed: ${why}`;
   const closed = { type: 'hold-closed', id: hold, reason } as const;
   return [
-    { stream: 'book', event: closed },
-    { stream: 'admin', event: closed },
+    { stream: bookStream(room), event: closed },
+    { stream: adminStream(room), event: closed },
     {
-      stream: `patron:${patron}`,
+      stream: patronStream(room, patron),
       event: { type: 'patron-hold-closed', id: hold, reason, notify },
     },
   ];
 }
 
 /** the patron who owns an open hold, as the librarians' record names them */
-export function holderOf(txn: AdminTxn, hold: string): string {
-  const patron = txn.get.hold_owner(hold);
+export function holderOf(txn: AdminTxn, room: string, hold: string): string {
+  const patron = txn.get.hold_owner(room, hold);
   if (patron === undefined) throw new Error('no such hold');
   return patron;
 }
 
 // when a free unrestricted copy of an edition leaves the pool, the edition-level holds that no
 // longer fit close, newest first
-function overflow(txn: AdminTxn, isbn: string, why: string) {
-  const excess = 1 - freeCopies(txn, isbn);
+function overflow(txn: AdminTxn, room: string, isbn: string, why: string) {
+  const excess = 1 - freeCopies(txn, room, isbn);
   if (excess <= 0) return [];
-  const holds = [...txn.scan.edition_hold({ isbn }, { keys: true })]
-    .flatMap(({ hold }) => txn.get.hold(hold) ?? [])
+  const holds = [...txn.scan.edition_hold({ room, isbn }, { keys: true })]
+    .flatMap(({ hold }) => txn.get.hold(room, hold) ?? [])
     .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
   return holds
     .slice(0, excess)
-    .flatMap((h) => closeHold(txn, h.id, holderOf(txn, h.id), why, true));
+    .flatMap((h) => closeHold(txn, room, h.id, holderOf(txn, room, h.id), why, true));
 }
 
 // a hold opens, or fails with a notice to its patron
 function tryHold(txn: Txn, cmd: TryHold): TryHoldOutput {
+  const room = cmd.room;
   const fail = (why: string): TryHoldOutput => ({
-    stream: `patron:${cmd.patron}`,
+    stream: patronStream(room, cmd.patron),
     event: {
       type: 'hold-failed',
       id: cmd.id,
-      reason: `Your hold on ${titleOf(txn, cmd.target)} could not be placed: ${why}`,
+      reason: `Your hold on ${titleOf(txn, room, cmd.target)} could not be placed: ${why}`,
     },
   });
 
   // the patron's own limits
-  const patron = patronOf(txn, cmd.patron);
+  const patron = patronOf(txn, room, cmd.patron);
   if (cmd.open && !patron.researcher) return fail('only a researcher may hold open-ended');
-  const load = loadOf(txn, cmd.patron);
+  const load = loadOf(txn, room, cmd.patron);
   if (!patron.researcher && load.holds + load.checkouts >= MAX_HOLDS) {
     return fail(`too many holds (${load.holds}) and checkouts (${load.checkouts})`);
   }
@@ -160,7 +168,7 @@ function tryHold(txn: Txn, cmd: TryHold): TryHoldOutput {
   let isbn: string;
   if ('book' in cmd.target) {
     // the book itself must be free, and a restricted one is for researchers
-    const book = bookOf(txn, cmd.target.book);
+    const book = bookOf(txn, room, cmd.target.book);
     if (book.restricted && !patron.researcher) return fail('only a researcher may hold this book');
     if (book.status !== undefined) {
       return fail('hold' in book.status ? 'the book is already held' : 'the book is checked out');
@@ -173,7 +181,7 @@ function tryHold(txn: Txn, cmd: TryHold): TryHoldOutput {
   }
 
   // the hold takes one copy from the pool of the edition's unrestricted copies
-  if (freeCopies(txn, isbn) < 1) return fail('every copy is already held or checked out');
+  if (freeCopies(txn, room, isbn) < 1) return fail('every copy is already held or checked out');
   return opened(cmd);
 }
 
@@ -190,25 +198,29 @@ function opened(cmd: TryHold): TryHoldOutput {
     hold.expires = own.expires = new Date(cmd.timestamp.getTime() + HOLD_DAYS * DAY);
   }
   return [
-    { stream: 'book', event: hold },
-    { stream: `patron:${cmd.patron}`, event: own },
-    { stream: 'admin', event: { type: 'hold-owner', hold: cmd.id, patron: cmd.patron } },
+    { stream: bookStream(cmd.room), event: hold },
+    { stream: patronStream(cmd.room, cmd.patron), event: own },
+    {
+      stream: adminStream(cmd.room),
+      event: { type: 'hold-owner', hold: cmd.id, patron: cmd.patron },
+    },
   ];
 }
 
 // a checkout opens, closing the patron's own hold on the book if they have one, or fails with a
 // notice to the librarians
 function tryCheckout(txn: Txn, cmd: TryCheckout): TryCheckoutOutput {
+  const room = cmd.room;
   const fail = (reason: string): TryCheckoutOutput => [
     {
-      stream: 'admin',
+      stream: adminStream(room),
       event: { type: 'checkout-failed', id: cmd.id, patron: cmd.patron, book: cmd.book, reason },
     },
   ];
 
   // the book must not be out, and a restricted one is for researchers
-  const patron = patronOf(txn, cmd.patron);
-  const book = bookOf(txn, cmd.book);
+  const patron = patronOf(txn, room, cmd.patron);
+  const book = bookOf(txn, room, cmd.book);
   if (book.status !== undefined && 'checkout' in book.status) {
     return fail('the book is already checked out');
   }
@@ -217,9 +229,10 @@ function tryCheckout(txn: Txn, cmd: TryCheckout): TryCheckoutOutput {
   // the patron's own hold on this book, or on its edition
   let ours: string | undefined;
   if (book.status !== undefined) {
-    if (txn.get.patron_hold(cmd.patron, book.status.hold) !== undefined) ours = book.status.hold;
+    const held = txn.get.patron_hold(room, cmd.patron, book.status.hold);
+    if (held !== undefined) ours = book.status.hold;
   } else {
-    for (const [{ hold }, h] of txn.scan.patron_hold({ patron: cmd.patron })) {
+    for (const [{ hold }, h] of txn.scan.patron_hold({ room, patron: cmd.patron })) {
       if ('edition' in h.target && h.target.edition === book.isbn) {
         ours = hold;
         break;
@@ -229,7 +242,7 @@ function tryCheckout(txn: Txn, cmd: TryCheckout): TryCheckoutOutput {
 
   /* The domain does not say whether the hold limit and the overdue rule apply to checkouts; they
      do here.  A checkout that fulfills the patron's own hold takes no new place in the limit. */
-  const load = loadOf(txn, cmd.patron);
+  const load = loadOf(txn, room, cmd.patron);
   if (!patron.researcher && ours === undefined && load.holds + load.checkouts >= MAX_HOLDS) {
     return fail(`too many holds (${load.holds}) and checkouts (${load.checkouts})`);
   }
@@ -238,49 +251,54 @@ function tryCheckout(txn: Txn, cmd: TryCheckout): TryCheckoutOutput {
   // without a hold of their own, the patron may not take a copy someone else holds
   if (ours === undefined) {
     if (book.status !== undefined) return fail('the book is held by someone else');
-    if (!book.restricted && freeCopies(txn, book.isbn) < 1) {
+    if (!book.restricted && freeCopies(txn, room, book.isbn) < 1) {
       return fail('every copy is held by someone else');
     }
   }
 
   // the checkout opens
   const expires = new Date(cmd.timestamp.getTime() + CHECKOUT_DAYS * DAY);
-  const checkout = {
-    stream: 'book',
-    event: {
-      type: 'checkout-opened',
-      id: cmd.id,
-      book: cmd.book,
-      expires,
-      timestamp: cmd.timestamp,
+  const out: TryCheckoutOutput = [
+    {
+      stream: bookStream(room),
+      event: {
+        type: 'checkout-opened',
+        id: cmd.id,
+        book: cmd.book,
+        expires,
+        timestamp: cmd.timestamp,
+      },
     },
-  } as const;
-  const own = {
-    stream: `patron:${cmd.patron}`,
-    event: { type: 'patron-checkout-opened', id: cmd.id, book: cmd.book, expires },
-  } as const;
-  const owner = {
-    stream: 'admin',
-    event: { type: 'checkout-owner', checkout: cmd.id, patron: cmd.patron },
-  } as const;
-  if (ours === undefined) return [checkout, own, owner];
+    {
+      stream: patronStream(room, cmd.patron),
+      event: { type: 'patron-checkout-opened', id: cmd.id, book: cmd.book, expires },
+    },
+    {
+      stream: adminStream(room),
+      event: { type: 'checkout-owner', checkout: cmd.id, patron: cmd.patron },
+    },
+  ];
 
   // and the hold it fulfills closes
-  return [checkout, own, owner, ...closeHold(txn, ours, cmd.patron, 'checked out', false)];
+  if (ours !== undefined) out.push(...closeHold(txn, room, ours, cmd.patron, 'checked out', false));
+  return out;
 }
 
 // a hold canceled by a librarian rather than its patron notifies the patron
 function cancelHold(txn: Txn, cmd: CancelHold, byLibrary: boolean): CancelHoldOutput {
   const why = byLibrary ? 'canceled by the library' : 'canceled';
-  return closeHold(txn, cmd.id, cmd.patron, why, byLibrary);
+  return closeHold(txn, cmd.room, cmd.id, cmd.patron, why, byLibrary);
 }
 
 function endCheckout(_txn: Txn, cmd: EndCheckout): EndCheckoutOutput {
   const ended = { type: 'checkout-ended', id: cmd.checkout, timestamp: cmd.timestamp } as const;
   return [
-    { stream: 'book', event: ended },
-    { stream: 'admin', event: ended },
-    { stream: `patron:${cmd.patron}`, event: { type: 'patron-checkout-ended', id: cmd.checkout } },
+    { stream: bookStream(cmd.room), event: ended },
+    { stream: adminStream(cmd.room), event: ended },
+    {
+      stream: patronStream(cmd.room, cmd.patron),
+      event: { type: 'patron-checkout-ended', id: cmd.checkout },
+    },
   ];
 }
 
@@ -291,56 +309,53 @@ function updateBookRestricted(
   txn: AdminTxn,
   cmd: UpdateBookRestricted,
 ): UpdateBookRestrictedOutput {
-  const book = bookOf(txn, cmd.id);
+  const room = cmd.room;
+  const book = bookOf(txn, room, cmd.id);
   const out: UpdateBookRestrictedOutput = [];
 
   // is the book newly restricted?
   if (cmd.restricted && !book.restricted) {
     if (book.status === undefined) {
-      out.push(...overflow(txn, book.isbn, 'a copy was restricted'));
+      out.push(...overflow(txn, room, book.isbn, 'a copy was restricted'));
     } else if ('hold' in book.status) {
-      const holder = holderOf(txn, book.status.hold);
-      if (!patronOf(txn, holder).researcher) {
-        out.push(...closeHold(txn, book.status.hold, holder, 'the book was restricted', true));
+      const holder = holderOf(txn, room, book.status.hold);
+      if (!patronOf(txn, room, holder).researcher) {
+        const why = 'the book was restricted';
+        out.push(...closeHold(txn, room, book.status.hold, holder, why, true));
       }
     }
   }
-  out.push({ stream: 'book', event: cmd });
+  out.push({ stream: bookStream(room), event: cmd });
   return out;
 }
 
 // removing a book closes a book-level hold on it, or takes a free copy out of the pool
 function removeBook(txn: AdminTxn, cmd: RemoveBook): RemoveBookOutput {
-  const book = bookOf(txn, cmd.id);
+  const room = cmd.room;
+  const book = bookOf(txn, room, cmd.id);
   const out: RemoveBookOutput = [];
   if (book.status !== undefined && 'hold' in book.status) {
-    out.push(
-      ...closeHold(
-        txn,
-        book.status.hold,
-        holderOf(txn, book.status.hold),
-        'the book was removed',
-        true,
-      ),
-    );
+    const holder = holderOf(txn, room, book.status.hold);
+    out.push(...closeHold(txn, room, book.status.hold, holder, 'the book was removed', true));
   } else if (book.status === undefined && !book.restricted) {
-    out.push(...overflow(txn, book.isbn, 'a copy was removed'));
+    out.push(...overflow(txn, room, book.isbn, 'a copy was removed'));
   }
-  out.push({ stream: 'book', event: cmd });
+  out.push({ stream: bookStream(room), event: cmd });
   return out;
 }
 
 // a patron who is no longer a researcher loses their holds on restricted books
 function assignPatron(txn: Txn, cmd: AssignPatron): AssignPatronOutput {
+  const room = cmd.room;
   const out: AssignPatronOutput = [];
   if (!cmd.researcher) {
-    for (const [{ hold }, h] of txn.scan.patron_hold({ patron: cmd.id })) {
-      if ('book' in h.target && txn.get.book(h.target.book)?.restricted) {
-        out.push(...closeHold(txn, hold, cmd.id, 'you are no longer a researcher', true));
+    for (const [{ hold }, h] of txn.scan.patron_hold({ room, patron: cmd.id })) {
+      if ('book' in h.target && txn.get.book(room, h.target.book)?.restricted) {
+        out.push(...closeHold(txn, room, hold, cmd.id, 'you are no longer a researcher', true));
       }
     }
   }
-  out.push({ stream: `patron:${cmd.id}`, event: cmd });
+  out.push({ stream: patronStream(room, cmd.id), event: cmd });
   return out;
 }
 
@@ -357,10 +372,13 @@ export const outcomes = {
 
 /** a patron's forecasts: every command they send, as the database will most likely decide it */
 export const userForecasters: UserEngineForecasters = {
-  renamePatron: (_txn, cmd) => ({ stream: `patron:${cmd.id}`, event: cmd }),
+  renamePatron: (_txn, cmd) => ({ stream: patronStream(cmd.room, cmd.id), event: cmd }),
   tryHold,
   cancelHold: (txn, cmd) => cancelHold(txn, cmd, false),
-  patronDismissNotice: (_txn, cmd) => ({ stream: `patron:${cmd.patron}`, event: cmd }),
+  patronDismissNotice: (_txn, cmd) => ({
+    stream: patronStream(cmd.room, cmd.patron),
+    event: cmd,
+  }),
 };
 
 /** the librarians' forecasts, which cover every command they send */
@@ -368,13 +386,13 @@ export const adminForecasters: AdminEngineForecasters = {
   ...userForecasters,
   // a librarian cancels a hold for its patron
   cancelHold: (txn, cmd) => cancelHold(txn, cmd, true),
-  addEdition: (_txn, cmd) => ({ stream: 'book', event: cmd }),
-  updateEditionTitle: (_txn, cmd) => ({ stream: 'book', event: cmd }),
-  addBook: (_txn, cmd) => ({ stream: 'book', event: cmd }),
+  addEdition: (_txn, cmd) => ({ stream: bookStream(cmd.room), event: cmd }),
+  updateEditionTitle: (_txn, cmd) => ({ stream: bookStream(cmd.room), event: cmd }),
+  addBook: (_txn, cmd) => ({ stream: bookStream(cmd.room), event: cmd }),
   updateBookRestricted,
   removeBook,
   assignPatron,
   tryCheckout,
   endCheckout,
-  dismissNotice: (_txn, cmd) => ({ stream: 'admin', event: cmd }),
+  dismissNotice: (_txn, cmd) => ({ stream: adminStream(cmd.room), event: cmd }),
 };

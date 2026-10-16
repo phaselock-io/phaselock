@@ -150,7 +150,7 @@ export const adminReducers: AdminSliceReducers = {
 
 export const loginReducers: LoginSliceReducers = {
   loginCreated: (txn, e) => {
-    txn.set.login(e.login, { user: e.user, password: e.password });
+    txn.set.login(e.login, { user: e.user, password: e.password, librarian: e.librarian });
     txn.set.user_login(e.user, e.login);
   },
   passwordChanged: (txn, e) => {
