@@ -1,6 +1,0 @@
-emit:
-  - "@phaselock/typespec-ts"
-options:
-  "@phaselock/typespec-ts":
-    emitter-output-dir: "{project-root}"
-    out-file: "model.gen.ts"
