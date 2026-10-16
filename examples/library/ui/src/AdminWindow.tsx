@@ -292,7 +292,7 @@ export default function AdminWindow({ client }: { client: Client<AdminEngine> })
       className="window"
       title={
         <Flex align="center" gap="small">
-          <Text strong>Front desk</Text>
+          <Text strong>Front Desk</Text>
           <span className="grow" />
           <Connection state={connState} online={online} onOnline={setOnline} />
         </Flex>

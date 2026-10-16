@@ -359,6 +359,8 @@ Every frame is an array whose first element is a tag.
       → msgpack array of outcomes, one per command, in order:
         ["ok", position] | ["reject", reason]
         | ["conflict", { stream: actualSeq }]
+        with a Server-Timing header, db;dur=<ms>: the database's own
+        time, from the whole request in hand to its answer
       → 400 when the body is not a sequence of [S, n, id, data,
         expect?] values with S a string and n an integer, or both nil,
         and id 16 bytes of bin; nothing can be answered for such a

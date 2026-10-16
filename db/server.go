@@ -790,6 +790,9 @@ func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// the database's own time, from a whole request in hand to its answer, which the response
+	// reports as Server-Timing so a client can tell it from the network's
+	start := time.Now()
 	client := s.clientOf(r)
 	limit := s.maxCommands
 	if p.anonymous {
@@ -853,6 +856,7 @@ func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.Header().Set("Content-Type", "application/msgpack")
+	w.Header().Set("Server-Timing", fmt.Sprintf("db;dur=%.2f", float64(time.Since(start).Microseconds())/1000))
 	w.Write(mpEncode(merged))
 }
 

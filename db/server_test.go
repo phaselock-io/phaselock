@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -1401,6 +1402,19 @@ func TestDevAuthCanBeDisabled(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 403 {
 		t.Fatalf("dev auth without --dev-auth: %d", resp.StatusCode)
+	}
+}
+
+// a command's answer reports the database's own time, as Server-Timing
+func TestCommandsServerTiming(t *testing.T) {
+	h := start(t)
+	body := cmd("c1", "add-patron", "id", "p1", "name", "Ann").encode(nil)
+	status, header, _ := h.do("POST", "/commands", h.admin(), body)
+	if status != 200 {
+		t.Fatalf("commands: status %d", status)
+	}
+	if st := header.Get("Server-Timing"); !regexp.MustCompile(`^db;dur=\d+\.\d\d$`).MatchString(st) {
+		t.Fatalf("Server-Timing: %q", st)
 	}
 }
 

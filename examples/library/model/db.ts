@@ -90,10 +90,10 @@ const PASSWORD =
 
 // the seeded catalog: two copies of each edition, one of them restricted
 const EDITIONS = [
-  ['978-1-4842-4585-9', 'Versioning in an Event Sourced System'],
-  ['978-1-4842-2553-0', 'Implementing Domain-Driven Design'],
-  ['978-1-09-812345-6', 'Building Local-First Software'],
-  ['978-0-13-709431-2', 'Designing Offline-First Web Apps with Sync Engines'],
+  ['978-0-14-143956-3', 'Great Expectations'],
+  ['978-0-14-143960-0', 'A Tale of Two Cities'],
+  ['978-0-06-088328-7', 'One Hundred Years of Solitude'],
+  ['978-0-14-044793-4', 'War and Peace'],
 ];
 
 // the seeded patrons: their login names, names, colors, and whether each is a researcher

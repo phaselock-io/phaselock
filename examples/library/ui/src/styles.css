@@ -29,8 +29,34 @@ h1 {
   flex-shrink: 0;
 }
 
-.room {
+/* the intro reads as prose above the wide windows */
+.intro {
+  max-width: 44em;
+  margin-bottom: 20px;
+  line-height: 1.5;
+}
+
+.intro p {
+  margin: 0 0 8px;
+}
+
+.intro a {
+  color: #2ee6a8;
+}
+
+/* the lines under the windows: the last write's timing, then the room's */
+.room,
+.timing {
   color: #8a9a92;
+}
+
+.timing {
+  margin: 12px 0 4px;
+  font-size: 12px;
+}
+
+.room {
+  margin: 4px 0;
 }
 
 /* The windows' layout: one spacing unit of 4px, and a small type scale of 11px section labels,
