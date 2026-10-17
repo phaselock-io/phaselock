@@ -2926,10 +2926,13 @@ export type Forecaster<FX, C> = (fx: FX, command: C) => ForecastOutput[];
    forward. */
 
 /** Where the Engine's connection stands: `connecting` until the connection opens, `syncing`
-    while it replays history, `live` past that, and `offline` between attempts, the next at
-    `nextAttemptAt`.  `hasBase` is false until a first boot's sync lands, while queries may read
-    only the status; `frozen` is true while a replacing backfill is in flight and the base waits
-    for it. */
+    while it replays history, `live` past that, and `offline` once a connection has failed or
+    ended, until another opens.  The first attempt is `connecting`, and so is the Engine from a
+    `reconnectNow` until a connection opens; a retry after backoff stays `offline`, so a
+    connection that keeps failing never flickers to `connecting`.  `nextAttemptAt` is when the
+    next retry is due, and null while one is trying.  `hasBase` is false until a first boot's
+    sync lands, while queries may read only the status; `frozen` is true while a replacing
+    backfill is in flight and the base waits for it. */
 export type ConnectionStatus = {
   state: 'connecting' | 'syncing' | 'live' | 'offline';
   nextAttemptAt: Date | null;
@@ -3158,6 +3161,8 @@ export class Engine<QX, FX, C, N = never> {
   #retryTimer: unknown = null;
   #nextAttemptAt: number | null = null;
   #connectNow: boolean = false;
+  // an attempt is in flight that was asked for, the first or reconnectNow's, rather than a retry
+  #asked: boolean = false;
 
   // the connection's checkpoint as it started, the server's head as last known, and whether a
   // frame after the open has confirmed the ref list
@@ -3619,6 +3624,7 @@ export class Engine<QX, FX, C, N = never> {
   // a new connection restarts every backfill that is still downloading and is not waiting on its
   // own backoff timer, and resends the outbox
   #onConnect(): void {
+    this.#asked = this.#connectNow;
     this.#connectNow = false;
     this.#nextAttemptAt = null;
     if (this.#retryTimer !== null) {
@@ -4675,6 +4681,7 @@ export class Engine<QX, FX, C, N = never> {
   // connection to restart them, and commands handed to it are unsent again for the next resend.
   #onEnd(): void {
     this.#connection = null;
+    this.#asked = false;
     this.#connectionAbort.abort();
     this.#connectionAbort = new host.AbortController();
     this.#sent.clear();
@@ -4771,12 +4778,13 @@ export class Engine<QX, FX, C, N = never> {
   }
 
   #connectionStatus(): ConnectionStatus {
-    // between attempts, opening, replaying history, or past it
+    // between attempts, opening (offline still, for a retry no one has asked for), replaying
+    // history, or past it
     let state: ConnectionStatus['state'];
     if (this.#connection === null) {
       state = this.#connectNow ? 'connecting' : 'offline';
     } else if (this.#epoch === null) {
-      state = 'connecting';
+      state = this.#asked || this.#connectNow ? 'connecting' : 'offline';
     } else {
       state = this.#live ? 'live' : 'syncing';
     }

@@ -1,6 +1,6 @@
 // The Engine's status as queries read it, and when queries wait for a first sync
 
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 
 import { type Blob, ev, last, rig, settle, watch, watchStatus } from './harness.ts';
 
@@ -188,6 +188,68 @@ describe('the connection', () => {
     await settle();
     expect(r.server.conns.length).toBe(2);
     expect(last(status.connection)).toMatchObject({ state: 'connecting', nextAttemptAt: null });
+  });
+
+  test('stays offline while a retry after backoff tries, until it opens', async () => {
+    vi.useFakeTimers();
+    try {
+      const r = rig({ seed: resumed });
+      const status = watchStatus(r);
+      await settle();
+      r.server.open('e1', 40);
+      r.server.live(40);
+      await settle();
+      r.server.end();
+      await settle();
+      const ended = status.connection.length;
+
+      // the retry's timer fires, and its connection is trying, with no next attempt due
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(r.server.conns.length).toBe(2);
+      expect(last(status.connection)).toMatchObject({ state: 'offline', nextAttemptAt: null });
+
+      // it opens and replays, and nothing since the end said connecting
+      r.server.open('e1', 40);
+      await settle();
+      expect(last(status.connection).state).toBe('syncing');
+      expect(status.connection.slice(ended).map((c) => c.state)).not.toContain('connecting');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('says connecting once reconnectNow is called during a retry, until a connection opens', async () => {
+    vi.useFakeTimers();
+    try {
+      const r = rig({ seed: resumed });
+      const status = watchStatus(r);
+      await settle();
+      r.server.open('e1', 40);
+      r.server.live(40);
+      await settle();
+      r.server.end();
+      await settle();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(last(status.connection).state).toBe('offline');
+
+      // asked for while the retry is still trying, which goes on
+      r.engine.reconnectNow();
+      await settle();
+      expect(r.server.conns.length).toBe(2);
+      expect(last(status.connection).state).toBe('connecting');
+
+      // the retry fails, and the attempt asked for starts at once
+      r.server.end();
+      await settle();
+      expect(r.server.conns.length).toBe(3);
+      expect(last(status.connection).state).toBe('connecting');
+
+      r.server.open('e1', 40);
+      await settle();
+      expect(last(status.connection).state).toBe('syncing');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
