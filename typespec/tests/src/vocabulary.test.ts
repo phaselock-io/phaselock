@@ -720,8 +720,10 @@ describe('the library example', () => {
     expect(db.slices.map((s) => s.name)).toEqual([
       'BookSlice',
       'PatronSlice',
+      'RoomSlice',
       'AdminSlice',
       'LoginSlice',
+      'RoomRegistrySlice',
     ]);
     expect(show(command(l.lowered, 'DeleteAccount').output)).toBe(
       'all(LoginDeleted, erasure, many(HoldClosed))',
