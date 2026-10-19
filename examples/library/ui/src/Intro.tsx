@@ -1,5 +1,6 @@
 // the code that decides what a hold is and when one fails, which is all the app had to write
-const MODEL_SOURCE = 'https://github.com/phaselock-io/phaselock/tree/master/examples/library/model';
+const MODEL_SOURCE =
+  'https://github.com/phaselock-io/phaselock/blob/dabee11d99185526ca6cda4549522d7eacbd32ad/examples/library/model/outcomes.ts#L184-L189';
 
 /** what PhaseLock is, what the demo is, and a conflict to try in it */
 export default function Intro() {

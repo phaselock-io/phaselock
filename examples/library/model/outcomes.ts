@@ -10,27 +10,37 @@
    its room, and an outcome reads and writes that room alone. */
 
 import type {
-  AdminEngineForecasters,
+  AddBook,
+  AddBookOutput,
+  AddEdition,
+  AddEditionOutput,
   AdminEngineTxn,
   AssignPatron,
   AssignPatronOutput,
   CancelHold,
   CancelHoldOutput,
+  DismissNotice,
+  DismissNoticeOutput,
   EndCheckout,
   EndCheckoutOutput,
   HoldClosed,
   HoldOpened,
+  PatronDismissNotice,
+  PatronDismissNoticeOutput,
   PatronHoldClosed,
   PatronHoldOpened,
   RemoveBook,
   RemoveBookOutput,
+  RenamePatron,
+  RenamePatronOutput,
   TryCheckout,
   TryCheckoutOutput,
   TryHold,
   TryHoldOutput,
   UpdateBookRestricted,
   UpdateBookRestrictedOutput,
-  UserEngineForecasters,
+  UpdateEditionTitle,
+  UpdateEditionTitleOutput,
   UserEngineTxn,
 } from './model.gen';
 
@@ -185,7 +195,7 @@ function tryHold(txn: Txn, cmd: TryHold): TryHoldOutput {
      see after following the steps.  The business logic is expressed as a plain TypeScript function,
      typed according to what model.tsp declares.  The same logic provides both database consistency
      and optimistic updates, because this function is called from both `precommit.tryHold()` (db.ts)
-     and `userForecasters.tryHold()` (below). */
+     and `userForecasters.tryHold()` (ui.ts). */
   if (freeCopies(txn, room, isbn) < 1) return fail('every copy is already held or checked out');
   return opened(cmd);
 }
@@ -364,40 +374,46 @@ function assignPatron(txn: Txn, cmd: AssignPatron): AssignPatronOutput {
   return out;
 }
 
-/** every outcome, by command; a command not named here is its own event, on the stream it names */
+// the commands that are their own events, each on the stream it names
+
+function renamePatron(_txn: Txn, cmd: RenamePatron): RenamePatronOutput {
+  return { stream: patronStream(cmd.room, cmd.id), event: cmd };
+}
+
+function patronDismissNotice(_txn: Txn, cmd: PatronDismissNotice): PatronDismissNoticeOutput {
+  return { stream: patronStream(cmd.room, cmd.patron), event: cmd };
+}
+
+function addEdition(_txn: Txn, cmd: AddEdition): AddEditionOutput {
+  return { stream: bookStream(cmd.room), event: cmd };
+}
+
+function updateEditionTitle(_txn: Txn, cmd: UpdateEditionTitle): UpdateEditionTitleOutput {
+  return { stream: bookStream(cmd.room), event: cmd };
+}
+
+function addBook(_txn: Txn, cmd: AddBook): AddBookOutput {
+  return { stream: bookStream(cmd.room), event: cmd };
+}
+
+function dismissNotice(_txn: Txn, cmd: DismissNotice): DismissNoticeOutput {
+  return { stream: adminStream(cmd.room), event: cmd };
+}
+
+/** every outcome, by command, which precommit answers once it has checked the command, and which
+    the forecasters answer as the database will most likely decide it */
 export const outcomes = {
+  renamePatron,
   tryHold,
   cancelHold,
-  tryCheckout,
-  endCheckout,
-  updateBookRestricted,
-  removeBook,
-  assignPatron,
-};
-
-/** a patron's forecasts: every command they send, as the database will most likely decide it */
-export const userForecasters: UserEngineForecasters = {
-  renamePatron: (_txn, cmd) => ({ stream: patronStream(cmd.room, cmd.id), event: cmd }),
-  tryHold,
-  cancelHold: (txn, cmd) => cancelHold(txn, cmd, false),
-  patronDismissNotice: (_txn, cmd) => ({
-    stream: patronStream(cmd.room, cmd.patron),
-    event: cmd,
-  }),
-};
-
-/** the librarians' forecasts, which cover every command they send */
-export const adminForecasters: AdminEngineForecasters = {
-  ...userForecasters,
-  // a librarian cancels a hold for its patron
-  cancelHold: (txn, cmd) => cancelHold(txn, cmd, true),
-  addEdition: (_txn, cmd) => ({ stream: bookStream(cmd.room), event: cmd }),
-  updateEditionTitle: (_txn, cmd) => ({ stream: bookStream(cmd.room), event: cmd }),
-  addBook: (_txn, cmd) => ({ stream: bookStream(cmd.room), event: cmd }),
+  patronDismissNotice,
+  addEdition,
+  updateEditionTitle,
+  addBook,
   updateBookRestricted,
   removeBook,
   assignPatron,
   tryCheckout,
   endCheckout,
-  dismissNotice: (_txn, cmd) => ({ stream: adminStream(cmd.room), event: cmd }),
+  dismissNotice,
 };

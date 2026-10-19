@@ -168,7 +168,7 @@ const precommit: LibraryDBPrecommit<Plugins> = {
   renamePatron: (auth, txn, cmd) => {
     auth.authorize(isLibrarianOr(txn, auth, cmd.room, cmd.id));
     requirePatron(txn, cmd.room, cmd.id);
-    return { stream: patronStream(cmd.room, cmd.id), event: cmd };
+    return outcomes.renamePatron(txn, cmd);
   },
   tryHold: (auth, txn, cmd) => {
     auth.authorize(isLibrarianOr(txn, auth, cmd.room, cmd.patron));
@@ -193,7 +193,7 @@ const precommit: LibraryDBPrecommit<Plugins> = {
     if (txn.get.patron_notice(cmd.room, cmd.patron, cmd.id) === undefined) {
       throw new Reject('no such notice');
     }
-    return { stream: patronStream(cmd.room, cmd.patron), event: cmd };
+    return outcomes.patronDismissNotice(txn, cmd);
   },
 
   // a patron's account, which only its patron changes; the database has checked the proof
@@ -243,18 +243,18 @@ const precommit: LibraryDBPrecommit<Plugins> = {
   addEdition: (auth, txn, cmd) => {
     auth.authorize(isLibrarian(txn, auth, cmd.room));
     if (txn.get.edition(cmd.room, cmd.isbn) !== undefined) throw new Reject('edition exists');
-    return { stream: bookStream(cmd.room), event: cmd };
+    return outcomes.addEdition(txn, cmd);
   },
   updateEditionTitle: (auth, txn, cmd) => {
     auth.authorize(isLibrarian(txn, auth, cmd.room));
     requireEdition(txn, cmd.room, cmd.isbn);
-    return { stream: bookStream(cmd.room), event: cmd };
+    return outcomes.updateEditionTitle(txn, cmd);
   },
   addBook: (auth, txn, cmd) => {
     auth.authorize(isLibrarian(txn, auth, cmd.room));
     requireEdition(txn, cmd.room, cmd.isbn);
     if (txn.get.book(cmd.room, cmd.id) !== undefined) throw new Reject('book exists');
-    return { stream: bookStream(cmd.room), event: cmd };
+    return outcomes.addBook(txn, cmd);
   },
   updateBookRestricted: (auth, txn, cmd) => {
     auth.authorize(isLibrarian(txn, auth, cmd.room));
@@ -291,7 +291,7 @@ const precommit: LibraryDBPrecommit<Plugins> = {
   dismissNotice: (auth, txn, cmd) => {
     auth.authorize(isLibrarian(txn, auth, cmd.room));
     if (txn.get.admin_notice(cmd.room, cmd.id) === undefined) throw new Reject('no such notice');
-    return { stream: adminStream(cmd.room), event: cmd };
+    return outcomes.dismissNotice(txn, cmd);
   },
 
   // the database's own command: anyone may sign up in a room, and the account's patron id is new
