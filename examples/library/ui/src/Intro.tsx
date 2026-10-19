@@ -17,7 +17,7 @@ export default function Intro() {
       </p>
       <p>Then switch Bob online. His hold is rejected with a message.</p>
       <p>
-        The demo only needs{' '}
+        You write your UI and{' '}
         <a href={MODEL_SOURCE} target="_blank" rel="noopener">
           business logic
         </a>

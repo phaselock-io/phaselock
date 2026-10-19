@@ -78,22 +78,42 @@ export class SwitchedTransport implements Transport {
 
 // room stuff; for hosting a demo with many rooms
 
-/* The room in the page's URL, `/<room>`.  A page without one mints a room and puts it in the URL,
-   replacing the bare address, so Back does not mint another and the link a visitor shares is the
-   room. */
-function pageRoom(): { room: string; minted: boolean } {
+/* The page's room: an invite's, from a link to `/<room>`, else the one this tab was already in,
+   else a new one.  The tab keeps its room in sessionStorage, so a reload stays in it, and the
+   address is always the bare demo, so a copied address gives its reader a room of their own; an
+   invite is the room's link, shown under the windows. */
+function pageRoom(): { room: string; joined: boolean } {
   const path = window.location.pathname.slice(1);
-  if (ROOM_RE.test(path)) return { room: path, minted: false };
-  return { room: crypto.randomUUID(), minted: true };
+  const joined = ROOM_RE.test(path);
+  const room = joined ? path : (stored() ?? crypto.randomUUID());
+  try {
+    sessionStorage.setItem('room', room);
+  } catch {
+    // without storage a reload gets a new room
+  }
+  return { room, joined };
 }
 
-/** the room every window here is in */
-export const { room, minted } = pageRoom();
+// the room this tab was in, if storage holds one
+function stored(): string | null {
+  try {
+    const room = sessionStorage.getItem('room');
+    return room !== null && ROOM_RE.test(room) ? room : null;
+  } catch {
+    return null;
+  }
+}
+
+/** the room every window here is in, and whether the page came in on its invite */
+export const { room, joined } = pageRoom();
+
+/** the room's invite, the link that brings its reader into this room */
+export const invite = `${window.location.origin}/${room}`;
 
 // the room exists before anyone signs in to it; for a room that exists, CreateRoom writes nothing
 const created = await postLibraryCommand(http, { type: 'create-room', room });
 if (created.kind !== 'ok') throw new Error(`the room was not created: ${JSON.stringify(created)}`);
-if (minted) history.replaceState(null, '', `/${room}`);
+if (joined) history.replaceState(null, '', '/');
 
 /** a command without its room, which the window sending it names */
 export type Unroomed<C> = C extends unknown ? Omit<C, 'room'> : never;

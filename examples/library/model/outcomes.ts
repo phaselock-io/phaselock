@@ -180,7 +180,12 @@ function tryHold(txn: Txn, cmd: TryHold): TryHoldOutput {
     isbn = cmd.target.edition;
   }
 
-  // the hold takes one copy from the pool of the edition's unrestricted copies
+  // The hold takes one copy from the pool of the edition's unrestricted copies.
+  /* If you are arriving here from the demo, this is the line that generates the error message you
+     see after following the steps.  The business logic is expressed as a plain TypeScript function,
+     typed according to what model.tsp declares.  The same logic provides both database consistency
+     and optimistic updates, because this function is called from both `precommit.tryHold()` (db.ts)
+     and `userForecasters.tryHold()` (below). */
   if (freeCopies(txn, room, isbn) < 1) return fail('every copy is already held or checked out');
   return opened(cmd);
 }
