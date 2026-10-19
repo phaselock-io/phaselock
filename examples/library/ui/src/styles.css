@@ -63,6 +63,15 @@ h1 {
    12px secondary lines, and 14px text.  Rows in a section are divided by a thin rule. */
 .window {
   width: 32em;
+  max-width: 100%;
+}
+
+/* a phone's screen is narrower than a window, so the page keeps a slim gutter and each window
+   takes the screen's width */
+@media (max-width: 600px) {
+  body {
+    padding: 2rem 16px;
+  }
 }
 
 .grow {
