@@ -1,5 +1,5 @@
-// Scans through the query context and the reducer context: what a query's scan depends on, the
-// parameters a walk yields, a scan's lifetime, and a reducer's scans of its own stream
+// Scans through the query context and the predict context: what a query's scan depends on, the
+// parameters a walk yields, a scan's lifetime, and a predictor's scans over its own writes
 
 import { describe, expect, test } from 'vitest';
 
@@ -9,14 +9,11 @@ import {
   type KeyPattern,
   QueryGraph,
   type ReadTxn,
-  type ReducerTxn,
   scanEach,
-  scanEachLocal,
   type ScanRequest,
-  type SliceReducer,
 } from '../../../ts/assets/skeleton.ts';
 
-import { type Blob, bootstrap, ev, registry, rig, settle } from './harness.ts';
+import { type Blob, bootstrap, registry, rig, settle } from './harness.ts';
 
 const T = '.json';
 
@@ -61,7 +58,7 @@ function counted(graph: QueryGraph<ReadTxn>, pattern: KeyPattern, stopAfter = In
 }
 
 const posts = (org: string | null): KeyPattern => ({
-  stream: { family: 'chat', params: [org === null ? null : { eq: org }, null] },
+  slice: { family: 'chat', params: [org === null ? null : { eq: org }, null] },
   name: 'post',
   local: [null],
 });
@@ -74,7 +71,7 @@ describe("a query's scans", () => {
     run();
     expect(query.latest).toEqual(['acme gen 1', 'acme gen 3']);
 
-    // another org, another template in the walked stream, and a key the pattern skips
+    // another org, another template in the walked slice, and a key the pattern skips
     write(['chat:beta,gen!post:2', 'chat:acme,gen!meta', 'chat:acme,gen!post-x:1']);
     expect(counter.runs).toBe(1);
 
@@ -86,7 +83,7 @@ describe("a query's scans", () => {
     expect(query.latest).toEqual(['acme gen 2', 'acme gen 3']);
   });
 
-  test('a stream created after the walk dirties a pattern over its family', () => {
+  test('a slice created after the walk dirties a pattern over its family', () => {
     const store = seeded('chat:acme,gen!post:1');
     const { graph, run, write } = graphOver(store);
     const { query } = counted(graph, posts(null));
@@ -123,7 +120,7 @@ describe("a query's scans", () => {
     run();
     expect(query.latest).toEqual([]);
 
-    // outside the pattern nothing changes; a first post anywhere in it, in a new stream too, does
+    // outside the pattern nothing changes; a first post anywhere in it, in a new slice too, does
     write(['chat:beta,gen!post:2', 'chat:acme,gen!meta-x']);
     expect(counter.runs).toBe(1);
     write(['chat:acme,zz!post:9']);
@@ -161,14 +158,14 @@ describe("a query's scans", () => {
     expect(query.latest).toHaveLength(41);
   });
 
-  test('a scan yields the template parameters in order, stream ones first, the last holding the rest', () => {
+  test('a scan yields the template parameters in order, slice ones first, the last holding the rest', () => {
     const store = seeded(
       'chat:acme,gen!reply:t1,a,b!c',
       'chat:acme,gen!reply:t1,',
       'chat:acme,gen-2!reply:t2,z',
     );
     const pattern: KeyPattern = {
-      stream: { family: 'chat', params: [{ eq: 'acme' }, null] },
+      slice: { family: 'chat', params: [{ eq: 'acme' }, null] },
       name: 'reply',
       local: [null, null],
     };
@@ -186,7 +183,7 @@ describe("a query's scans", () => {
     const query = graph.newQuery((txn) => scanEach(txn, { pattern: posts('acme'), type: T }));
     run();
     expect(() => query.latest!.next()).toThrow(
-      'a scan was used after its query or forecast returned',
+      'a scan was used after its query or prediction returned',
     );
   });
 
@@ -215,7 +212,7 @@ function readOf(txn: Parameters<Parameters<InMemStore['read']>[0]>[0]): ReadTxn 
   };
 }
 
-describe("a reducer's scans", () => {
+describe("a predictor's scans", () => {
   const held: Blob = {
     position: 10,
     seqs: { 'patron:p1': 1, 'patron:p2': 1 },
@@ -226,27 +223,25 @@ describe("a reducer's scans", () => {
     ],
   };
 
-  test('a reducer walks only its own stream, keyed locally, and sees its own writes', async () => {
+  test('a predictor walks the keys its pattern picks out, and sees its own writes', async () => {
     const seen: string[][] = [];
-    const scanner: SliceReducer = {
-      template: 'patron:{id}',
-      keys: ['item:{name}'],
-      reducer(txn: ReducerTxn): void {
-        txn.set('item:b', 'state', { count: 1, fields: {} });
-        txn.del('item:c');
-        const items = [...scanEachLocal(txn, { name: 'item', local: [null], type: 'state' })];
+    const pattern: KeyPattern = { slice: 'patron:p1', name: 'item', local: [null] };
+    const r = rig({
+      predictor: (txn) => {
+        txn.set('patron:p1!item:b', 'state', { count: 1, fields: {} });
+        txn.del('patron:p1!item:c');
+        const items = [...scanEach(txn, { pattern, type: 'state' })];
         seen.push(items.map(([[name]]) => name));
-        const raw = txn.scan({ name: 'item', local: [null], type: false, limit: 10 });
+        const raw = txn.scan({ pattern, type: false, limit: 10 });
         seen.push(raw.entries.map(([k]) => k));
       },
-    };
-    const r = rig({ reducers: { patron: scanner } });
+    });
     await bootstrap(r, ['patron:*'], { 'patron:*': held });
-    r.server.events(ev('patron:p1', 2, 11));
+    r.engine.sendMutation({});
     await settle();
-    expect(seen).toEqual([
+    expect(seen.slice(0, 2)).toEqual([
       ['a', 'b'],
-      ['item:a', 'item:b'],
+      ['patron:p1!item:a', 'patron:p1!item:b'],
     ]);
   });
 });

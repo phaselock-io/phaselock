@@ -5,14 +5,14 @@
     "!backfill:chat:*",
     "!backfill:chat:acme,*",
     "!checkpoint",
-    "!command:00000000000000000001",
-    "!command:00000000000000000002",
-    "!park-ev:chat:ac,gen!00000000000000000001",
-    "!park-ev:chat:acme,gen!00000000000000000001",
-    "!park-ev:chat:acme,gen!00000000000000000002",
-    "!park-ev:chat:acme,gen-2!00000000000000000001",
-    "!park-ev:login!00000000000000000003",
-    "!park-kv:chat:acme,*!chat:acme,gen!meta",
+    "!mutation:00000000000000000001",
+    "!mutation:00000000000000000002",
+    "!park-ed:chat:ac,gen!00000000000000000001",
+    "!park-ed:chat:acme,gen!00000000000000000001",
+    "!park-ed:chat:acme,gen!00000000000000000002",
+    "!park-ed:chat:acme,gen-2!00000000000000000001",
+    "!park-ed:login!00000000000000000003",
+    "!park-snap:chat:acme,*!00000000000000000000",
     "!seq:chat:acme,gen",
     "!seq:login",
     "!view",
@@ -216,7 +216,7 @@
     {
       "name": "every post of a family",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chat",
           "params": [
             null,
@@ -300,7 +300,7 @@
     {
       "name": "one org, any channel, posts from a bound",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chat",
           "params": [
             {
@@ -342,7 +342,7 @@
     {
       "name": "channels by prefix in every org",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chat",
           "params": [
             null,
@@ -378,9 +378,9 @@
       ]
     },
     {
-      "name": "an open lower bound on a stream parameter skips the value and keeps its extensions",
+      "name": "an open lower bound on a slice parameter skips the value and keeps its extensions",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chat",
           "params": [
             null,
@@ -416,7 +416,7 @@
     {
       "name": "an upper bound on the first parameter",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chat",
           "params": [
             {
@@ -437,7 +437,7 @@
     {
       "name": "a closed upper bound on the first parameter",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chat",
           "params": [
             {
@@ -459,7 +459,7 @@
     {
       "name": "one thread of a two-parameter template",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chat",
           "params": [
             {
@@ -486,7 +486,7 @@
     {
       "name": "a range on a local parameter that is not last",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chat",
           "params": [
             null,
@@ -550,7 +550,7 @@
     {
       "name": "a range on the last local parameter",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chat",
           "params": [
             {
@@ -577,7 +577,7 @@
     {
       "name": "a template with no parameters across a family",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chat",
           "params": [
             null,
@@ -613,7 +613,7 @@
     {
       "name": "the tighter of two lower bounds and of two upper bounds",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chat",
           "params": [
             {
@@ -644,7 +644,7 @@
     {
       "name": "last values holding separators, empty, and above U+FFFF",
       "pattern": {
-        "stream": "chat:acme,gen",
+        "slice": "chat:acme,gen",
         "name": "post",
         "local": [
           null
@@ -665,7 +665,7 @@
     {
       "name": "a prefix on the last local parameter",
       "pattern": {
-        "stream": "chat:acme,gen",
+        "slice": "chat:acme,gen",
         "name": "post",
         "local": [
           {
@@ -679,9 +679,9 @@
       ]
     },
     {
-      "name": "every local key of one stream",
+      "name": "every local key of one slice",
       "pattern": {
-        "stream": "chat:acme,gen",
+        "slice": "chat:acme,gen",
         "name": null,
         "local": []
       },
@@ -707,9 +707,9 @@
       ]
     },
     {
-      "name": "every stream of a family, every local key",
+      "name": "every slice of a family, every local key",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chat",
           "params": [
             {
@@ -772,7 +772,7 @@
     {
       "name": "a family whose name another extends",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chatx",
           "params": [
             null
@@ -790,7 +790,7 @@
     {
       "name": "a singleton family",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "login",
           "params": []
         },
@@ -807,7 +807,7 @@
     {
       "name": "a name another name extends with a lower character",
       "pattern": {
-        "stream": "",
+        "slice": "",
         "name": "backfill",
         "local": [
           null
@@ -819,10 +819,10 @@
       ]
     },
     {
-      "name": "parked events under a ref prefix",
+      "name": "parked edits under a selector prefix",
       "pattern": {
-        "stream": "",
-        "name": "park-ev",
+        "slice": "",
+        "name": "park-ed",
         "local": [
           {
             "prefix": "chat:acme,"
@@ -830,46 +830,46 @@
         ]
       },
       "expect": [
-        "!park-ev:chat:acme,gen!00000000000000000001",
-        "!park-ev:chat:acme,gen!00000000000000000002",
-        "!park-ev:chat:acme,gen-2!00000000000000000001"
+        "!park-ed:chat:acme,gen!00000000000000000001",
+        "!park-ed:chat:acme,gen!00000000000000000002",
+        "!park-ed:chat:acme,gen-2!00000000000000000001"
       ]
     },
     {
-      "name": "every parked event",
+      "name": "every parked edit",
       "pattern": {
-        "stream": "",
-        "name": "park-ev",
+        "slice": "",
+        "name": "park-ed",
         "local": [
           null
         ]
       },
       "expect": [
-        "!park-ev:chat:ac,gen!00000000000000000001",
-        "!park-ev:chat:acme,gen!00000000000000000001",
-        "!park-ev:chat:acme,gen!00000000000000000002",
-        "!park-ev:chat:acme,gen-2!00000000000000000001",
-        "!park-ev:login!00000000000000000003"
+        "!park-ed:chat:ac,gen!00000000000000000001",
+        "!park-ed:chat:acme,gen!00000000000000000001",
+        "!park-ed:chat:acme,gen!00000000000000000002",
+        "!park-ed:chat:acme,gen-2!00000000000000000001",
+        "!park-ed:login!00000000000000000003"
       ]
     },
     {
       "name": "the outbox",
       "pattern": {
-        "stream": "",
-        "name": "command",
+        "slice": "",
+        "name": "mutation",
         "local": [
           null
         ]
       },
       "expect": [
-        "!command:00000000000000000001",
-        "!command:00000000000000000002"
+        "!mutation:00000000000000000001",
+        "!mutation:00000000000000000002"
       ]
     },
     {
       "name": "a whole system key",
       "pattern": {
-        "stream": "",
+        "slice": "",
         "name": "view",
         "local": []
       },
@@ -880,7 +880,7 @@
     {
       "name": "nothing matches",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chat",
           "params": [
             {
@@ -899,7 +899,7 @@
     {
       "name": "a bound below every value and one above",
       "pattern": {
-        "stream": {
+        "slice": {
           "family": "chat",
           "params": [
             {
@@ -943,7 +943,7 @@
     {
       "name": "every key",
       "pattern": {
-        "stream": null,
+        "slice": null,
         "name": null,
         "local": []
       },
@@ -952,14 +952,14 @@
         "!backfill:chat:*",
         "!backfill:chat:acme,*",
         "!checkpoint",
-        "!command:00000000000000000001",
-        "!command:00000000000000000002",
-        "!park-ev:chat:ac,gen!00000000000000000001",
-        "!park-ev:chat:acme,gen!00000000000000000001",
-        "!park-ev:chat:acme,gen!00000000000000000002",
-        "!park-ev:chat:acme,gen-2!00000000000000000001",
-        "!park-ev:login!00000000000000000003",
-        "!park-kv:chat:acme,*!chat:acme,gen!meta",
+        "!mutation:00000000000000000001",
+        "!mutation:00000000000000000002",
+        "!park-ed:chat:ac,gen!00000000000000000001",
+        "!park-ed:chat:acme,gen!00000000000000000001",
+        "!park-ed:chat:acme,gen!00000000000000000002",
+        "!park-ed:chat:acme,gen-2!00000000000000000001",
+        "!park-ed:login!00000000000000000003",
+        "!park-snap:chat:acme,*!00000000000000000000",
         "!seq:chat:acme,gen",
         "!seq:login",
         "!view",

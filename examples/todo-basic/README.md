@@ -2,7 +2,7 @@
 
 A very simple to-do app to illustrate:
 
-- defining data types, reducers, and precommit
+- defining data types, mutations, and deciders
 - adding a PhaseLock Engine to your app
 - connecting live query results to your UI
 
@@ -13,55 +13,53 @@ collaborative clients would do.
 
 The logical flow of information is circular:
 
-- PhaseLockDB stores events in a log.
-- The transport streams events from PhaseLockDB to Engine.
-- The Engine processes events with reducers to populate the store.
-- The app submits queries to read the store.
-- The app feeds live query results to a reactive UI.
-- User actions generate commands to send to PhaseLockDB.
-- Precommit validates commands and generates new events for the event log.
-- PhaseLockDB emits fresh events, and the cycle continues.
+- The app UI is populated by queries against the local store.
+- User actions generate new mutations to send to PhaseLockDB.
+- The decider validates mutations and updates server state.
+- Those updates are captured as edits in a log.
+- Edits from the log are streamed back to the client.
+- Edits in the client are applied to the store.
+- Live queries rerun when their inputs have changed, updating the app UI.
 
 ```
  ________________________________________
 | todo-basic web app                     |
 |    _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _   |
-|   | PhaseLock Engine [5]            |  |
+|   | PhaseLock Engine [4]            |  |
 |       _________          _________     |
-|   |  |      [1]|        |      [3]| |  |
+|   |  |      [1]|        |      [2]| |  |
 |      |  store  |------->| queries |    |
 |   |  |_________|        |_________| |  |
 |         ^            _ _ _ _ _|_ _ _   |
-|   |   __|_______    |       __v___     |
-|      |       [2]|          |   [4]|    |
-|   |  | reducers |   |      |  UI  |    |
-|      |__________|          |______|    |
-|   |     ^           |_ _ _ _ _|_ _ _   |
+|   |     |           |       __v___     |
+|         |                  |   [3]|    |
+|   |     |           |      |  UI  |    |
+|         |                  |______|    |
+|   |     |           |_ _ _ _ _|_ _ _   |
 |       __|_____________________v___     |
-|   |  |                            | |  |
+|   |  |                         [4]| |  |
 |      |         transport          |    |
 |   |  |____________________________| |  |
 |         ^                     |        |
 |   |_ _ _|_ _ _ _ _ _ _ _ _ _ _|_ _ _|  |
 |_________|_____________________|________|
           |                     |
-          | events              | commands
+          | edits               | mutations
     ______|_____________________|_____
    |  PhaseLockDB               |     |
-   |  ____|______        _______v___  |
-   | |        [1]|      |        [6]| |
-   | | event log |<-----| precommit | |
-   | |___________|      |___________| |
+   |  ____|_____           _____v___  |
+   | |          |         |      [5]| |
+   | | edit log |<--------| decider | |
+   | |__________|         |_________| |
    |                                  |
    |__________________________________|
 ```
 
-- [1] model/model.tsp defines event types and store layouts using TypeSpec
-- [2] model/reducers.ts defines reducer functions that build state from events
-- [3] ui/src/Window.tsx defines queries in-line with the UI components
-- [4] ui/src/useLocalQuery.ts defines the React hook for queries
-- [5] ui/src/engines.ts starts an Engine+Transport pair that manages sync
-- [6] model/db.ts defines the precommit function for processing commands
+- [1] model/model.tsp defines store layouts and mutation types using TypeSpec
+- [2] ui/src/Window.tsx defines queries in-line with the UI components
+- [3] ui/src/useLocalQuery.ts defines the React hook for queries
+- [4] ui/src/engines.ts starts an Engine+Transport pair that manages sync
+- [5] model/db.ts defines the decider functions for processing mutations
 
 ## Run the example
 

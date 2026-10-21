@@ -1,8 +1,8 @@
-// TESTS.md: Outbox and commands
+// TESTS.md: Outbox and mutations
 
 import { describe, expect, test } from 'vitest';
 
-import { type Command, type CommandResult, Reject } from '../../../ts/assets/skeleton.ts';
+import { type Mutation, type MutationResult, Reject } from '../../../ts/assets/skeleton.ts';
 
 import {
   type Blob,
@@ -10,44 +10,45 @@ import {
   checkpoint,
   ev,
   FakeServer,
-  type Forecaster,
   keys,
   log,
   parse,
-  type Rig,
+  predict,
+  type Predictor,
+  readState,
   rig,
+  type Rig,
   seq,
   settle,
-  type State,
   state,
+  type State,
   watch,
 } from './harness.ts';
 
-/** a test command: what the forecast should do with it */
+/** a test mutation: what the prediction should do with it */
 type Cmd = {
   field?: string;
   value?: unknown;
-  stream?: string;
+  slice?: string;
   reason?: true;
   throws?: true;
   reads?: true;
   ghost?: true;
 };
 
-/** forecasts a `set` on patron:p1 (or the named stream), or misbehaves as the command asks */
-const forecaster: Forecaster = (qx, command) => {
-  const cmd = command as Cmd;
+/** predicts a `set` on patron:p1 (or the named slice), or misbehaves as the mutation asks */
+const predictor: Predictor = (txn, mutation) => {
+  const cmd = mutation as Cmd;
   if (cmd.reason) throw new Reject('not this time');
-  if (cmd.throws) throw new Error('forecast boom');
-  if (cmd.ghost) return [{ stream: 'ghost:g1', event: { id: 'g1', type: 'bump' } }];
+  if (cmd.throws) throw new Error('prediction boom');
+  if (cmd.ghost) return predict(txn, 'ghost:g1', { id: 'g1', type: 'bump' });
   if (cmd.reads) {
-    const st = qx.get('patron:p1!state', 'state') as State | undefined;
-    const seen = JSON.stringify(st?.fields ?? {});
-    return [{ stream: 'patron:p1', event: { id: 'p1', type: 'set', field: 'seen', value: seen } }];
+    const seen = JSON.stringify(readState(txn, 'patron:p1')?.fields ?? {});
+    return predict(txn, 'patron:p1', { id: 'p1', type: 'set', field: 'seen', value: seen });
   }
-  const stream = cmd.stream ?? 'patron:p1';
-  const id = stream.slice(stream.indexOf(':') + 1);
-  return [{ stream, event: { id, type: 'set', field: cmd.field ?? 'f', value: cmd.value ?? 1 } }];
+  const slice = cmd.slice ?? 'patron:p1';
+  const id = slice.slice(slice.indexOf(':') + 1);
+  predict(txn, slice, { id, type: 'set', field: cmd.field ?? 'f', value: cmd.value ?? 1 });
 };
 
 const patrons: Blob = {
@@ -59,37 +60,37 @@ const patrons: Blob = {
   ],
 };
 
-/** a live Engine holding patron:p1 and patron:p2 at position 10, with the forecaster */
+/** a live Engine holding patron:p1 and patron:p2 at position 10, with the predictor */
 async function held(server = new FakeServer()): Promise<Rig> {
-  const r = rig({ forecaster, server });
+  const r = rig({ predictor, server });
   await bootstrap(r, ['patron:*'], { 'patron:*': patrons });
   return r;
 }
 
 type SendCall = {
-  cmds: Command<Uint8Array>[];
-  resolve: (results: CommandResult[]) => void;
+  cmds: Mutation<Uint8Array>[];
+  resolve: (results: MutationResult[]) => void;
   reject: (e: unknown) => void;
 };
 
-/** take over the server's sendCommands: every call is recorded and answered by the test */
+/** take over the server's sendMutations: every call is recorded and answered by the test */
 function sendControl(server: FakeServer): SendCall[] {
   const calls: SendCall[] = [];
   server.onSend = (cmds) =>
-    new Promise<CommandResult[]>((resolve, reject) => {
+    new Promise<MutationResult[]>((resolve, reject) => {
       calls.push({ cmds, resolve, reject });
     });
   return calls;
 }
 
-const ok = (position: number): CommandResult => ({ kind: 'ok', position });
-const reject: CommandResult = { kind: 'reject', reason: 'no' };
-const conflict: CommandResult = { kind: 'conflict', current: {} };
+const ok = (position: number): MutationResult => ({ kind: 'ok', position });
+const reject: MutationResult = { kind: 'reject', reason: 'no' };
+const conflict: MutationResult = { kind: 'conflict', current: {} };
 
 /** the outbox as stored: ordinal keys and their envelopes, the wire bytes parsed back */
 function outbox(data: Record<string, unknown>): { key: string; id: string; data: unknown }[] {
-  return keys(data, '!command:').map((key) => {
-    const c = data[key] as Command<Uint8Array>;
+  return keys(data, '!mutation:').map((key) => {
+    const c = data[key] as Mutation<Uint8Array>;
     return { key, id: c.id, data: parse(c.data) };
   });
 }
@@ -97,7 +98,7 @@ function outbox(data: Record<string, unknown>): { key: string; id: string; data:
 /** freeze the base: a gap on patron:p2 whose replacing backfill is held; returns the release */
 async function freeze(r: Rig, position = 11): Promise<() => void> {
   const hold = r.server.hold('patron:p2');
-  r.server.events(ev('patron:p2', 9, position));
+  r.server.edits(ev('patron:p2', 9, position));
   await settle();
   expect(seq(r.data(), 'patron:p2')).toBe('backfill');
   return () => {
@@ -111,15 +112,15 @@ async function freeze(r: Rig, position = 11): Promise<() => void> {
 }
 
 describe('outbox rows and sends', () => {
-  test('sendCommand writes padded ordinal rows holding the envelope and sends them in order', async () => {
+  test('sendMutation writes padded ordinal rows holding the envelope and sends them in order', async () => {
     const r = await held();
-    r.engine.sendCommand({ field: 'a', value: 1 });
-    r.engine.sendCommand({ field: 'b', value: 2 });
+    r.engine.sendMutation({ field: 'a', value: 1 });
+    r.engine.sendMutation({ field: 'b', value: 2 });
     await settle();
     const rows = outbox(r.data());
     expect(rows.map((x) => x.key)).toEqual([
-      '!command:00000000000000000000',
-      '!command:00000000000000000001',
+      '!mutation:00000000000000000000',
+      '!mutation:00000000000000000001',
     ]);
     expect(rows.map((x) => x.data)).toEqual([
       { field: 'a', value: 1 },
@@ -127,7 +128,7 @@ describe('outbox rows and sends', () => {
     ]);
     expect(r.server.sends.length).toBe(1);
     expect(r.server.sends[0].map((c) => c.id)).toEqual(rows.map((x) => x.id));
-    // wire data is the command through the commands type; the row keeps the JS envelope
+    // wire data is the mutation through the mutations type; the row keeps the JS envelope
     expect(r.server.sends[0].map((c) => parse(c.data))).toEqual([
       { field: 'a', value: 1 },
       { field: 'b', value: 2 },
@@ -135,13 +136,13 @@ describe('outbox rows and sends', () => {
     expect(typeof rows[0].id).toBe('string');
   });
 
-  test('an ok releases once the reduced position reaches it; a reject and a conflict at once', async () => {
+  test('an ok releases once the applied position reaches it; a reject and a conflict at once', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    r.engine.sendCommand({ field: 'a' });
-    r.engine.sendCommand({ field: 'b' });
-    r.engine.sendCommand({ field: 'c' });
-    r.engine.sendCommand({ field: 'd' });
+    r.engine.sendMutation({ field: 'a' });
+    r.engine.sendMutation({ field: 'b' });
+    r.engine.sendMutation({ field: 'c' });
+    r.engine.sendMutation({ field: 'd' });
     await settle();
     calls[0].resolve([ok(15), ok(16), reject, conflict]);
     await settle();
@@ -155,13 +156,13 @@ describe('outbox rows and sends', () => {
     expect(outbox(r.data())).toEqual([]);
   });
 
-  test('an event carrying the command id releases it when reduced, before the ack', async () => {
+  test('an edit carrying the mutation id releases it when applied, before the ack', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    r.engine.sendCommand({ field: 'a' });
+    r.engine.sendMutation({ field: 'a' });
     await settle();
     const id = outbox(r.data())[0].id;
-    r.server.events(ev('patron:p1', 3, 11, { type: 'set', field: 'a', value: 1 }, id));
+    r.server.edits(ev('patron:p1', 3, 11, { type: 'set', field: 'a', value: 1 }, id));
     await settle();
     expect(outbox(r.data())).toEqual([]);
     expect(log(r.data(), 'patron:p1')).toEqual(['set a=1']);
@@ -172,17 +173,17 @@ describe('outbox rows and sends', () => {
     expect(state(r.data(), 'patron:p1')).toEqual({ count: 2, fields: { a: 1 } });
   });
 
-  test("a failed call's commands wait for the connection's end; the next connection resends them in order in one call", async () => {
+  test("a failed call's mutations wait for the connection's end; the next connection resends them in order in one call", async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    r.engine.sendCommand({ field: 'a' });
-    r.engine.sendCommand({ field: 'b' });
+    r.engine.sendMutation({ field: 'a' });
+    r.engine.sendMutation({ field: 'b' });
     await settle();
     calls[0].reject(new Error('500'));
     await settle();
     expect(outbox(r.data()).length).toBe(2);
-    // the connection has not ended yet, so a new command goes alone
-    r.engine.sendCommand({ field: 'c' });
+    // the connection has not ended yet, so a new mutation goes alone
+    r.engine.sendMutation({ field: 'c' });
     await settle();
     expect(r.server.sends.map((call) => call.map((c) => parse(c.data)))).toEqual([
       [{ field: 'a' }, { field: 'b' }],
@@ -201,19 +202,19 @@ describe('outbox rows and sends', () => {
     ]);
   });
 
-  test('a row an earlier build wrote, unreadable now, is still sent as stored and forecasts nothing', async () => {
+  test('a row an earlier build wrote, unreadable now, is still sent as stored and predicts nothing', async () => {
     const server = new FakeServer();
     const calls = sendControl(server);
     const stale = new TextEncoder().encode('not json');
     const r = rig({
-      forecaster,
+      predictor,
       server,
       seed: {
-        '!view': { token: 't1', position: 10, refs: ['patron:*'] },
-        '!checkpoint': { epoch: 'e1', position: 10, reduced: 10 },
+        '!view': { token: 't1', position: 10, selectors: ['patron:*'] },
+        '!checkpoint': { epoch: 'e1', position: 10, applied: 10 },
         '!seq:patron:p1': 2,
         'patron:p1!state': { count: 2, fields: {} },
-        '!command:00000000000000000000': { id: 'old', data: stale },
+        '!mutation:00000000000000000000': { id: 'old', data: stale },
       },
     });
     const w = watch(r, 'patron:p1');
@@ -222,26 +223,26 @@ describe('outbox rows and sends', () => {
     r.server.live(10);
     await settle();
 
-    // sent byte for byte, and the graph delivered the base with no forecast on it
+    // sent byte for byte, and the graph delivered the base with no prediction on it
     expect(calls.length).toBe(1);
     expect(calls[0].cmds).toEqual([{ id: 'old', data: stale }]);
     expect(w.values.at(-1)).toEqual({ count: 2, fields: {} });
 
-    // acked like any other command
+    // acked like any other mutation
     calls[0].resolve([ok(10)]);
     await settle();
-    expect(keys(r.data(), '!command:')).toEqual([]);
+    expect(keys(r.data(), '!mutation:')).toEqual([]);
   });
 
-  test('a new connection flushes every command not acked, in ordinal order, in one call', async () => {
+  test('a new connection flushes every mutation not acked, in ordinal order, in one call', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    r.engine.sendCommand({ field: 'a' });
+    r.engine.sendMutation({ field: 'a' });
     await settle();
     calls[0].resolve([ok(500)]);
     await settle();
-    r.engine.sendCommand({ field: 'b' });
-    r.engine.sendCommand({ field: 'c' });
+    r.engine.sendMutation({ field: 'b' });
+    r.engine.sendMutation({ field: 'c' });
     await settle();
     expect(calls.length).toBe(2);
     // the connection ends with b and c unanswered; a is acked and waits for the cursor
@@ -253,35 +254,35 @@ describe('outbox rows and sends', () => {
     expect(outbox(r.data()).length).toBe(3);
   });
 
-  test('commands survive a restart in order and are flushed on connect; the next ordinal continues', async () => {
+  test('mutations survive a restart in order and are flushed on connect; the next ordinal continues', async () => {
     const r = await held();
     sendControl(r.server);
-    r.engine.sendCommand({ field: 'a' });
-    r.engine.sendCommand({ field: 'b' });
+    r.engine.sendMutation({ field: 'a' });
+    r.engine.sendMutation({ field: 'b' });
     await settle();
     r.abort.abort();
     await settle();
     const server = new FakeServer();
     server.blobs.set('patron:*', patrons);
     const calls = sendControl(server);
-    const r2 = rig({ store: r.store, server, forecaster });
+    const r2 = rig({ store: r.store, server, predictor });
     await settle();
     expect(server.sends.length).toBe(1);
     expect(server.sends[0].map((c) => parse(c.data))).toEqual([{ field: 'a' }, { field: 'b' }]);
     expect(calls.length).toBe(1);
-    r2.engine.sendCommand({ field: 'c' });
+    r2.engine.sendMutation({ field: 'c' });
     await settle();
     expect(outbox(r2.data()).map((x) => x.key)).toEqual([
-      '!command:00000000000000000000',
-      '!command:00000000000000000001',
-      '!command:00000000000000000002',
+      '!mutation:00000000000000000000',
+      '!mutation:00000000000000000001',
+      '!mutation:00000000000000000002',
     ]);
   });
 
   test('acks are memory only: acked before a crash, resent under its series, ok again, dropped the same way', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    r.engine.sendCommand({ field: 'a' });
+    r.engine.sendMutation({ field: 'a' });
     await settle();
     calls[0].resolve([ok(15)]);
     await settle();
@@ -291,7 +292,7 @@ describe('outbox rows and sends', () => {
     const server = new FakeServer();
     server.blobs.set('patron:*', patrons);
     const calls2 = sendControl(server);
-    rig({ store: r.store, server, forecaster });
+    rig({ store: r.store, server, predictor });
     await settle();
     expect(server.sends.length).toBe(1);
     expect(server.sends[0].map((c) => parse(c.data))).toEqual([{ field: 'a' }]);
@@ -309,19 +310,19 @@ describe('outbox rows and sends', () => {
 });
 
 describe('series', () => {
-  test('outbox and @online commands take consecutive numbers of one series, in submission order', async () => {
+  test('outbox and @online mutations take consecutive numbers of one series, in submission order', async () => {
     const r = await held();
     sendControl(r.server);
-    r.engine.sendCommand({ field: 'a' });
-    void r.engine.sendOnlineCommand({ field: 'x' });
-    r.engine.sendCommand({ field: 'b' });
+    r.engine.sendMutation({ field: 'a' });
+    void r.engine.sendOnlineMutation({ field: 'x' });
+    r.engine.sendMutation({ field: 'b' });
     await settle();
     const sent = r.server.sends.flat();
     expect(sent.map((c) => c.n)).toEqual([1, 2, 3]);
     expect(new Set(sent.map((c) => c.series)).size).toBe(1);
     expect(sent[0].series).toMatch(/^[A-Za-z0-9_-]{22}$/);
     // the outbox rows keep the series and number they were minted with
-    const rows = keys(r.data(), '!command:').map((k) => r.data()[k] as Command<Uint8Array>);
+    const rows = keys(r.data(), '!mutation:').map((k) => r.data()[k] as Mutation<Uint8Array>);
     expect(rows.map((c) => [c.series, c.n])).toEqual([
       [sent[0].series, 1],
       [sent[0].series, 3],
@@ -329,50 +330,50 @@ describe('series', () => {
   });
 });
 
-describe('forecasts', () => {
-  test('the overlay is rebuilt from the outbox; a throwing forecast is dropped and the Engine survives', async () => {
+describe('predictions', () => {
+  test('the overlay is rebuilt from the outbox; a throwing prediction is dropped and the Engine survives', async () => {
     const r = await held();
     const w = watch(r, 'patron:p1');
     await settle();
     expect(w.values).toEqual([{ count: 2, fields: {} }]);
-    r.engine.sendCommand({ throws: true });
-    r.engine.sendCommand({ field: 'a', value: 1 });
+    r.engine.sendMutation({ throws: true });
+    r.engine.sendMutation({ field: 'a', value: 1 });
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1 } });
-    // a base change rebuilds the overlay over the new base, forecasts still on top
-    r.server.events(ev('patron:p1', 3, 11));
+    // a base change rebuilds the overlay over the new base, predictions still on top
+    r.server.edits(ev('patron:p1', 3, 11));
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 3, fields: { a: 1 } });
     expect(state(r.data(), 'patron:p1')).toEqual({ count: 3, fields: {} });
   });
 
-  test('forecasts run in outbox order, each reading the overlay the earlier ones left', async () => {
+  test('predictions run in outbox order, each reading the overlay the earlier ones left', async () => {
     const r = await held();
     const w = watch(r, 'patron:p1');
-    r.engine.sendCommand({ field: 'a', value: 1 });
+    r.engine.sendMutation({ field: 'a', value: 1 });
     await settle();
-    r.engine.sendCommand({ reads: true });
+    r.engine.sendMutation({ reads: true });
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1, seen: '{"a":1}' } });
   });
 
-  test('a rejection adds nothing; a family with no reducer adds nothing', async () => {
+  test('a rejection adds nothing; a write to a slice type the Engine does not declare stays off the base', async () => {
     const r = await held();
     const w = watch(r, 'patron:p1');
     await settle();
-    r.engine.sendCommand({ reason: true });
-    r.engine.sendCommand({ ghost: true });
+    r.engine.sendMutation({ reason: true });
+    r.engine.sendMutation({ ghost: true });
     await settle();
     expect(outbox(r.data()).length).toBe(2);
     expect(w.values.at(-1)).toEqual({ count: 2, fields: {} });
     expect(keys(r.data(), 'ghost')).toEqual([]);
   });
 
-  test('a dropped command rebuilds the overlay and runs the graph even while frozen', async () => {
+  test('a dropped mutation rebuilds the overlay and runs the graph even while frozen', async () => {
     const r = await held();
     const w = watch(r, 'patron:p1');
     const calls = sendControl(r.server);
-    r.engine.sendCommand({ field: 'a', value: 1 });
+    r.engine.sendMutation({ field: 'a', value: 1 });
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1 } });
     await freeze(r);
@@ -384,42 +385,42 @@ describe('forecasts', () => {
   });
 });
 
-describe('the reduced position', () => {
-  test('a batch that froze part way, a vouch while frozen, an ack already reduced past, and the unfreeze', async () => {
+describe('the applied position', () => {
+  test('a batch that froze part way, a vouch while frozen, an ack already applied past, and the unfreeze', async () => {
     const r = await held();
     const w = watch(r, 'patron:p1');
     const calls = sendControl(r.server);
-    r.engine.sendCommand({ field: 'a', value: 1 });
-    r.engine.sendCommand({ field: 'b', value: 2 });
+    r.engine.sendMutation({ field: 'a', value: 1 });
+    r.engine.sendMutation({ field: 'b', value: 2 });
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1, b: 2 } });
-    // p1 reduces at 11, then p2's gap at 12 freezes the rest of the atom
+    // p1 applies at 11, then p2's gap at 12 freezes the rest of the frame
     const hold = r.server.hold('patron:p2');
-    r.server.events(ev('patron:p1', 3, 11), ev('patron:p2', 9, 12));
+    r.server.edits(ev('patron:p1', 3, 11), ev('patron:p2', 9, 12));
     await settle();
-    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 12, reduced: 11 });
-    // frozen: the base change reaches no query
-    expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1, b: 2 } });
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 12, applied: 11 });
+    // the edit before the gap applied, and the freeze's status change runs the graph over it
+    expect(w.values.at(-1)).toEqual({ count: 3, fields: { a: 1, b: 2 } });
     calls[0].resolve([ok(11), ok(12)]);
     await settle();
     expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
-    // the release rebuilds the overlay over the reduced base, b's forecast still on it
+    // the release rebuilds the overlay over the applied base, b's prediction still on it
     expect(w.values.at(-1)).toEqual({ count: 3, fields: { b: 2 } });
-    // a vouch moves the cursor but not the reduced position while frozen
+    // a vouch moves the cursor but not the applied position while frozen
     r.server.vouch(20);
     await settle();
-    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 20, reduced: 11 });
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 20, applied: 11 });
     expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
-    // an ack at a position already reduced past releases at once, frozen or not
-    r.engine.sendCommand({ field: 'c', value: 3 });
+    // an ack at a position already applied past releases at once, frozen or not
+    r.engine.sendMutation({ field: 'c', value: 3 });
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 3, fields: { b: 2, c: 3 } });
     calls[1].resolve([ok(5)]);
     await settle();
     expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
-    // b's forecast never left the overlay through the freeze
+    // b's prediction never left the overlay through the freeze
     for (const v of w.values.slice(1)) expect(v?.fields.b).toBe(2);
-    // the unfreeze moves the reduced position to the checkpoint and releases b
+    // the unfreeze moves the applied position to the checkpoint and releases b
     r.server.blobs.set('patron:p2', {
       position: 12,
       seqs: { 'patron:p2': 9 },
@@ -427,18 +428,18 @@ describe('the reduced position', () => {
     });
     hold.go();
     await settle();
-    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 20, reduced: 20 });
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 20, applied: 20 });
     expect(outbox(r.data())).toEqual([]);
     expect(w.values.at(-1)).toEqual({ count: 3, fields: {} });
   });
 
-  test('the reduced position is persisted and restored on boot mid-freeze', async () => {
+  test('the applied position is persisted and restored on boot mid-freeze', async () => {
     const r = await held();
     const hold = r.server.hold('patron:p2');
-    r.server.events(ev('patron:p1', 3, 11), ev('patron:p2', 9, 12));
+    r.server.edits(ev('patron:p1', 3, 11), ev('patron:p2', 9, 12));
     r.server.vouch(20);
     await settle();
-    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 20, reduced: 11 });
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 20, applied: 11 });
     void hold;
     r.abort.abort();
     await settle();
@@ -446,11 +447,11 @@ describe('the reduced position', () => {
     server.blobs.set('patron:*', patrons);
     server.hold('patron:p2');
     const calls = sendControl(server);
-    const r2 = rig({ store: r.store, server, forecaster });
+    const r2 = rig({ store: r.store, server, predictor });
     await settle();
     expect(server.conn.since).toBe(20);
-    r2.engine.sendCommand({ field: 'a' });
-    r2.engine.sendCommand({ field: 'b' });
+    r2.engine.sendMutation({ field: 'a' });
+    r2.engine.sendMutation({ field: 'b' });
     await settle();
     calls[0].resolve([ok(11), ok(12)]);
     await settle();
@@ -460,10 +461,10 @@ describe('the reduced position', () => {
   test('the round trip is observed in a landed backfill tail', async () => {
     const server = new FakeServer();
     const hold = server.hold('patron:*');
-    const r = rig({ forecaster, server });
+    const r = rig({ predictor, server });
     await bootstrap(r, ['patron:*'], {});
     sendControl(server);
-    r.engine.sendCommand({ field: 'a' });
+    r.engine.sendMutation({ field: 'a' });
     await settle();
     const id = outbox(r.data())[0].id;
     server.blobs.set('patron:*', {
@@ -481,11 +482,11 @@ describe('the reduced position', () => {
   test('the round trip is observed in the frozen walk', async () => {
     const r = await held();
     sendControl(r.server);
-    r.engine.sendCommand({ field: 'a' });
+    r.engine.sendMutation({ field: 'a' });
     await settle();
     const id = outbox(r.data())[0].id;
     const unfreeze = await freeze(r);
-    r.server.events(ev('patron:p1', 3, 12, { type: 'set', field: 'a', value: 1 }, id));
+    r.server.edits(ev('patron:p1', 3, 12, { type: 'set', field: 'a', value: 1 }, id));
     await settle();
     expect(outbox(r.data()).length).toBe(1);
     expect(log(r.data(), 'patron:p1')).toEqual([]);
@@ -495,20 +496,20 @@ describe('the reduced position', () => {
     expect(outbox(r.data())).toEqual([]);
   });
 
-  test('a no-op command acked during a freeze is released at the unfreeze', async () => {
+  test('a no-op mutation acked during a freeze is released at the unfreeze', async () => {
     const r = await held();
     const calls = sendControl(r.server);
     const unfreeze = await freeze(r);
-    r.engine.sendCommand({ field: 'a' });
+    r.engine.sendMutation({ field: 'a' });
     await settle();
     calls[0].resolve([ok(15)]);
     r.server.vouch(15);
     await settle();
-    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, reduced: 10 });
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, applied: 10 });
     expect(outbox(r.data()).length).toBe(1);
     unfreeze();
     await settle();
-    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, reduced: 15 });
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, applied: 15 });
     expect(outbox(r.data())).toEqual([]);
   });
 });
@@ -523,21 +524,21 @@ function track<T>(p: Promise<T>): { settled: boolean; value?: T; error?: unknown
   return t;
 }
 
-describe('@online commands', () => {
-  test('one goes in a call of its own, behind the commands submitted before it and ahead of those after', async () => {
+describe('@online mutations', () => {
+  test('one goes in a call of its own, behind the mutations submitted before it and ahead of those after', async () => {
     const r = await held();
     const w = watch(r, 'patron:p1');
     sendControl(r.server);
-    r.engine.sendCommand({ field: 'a' });
-    void r.engine.sendOnlineCommand({ field: 'x' });
-    r.engine.sendCommand({ field: 'b' });
+    r.engine.sendMutation({ field: 'a' });
+    void r.engine.sendOnlineMutation({ field: 'x' });
+    r.engine.sendMutation({ field: 'b' });
     await settle();
     expect(r.server.sends.map((call) => call.map((c) => parse(c.data)))).toEqual([
       [{ field: 'a' }],
       [{ field: 'x' }],
       [{ field: 'b' }],
     ]);
-    // never persisted, never forecast
+    // never persisted, never predicted
     expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'a' }, { field: 'b' }]);
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1, b: 1 } });
   });
@@ -545,15 +546,15 @@ describe('@online commands', () => {
   test('after a reconnect it goes behind the resent outbox', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    r.engine.sendCommand({ field: 'a' });
+    r.engine.sendMutation({ field: 'a' });
     await settle();
     calls[0].reject(new Error('500'));
     r.server.end();
     await settle();
-    r.engine.sendCommand({ field: 'b' });
+    r.engine.sendMutation({ field: 'b' });
     r.engine.reconnectNow();
     await settle();
-    void r.engine.sendOnlineCommand({ field: 'x' });
+    void r.engine.sendOnlineMutation({ field: 'x' });
     await settle();
     expect(r.server.sends.slice(1).map((call) => call.map((c) => parse(c.data)))).toEqual([
       [{ field: 'a' }, { field: 'b' }],
@@ -564,8 +565,8 @@ describe('@online commands', () => {
   test('a reject or a conflict settles it at once', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    const rejected = r.engine.sendOnlineCommand({ field: 'x' });
-    const conflicted = r.engine.sendOnlineCommand({ field: 'y' });
+    const rejected = r.engine.sendOnlineMutation({ field: 'x' });
+    const conflicted = r.engine.sendOnlineMutation({ field: 'y' });
     await settle();
     calls[0].resolve([reject]);
     calls[1].resolve([conflict]);
@@ -573,33 +574,33 @@ describe('@online commands', () => {
     expect(await conflicted).toEqual(conflict);
   });
 
-  test('an ack settles on the round trip, once the queries show its event', async () => {
+  test('an ack settles on the round trip, once the queries show its edit', async () => {
     const r = await held();
     const w = watch(r, 'patron:p1');
     const calls = sendControl(r.server);
     let shown: State | undefined;
     const t = track(
-      r.engine.sendOnlineCommand({ field: 'x' }).finally(() => (shown = w.values.at(-1))),
+      r.engine.sendOnlineMutation({ field: 'x' }).finally(() => (shown = w.values.at(-1))),
     );
     await settle();
-    // the command also wrote past the event this client sees
+    // the mutation also wrote past the edit this client sees
     calls[0].resolve([ok(12)]);
     await settle();
     expect(t.settled).toBe(false);
     const id = r.server.sends[0][0].id;
-    r.server.events(ev('patron:p1', 3, 11, { type: 'set', field: 'x', value: 1 }, id));
+    r.server.edits(ev('patron:p1', 3, 11, { type: 'set', field: 'x', value: 1 }, id));
     await settle();
     expect(t.value).toEqual(ok(12));
     expect(shown).toEqual({ count: 2, fields: { x: 1 } });
   });
 
-  test('an event carrying its id that arrives before the answer settles it on the answer', async () => {
+  test('an edit carrying its id that arrives before the answer settles it on the answer', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
+    const t = track(r.engine.sendOnlineMutation({ field: 'x' }));
     await settle();
     const id = r.server.sends[0][0].id;
-    r.server.events(ev('patron:p1', 3, 11, { type: 'set', field: 'x', value: 1 }, id));
+    r.server.edits(ev('patron:p1', 3, 11, { type: 'set', field: 'x', value: 1 }, id));
     await settle();
     expect(t.settled).toBe(false);
     calls[0].resolve([ok(12)]);
@@ -607,10 +608,10 @@ describe('@online commands', () => {
     expect(t.value).toEqual(ok(12));
   });
 
-  test('an ack with no visible events settles once the base is reduced through its position', async () => {
+  test('an ack with no visible edits settles once the base is applied through its position', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
+    const t = track(r.engine.sendOnlineMutation({ field: 'x' }));
     await settle();
     calls[0].resolve([ok(15)]);
     r.server.vouch(14);
@@ -621,11 +622,11 @@ describe('@online commands', () => {
     expect(t.value).toEqual(ok(15));
   });
 
-  test('an acked command whose round trip is observed during a freeze settles at the unfreeze', async () => {
+  test('an acked mutation whose round trip is observed during a freeze settles at the unfreeze', async () => {
     const r = await held();
     const calls = sendControl(r.server);
     const unfreeze = await freeze(r);
-    const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
+    const t = track(r.engine.sendOnlineMutation({ field: 'x' }));
     await settle();
     calls[0].resolve([ok(5)]);
     await settle();
@@ -635,12 +636,12 @@ describe('@online commands', () => {
     expect(t.value).toEqual(ok(5));
   });
 
-  test('with no connection it rejects at once, while outbox commands wait for the next one', async () => {
+  test('with no connection it rejects at once, while outbox mutations wait for the next one', async () => {
     const r = await held();
     r.server.end();
     await settle();
-    r.engine.sendCommand({ field: 'a' });
-    const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
+    r.engine.sendMutation({ field: 'a' });
+    const t = track(r.engine.sendOnlineMutation({ field: 'x' }));
     await settle();
     expect((t.error as Error).message).toBe('no connection');
     expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'a' }]);
@@ -654,8 +655,8 @@ describe('@online commands', () => {
   test('a failed call rejects it, and it is never resent', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    r.engine.sendCommand({ field: 'a' });
-    const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
+    r.engine.sendMutation({ field: 'a' });
+    const t = track(r.engine.sendOnlineMutation({ field: 'x' }));
     await settle();
     const failure = new Error('500');
     calls[0].reject(failure);
@@ -673,7 +674,7 @@ describe('@online commands', () => {
   test('a connection that ends after the ack leaves it waiting for the next connection to show the round trip', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    const t = track(r.engine.sendOnlineCommand({ field: 'x' }));
+    const t = track(r.engine.sendOnlineMutation({ field: 'x' }));
     await settle();
     calls[0].resolve([ok(15)]);
     await settle();
@@ -692,8 +693,8 @@ describe('@online commands', () => {
   test('the Engine ending rejects every one waiting, and one sent afterwards', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    const answered = track(r.engine.sendOnlineCommand({ field: 'x' }));
-    const inFlight = track(r.engine.sendOnlineCommand({ field: 'y' }));
+    const answered = track(r.engine.sendOnlineMutation({ field: 'x' }));
+    const inFlight = track(r.engine.sendOnlineMutation({ field: 'y' }));
     await settle();
     calls[0].resolve([ok(15)]);
     await settle();
@@ -701,12 +702,12 @@ describe('@online commands', () => {
     await settle();
     expect((answered.error as Error).message).toBe('engine shut down');
     expect((inFlight.error as Error).message).toBe('engine shut down');
-    await expect(r.engine.sendOnlineCommand({ field: 'z' })).rejects.toThrow('engine ended');
+    await expect(r.engine.sendOnlineMutation({ field: 'z' })).rejects.toThrow('engine ended');
   });
 
-  test('a command that fails to convert ends the Engine and rejects with its error', async () => {
+  test('a mutation that fails to convert ends the Engine and rejects with its error', async () => {
     const r = await held();
-    const t = track(r.engine.sendOnlineCommand({ field: 'x', value: 1n }));
+    const t = track(r.engine.sendOnlineMutation({ field: 'x', value: 1n }));
     await expect(settle()).rejects.toThrow('BigInt');
     expect((t.error as Error).message).toMatch('BigInt');
   });

@@ -269,7 +269,7 @@ func (s *Server) lookup(ident map[string]any) (*account, error) {
 }
 
 // passwordHashOf is the password hash lookup answers for a principal's token, which its
-// CommandAuth proofs are checked against: nil for the anonymous principal and for none
+// MutationAuth proofs are checked against: nil for the anonymous principal and for none
 func (s *Server) passwordHashOf(p principal) (*string, error) {
 	if p.anonymous {
 		return nil, nil
@@ -281,9 +281,9 @@ func (s *Server) passwordHashOf(p principal) (*string, error) {
 	return a.passwordHash, nil
 }
 
-// prove checks each command's proofs, the passwords prepare set aside, against hash, and answers
-// each command's verdict: none for a command without proofs, and failed for one when there is no
-// hash.  A first check spends the client's budget, as a login does; a check after a bounce does
+// prove checks each mutation's proofs, the passwords prepare set aside, against hash, and answers
+// each mutation's verdict: none for a mutation without proofs, and failed for one when there is
+// no hash.  A first check spends the client's budget, as a login does; a check after a bounce does
 // not (recheck).
 func (s *Server) prove(ctx context.Context, client string, hash *string, proofs [][]string,
 	first bool) ([]verdict, error) {

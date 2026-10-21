@@ -1,7 +1,7 @@
 /**
  * Lowering unit tests: compile small TypeSpec programs in-memory and assert that lowerProgram()
  * translates them into the expected interned IR — type mapping, naming, interning identity, and
- * queries discovery.  Slices, engines, databases, and commands are in vocabulary.test.ts.
+ * queries discovery.  Slices, engines, databases, and mutations are in vocabulary.test.ts.
  */
 
 import {

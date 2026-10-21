@@ -22,9 +22,10 @@ Future emitter languages include:
 
 ```
 core/     @phaselock/typespec-core — the definition library apps import.
-          lib/main.tsp declares the vocabulary (the Store, Queries, and
-          Engine interface templates); src/ holds everything shared by
-          emitters:
+          lib/main.tsp declares the vocabulary (the Slice, Engine,
+          Database, and Queries interface templates, @online, and the
+          fields the database prepares for a decider); src/ holds
+          everything shared by emitters:
             ptypes.ts  interned concrete-type IR
             solver.ts  union solver
             lower.ts   TypeSpec Program -> IR
@@ -54,6 +55,12 @@ pnpm test        # from typespec: regenerate fixtures, run the vitest suite
 pnpm --filter @phaselock/typespec-tests test:py   # emitted-Python checker suite (stdlib only)
 pnpm --filter @phaselock/typespec-tests test:go   # emitted-Go checker suite
 ```
+
+`tests/src/engine/conformance/` checks the Engine against the protocol rules in
+`db/README.md`, P1 to P23: one file per group of rules, so related rules share their
+fixtures and each file stays short, and a `describe` per rule, with each test's name starting
+with its rule, so a failure names the rule it breaks.  Each rule's `describe` cites the tests
+elsewhere in `tests/src/engine/` that check the same rule.
 
 ## Known issues
 

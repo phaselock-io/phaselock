@@ -5,15 +5,15 @@
  * IR, plus:
  *   - names: top-level declarations name the IR types they lower to (first name wins; a second
  *     declaration that resolves to the same structural type is a diagnostic)
- *   - slices: interfaces extending `PhaseLock.Slice<Family, Events, Spec>` become PSlice; the
- *     Spec model's property names are the key templates
- *   - commands: models carrying `@command` become PCommand, with the output it declares
- *   - engines: interfaces extending `PhaseLock.Engine<Slices, Commands>` become PEngine
- *   - databases: interfaces extending `PhaseLock.Database<Engines, Slices, Commands>` become
+ *   - slices: interfaces extending `PhaseLock.Slice<Family, Spec>` become PSlice; the Spec
+ *     model's property names are the key templates
+ *   - engines: interfaces extending `PhaseLock.Engine<Slices, Mutations>` become PEngine
+ *   - databases: interfaces extending `PhaseLock.Database<Engines, Slices, Mutations>` become
  *     PDatabase
+ *   - mutations: the models an engine's or a database's mutations union lists become PMutation
  *   - queries: interfaces extending `PhaseLock.Queries` become PQueries; each operation
  *     becomes a PQuery carrying its name, arguments, and result type
- *   - intake types: the vocabulary's NewPassword, CommandAuth, and the rest lower by identity to
+ *   - intake types: the vocabulary's NewPassword, MutationAuth, and the rest lower by identity to
  *     PIntake, and their results to PResult
  *
  * Interfaces are deliberately the carrier for slices, engines, databases, and queries: they are
@@ -24,7 +24,7 @@
  *
  * Ordering: `roots` follows IR creation order, which is a depth-first walk of declarations in
  * source order — children precede parents (e.g. union members appear before the union itself).
- * Slices, commands, engines, databases, and queries are each in source order.
+ * Slices, mutations, engines, databases, and queries are each in source order.
  */
 
 import {
@@ -47,14 +47,13 @@ import type {
   Union,
 } from '@typespec/compiler';
 
-import { getCommandOutput, isOnline } from './decorators.ts';
+import { isOnline } from './decorators.ts';
 import { reportDiagnostic } from './lib.ts';
 import {
-  PCommand,
   PDatabase,
   PEngine,
   type PField,
-  type POutput,
+  PMutation,
   PQueries,
   PQuery,
   PResult,
@@ -70,8 +69,8 @@ export interface LoweredProgram {
   roots: PType[];
   /** all slices, in declaration order */
   slices: PSlice[];
-  /** all `@command` models, in declaration order */
-  commands: PCommand[];
+  /** every model an engine or a database lists as a mutation, in declaration order */
+  mutations: PMutation[];
   /** all engines, in declaration order */
   engines: PEngine[];
   /** all databases, in declaration order */
@@ -80,8 +79,8 @@ export interface LoweredProgram {
   queries: PQueries[];
   /** the first TypeSpec type that lowered to each IR type, for diagnostic targeting */
   targets: Map<PType, Type>;
-  /** the declaration each slice, command, engine, and database came from */
-  sources: Map<PSlice | PCommand | PEngine | PDatabase, Type>;
+  /** the declaration each slice, mutation, engine, and database came from */
+  sources: Map<PSlice | PMutation | PEngine | PDatabase, Type>;
 }
 
 // a name, then optionally `:{param}` and `,{param}` for each further parameter: the shape of a
@@ -143,10 +142,10 @@ export function lowerProgram(program: Program): LoweredProgram {
   const registry = new PTypeRegistry();
   const typeCache = new Map<Type, PType>();
   const targets = new Map<PType, Type>();
-  const sources = new Map<PSlice | PCommand | PEngine | PDatabase, Type>();
+  const sources = new Map<PSlice | PMutation | PEngine | PDatabase, Type>();
   const sliceCache = new Map<Interface, PSlice | undefined>();
   const engineCache = new Map<Interface, PEngine | undefined>();
-  const commandCache = new Map<Model, PCommand>();
+  const mutationCache = new Map<Model, PMutation>();
 
   function unsupported(target: Type, message: string): PType {
     reportDiagnostic(program, {
@@ -186,17 +185,13 @@ export function lowerProgram(program: Program): LoweredProgram {
         return registry.intake(name, registry.string(), resultType('CaptchaResult'));
       case 'IdentityProof':
         return registry.intake(name, registry.string(), resultType('IdentityResult'));
-      case 'CommandAuth':
-        return registry.intake(name, lowerUnion(type as Union), resultType('CommandAuthResult'));
+      case 'MutationAuth':
+        return registry.intake(name, lowerUnion(type as Union), resultType('MutationAuthResult'));
       case 'PasswordHash':
       case 'CaptchaResult':
-      case 'CommandAuthResult':
+      case 'MutationAuthResult':
       case 'IdentityResult':
         return resultType(name);
-      case 'Death':
-      case 'Erasure':
-        reportDiagnostic(program, { code: 'death-placement', target: type });
-        return registry.json();
       default:
         return undefined;
     }
@@ -316,7 +311,7 @@ export function lowerProgram(program: Program): LoweredProgram {
     sliceCache.set(iface, undefined);
 
     const instance = vocabSource(iface, 'Slice')!;
-    const [familyArg, eventsArg, specArg] = (instance.templateMapper?.args ?? []).map(argType);
+    const [familyArg, specArg] = (instance.templateMapper?.args ?? []).map(argType);
 
     // the family template: a name, then its parameters
     if (familyArg?.kind !== 'String') {
@@ -334,34 +329,6 @@ export function lowerProgram(program: Program): LoweredProgram {
     }
     const family = tpl.split(':')[0];
     const params = [...tpl.matchAll(/\{([^}]*)\}/g)].map((m) => m[1]);
-
-    // the events: a named union of named models, or a single named model
-    const named =
-      (eventsArg?.kind === 'Union' || eventsArg?.kind === 'Model') &&
-      eventsArg.name !== undefined &&
-      eventsArg.name !== '';
-    if (!named) {
-      reportDiagnostic(program, {
-        code: 'slice-events-not-named',
-        format: { name: iface.name },
-        target: iface,
-      });
-      return undefined;
-    }
-    const eventModels = eventsArg.kind === 'Union' ? unionModels(eventsArg) : [eventsArg];
-    for (const ev of eventModels) {
-      const isNamedModel =
-        ev.kind === 'Model' && ev.name !== '' && !isArrayModelType(ev) && !isRecordModelType(ev);
-      if (!isNamedModel) {
-        reportDiagnostic(program, {
-          code: 'slice-event-not-model',
-          format: { name: iface.name, found: nameOf(ev) },
-          target: iface,
-        });
-        return undefined;
-      }
-    }
-    const events = lowerType(eventsArg);
 
     // the key layout: the Spec model's property names are the key templates
     if (specArg?.kind !== 'Model') {
@@ -403,7 +370,7 @@ export function lowerProgram(program: Program): LoweredProgram {
       }
     }
 
-    const slice = new PSlice(iface.name, family, params, events, store);
+    const slice = new PSlice(iface.name, family, params, store);
     sliceCache.set(iface, slice);
     sources.set(slice, iface);
     return slice;
@@ -431,85 +398,34 @@ export function lowerProgram(program: Program): LoweredProgram {
     return out;
   }
 
-  // which slices fold each event type, for labelling command outputs
-  const eventSlices = new Map<PType, PSlice[]>();
-
-  /** Lower a `@command` output, reporting anything that is not a combination of events. */
-  function lowerOutput(cmd: Model, type: Type): POutput {
-    const invalid = (found: string): POutput => {
-      reportDiagnostic(program, {
-        code: 'invalid-command-output',
-        format: { name: cmd.name, found },
-        target: cmd,
-      });
-      return { kind: 'all', items: [] };
-    };
-
-    switch (type.kind) {
-      case 'Model': {
-        if (vocabName(type) === 'Death') return { kind: 'death', erase: false };
-        if (vocabName(type) === 'Erasure') return { kind: 'death', erase: true };
-        if (isArrayModelType(type)) {
-          return { kind: 'many', item: lowerOutput(cmd, type.indexer.value) };
-        }
-        if (isRecordModelType(type) || type.name === '') return invalid(nameOf(type));
-        const event = lowerType(type);
-        const slices = eventSlices.get(event) ?? [];
-        if (slices.length === 0) {
-          reportDiagnostic(program, {
-            code: 'command-output-not-event',
-            format: { name: cmd.name, event: type.name },
-            target: cmd,
-          });
-        }
-        return { kind: 'event', type: event, slices };
-      }
-      case 'Union':
-        return {
-          kind: 'oneOf',
-          options: [...type.variants.values()].map((v) => lowerOutput(cmd, v.type)),
-        };
-      case 'Tuple':
-        return { kind: 'all', items: type.values.map((v) => lowerOutput(cmd, v)) };
-      case 'String':
-        return invalid(`"${type.value}"`);
-      default:
-        return invalid(nameOf(type));
-    }
-  }
-
-  function lowerCommand(model: Model, output: Type): PCommand {
-    const cached = commandCache.get(model);
+  function lowerMutation(model: Model): PMutation {
+    const cached = mutationCache.get(model);
     if (cached !== undefined) return cached;
-    const cmd = new PCommand(
-      model.name,
-      lowerType(model),
-      lowerOutput(model, output),
-      isOnline(program, model),
-    );
-    commandCache.set(model, cmd);
-    sources.set(cmd, model);
-    return cmd;
+    const mutation = new PMutation(model.name, lowerType(model), isOnline(program, model));
+    mutationCache.set(model, mutation);
+    sources.set(mutation, model);
+    return mutation;
   }
 
   /**
-   * the commands a commands argument names, a union of `@command` models or a single one,
-   * reporting any member that has no `@command`
+   * the mutations a mutations argument names, a union of named models or a single one, reporting
+   * any member that is not a named model
    */
-  function commandList(owner: Interface, arg: Type): PCommand[] {
+  function mutationList(owner: Interface, arg: Type): PMutation[] {
     const models = arg.kind === 'Union' ? unionModels(arg) : [arg];
-    const out: PCommand[] = [];
+    const out: PMutation[] = [];
     for (const m of models) {
-      const output = m.kind === 'Model' ? getCommandOutput(program, m) : undefined;
-      if (output === undefined) {
+      const isNamedModel =
+        m.kind === 'Model' && m.name !== '' && !isArrayModelType(m) && !isRecordModelType(m);
+      if (!isNamedModel) {
         reportDiagnostic(program, {
-          code: 'not-a-command',
+          code: 'not-a-mutation',
           format: { name: nameOf(m), owner: owner.name },
           target: owner,
         });
         continue;
       }
-      out.push(lowerCommand(m as Model, output));
+      out.push(lowerMutation(m));
     }
     return out;
   }
@@ -520,24 +436,24 @@ export function lowerProgram(program: Program): LoweredProgram {
     engineCache.set(iface, undefined);
 
     const instance = vocabSource(iface, 'Engine')!;
-    const [slicesArg, commandsArg] = (instance.templateMapper?.args ?? []).map(argType);
+    const [slicesArg, mutationsArg] = (instance.templateMapper?.args ?? []).map(argType);
     const slices = sliceList(iface, slicesArg, "Engine 'Slices'");
 
-    // the commands: a named union, or a single named command; decoders are looked up by name
+    // the mutations: a named union, or a single named model; a registry finds them by name
     const named =
-      (commandsArg?.kind === 'Union' || commandsArg?.kind === 'Model') &&
-      commandsArg.name !== undefined &&
-      commandsArg.name !== '';
+      (mutationsArg?.kind === 'Union' || mutationsArg?.kind === 'Model') &&
+      mutationsArg.name !== undefined &&
+      mutationsArg.name !== '';
     if (!named) {
       invalidArgs(
         iface,
-        `Engine '${iface.name}' Commands must be a named union of commands, or one named command`,
+        `Engine '${iface.name}' Mutations must be a named union of models, or one named model`,
       );
       return undefined;
     }
-    const commands = commandList(iface, commandsArg);
+    const mutations = mutationList(iface, mutationsArg);
 
-    const eng = new PEngine(iface.name, slices, lowerType(commandsArg), commands);
+    const eng = new PEngine(iface.name, slices, lowerType(mutationsArg), mutations);
     engineCache.set(iface, eng);
     sources.set(eng, iface);
     return eng;
@@ -546,7 +462,9 @@ export function lowerProgram(program: Program): LoweredProgram {
   /** Lower an interface extending PhaseLock.Database into a PDatabase. */
   function lowerDatabase(iface: Interface): PDatabase | undefined {
     const instance = vocabSource(iface, 'Database')!;
-    const [enginesArg, slicesArg, commandsArg] = (instance.templateMapper?.args ?? []).map(argType);
+    const [enginesArg, slicesArg, mutationsArg] = (instance.templateMapper?.args ?? []).map(
+      argType,
+    );
 
     // its engines
     if (enginesArg?.kind !== 'Tuple') {
@@ -567,14 +485,14 @@ export function lowerProgram(program: Program): LoweredProgram {
       if (eng !== undefined) engines.push(eng);
     }
 
-    // its own slices and commands; `never` is none
+    // its own slices and mutations; `never` is none
     const slices = sliceList(iface, slicesArg, "Database 'Slices'");
-    const noCommands =
-      commandsArg === undefined ||
-      (commandsArg.kind === 'Intrinsic' && commandsArg.name === 'never');
-    const commands = noCommands ? [] : commandList(iface, commandsArg);
+    const noMutations =
+      mutationsArg === undefined ||
+      (mutationsArg.kind === 'Intrinsic' && mutationsArg.name === 'never');
+    const mutations = noMutations ? [] : mutationList(iface, mutationsArg);
 
-    const db = new PDatabase(iface.name, engines, slices, commands);
+    const db = new PDatabase(iface.name, engines, slices, mutations);
     sources.set(db, iface);
     return db;
   }
@@ -618,7 +536,7 @@ export function lowerProgram(program: Program): LoweredProgram {
     assignName(lowerType(decl), decl.name!, decl);
   }
 
-  // slices first, so that command outputs can name the slices that fold each event
+  // slices, whether or not anything composes them
   const userInterfaces = sourceOrder(
     [...globalNs.interfaces.values()].filter((i) => !isTemplateDeclaration(i)),
   );
@@ -626,20 +544,7 @@ export function lowerProgram(program: Program): LoweredProgram {
   for (const iface of userInterfaces) {
     if (vocabSource(iface, 'Slice') === undefined) continue;
     const slice = lowerSlice(iface);
-    if (slice === undefined) continue;
-    slices.push(slice);
-    for (const ev of slice.eventTypes) {
-      const folds = eventSlices.get(ev) ?? [];
-      if (!folds.includes(slice)) folds.push(slice);
-      eventSlices.set(ev, folds);
-    }
-  }
-
-  // every @command model, whether or not anything lists it
-  const commands: PCommand[] = [];
-  for (const model of models) {
-    const output = getCommandOutput(program, model);
-    if (output !== undefined) commands.push(lowerCommand(model, output));
+    if (slice !== undefined) slices.push(slice);
   }
 
   // engines, databases, and queries, in source order
@@ -668,6 +573,9 @@ export function lowerProgram(program: Program): LoweredProgram {
     }
   }
 
+  // the mutations the engines and databases list, in source order
+  const mutations = sourceOrder([...mutationCache.keys()]).map((m) => mutationCache.get(m)!);
+
   const roots = registry.all.filter((t) => t.name !== null);
-  return { registry, roots, slices, commands, engines, databases, queries, targets, sources };
+  return { registry, roots, slices, mutations, engines, databases, queries, targets, sources };
 }

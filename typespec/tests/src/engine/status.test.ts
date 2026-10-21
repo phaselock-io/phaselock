@@ -10,10 +10,10 @@ const patrons: Blob = {
   values: [['patron:p1!state', { count: 2, fields: {} }]],
 };
 
-/** a store a resumed app left: patron:p1 and patron:p2 held, reduced through position 40 */
+/** a store a resumed app left: patron:p1 and patron:p2 held, applied through position 40 */
 const resumed = {
-  '!view': { token: 't1', position: 40, refs: ['patron:*'] },
-  '!checkpoint': { epoch: 'e1', position: 40, reduced: 40 },
+  '!view': { token: 't1', position: 40, selectors: ['patron:*'] },
+  '!checkpoint': { epoch: 'e1', position: 40, applied: 40 },
   '!seq:patron:p1': 2,
   'patron:p1!state': { count: 2, fields: {} },
   '!seq:patron:p2': 1,
@@ -100,7 +100,7 @@ describe('first boot', () => {
     await settle();
     expect(last(status.progress).backfills).toEqual([
       {
-        ref: 'patron:*',
+        selector: 'patron:*',
         replacing: true,
         snapshot: { bytes: 0, length: null, done: false },
         tail: null,
@@ -133,7 +133,7 @@ describe('a resumed app', () => {
     const p1 = watch(r, 'patron:p1');
     await settle();
     r.server.open('e1', 50);
-    r.server.events(ev('patron:p1', 3, 45));
+    r.server.edits(ev('patron:p1', 3, 45));
     await settle();
     expect(p1.values).toEqual([
       { count: 2, fields: {} },
@@ -141,7 +141,7 @@ describe('a resumed app', () => {
     ]);
   });
 
-  test('estimates the resync from the ref list, the streams resolved, and the replay to head', async () => {
+  test('estimates the resync from the selector list, the slices resolved, and the replay to head', async () => {
     const r = rig({ seed: resumed });
     const status = watchStatus(r);
     await settle();
@@ -150,12 +150,12 @@ describe('a resumed app', () => {
     r.server.open('e1', 50);
     await settle();
     expect(last(status.connection).state).toBe('syncing');
-    expect(last(status.progress).log).toEqual({ since: 40, head: 50, committed: 40, reduced: 40 });
+    expect(last(status.progress).log).toEqual({ since: 40, head: 50, committed: 40, applied: 40 });
     expect(last(status.progress).estimate).toBeCloseTo(0.2 * 0.5);
 
-    // an event chains onto patron:p1: the ref list is confirmed, one of two streams resolved, and
+    // an edit chains onto patron:p1: the selector list is confirmed, one of two slices resolved, and
     // the replay is halfway to head
-    r.server.events(ev('patron:p1', 3, 45));
+    r.server.edits(ev('patron:p1', 3, 45));
     await settle();
     expect(last(status.progress).estimate).toBeCloseTo(0.05 + 0.2 * 0.75 + 0.75 * 0.5);
 
@@ -254,7 +254,7 @@ describe('the connection', () => {
 });
 
 describe('the outbox', () => {
-  test('counts the commands the database has not acknowledged', async () => {
+  test('counts the mutations the database has not acknowledged', async () => {
     const r = rig({ seed: resumed });
     const status = watchStatus(r);
     let answer!: (results: { kind: 'ok'; position: number }[]) => void;
@@ -265,11 +265,11 @@ describe('the outbox', () => {
     await settle();
     expect(last(status.outbox)).toEqual({ unacknowledged: 0 });
 
-    r.engine.sendCommand({ field: 'a', value: 1 });
+    r.engine.sendMutation({ field: 'a', value: 1 });
     await settle();
     expect(last(status.outbox)).toEqual({ unacknowledged: 1 });
 
-    // acknowledged, though not yet reduced
+    // acknowledged, though not yet applied
     answer([{ kind: 'ok', position: 41 }]);
     await settle();
     expect(last(status.outbox)).toEqual({ unacknowledged: 0 });

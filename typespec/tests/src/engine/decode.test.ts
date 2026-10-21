@@ -1,18 +1,25 @@
-// An event the registry rejects ends the Engine, with an error that names where it came from
+// An applied value the registry cannot decode is an error, in dev mode, where a query reads it
 
 import { describe, expect, test } from 'vitest';
 
-import { bootstrap, engineError, ev, INVALID, rig, settle, state } from './harness.ts';
+import { JS } from '../../../ts/assets/skeleton.ts';
 
-describe('an event that fails its schema', () => {
-  test('ends the Engine, naming the stream and position, and folds nothing of its atom', async () => {
+import { bootstrap, engineError, ev, INVALID, readState, rig, settle } from './harness.ts';
+
+describe('a value that fails its schema', () => {
+  test('applies as bytes, and ends the Engine, naming its key, when a query reads it', async () => {
     const r = rig();
     await bootstrap(r, ['patron:*'], {
       'patron:*': { position: 10, seqs: { 'patron:p1': 1 }, values: [] },
     });
 
-    // a valid event followed by an invalid one, in one atom
-    r.server.events(ev('patron:p1', 2, 11), ev('patron:p1', 3, 12, { type: INVALID }));
+    // the edit applies, since the Engine never decodes a payload
+    r.server.edits(ev('patron:p1', 2, 11), ev('patron:p1', 3, 12, { type: INVALID }));
+    await settle();
+    expect(r.store.read((txn) => txn.get('!seq:patron:p1', '.json', JS))).toBe(3);
+
+    // a query that reads it ends the Engine with the read's error
+    r.engine.newQuery((qx) => readState(qx, 'patron:p1'));
     let error: unknown = null;
     try {
       await settle();
@@ -22,10 +29,7 @@ describe('an event that fails its schema', () => {
     expect(error).toBeInstanceOf(Error);
     expect(engineError()).toBeUndefined();
     const message = (error as Error).message;
-    expect(message).toMatch(/patron:p1/);
-    expect(message).toMatch(/12/);
+    expect(message).toMatch(/patron:p1!log:000003/);
     expect(message).toMatch(/\$\.type: invalid/);
-    // the transaction rolled back: the valid event is not in the base either
-    expect(state(r.data(), 'patron:p1')).toBeUndefined();
   });
 });

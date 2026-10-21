@@ -3,12 +3,12 @@
 
 import { decode, encode } from '@msgpack/msgpack';
 import { describe, expect, test } from 'vitest';
-import { type Command, JS, MSGPACK, type Schema, type SchemaNode } from '../src/contract.js';
+import { JS, MSGPACK, type Mutation, type Schema, type SchemaNode } from '../src/contract.js';
 import { buildRegistry, ConvertError } from '../src/registry.js';
 import { uuidBytes } from '../src/uuid.js';
 
-// a schema shaped like the emitter's output for a small model: the catalog and inbox slices, the
-// writer engine's commands, two prepared fields, and a query interface
+// a schema shaped like the emitter's output for a small model: the values of the catalog and inbox
+// slices, the writer engine's mutations, two prepared fields, and a query interface
 const nodes: SchemaNode[] = [];
 const add = (n: SchemaNode): number => nodes.push(n) - 1;
 const STR = add(['str']);
@@ -84,9 +84,9 @@ const Noted = add([
   ],
   0,
 ]);
-const CatalogEvents = add([
+const CatalogEntry = add([
   'union',
-  'CatalogEvents',
+  'CatalogEntry',
   [
     'jsontype',
     [
@@ -218,9 +218,9 @@ const AuthTotp = add([
   ],
   0,
 ]);
-const CommandAuthWire = add([
+const MutationAuthWire = add([
   'union',
-  'CommandAuth',
+  'MutationAuth',
   [
     'jsontype',
     [
@@ -241,7 +241,7 @@ const CommandAuthWire = add([
     ],
   ],
 ]);
-const CommandAuth = add(['intake', 'CommandAuth', CommandAuthWire]);
+const MutationAuth = add(['intake', 'MutationAuth', MutationAuthWire]);
 const ADD_ITEM = add(['lit', 'add-item']);
 const SIGN_UP = add(['lit', 'sign-up']);
 const LEAVE = add(['lit', 'leave']);
@@ -253,6 +253,7 @@ const AddItem = add([
     ['id', STR, false],
     ['title', STR, false],
     ['added', DATE, false],
+    ['color', Color, true],
   ],
   0,
 ]);
@@ -271,13 +272,13 @@ const Leave = add([
   'Leave',
   [
     ['type', LEAVE, false],
-    ['check', CommandAuth, false],
+    ['check', MutationAuth, false],
   ],
   0,
 ]);
-const WriterCommands = add([
+const WriterMutations = add([
   'union',
-  'WriterCommands',
+  'WriterMutations',
   [
     'jsontype',
     [
@@ -346,6 +347,24 @@ const AdminQuery = add([
   ],
 ]);
 
+const Targets = add(['array', null, Target]);
+const TargetsByName = add(['record', null, Target]);
+const Located = add(['tuple', null, [STR, Target]]);
+const Shelf = add([
+  'struct',
+  'Shelf',
+  [
+    ['id', STR, false],
+    ['main', Target, false],
+    ['target', Target, true],
+    ['color', Color, true],
+    ['targets', Targets, true],
+    ['byName', TargetsByName, true],
+    ['located', Located, true],
+  ],
+  -1,
+]);
+
 const schema: Schema = {
   nodes,
   ids: {
@@ -354,35 +373,29 @@ const schema: Schema = {
     ItemAdded,
     ItemRemoved,
     Noted,
-    CatalogEvents,
+    CatalogEntry,
     Slot,
     'inbox/slots': Slots,
     Profile,
     AddItem,
     SignUp,
     Leave,
-    WriterCommands,
+    WriterMutations,
     'PasswordHash': STR,
     'catalog/count': INT,
     PatronInfo,
     AdminQuery,
     'AdminQueries.allPatrons#result': Patrons,
     'AdminQueries.patronsSince#result': Patrons,
+    Shelf,
   },
-  commands: 'WriterCommands',
-  eventTypes: { catalog: 'CatalogEvents', inbox: 'CatalogEvents' },
-  storeTypes: {
-    'catalog/item': 'Item',
-    'catalog/count': 'catalog/count',
-    'inbox/profile': 'Profile',
-    'inbox/slots': 'inbox/slots',
-  },
+  mutations: 'WriterMutations',
 };
 
 const reg = buildRegistry(schema);
 
 const added = new Date('2026-01-02T03:04:05.678Z');
-// a command id as the Engine holds it, and as an envelope carries it
+// a mutation id as the Engine holds it, and as an envelope carries it
 const C1 = '00000000-0000-0000-0000-0000000000c1';
 const c1 = uuidBytes(C1);
 const itemAdded = { type: 'item-added', id: 'i1', title: 'Dune', added };
@@ -479,7 +492,7 @@ describe('structs', () => {
   });
 
   test("writes a union member's discriminator first", () => {
-    const bytes = toBytes('CatalogEvents', { id: 'i1', title: 'Dune', added, type: 'item-added' });
+    const bytes = toBytes('CatalogEntry', { id: 'i1', title: 'Dune', added, type: 'item-added' });
     expect(Object.keys(plain(bytes) as object)[0]).toBe('type');
     // and directly, under the member's own identity
     expect(
@@ -527,18 +540,18 @@ describe('structs', () => {
 describe('unknown fields', () => {
   const extra = { ...itemAdded, surprise: true };
 
-  test('are rejected for the commands identity, reading and writing', () => {
-    rejects(() => toJs('WriterCommands', encode({ ...extra, type: 'add-item' })), '$.surprise');
-    rejects(() => toBytes('WriterCommands', { ...extra, type: 'add-item' }), '$.surprise');
+  test('are rejected for the mutations identity, reading and writing', () => {
+    rejects(() => toJs('WriterMutations', encode({ ...extra, type: 'add-item' })), '$.surprise');
+    rejects(() => toBytes('WriterMutations', { ...extra, type: 'add-item' }), '$.surprise');
   });
 
   test('are dropped for every other identity, reading and writing', () => {
-    expect(toJs('CatalogEvents', encode(extra))).toEqual(itemAdded);
+    expect(toJs('CatalogEntry', encode(extra))).toEqual(itemAdded);
     expect(toJs('Item', encode(extra))).toEqual({ id: 'i1', title: 'Dune', added });
-    expect(plain(toBytes('CatalogEvents', extra))).toEqual(itemAdded);
+    expect(plain(toBytes('CatalogEntry', extra))).toEqual(itemAdded);
     // nested too
     const nested = { ...itemAdded, type: 'item-removed', target: { book: 'b1', shelf: 3 } };
-    const out = toJs('CatalogEvents', encode(nested)) as { target: unknown };
+    const out = toJs('CatalogEntry', encode(nested)) as { target: unknown };
     expect(out.target).toEqual({ book: 'b1' });
   });
 });
@@ -546,10 +559,10 @@ describe('unknown fields', () => {
 describe('unions', () => {
   test('dispatches on a literal field wherever it sits in the map', () => {
     const last = { id: 'n1', text: 'hi', note: 'n1', type: 'noted' };
-    expect(toJs('CatalogEvents', encode(last))).toEqual({ type: 'noted', note: 'n1', text: 'hi' });
-    rejects(() => toJs('CatalogEvents', encode({ type: 'bogus', id: 'x' })), 'bogus');
-    rejects(() => toJs('CatalogEvents', encode({ id: 'x' })), 'type');
-    rejects(() => toBytes('CatalogEvents', { type: 'bogus' }), 'bogus');
+    expect(toJs('CatalogEntry', encode(last))).toEqual({ type: 'noted', note: 'n1', text: 'hi' });
+    rejects(() => toJs('CatalogEntry', encode({ type: 'bogus', id: 'x' })), 'bogus');
+    rejects(() => toJs('CatalogEntry', encode({ id: 'x' })), 'type');
+    rejects(() => toBytes('CatalogEntry', { type: 'bogus' }), 'bogus');
   });
 
   test('dispatches a one-of on the field present', () => {
@@ -591,8 +604,8 @@ describe('containers', () => {
     ];
     expect(toJs('inbox/slots', toBytes('inbox/slots', slots))).toEqual(slots);
     rejects(
-      () => toJs('inbox/slots', encode([slots[0], { ...slots[1], color: 'blue' }])),
-      '$[1].color',
+      () => toJs('inbox/slots', encode([slots[0], { ...slots[1], pair: ['b', 'two'] }])),
+      '$[1].pair[1]',
     );
     rejects(() => toBytes('inbox/slots', 'nope'), 'expected an array');
   });
@@ -636,85 +649,173 @@ describe('the whole value', () => {
 describe('prepared fields', () => {
   test('an intake node is transparent: the client reads and writes its wire type', () => {
     const signUp = { type: 'sign-up', user: 'u1', password: 'hunter2' };
-    expect(toJs('WriterCommands', toBytes('WriterCommands', signUp))).toEqual(signUp);
-    rejects(() => toBytes('WriterCommands', { ...signUp, password: 7 }), '$.password');
+    expect(toJs('WriterMutations', toBytes('WriterMutations', signUp))).toEqual(signUp);
+    rejects(() => toBytes('WriterMutations', { ...signUp, password: 7 }), '$.password');
     const leave = { type: 'leave', check: { kind: 'totp', code: '123456' } };
-    expect(toJs('WriterCommands', toBytes('WriterCommands', leave))).toEqual(leave);
+    expect(toJs('WriterMutations', toBytes('WriterMutations', leave))).toEqual(leave);
     rejects(
-      () => toBytes('WriterCommands', { type: 'leave', check: { kind: 'password' } }),
+      () => toBytes('WriterMutations', { type: 'leave', check: { kind: 'password' } }),
       '$.check.password',
     );
   });
 });
 
 describe('the reserved identities', () => {
-  test('.json and .command pass values through, bytes included', () => {
-    const record = { epoch: 'e', position: 3, reduced: -1, when: added };
+  test('.json and .mutation pass values through, bytes included', () => {
+    const record = { epoch: 'e', position: 3, applied: -1, when: added };
     expect(toJs('.json', toBytes('.json', record))).toEqual(record);
-    const command = { id: C1, series: 's1', n: 2, data: encode({ type: 'noted' }) };
-    const back = toJs('.command', toBytes('.command', command)) as Command<Uint8Array>;
+    const mutation = { id: C1, series: 's1', n: 2, data: encode({ type: 'noted' }) };
+    const back = toJs('.mutation', toBytes('.mutation', mutation)) as Mutation<Uint8Array>;
     expect([back.id, back.series, back.n]).toEqual([C1, 's1', 2]);
     expect(decode(back.data)).toEqual({ type: 'noted' });
-    const unnumbered = { ...command, series: null, n: null };
-    const again = toJs('.command', toBytes('.command', unnumbered)) as Command<Uint8Array>;
+    const unnumbered = { ...mutation, series: null, n: null };
+    const again = toJs('.mutation', toBytes('.mutation', unnumbered)) as Mutation<Uint8Array>;
     expect([again.series, again.n]).toEqual([null, null]);
   });
 
-  test(".event reads the wire pair into a DbEvent, typing its data by the stream's family", () => {
-    const raw = encode([[7, 'catalog', 3, c1, added], { ...itemAdded }]);
-    expect(toJs('.event', raw)).toEqual({
+  test('.edits reads a raw edit as its envelope alone, its payload unread', () => {
+    const raw = encode([[7, 'catalog', 3, c1, added, 1], 0, 'catalog!item:i1', itemAdded]);
+    expect(toJs('.edits', raw)).toEqual({
       position: 7,
-      stream: 'catalog',
+      slice: 'catalog',
       seq: 3,
       id: C1,
       servertime: added,
-      data: itemAdded,
+      lifecycle: 'birth',
     });
-    // a family's parameters do not change its type
-    const inbox = encode([
-      [8, 'inbox:acme,u1', 1, c1, added],
-      { type: 'noted', note: 'n', text: 't' },
+    // a payload the envelope's reader never looks at, opcodes and all
+    const odd = encode([[8, 'inbox:acme,u1', 1, c1, added, 2], 9, 'nonsense']);
+    expect((toJs('.edits', odd) as { lifecycle: string }).lifecycle).toBe('death');
+  });
+
+  test('.edits skips envelope elements a later protocol appends', () => {
+    const raw = encode([[7, 'catalog', 3, c1, added, 0, 'newer', { x: 1 }], 1, 'catalog!k']);
+    expect((toJs('.edits', raw) as { seq: number }).seq).toBe(3);
+  });
+
+  test('.edits rejects a bad envelope', () => {
+    rejects(() => toJs('.edits', encode([[7, 'catalog', 3, c1, 1700000000000, 0]])), 'timestamp');
+    rejects(() => toJs('.edits', encode([[7, 'catalog', 3, 'c1', added, 0]])), 'bin');
+    rejects(() => toJs('.edits', encode([[7, 'catalog', 3, c1, added, 3]])), 'lifecycle 3');
+    rejects(() => toJs('.edits', encode([[7, 'catalog', 3, c1, added]])), 'short envelope');
+  });
+
+  test('.edits converts from msgpack only, and a .page never converts', () => {
+    const env = { position: 7, slice: 'catalog', seq: 3, id: C1, servertime: added };
+    rejects(() => toBytes('.edits', { ...env, lifecycle: 'normal' }), 'msgpack only');
+    const page = encode(0);
+    rejects(() => toJs('.page', page), 'never converted');
+    rejects(() => toBytes('.page', page), 'never converted');
+    expect(reg.convert('.page', page, MSGPACK, MSGPACK)).toBe(page);
+  });
+});
+
+describe('the operations of edits and pages', () => {
+  const cat = (...parts: Uint8Array[]) => new Uint8Array(parts.flatMap((p) => [...p]));
+
+  test("an edit's operations follow its envelope: sets with their values undecoded, and deletions", () => {
+    const raw = encode([
+      [7, 'catalog', 3, c1, added, 0],
+      0,
+      'catalog!item:i1',
+      itemAdded,
+      1,
+      'catalog!item:i0',
+      0,
+      'catalog!count',
+      null,
     ]);
-    expect((toJs('.event', inbox) as { data: unknown }).data).toEqual({
-      type: 'noted',
-      note: 'n',
-      text: 't',
+    const ops = reg.ops(raw, true);
+    expect(ops.map(([k, v]) => [k, v === undefined ? undefined : decode(v)])).toEqual([
+      ['catalog!item:i1', itemAdded],
+      ['catalog!item:i0', undefined],
+      ['catalog!count', null],
+    ]);
+    // each value is its bytes as the edit holds them, the item's map included
+    expect(ops[0][1]).toEqual(encode(itemAdded));
+    expect(ops[2][1]).toEqual(Uint8Array.of(0xc0));
+  });
+
+  test('an edit with no operations, as a death has, answers none', () => {
+    expect(reg.ops(encode([[7, 'catalog', 3, c1, added, 2]]), true)).toEqual([]);
+  });
+
+  test("a page's operations run to the end of its bytes, with no envelope", () => {
+    const page = cat(
+      encode(0),
+      encode('catalog!a'),
+      encode({ x: [1, 2] }),
+      encode(0),
+      encode('catalog!b'),
+      encode('two'),
+    );
+    const ops = reg.ops(page, false);
+    expect(ops.map(([k, v]) => [k, decode(v!)])).toEqual([
+      ['catalog!a', { x: [1, 2] }],
+      ['catalog!b', 'two'],
+    ]);
+    expect(reg.ops(new Uint8Array(0), false)).toEqual([]);
+  });
+
+  test('an unknown opcode, or an operation cut short, throws', () => {
+    expect(() => reg.ops(encode([[7, 'c', 3, c1, added, 0], 2, 'c!k']), true)).toThrow(
+      'unknown opcode 2',
+    );
+    expect(() => reg.ops(encode([[7, 'c', 3, c1, added, 0], 0, 'c!k']), true)).toThrow(/truncated/);
+    expect(() => reg.ops(cat(encode(0), encode('c!k')), false)).toThrow(/truncated/);
+    expect(() => reg.ops(cat(encode(5), encode('c!k')), false)).toThrow('unknown opcode 5');
+  });
+});
+
+describe('values from a newer schema', () => {
+  const shelf = { id: 's1', main: { book: 'b1' } };
+
+  test('an unknown member in an optional field reads as absent', () => {
+    expect(toJs('Shelf', encode({ ...shelf, target: { isbn: 'x' }, color: 'blue' }))).toEqual(
+      shelf,
+    );
+    // a tuple holding one fails, and so does the optional field holding the tuple
+    expect(toJs('Shelf', encode({ ...shelf, located: ['a', { isbn: 'x' }] }))).toEqual(shelf);
+    expect(toJs('Shelf', encode({ ...shelf, located: ['a', { book: 'b' }] }))).toEqual({
+      ...shelf,
+      located: ['a', { book: 'b' }],
     });
   });
 
-  test('.event writes a DbEvent back as the wire pair', () => {
-    const ev = {
-      position: 7,
-      stream: 'catalog',
-      seq: 3,
-      id: C1,
-      servertime: added,
-      data: itemAdded,
-    };
-    expect(plain(toBytes('.event', ev))).toEqual([[7, 'catalog', 3, c1, added], itemAdded]);
+  test("an unknown member in an array's or a record's element drops the element", () => {
+    const targets = [{ book: 'b1' }, { isbn: 'x' }, { edition: 'e1' }];
+    const byName = { a: { book: 'b1' }, b: { isbn: 'x' }, c: { edition: 'e1' } };
+    expect(toJs('Shelf', encode({ ...shelf, targets, byName }))).toEqual({
+      ...shelf,
+      targets: [{ book: 'b1' }, { edition: 'e1' }],
+      byName: { a: { book: 'b1' }, c: { edition: 'e1' } },
+    });
+    // a member's failure in a required field bubbles up to the element that holds it
+    const slot = { pair: ['a', 1], color: 'red', level: 1, note: null, blob: null };
+    expect(toJs('inbox/slots', encode([slot, { ...slot, color: 'blue' }, slot]))).toEqual([
+      slot,
+      slot,
+    ]);
   });
 
-  test('.event skips envelope elements a later protocol appends', () => {
-    const raw = encode([[7, 'catalog', 3, c1, added, 'newer', { x: 1 }], itemAdded]);
-    expect((toJs('.event', raw) as { data: unknown }).data).toEqual(itemAdded);
+  test('an unknown member in a required field fails the whole value', () => {
+    rejects(() => toJs('Shelf', encode({ ...shelf, main: { isbn: 'x' } })), '$.main');
+    rejects(() => toJs('Target', encode({ isbn: 'x' })), 'book, edition');
   });
 
-  test('.event passes system events through untyped', () => {
-    const birth = encode([[1, 'catalog', 1, c1, added], { $sys: 'birth' }]);
-    expect((toJs('.event', birth) as { data: unknown }).data).toEqual({ $sys: 'birth' });
+  test('a known field that fails to decode is an error, even in an optional field', () => {
+    rejects(() => toJs('Shelf', encode({ ...shelf, target: { book: 7 } })), '$.target.book');
+    rejects(() => toJs('Shelf', encode({ ...shelf, targets: [{ book: 7 }] })), '$.targets[0].book');
   });
 
-  test('.event rejects a bad envelope, data that fails its type, and an unknown family', () => {
-    rejects(
-      () => toJs('.event', encode([[7, 'catalog', 3, c1, 1700000000000], itemAdded])),
-      'servertime',
-    );
-    rejects(
-      () => toJs('.event', encode([[7, 'catalog', 3, c1, added], { type: 'bogus' }])),
-      'bogus',
-    );
-    rejects(() => toJs('.event', encode([[7, 'nowhere:x', 3, c1, added], itemAdded])), 'nowhere');
-    rejects(() => toJs('.event', encode([[7, 'catalog', 3, 'c1', added], itemAdded])), 'id');
+  test("a mutation's unknown member is an error wherever it sits", () => {
+    const addItem = { type: 'add-item', id: 'i1', title: 'Dune', added };
+    expect(toJs('WriterMutations', encode({ ...addItem, color: 'red' }))).toEqual({
+      ...addItem,
+      color: 'red',
+    });
+    rejects(() => toJs('WriterMutations', encode({ ...addItem, color: 'blue' })), '$.color');
+    rejects(() => toBytes('WriterMutations', { ...addItem, color: 'blue' }), '$.color');
   });
 });
 

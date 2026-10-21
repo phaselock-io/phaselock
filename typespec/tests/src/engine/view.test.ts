@@ -3,11 +3,11 @@
 import { describe, expect, test } from 'vitest';
 
 import {
-  parkedEventKey,
+  parkedEditKey,
   parsePark,
-  refCovers,
-  refPrefix,
-  storeTypeOf,
+  selectorCovers,
+  selectorPrefix,
+  sliceOf,
 } from '../../../ts/assets/skeleton.ts';
 
 import {
@@ -18,7 +18,8 @@ import {
   FakeServer,
   keys,
   log,
-  parkedEvent,
+  parkedEdit,
+  parkedKeys,
   type Rig,
   rig,
   seq,
@@ -27,10 +28,10 @@ import {
 } from './harness.ts';
 
 type Record_ = { until: number; replacing: boolean; children: string[] };
-const record = (r: Rig, ref: string): Record_ | undefined =>
-  r.data()[`!backfill:${ref}`] as Record_ | undefined;
+const record = (r: Rig, selector: string): Record_ | undefined =>
+  r.data()[`!backfill:${selector}`] as Record_ | undefined;
 
-type View = { token: string; position: number; refs: string[] };
+type View = { token: string; position: number; selectors: string[] };
 const view = (r: Rig): View | undefined => r.data()['!view'] as View | undefined;
 
 const patrons: Blob = {
@@ -52,13 +53,13 @@ const p1Blob: Blob = {
   values: [['patron:p1!state', { count: 2, fields: {} }]],
 };
 
-/** a live Engine holding the given refs at position 10 */
+/** a live Engine holding the given selectors at position 10 */
 async function held(
-  refs = ['patron:*'],
+  selectors = ['patron:*'],
   blobs: Record<string, Blob> = { 'patron:*': patrons },
 ): Promise<Rig> {
   const r = rig();
-  await bootstrap(r, refs, blobs);
+  await bootstrap(r, selectors, blobs);
   return r;
 }
 
@@ -69,34 +70,34 @@ describe('view reconciliation', () => {
     delete before['!view'];
     r.server.view('t1', 12, ['patron:*']);
     await settle();
-    expect(view(r)).toEqual({ token: 't1', position: 12, refs: ['patron:*'] });
+    expect(view(r)).toEqual({ token: 't1', position: 12, selectors: ['patron:*'] });
     const after = { ...r.data() };
     delete after['!view'];
     expect(after).toEqual(before);
     expect(r.server.backfills.length).toBe(1);
   });
 
-  test('a grant covered by another ref in the same set is never backfilled separately', async () => {
+  test('a grant covered by another selector in the same set is never backfilled separately', async () => {
     const r = await held();
     r.server.hold('book:*');
     r.server.view('t2', 11, ['patron:*', 'book:*', 'book:b1']);
     await settle();
-    expect(r.server.backfills.map((b) => b.ref)).toEqual(['patron:*', 'book:*']);
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['patron:*', 'book:*']);
     expect(record(r, 'book:*')).toMatchObject({ until: 11, replacing: false });
     expect(record(r, 'book:b1')).toBeUndefined();
   });
 
-  test('a grant of a ref that already has an in-flight entry is a no-op', async () => {
+  test('a grant of a selector that already has an in-flight entry is a no-op', async () => {
     const r = await held(['book:*'], { 'book:*': books });
     r.server.hold('patron:p9');
-    r.server.events(ev('patron:p9', 7, 11));
+    r.server.edits(ev('patron:p9', 7, 11));
     await settle();
     expect(record(r, 'patron:p9')).toMatchObject({ until: 11, replacing: false });
     r.server.view('t2', 12, ['book:*', 'patron:p9']);
     await settle();
-    expect(r.server.backfills.map((b) => b.ref)).toEqual(['book:*', 'patron:p9']);
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['book:*', 'patron:p9']);
     expect(record(r, 'patron:p9')).toMatchObject({ until: 11, replacing: false });
-    expect(view(r)).toEqual({ token: 't2', position: 12, refs: ['book:*', 'patron:p9'] });
+    expect(view(r)).toEqual({ token: 't2', position: 12, selectors: ['book:*', 'patron:p9'] });
   });
 
   test("reconciliation is against state: '*' revoked while in flight leaves 'patron:*' to backfill itself", async () => {
@@ -104,27 +105,27 @@ describe('view reconciliation', () => {
     r.server.hold('*');
     r.server.view('t2', 11, ['*']);
     await settle();
-    // a patron stream first seen under the in-flight *: marked and parked
-    r.server.events(ev('patron:p1', 3, 12));
+    // a patron slice first seen under the in-flight *: marked and parked
+    r.server.edits(ev('patron:p1', 3, 12));
     await settle();
     expect(seq(r.data(), 'patron:p1')).toBe('backfill');
     // patron:* granted beside *: covered by the entry, so nothing starts
     r.server.view('t3', 13, ['*', 'patron:*']);
     await settle();
     expect(record(r, 'patron:*')).toBeUndefined();
-    expect(r.server.backfills.map((b) => b.ref)).toEqual(['book:*', '*']);
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['book:*', '*']);
     // * revoked: patron:* is not held (an entry covered it) and downloads itself
     const fam = r.server.hold('patron:*');
     r.server.view('t4', 14, ['patron:*']);
     await settle();
     expect(record(r, '*')).toBeUndefined();
-    expect(keys(r.data(), '!park-kv:*!')).toEqual([]);
+    expect(parkedKeys(r.data(), '*')).toEqual([]);
     expect(seq(r.data(), 'book:b1')).toBeUndefined();
     expect(state(r.data(), 'book:b1')).toBeUndefined();
     expect(record(r, 'patron:*')).toMatchObject({ until: 14, replacing: false });
-    expect(r.server.backfills.map((b) => b.ref)).toEqual(['book:*', '*', 'patron:*']);
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['book:*', '*', 'patron:*']);
     expect(seq(r.data(), 'patron:p1')).toBe('backfill');
-    expect(keys(r.data(), '!park-ev:patron:p1!')).toEqual([parkedEvent('patron:p1', 3)]);
+    expect(keys(r.data(), '!park-ed:patron:p1!')).toEqual([parkedEdit('patron:p1', 3)]);
     r.server.blobs.set('patron:*', {
       position: 14,
       seqs: { 'patron:p1': 2 },
@@ -137,20 +138,20 @@ describe('view reconciliation', () => {
     expect(keys(r.data(), '!backfill')).toEqual([]);
   });
 
-  test('a held family covered by a wider in-flight ref and narrowed back to is downloaded again, members kept', async () => {
+  test('a held family covered by a wider in-flight selector and narrowed back to is downloaded again, members kept', async () => {
     const r = await held();
     r.server.hold('*');
     r.server.view('t2', 11, ['*']);
     await settle();
     // held members stay held under the additive *
-    r.server.events(ev('patron:p1', 3, 12));
+    r.server.edits(ev('patron:p1', 3, 12));
     await settle();
     expect(seq(r.data(), 'patron:p1')).toBe(3);
     const fam = r.server.hold('patron:*');
     r.server.view('t3', 13, ['patron:*']);
     await settle();
     expect(record(r, '*')).toBeUndefined();
-    expect(r.server.backfills.map((b) => b.ref)).toEqual(['patron:*', '*', 'patron:*']);
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['patron:*', '*', 'patron:*']);
     expect(seq(r.data(), 'patron:p1')).toBe(3);
     r.server.blobs.set('patron:*', {
       position: 13,
@@ -171,26 +172,26 @@ describe('view reconciliation', () => {
     expect(keys(r.data(), '!backfill')).toEqual([]);
   });
 
-  test('a stream born under a wider in-flight ref is rediscovered when that ref is revoked before landing', async () => {
+  test('a slice born under a wider in-flight selector is rediscovered when that selector is revoked before landing', async () => {
     const r = await held();
     r.server.hold('*');
     r.server.view('t2', 11, ['*']);
     await settle();
-    r.server.events(birth('patron:p9', 1, 12));
-    r.server.events(ev('patron:p9', 2, 13));
+    r.server.edits(birth('patron:p9', 1, 12));
+    r.server.edits(ev('patron:p9', 2, 13));
     await settle();
     expect(seq(r.data(), 'patron:p9')).toBe('backfill');
-    expect(keys(r.data(), '!park-ev:patron:p9!')).toEqual([
-      parkedEvent('patron:p9', 1),
-      parkedEvent('patron:p9', 2),
+    expect(keys(r.data(), '!park-ed:patron:p9!')).toEqual([
+      parkedEdit('patron:p9', 1),
+      parkedEdit('patron:p9', 2),
     ]);
     const fam = r.server.hold('patron:*');
     r.server.view('t3', 14, ['patron:*']);
     await settle();
     expect(record(r, '*')).toBeUndefined();
     expect(seq(r.data(), 'patron:p9')).toBe('backfill');
-    expect(keys(r.data(), '!park-ev:patron:p9!').length).toBe(2);
-    // the renewed family blob, cut between p9's birth and its first event
+    expect(keys(r.data(), '!park-ed:patron:p9!').length).toBe(2);
+    // the renewed family blob, cut between p9's birth and its first edit
     r.server.blobs.set('patron:*', {
       position: 12,
       seqs: { 'patron:p1': 2, 'patron:p2': 1, 'patron:p9': 1 },
@@ -208,12 +209,12 @@ describe('view reconciliation', () => {
     expect(keys(r.data(), '!park')).toEqual([]);
   });
 
-  test('removing a ref drops per stream, skipping streams the new set covers; a partially uncovered in-flight ref is aborted', async () => {
+  test('removing a selector drops per slice, skipping slices the new set covers; a partially uncovered in-flight selector is aborted', async () => {
     const r = await held(['patron:*', 'book:*'], { 'patron:*': patrons, 'book:*': books });
     r.server.hold('*');
     r.server.view('t2', 11, ['*']);
     await settle();
-    r.server.events(birth('book:b7', 1, 12));
+    r.server.edits(birth('book:b7', 1, 12));
     await settle();
     expect(seq(r.data(), 'book:b7')).toBe('backfill');
     r.server.hold('patron:*');
@@ -221,19 +222,19 @@ describe('view reconciliation', () => {
     await settle();
     // * is partially uncovered: its entry and values range go
     expect(record(r, '*')).toBeUndefined();
-    expect(keys(r.data(), '!park-kv:*!')).toEqual([]);
-    // book streams, held or marked, are uncovered and go with everything they had
+    expect(parkedKeys(r.data(), '*')).toEqual([]);
+    // book slices, held or marked, are uncovered and go with everything they had
     expect(seq(r.data(), 'book:b1')).toBeUndefined();
     expect(state(r.data(), 'book:b1')).toBeUndefined();
     expect(seq(r.data(), 'book:b7')).toBeUndefined();
-    expect(keys(r.data(), '!park-ev:book:')).toEqual([]);
-    // patron streams are covered and untouched
+    expect(keys(r.data(), '!park-ed:book:')).toEqual([]);
+    // patron slices are covered and untouched
     expect(seq(r.data(), 'patron:p1')).toBe(2);
     expect(state(r.data(), 'patron:p1')).toEqual({ count: 2, fields: {} });
     expect(seq(r.data(), 'patron:p2')).toBe(1);
   });
 
-  test('an in-flight ref fully covered by the new set is kept and adopted, not aborted', async () => {
+  test('an in-flight selector fully covered by the new set is kept and adopted, not aborted', async () => {
     const r = await held(['book:b1'], { 'book:b1': books });
     const b2 = r.server.hold('book:b2');
     r.server.view('t2', 11, ['book:b1', 'book:b2']);
@@ -244,7 +245,7 @@ describe('view reconciliation', () => {
     await settle();
     expect(record(r, 'book:b2')).toMatchObject({ until: 11 });
     expect(record(r, 'book:*')?.children).toEqual(['book:b2']);
-    expect(r.server.backfills.map((b) => b.ref)).toEqual(['book:b1', 'book:b2', 'book:*']);
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['book:b1', 'book:b2', 'book:*']);
     expect(seq(r.data(), 'book:b1')).toBe(1);
     b2.go();
   });
@@ -259,7 +260,7 @@ describe('view reconciliation', () => {
     expect(seq(r.data(), 'patron:p2')).toBeUndefined();
     expect(r.server.backfills.length).toBe(1);
     expect(keys(r.data(), '!backfill')).toEqual([]);
-    r.server.events(ev('patron:p1', 3, 12));
+    r.server.edits(ev('patron:p1', 3, 12));
     await settle();
     expect(seq(r.data(), 'patron:p1')).toBe(3);
   });
@@ -275,16 +276,16 @@ describe('view reconciliation', () => {
     expect(record(r, 'patron:*')).toBeUndefined();
     expect(seq(r.data(), 'patron:p1')).toBe(2);
     expect(state(r.data(), 'patron:p1')).toEqual({ count: 2, fields: {} });
-    expect(r.server.backfills.map((b) => b.ref)).toEqual(['patron:p1', 'patron:*']);
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['patron:p1', 'patron:*']);
     expect(keys(r.data(), '!backfill')).toEqual([]);
   });
 
-  test('narrowing from an in-flight parent, p1 marked under it: p1 gets its own backfill and its parked events chain from the new cut', async () => {
+  test('narrowing from an in-flight parent, p1 marked under it: p1 gets its own backfill and its parked edits chain from the new cut', async () => {
     const r = await held(['book:*'], { 'book:*': books });
     r.server.hold('patron:*');
     r.server.view('t2', 11, ['book:*', 'patron:*']);
     await settle();
-    r.server.events(ev('patron:p1', 5, 12), ev('patron:p2', 3, 12));
+    r.server.edits(ev('patron:p1', 5, 12), ev('patron:p2', 3, 12));
     await settle();
     expect(seq(r.data(), 'patron:p1')).toBe('backfill');
     const p1 = r.server.hold('patron:p1');
@@ -292,9 +293,9 @@ describe('view reconciliation', () => {
     await settle();
     expect(record(r, 'patron:*')).toBeUndefined();
     expect(seq(r.data(), 'patron:p2')).toBeUndefined();
-    expect(keys(r.data(), '!park-ev:patron:p2!')).toEqual([]);
+    expect(keys(r.data(), '!park-ed:patron:p2!')).toEqual([]);
     expect(seq(r.data(), 'patron:p1')).toBe('backfill');
-    expect(keys(r.data(), '!park-ev:patron:p1!')).toEqual([parkedEvent('patron:p1', 5)]);
+    expect(keys(r.data(), '!park-ed:patron:p1!')).toEqual([parkedEdit('patron:p1', 5)]);
     expect(record(r, 'patron:p1')).toMatchObject({ until: 13, replacing: false });
     r.server.blobs.set('patron:p1', {
       position: 13,
@@ -313,7 +314,7 @@ describe('view reconciliation', () => {
     const fam = r.server.hold('patron:*');
     r.server.view('t2', 11, ['book:*', 'patron:*']);
     await settle();
-    r.server.events(ev('patron:p1', 7, 12));
+    r.server.edits(ev('patron:p1', 7, 12));
     await settle();
     r.server.blobs.set('patron:*', {
       position: 11,
@@ -329,11 +330,11 @@ describe('view reconciliation', () => {
     // the land found p1's break and spawned the child; the parent waits on it
     expect(record(r, 'patron:*')?.children).toEqual(['patron:p1']);
     expect(record(r, 'patron:p1')).toMatchObject({ replacing: false, until: 12 });
-    expect(r.server.backfills.map((b) => b.ref)).toEqual(['book:*', 'patron:*', 'patron:p1']);
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['book:*', 'patron:*', 'patron:p1']);
     r.server.view('t3', 13, ['book:*', 'patron:p1']);
     await settle();
     expect(record(r, 'patron:*')).toBeUndefined();
-    expect(keys(r.data(), '!park-kv:patron:*!')).toEqual([]);
+    expect(parkedKeys(r.data(), 'patron:*')).toEqual([]);
     expect(record(r, 'patron:p1')).toMatchObject({ replacing: false, until: 12 });
     expect(r.server.backfills.length).toBe(3);
     expect(seq(r.data(), 'patron:p2')).toBeUndefined();
@@ -359,10 +360,10 @@ describe('view reconciliation', () => {
     expect(r.server.conn.since).toBe(10);
     expect(r.server.conn.view).toBe('t1');
     r.server.open();
-    r.server.events(ev('patron:p1', 3, 11));
+    r.server.edits(ev('patron:p1', 3, 11));
     r.server.live(11);
     await settle();
-    expect(view(r)).toEqual({ token: 't1', position: 10, refs: ['patron:*'] });
+    expect(view(r)).toEqual({ token: 't1', position: 10, selectors: ['patron:*'] });
     expect(seq(r.data(), 'patron:p1')).toBe(3);
     expect(r.server.backfills.length).toBe(1);
     // the view changed while away: the frame comes first and the history behind it parks under its grant
@@ -374,13 +375,13 @@ describe('view reconciliation', () => {
     r.server.open();
     r.server.hold('book:*');
     r.server.view('t2', 12, ['patron:*', 'book:*']);
-    r.server.events(ev('book:b1', 4, 12));
+    r.server.edits(ev('book:b1', 4, 12));
     r.server.live(12);
     await settle();
-    expect(view(r)).toEqual({ token: 't2', position: 12, refs: ['patron:*', 'book:*'] });
+    expect(view(r)).toEqual({ token: 't2', position: 12, selectors: ['patron:*', 'book:*'] });
     expect(record(r, 'book:*')).toMatchObject({ until: 12, replacing: false });
     expect(seq(r.data(), 'book:b1')).toBe('backfill');
-    expect(keys(r.data(), '!park-ev:book:b1!')).toEqual([parkedEvent('book:b1', 4)]);
+    expect(keys(r.data(), '!park-ed:book:b1!')).toEqual([parkedEdit('book:b1', 4)]);
   });
 
   test('!view is written with the reconciliation; a crash before it presents the old token again', async () => {
@@ -390,7 +391,7 @@ describe('view reconciliation', () => {
     // the frame is queued when the Engine ends, so it never commits
     r.abort.abort();
     await settle();
-    expect(view(r)).toEqual({ token: 't1', position: 10, refs: ['patron:*'] });
+    expect(view(r)).toEqual({ token: 't1', position: 10, selectors: ['patron:*'] });
     expect(record(r, 'book:*')).toBeUndefined();
     const server = new FakeServer();
     server.blobs.set('patron:*', patrons);
@@ -408,8 +409,8 @@ describe('view reconciliation', () => {
     expect(r.server.conn.view).toBe('t1');
     r.server.open();
     // the set is what it was, so the token is current and no frame comes; the replay carries the birth
-    r.server.events(birth('patron:p3', 1, 11), ev('patron:p3', 2, 11));
-    r.server.events(ev('patron:p1', 3, 12));
+    r.server.edits(birth('patron:p3', 1, 11), ev('patron:p3', 2, 11));
+    r.server.edits(ev('patron:p1', 3, 12));
     r.server.live(12);
     await settle();
     expect(seq(r.data(), 'patron:p3')).toBe(2);
@@ -421,44 +422,40 @@ describe('view reconciliation', () => {
   });
 });
 
-describe('refs and keys', () => {
+describe('selectors and keys', () => {
   test('a wildcard covers the names under its prefix, and a name only itself', () => {
-    expect(refCovers('*', 'patron:p1')).toBe(true);
-    expect(refCovers('patron:*', 'patron:p1')).toBe(true);
-    expect(refCovers('patron:*', 'book:b1')).toBe(false);
-    expect(refCovers('chat:acme,*', 'chat:acme,gen')).toBe(true);
-    expect(refCovers('chat:acme,*', 'chat:acme-2,gen')).toBe(false);
-    expect(refCovers('chat:*', 'chat:acme,*')).toBe(true);
-    expect(refCovers('chat:acme,gen', 'chat:acme,gen')).toBe(true);
-    expect(refCovers('chat:acme,gen', 'chat:acme,gen-2')).toBe(false);
+    expect(selectorCovers('*', 'patron:p1')).toBe(true);
+    expect(selectorCovers('patron:*', 'patron:p1')).toBe(true);
+    expect(selectorCovers('patron:*', 'book:b1')).toBe(false);
+    expect(selectorCovers('chat:acme,*', 'chat:acme,gen')).toBe(true);
+    expect(selectorCovers('chat:acme,*', 'chat:acme-2,gen')).toBe(false);
+    expect(selectorCovers('chat:*', 'chat:acme,*')).toBe(true);
+    expect(selectorCovers('chat:acme,gen', 'chat:acme,gen')).toBe(true);
+    expect(selectorCovers('chat:acme,gen', 'chat:acme,gen-2')).toBe(false);
   });
 
-  test("a ref's key prefix holds its streams' keys and no other stream's", () => {
-    expect(refPrefix('*')).toBe('');
-    expect(refPrefix('patron:*')).toBe('patron:');
-    expect(refPrefix('chat:acme,*')).toBe('chat:acme,');
-    expect(refPrefix('chat:acme,gen')).toBe('chat:acme,gen!');
-    expect('chat:acme,gen-2!post:m1'.startsWith(refPrefix('chat:acme,gen'))).toBe(false);
-    expect('login!user:a'.startsWith(refPrefix('login'))).toBe(true);
+  test("a selector's key prefix holds its slices' keys and no other slice's", () => {
+    expect(selectorPrefix('*')).toBe('');
+    expect(selectorPrefix('patron:*')).toBe('patron:');
+    expect(selectorPrefix('chat:acme,*')).toBe('chat:acme,');
+    expect(selectorPrefix('chat:acme,gen')).toBe('chat:acme,gen!');
+    expect('chat:acme,gen-2!post:m1'.startsWith(selectorPrefix('chat:acme,gen'))).toBe(false);
+    expect('login!user:a'.startsWith(selectorPrefix('login'))).toBe(true);
   });
 
-  test("a key's type comes from its family and its key name, before any ':'", () => {
-    const reg = {
-      storeTypes: { 'patron/state': 'state', 'chat/reply': 'Reply', 'login/user': 'U' },
-    };
-    const typeOf = (key: string) => storeTypeOf(reg as never, key);
-    expect(typeOf('patron:p1!state')).toBe('state');
-    expect(typeOf('chat:acme,gen!reply:t1,m:5!x')).toBe('Reply');
-    expect(typeOf('login!user:a')).toBe('U');
-    expect(typeOf('patron:p1!other')).toBeUndefined();
-    expect(() => typeOf('patron:p1')).toThrow("invalid key has no '!'");
+  test("a key's slice is everything before its first '!'", () => {
+    expect(sliceOf('patron:p1!state')).toBe('patron:p1');
+    expect(sliceOf('chat:acme,gen!reply:t1,m:5!x')).toBe('chat:acme,gen');
+    expect(sliceOf('login!user:a')).toBe('login');
+    expect(sliceOf('!view')).toBe('');
+    expect(() => sliceOf('patron:p1')).toThrow(`key "patron:p1" has no '!'`);
   });
 
-  test('a parked event key names its stream and seq, under its stream ref prefix', () => {
-    const key = parkedEventKey('chat:acme,gen', 7);
-    expect(key).toBe('!park-ev:chat:acme,gen!00000000000000000007');
-    expect(key.startsWith(`!park-ev:${refPrefix('chat:acme,*')}`)).toBe(true);
-    expect(key.startsWith(`!park-ev:${refPrefix('chat:acme,gen')}`)).toBe(true);
-    expect(parsePark(key)).toEqual({ stream: 'chat:acme,gen', seq: 7 });
+  test('a parked edit key names its slice and seq, under its slice selector prefix', () => {
+    const key = parkedEditKey('chat:acme,gen', 7);
+    expect(key).toBe('!park-ed:chat:acme,gen!00000000000000000007');
+    expect(key.startsWith(`!park-ed:${selectorPrefix('chat:acme,*')}`)).toBe(true);
+    expect(key.startsWith(`!park-ed:${selectorPrefix('chat:acme,gen')}`)).toBe(true);
+    expect(parsePark(key)).toEqual({ slice: 'chat:acme,gen', seq: 7 });
   });
 });

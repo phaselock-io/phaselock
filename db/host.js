@@ -1,7 +1,8 @@
-// The JS side of the QuickJS host.  Hands the bundle's slots transactions over the natives
-// (__pl_get, __pl_scan, __pl_set, __pl_del), which convert every value through the bundle's
-// registry under the type the call names, installs crypto over __pl_random, and exposes one
-// entry point per slot, and per plugin command the core makes, on globalThis.__host.
+// The JS side of the QuickJS host.  Binds the bundle's contexts, once, to a transaction over the
+// natives (__pl_get, __pl_scan, __pl_set, __pl_del, __pl_delete_slice), which convert every value
+// through the bundle's registry under the type the call names and read through the write buffer
+// of the call running, installs crypto over __pl_random, and exposes one entry point per slot,
+// and per plugin mutation the core makes, on globalThis.__host.
 
 // the Web Crypto randomness a bundle may use, over the kernel's CSPRNG
 globalThis.crypto = {
@@ -22,77 +23,27 @@ globalThis.crypto = {
 };
 
 globalThis.__host = (function () {
-  // the outputs plugin requests emit during one call into the bundle, in call order
-  let emitted = [];
-
-  // the read transaction over global keys that precommit, maySee, and lookup read through, which
-  // also takes what a plugin request emits
-  const rx = {
+  // The transaction every slot runs over, whichever call is running: its natives read and write
+  // through that call's write buffer, which the core keeps as the mutation's edits, and refuse a
+  // write from a call that only reads.
+  const txn = {
     get: (key, type) => __pl_get(key, type),
     scan: (req) => __pl_scan(req),
-    emit(outputs) {
-      for (const output of outputs) emitted.push(output);
-    },
+    set: (key, type, value) => __pl_set(key, type, value),
+    del: (key) => __pl_del(key),
+    deleteSlice: (slice, erase) => __pl_delete_slice(slice, erase === true),
   };
-
-  // run a slot that requests nothing, as maySee and lookup, where a plugin request is a bug
-  function withoutRequests(slot, fn) {
-    try {
-      const out = fn();
-      if (emitted.length > 0) throw new Error(`${slot} made a plugin request`);
-      return out;
-    } finally {
-      emitted = [];
-    }
-  }
-
-  // a reducer's transaction: its stream's local keys, prefixed here
-  function reducerTxn(stream) {
-    const prefix = stream + '!';
-    return {
-      get: (key, type) => __pl_get(prefix + key, type),
-      set: (key, type, value) => __pl_set(prefix + key, type, value),
-      del: (key) => __pl_del(prefix + key),
-      // a pattern over the stream's own keys, resumed and answered with local keys
-      scan(req) {
-        const pattern = { stream, name: req.name, local: req.local };
-        const after = req.after === undefined ? undefined : prefix + req.after;
-        const { entries, next } = __pl_scan({ ...req, pattern, after });
-        return {
-          entries: entries.map(([k, v]) => [k.slice(prefix.length), v]),
-          next: next === null ? null : next.slice(prefix.length),
-        };
-      },
-    };
-  }
 
   const bundle = () => globalThis.__bundle;
 
-  // outputs as the core reads them
-  const items = (outputs) =>
-    outputs.map((item) => ({
-      stream: item.stream,
-      death: item.death === true,
-      erase: item.death === true && item.erase === true,
-      event: item.death === true ? null : item.event,
-    }));
-
   return {
-    precommit(data, principal) {
-      // the handler's outputs, after what its plugin requests emitted while it ran; a rejection or
-      // a throw drops them all
-      let out;
-      let requests;
-      try {
-        out = bundle().precommit(rx, data, principal);
-        requests = emitted;
-      } finally {
-        emitted = [];
-      }
-      if (typeof out === 'string') return out;
-      if (!Array.isArray(out)) throw new Error('precommit must return a reason or a list');
-      return items([...requests, ...out]);
+    // bind the bundle's contexts to the transaction, once, after the bundle is evaluated
+    load() {
+      bundle().bindWrite(txn);
+      bundle().bindRead(txn);
     },
+    // null when decide carried the mutation out, or the reason it rejected it
+    decide: (data, principal) => bundle().decide(data, principal),
     // every entry of every cron install, as [install, entry, spec], in install and entry order
     cronEntries() {
       const out = [];
@@ -102,53 +53,32 @@ globalThis.__host = (function () {
       }
       return out;
     },
-    // A cron entry's tick, as its install's command: what the plugin emitted while it ran, its
-    // hook's outputs among them, then what it returned.  A throw drops them all.
+    // a cron entry's tick, as its install's mutation
     tick(install, entry, slot, now) {
-      const cmd = { entry, slot: new Date(slot), now: new Date(now) };
-      let out;
-      let emits;
-      try {
-        out = bundle().plugins[install].run(rx, cmd);
-        emits = emitted;
-      } finally {
-        emitted = [];
-      }
-      if (!Array.isArray(out)) throw new Error(`plugin ${install} must return a list`);
-      return items([...emits, ...out]);
+      const mutation = { entry, slot: new Date(slot), now: new Date(now) };
+      bundle().plugins[install].run(mutation);
     },
     bootstrap() {
       const seed = bundle().bootstrap;
-      const out = [];
-      if (!seed) return out;
+      if (!seed) return;
       seed({
-        emit: (stream, event) => out.push({ stream, death: false, event }),
         hashPassword: (plain) => __pl_hash(plain),
         env: (name) => __pl_env(name),
       });
-      return out;
     },
-    reduce(family, stream, events) {
-      const slice = bundle().reducers?.[family];
-      if (!slice) return false;
-      slice.reducer(reducerTxn(stream), events, stream, false);
-      return true;
-    },
-    maySee: (principal) => withoutRequests('maySee', () => bundle().maySee(rx, principal)),
+    grant: (principal) => bundle().grant(principal),
     lookup(ident) {
-      const r = withoutRequests('lookup', () => bundle().lookup(rx, ident));
+      const r = bundle().lookup(ident);
       return r == null ? null : r;
     },
     generation(principal) {
-      const ident = { kind: 'token', user: principal.user };
-      const r = withoutRequests('lookup', () => bundle().lookup(rx, ident));
+      const r = bundle().lookup({ kind: 'token', user: principal.user });
       return r == null ? -1 : (r.generation ?? 0);
     },
     // the password hash lookup answers for a principal's token, or null for none
     passwordHash(principal) {
       if (principal.user === null) return null;
-      const ident = { kind: 'token', user: principal.user };
-      const r = withoutRequests('lookup', () => bundle().lookup(rx, ident));
+      const r = bundle().lookup({ kind: 'token', user: principal.user });
       if (r == null || r.passwordHash == null) return null;
       if (typeof r.passwordHash !== 'string') {
         throw new Error('lookup answered a passwordHash that is not a string');

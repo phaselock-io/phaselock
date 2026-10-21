@@ -1,5 +1,5 @@
 /* Key patterns: the skeleton's KeyPattern compiled from the bundle's object, the skip-scan walk
-   of the keys a pattern picks out over the kv cursor, and the spans maySee's scans read.  It
+   of the keys a pattern picks out over the kv cursor, and the spans the grantor's scans read.  It
    follows the skeleton's "key patterns" section step for step.  Keys and bounds are UTF-8 and
    compare bytewise, which is code-point order, the order the skeleton's comparisons keep.  A
    bound's successor is its last byte incremented, and no valid key lies between that and the
@@ -200,10 +200,10 @@ static bool value_fields(JSContext *ctx, pattern *p, JSValueConst arr, int64_t n
     return true;
 }
 
-/* the head and stream fields of a KeyPattern's stream: one by name, a family's with a field per
-   parameter, or none for every stream (an empty head); false with an exception */
-static bool stream_fields(JSContext *ctx, pattern *p, JSValueConst s) {
-    // one stream by name
+/* the head and slice fields of a KeyPattern's slice: one by name, a family's with a field per
+   parameter, or none for every slice (an empty head); false with an exception */
+static bool slice_fields(JSContext *ctx, pattern *p, JSValueConst s) {
+    // one slice by name
     if (JS_IsString(s)) {
         text name;
         if (!text_of(ctx, s, &name)) return false;
@@ -212,11 +212,11 @@ static bool stream_fields(JSContext *ctx, pattern *p, JSValueConst s) {
         return true;
     }
     if (!JS_IsObject(s)) {
-        JS_ThrowTypeError(ctx, "a pattern's stream is a name, a family, or null");
+        JS_ThrowTypeError(ctx, "a pattern's slice is a name, a family, or null");
         return false;
     }
 
-    // a family's streams, with a field per parameter
+    // a family's slices, with a field per parameter
     JSValue fam = JS_GetPropertyStr(ctx, s, "family");
     JSValue params = JS_GetPropertyStr(ctx, s, "params");
     text family = {0};
@@ -242,7 +242,7 @@ pattern *pattern_from_js(JSContext *ctx, JSValueConst v) {
         pattern_free(p);
         return NULL;
     }
-    JSValue s = JS_GetPropertyStr(ctx, v, "stream");
+    JSValue s = JS_GetPropertyStr(ctx, v, "slice");
     JSValue name = JS_GetPropertyStr(ctx, v, "name");
     JSValue local = JS_GetPropertyStr(ctx, v, "local");
     bool ok = false;
@@ -256,7 +256,7 @@ pattern *pattern_from_js(JSContext *ctx, JSValueConst v) {
     // every key
     if (JS_IsNull(s)) {
         if (!JS_IsNull(name) || n > 0) {
-            throw_error(ctx, "a pattern over every stream picks out every local key");
+            throw_error(ctx, "a pattern over every slice picks out every local key");
             goto out;
         }
         p->head = text_copy("", 0);
@@ -264,10 +264,10 @@ pattern *pattern_from_js(JSContext *ctx, JSValueConst v) {
         goto out;
     }
 
-    // the streams: one by name, or a family's with a field per parameter
-    if (!stream_fields(ctx, p, s)) goto out;
+    // the slices: one by name, or a family's with a field per parameter
+    if (!slice_fields(ctx, p, s)) goto out;
 
-    // every local key of the streams, or one template's, its name a literal
+    // every local key of the slices, or one template's, its name a literal
     if (JS_IsNull(name)) {
         if (n > 0) {
             throw_error(ctx, "a pattern over every local key matches no parameter");
@@ -572,6 +572,13 @@ void span_list_free(span_list *l) {
     memset(l, 0, sizeof *l);
 }
 
+bool pattern_matches(const pattern *p, const char *key, size_t n) {
+    placement pl = {0};
+    bool match = place_key(p, key, n, false, &pl) == PLACE_MATCH;
+    placement_free(&pl);
+    return match;
+}
+
 bool span_covers(const scan_span *s, const char *key, size_t n) {
     if (s->from) {
         int d = cmp(key, n, s->from, s->from_n);
@@ -581,10 +588,7 @@ bool span_covers(const scan_span *s, const char *key, size_t n) {
         int d = cmp(key, n, s->to, s->to_n);
         if (s->reverse ? d < 0 : d > 0) return false;
     }
-    placement pl = {0};
-    bool match = place_key(s->pattern, key, n, false, &pl) == PLACE_MATCH;
-    placement_free(&pl);
-    return match;
+    return pattern_matches(s->pattern, key, n);
 }
 
 /* Every key under the prefix lies in one stretch of key order, and every key the span covers

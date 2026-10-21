@@ -1,15 +1,15 @@
-// The frames of /stream and /events.
+// The frames of /stream and /edits.
 
-import type { WireEvent } from './contract.js';
+import type { WireEdit } from './contract.js';
+import { readEnvelope } from './edits.js';
 import { Reader } from './msgpack.js';
 import type { ByteReader } from './bytes.js';
-import { uuidString } from './uuid.js';
 
 export type Frame =
-  | { tag: 'events'; events: WireEvent[] }
+  | { tag: 'edits'; edits: WireEdit[] }
   | { tag: 'live'; position: number }
   | { tag: 'vouch'; position: number }
-  | { tag: 'view'; token: string; position: number; refs: string[] }
+  | { tag: 'view'; token: string; position: number; selectors: string[] }
   | { tag: 'end'; code: number; reason: string };
 
 function strings(r: Reader): string[] {
@@ -19,8 +19,8 @@ function strings(r: Reader): string[] {
   return out;
 }
 
-/** parseFrame decodes one frame of /stream or /events.  Envelope and frame elements appended by
-    later protocol versions are skipped; event data is sliced out undecoded. */
+/** parseFrame decodes one frame of /stream or /edits.  Envelope and frame elements appended by
+    later protocol versions are skipped; an edit's payload is carried undecoded. */
 export function parseFrame(bytes: Uint8Array): Frame {
   const r = new Reader(bytes);
   const n = r.arrayHeader();
@@ -29,27 +29,15 @@ export function parseFrame(bytes: Uint8Array): Frame {
   let used = 1;
   let frame: Frame;
   switch (tag) {
-    case 'events': {
+    case 'edits': {
       const m = r.arrayHeader();
-      const events: WireEvent[] = [];
+      const edits: WireEdit[] = [];
       for (let i = 0; i < m; i++) {
-        // the whole pair is sliced once; the envelope is read from it and data is a view into it
+        // the whole edit is sliced once, and its envelope read from the slice
         const raw = r.raw();
-        const p = new Reader(raw);
-        const pair = p.arrayHeader();
-        if (pair < 2) throw new Error('event without data');
-        const env = p.arrayHeader();
-        if (env < 5) throw new Error('short envelope');
-        const position = p.int();
-        const stream = p.str();
-        const seq = p.int();
-        const id = uuidString(p.bin());
-        const servertime = p.timestamp();
-        for (let k = 5; k < env; k++) p.skip();
-        const data = p.view();
-        events.push({ id, data, raw, position, stream, seq, servertime });
+        edits.push({ ...readEnvelope(new Reader(raw)), raw });
       }
-      frame = { tag, events };
+      frame = { tag, edits };
       used = 2;
       break;
     }
@@ -59,7 +47,7 @@ export function parseFrame(bytes: Uint8Array): Frame {
       used = 2;
       break;
     case 'view':
-      frame = { tag, token: r.str(), position: r.int(), refs: strings(r) };
+      frame = { tag, token: r.str(), position: r.int(), selectors: strings(r) };
       used = 4;
       break;
     case 'end':

@@ -1,7 +1,7 @@
 package main
 
-// The HTTP layer: streams, commands, list, snapshots, and the dispatcher
-// that fans the core's results out to connections.
+// The HTTP layer: connections, mutations, snapshots, edit reads, and the dispatcher that fans the
+// core's results out to connections.
 
 import (
 	"context"
@@ -41,10 +41,10 @@ type Options struct {
 	// CF-Connecting-IP; trusted from every request, so set only when nothing but the proxy can
 	// reach the server
 	ClientIPHeader string
-	// the most commands one POST /commands may carry (default 128), and one without a session
+	// the most mutations one POST /mutations may carry (default 128), and one without a session
 	// (default 8)
-	MaxCommands          int
-	MaxAnonymousCommands int
+	MaxMutations          int
+	MaxAnonymousMutations int
 	// the path every route is under, such as /phaselock, so an origin the database shares with an
 	// app routes one prefix to it; "" puts the routes at the root
 	PathPrefix string
@@ -67,8 +67,8 @@ type Server struct {
 	limit   *limiter
 	// the header naming each request's client, if any
 	clientIPHeader string
-	// the most commands a request may carry, and an anonymous one
-	maxCommands, maxAnonymousCommands int
+	// the most mutations a request may carry, and an anonymous one
+	maxMutations, maxAnonymousMutations int
 	// the path every route is under, "" for the root
 	pathPrefix string
 
@@ -89,17 +89,15 @@ type Server struct {
 	proved func()
 }
 
-// conn is one stream connection.  Its view is what maySee allows cut down
-// to what it wants, and its token the hash of that set.  The dispatcher is
-// the only goroutine that writes the view and sends on out; the handler is
-// the only receiver.  Commit frames are pushed only once the handler has
-// finished its cold catchup and flipped streaming, so a long replay buffers
-// nothing; the hot catchup then covers the gap and the channel is deduped
-// by position.
+// conn is one connection.  Its view is what the grantor allows cut down to what it wants, and its
+// token the hash of that set.  The dispatcher is the only goroutine that writes the view and sends
+// on out; the handler is the only receiver.  Commit frames are pushed only once the handler has
+// finished its cold catchup and flipped streaming, so a long replay buffers nothing; the hot
+// catchup then covers the gap and the channel is deduped by position.
 type conn struct {
 	id        uint64
 	wants     []string
-	prefixes  []string // the view
+	selectors []string // the view
 	token     string   // the hash of the view
 	active    bool
 	ephemeral bool
@@ -121,8 +119,8 @@ const (
 	coldBatch = 1000
 )
 
-// eventsPage is the default and maximum size of one /events response.
-const eventsPage = 1000
+// editsPage is the default and maximum number of edits one /edits response asks for.
+const editsPage = 1000
 
 // Open starts a server that lives until ctx ends or Close is called.  Its handler's requests
 // should run under BaseContext, so that they end with it.
@@ -178,33 +176,33 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 	if rate <= 0 {
 		rate = 1
 	}
-	maxCommands, maxAnonymous := o.MaxCommands, o.MaxAnonymousCommands
-	if maxCommands <= 0 {
-		maxCommands = 128
+	maxMutations, maxAnonymous := o.MaxMutations, o.MaxAnonymousMutations
+	if maxMutations <= 0 {
+		maxMutations = 128
 	}
 	if maxAnonymous <= 0 {
 		maxAnonymous = 8
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Server{
-		ctx:                  ctx,
-		cancel:               cancel,
-		hashes:               newHashPool(ctx, workers, 2*workers),
-		limit:                newLimiter(rate, burst),
-		core:                 c,
-		keys:                 newKeyring(stored, now()),
-		now:                  now,
-		devAuth:              o.DevAuth,
-		clientIPHeader:       o.ClientIPHeader,
-		pathPrefix:           o.PathPrefix,
-		maxCommands:          maxCommands,
-		maxAnonymousCommands: min(maxAnonymous, maxCommands),
-		epoch:                c.epoch(),
-		pending:              map[uint64]chan result{},
-		conns:                map[uint64]*conn{},
-		done:                 make(chan struct{}),
-		cron:                 entries,
-		cronDone:             make(chan struct{}),
+		ctx:                   ctx,
+		cancel:                cancel,
+		hashes:                newHashPool(ctx, workers, 2*workers),
+		limit:                 newLimiter(rate, burst),
+		core:                  c,
+		keys:                  newKeyring(stored, now()),
+		now:                   now,
+		devAuth:               o.DevAuth,
+		clientIPHeader:        o.ClientIPHeader,
+		pathPrefix:            o.PathPrefix,
+		maxMutations:          maxMutations,
+		maxAnonymousMutations: min(maxAnonymous, maxMutations),
+		epoch:                 c.epoch(),
+		pending:               map[uint64]chan result{},
+		conns:                 map[uint64]*conn{},
+		done:                  make(chan struct{}),
+		cron:                  entries,
+		cronDone:              make(chan struct{}),
 	}
 	go s.dispatch()
 
@@ -269,9 +267,9 @@ func (s *Server) BaseContext(net.Listener) context.Context { return s.ctx }
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stream", s.handleStream)
-	mux.HandleFunc("/commands", s.handleCommands)
+	mux.HandleFunc("/mutations", s.handleMutations)
 	mux.HandleFunc("/snapshot/", s.handleSnapshot)
-	mux.HandleFunc("/events/", s.handleEvents)
+	mux.HandleFunc("/edits/", s.handleEdits)
 	mux.HandleFunc("/auth/token", s.handleAuth)
 	if s.pathPrefix == "" {
 		return mux
@@ -291,7 +289,6 @@ func checkPathPrefix(prefix string) error {
 
 // dispatch /////////////////////////////////////////////////////////////////
 
-// request sends one request to the core and waits for its reply.
 // request sends one request to the core and waits for its reply, or for the server to end.
 func (s *Server) request(send func(reqid uint64)) result {
 	reqid := s.nextReq.Add(1)
@@ -329,23 +326,23 @@ func (s *Server) dispatch() {
 			s.mu.Lock()
 			c := s.conns[r.conn]
 			if c != nil && r.status == 0 {
-				// the connection's view is maySee cut down to its wants
-				view := intersect(r.prefixes, c.wants)
+				// the connection's view is the grant cut down to its wants
+				view := intersect(r.selectors, c.wants)
 				token := viewToken(view)
 				changed := token != c.token
-				c.prefixes = view
+				c.selectors = view
 				c.token = token
 				if r.reqid != 0 {
 					if !c.ephemeral {
 						c.active = true
 					}
 				} else if c.active && changed {
-					// a maySee change that left this view as it was is no frame
+					// a grant change that left this view as it was is no frame
 					s.send(c, frame{pos: r.position, view: true,
 						data: mpEncode([]any{"view", token, r.position, view})})
 				}
 			} else if c != nil && r.reqid == 0 && c.active {
-				// maySee failed when a commit re-ran it, so the connection ends
+				// the grantor failed when a commit re-ran it, so the connection ends
 				s.send(c, frame{pos: r.position, view: true, end: true,
 					data: mpEncode([]any{"end", "error", r.errmsg})})
 				c.active = false
@@ -356,17 +353,17 @@ func (s *Server) dispatch() {
 			}
 		case rCommit:
 			s.position.Store(r.position)
-			atoms := groupAtoms(r.items)
+			mutations := groupPositions(r.items)
 			s.mu.Lock()
 			for _, c := range s.conns {
 				if !c.active || !c.streaming {
 					continue
 				}
-				for _, atom := range atoms {
-					if f := eventsFrame(atom, c.prefixes); f != nil {
-						// the atom's own position: the stream loop drops frames at or
-						// below its cursor, and a commit may carry several atoms
-						s.send(c, frame{pos: atom[len(atom)-1].position, data: f})
+				for _, edits := range mutations {
+					if f := editsFrame(edits, c.selectors); f != nil {
+						// the mutation's own position: the connection's loop drops frames at or
+						// below its cursor, and a commit may carry several mutations
+						s.send(c, frame{pos: edits[0].position, data: f})
 					}
 				}
 			}
@@ -395,44 +392,46 @@ func (s *Server) send(c *conn, f frame) {
 	}
 }
 
-// groupAtoms splits a commit's items into atoms.
-func groupAtoms(items []item) [][]item {
-	var atoms [][]item
+// groupPositions splits edits read in position order into each mutation's edits.
+func groupPositions(items []item) [][]item {
+	var groups [][]item
 	for i, it := range items {
-		if i == 0 || it.atom != items[i-1].atom {
-			atoms = append(atoms, nil)
+		if i == 0 || it.position != items[i-1].position {
+			groups = append(groups, nil)
 		}
-		atoms[len(atoms)-1] = append(atoms[len(atoms)-1], it)
+		groups[len(groups)-1] = append(groups[len(groups)-1], it)
 	}
-	return atoms
+	return groups
 }
 
-// matches reports whether a wire ref covers a stream name or a narrower
-// ref: a wildcard ("*", "chat:*", "chat:acme,*") covers the names that
-// begin with its text before the star, and a name covers itself.
-func matches(stream, ref string) bool {
-	if prefix, wild := strings.CutSuffix(ref, "*"); wild {
-		return strings.HasPrefix(stream, prefix)
+// matches reports whether a selector covers a slice name or a narrower
+// selector: a prefix selector ("*", "chat:*", "chat:acme,*") covers the names
+// that begin with its text before the star, and an exact one, a slice's name,
+// covers itself.
+func matches(name, selector string) bool {
+	if prefix, ok := strings.CutSuffix(selector, "*"); ok {
+		return strings.HasPrefix(name, prefix)
 	}
-	return stream == ref
+	return name == selector
 }
 
-// validRef checks the wire form of a ref: a stream name, a wildcard, or
-// "*".  A name is its family, a non-empty run of A-Z a-z 0-9 _ -, then, if
-// its family has parameters, ':' and their values separated by ','.  Every
-// value is non-empty; one before the last is a run of the family's
-// characters, and the last may also hold . and ~, the characters a URL
-// carries unencoded.  A wildcard is a family and ':', or a family, ':', and
-// whole leading values each followed by ',', then '*'.  The core checks a
-// name against its family's template.
-func validRef(ref string) bool {
-	if ref == "*" {
+// validSelector checks the wire form of a selector: a slice name, a prefix
+// selector, or "*".  A name is its family, a non-empty run of A-Z a-z 0-9 _
+// -, then, if its family has parameters, ':' and their values separated by
+// ','.  Every value is non-empty; one before the last is a run of the
+// family's characters, and the last may also hold . and ~, the characters a
+// URL carries unencoded.  A prefix selector is a family and ':', or a
+// family, ':', and whole leading values each followed by ',', then '*'.  The
+// core checks a grantor's selectors, and the slice names a write or an
+// expectation gives, by the same rules.
+func validSelector(selector string) bool {
+	if selector == "*" {
 		return true
 	}
 
-	// a wildcard's values are all leading ones, followed by their separator
-	name, wild := strings.CutSuffix(ref, "*")
-	if wild {
+	// a prefix selector's values are all leading ones, followed by their separator
+	name, prefix := strings.CutSuffix(selector, "*")
+	if prefix {
 		var sep bool
 		if name, sep = strings.CutSuffix(name, ","); !sep {
 			if name, sep = strings.CutSuffix(name, ":"); !sep || strings.Contains(name, ":") {
@@ -453,7 +452,7 @@ func validRef(ref string) bool {
 	}
 	values := strings.Split(rest, ",")
 	for i, v := range values {
-		if wild || i < len(values)-1 {
+		if prefix || i < len(values)-1 {
 			if !segment(v) {
 				return false
 			}
@@ -467,13 +466,13 @@ func validRef(ref string) bool {
 }
 
 // segment reports whether s is a non-empty run of the characters a family
-// name or a parameter other than a template's terminal one may hold.
+// name or a parameter other than a slice name's last one may hold.
 func segment(s string) bool {
 	return s != "" && strings.IndexFunc(s, func(c rune) bool { return !segmentChar(c) }) < 0
 }
 
 // segmentChar reports whether c may appear in a family name or a parameter
-// other than a template's terminal one.
+// other than a slice name's last one.
 func segmentChar(c rune) bool {
 	switch {
 	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '_', c == '-':
@@ -482,12 +481,12 @@ func segmentChar(c rune) bool {
 	return false
 }
 
-// eventsFrame encodes ["events", [ev...]] for the events of an atom that
-// are in the view, or nil when none are.
-func eventsFrame(atom []item, prefixes []string) []byte {
+// editsFrame encodes ["edits", [edit...]] for the edits of one mutation that are in the view, or
+// nil when none are.
+func editsFrame(edits []item, selectors []string) []byte {
 	var vis []item
-	for _, it := range atom {
-		if covers(prefixes, it.stream) {
+	for _, it := range edits {
+		if covers(selectors, it.slice) {
 			vis = append(vis, it)
 		}
 	}
@@ -495,7 +494,7 @@ func eventsFrame(atom []item, prefixes []string) []byte {
 		return nil
 	}
 	b := mpArrayHeader(nil, 2)
-	b = mpAppendStr(b, "events")
+	b = mpAppendStr(b, "edits")
 	b = mpArrayHeader(b, len(vis))
 	for _, it := range vis {
 		b = append(b, it.data...)
@@ -505,15 +504,15 @@ func eventsFrame(atom []item, prefixes []string) []byte {
 
 // views ////////////////////////////////////////////////////////////////////
 
-// intersect is a connection's view: every ref maySee allows that a want
-// covers, and every want that a maySee ref covers, sorted and unique.  No
-// wants means everything maySee allows.
-func intersect(maySee, wants []string) []string {
+// intersect is a connection's view: every selector the grantor allows that a want covers, and every
+// want that a granted selector covers, sorted and unique.  No wants means everything the grantor
+// allows.
+func intersect(granted, wants []string) []string {
 	if len(wants) == 0 {
 		wants = []string{"*"}
 	}
 	set := map[string]bool{}
-	for _, m := range maySee {
+	for _, m := range granted {
 		for _, w := range wants {
 			if matches(m, w) {
 				set[m] = true
@@ -523,26 +522,26 @@ func intersect(maySee, wants []string) []string {
 		}
 	}
 	view := make([]string, 0, len(set))
-	for ref := range set {
-		view = append(view, ref)
+	for selector := range set {
+		view = append(view, selector)
 	}
 	sort.Strings(view)
 	return view
 }
 
-// viewToken hashes a view: FNV-1a 64 over its refs in order, each with a
+// viewToken hashes a view: FNV-1a 64 over its selectors in order, each with a
 // terminating zero byte, as 16 hex digits.
 func viewToken(view []string) string {
 	h := fnv.New64a()
-	for _, ref := range view {
-		h.Write([]byte(ref))
+	for _, selector := range view {
+		h.Write([]byte(selector))
 		h.Write([]byte{0})
 	}
 	return fmt.Sprintf("%016x", h.Sum64())
 }
 
-// view registers the principal's maySee and returns the connection's view
-// and token.  The connection is subscribed to commits unless ephemeral.
+// view registers the principal's grant and returns the connection's view and token.  The
+// connection is subscribed to commits unless ephemeral.
 func (s *Server) view(p principal, wants []string, ephemeral bool) (*conn, result) {
 	c := &conn{
 		id:        s.nextConn.Add(1),
@@ -561,7 +560,7 @@ func (s *Server) view(p principal, wants []string, ephemeral bool) (*conn, resul
 
 	// the dispatcher computed the view before it replied
 	s.mu.Lock()
-	r.prefixes = c.prefixes
+	r.selectors = c.selectors
 	r.token = c.token
 	s.mu.Unlock()
 	return c, r
@@ -614,7 +613,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		wants = []string{"*"}
 	}
 	for _, want := range wants {
-		if !validRef(want) {
+		if !validSelector(want) {
 			http.Error(w, "malformed want", http.StatusBadRequest)
 			return
 		}
@@ -654,20 +653,21 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// the first frame, ahead of history, so reconciliation is in order with
 	// everything that follows
 	if r.URL.Query().Get("view") != view.token {
-		if !write(mpEncode([]any{"view", view.token, view.position, view.prefixes})) {
+		if !write(mpEncode([]any{"view", view.token, view.position, view.selectors})) {
 			return
 		}
 	}
-	prefixes := view.prefixes
-	// the stream delivers everything above the cursor: the client's checkpoint, or on a bootstrap
-	// the view's position, which the client takes as the bound of what its snapshots must cover
+	selectors := view.selectors
+	// the connection delivers everything above the cursor: the client's checkpoint, or on a
+	// bootstrap the view's position, which the client takes as the bound of what its snapshots
+	// must cover
 	cursor := view.position
 	if since >= 0 {
 		cursor = uint64(since)
 	}
 
-	// forwards queued view frames, updating the handler's prefix list;
-	// returns false when the connection is gone
+	// forwards queued view frames, updating the handler's selectors; returns false when the connection
+	// is gone
 	drainViews := func() bool {
 		for {
 			select {
@@ -677,7 +677,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				}
 				if f.view {
 					s.mu.Lock()
-					prefixes = append([]string(nil), c.prefixes...)
+					selectors = append([]string(nil), c.selectors...)
 					s.mu.Unlock()
 					if !write(f.data) || f.end {
 						return false
@@ -688,20 +688,20 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// the last position the client has been told of, by an events frame or a vouch
+	// the last position the client has been told of, by an edits frame or a vouch
 	told := cursor
 	replay := func(from, to uint64) bool {
-		items, err := s.core.readAtoms(from, to)
+		items, err := s.core.readLog(from, to)
 		if err != nil {
 			write(mpEncode([]any{"end", "error", err.Error()}))
 			return false
 		}
-		for _, atom := range groupAtoms(items) {
-			if f := eventsFrame(atom, prefixes); f != nil {
+		for _, edits := range groupPositions(items) {
+			if f := editsFrame(edits, selectors); f != nil {
 				if !write(f) {
 					return false
 				}
-				told = atom[len(atom)-1].position
+				told = edits[0].position
 			}
 		}
 		if len(items) > 0 {
@@ -737,7 +737,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	c.streaming = true
 	hot := s.position.Load()
-	prefixes = append([]string(nil), c.prefixes...)
+	selectors = append([]string(nil), c.selectors...)
 	s.mu.Unlock()
 	if !replay(cursor+1, hot) {
 		return
@@ -775,7 +775,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleMutations(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
@@ -794,14 +794,14 @@ func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request) {
 	// reports as Server-Timing so a client can tell it from the network's
 	start := time.Now()
 	client := s.clientOf(r)
-	limit := s.maxCommands
+	limit := s.maxMutations
 	if p.anonymous {
-		limit = s.maxAnonymousCommands
+		limit = s.maxAnonymousMutations
 	}
 	pc, err := s.core.prepare(s, r.Context(), client, body, limit)
 	if errors.Is(err, errTooMany) {
-		// the limit this request was held to, which the client splits its commands under
-		w.Header().Set("PhaseLock-Max-Commands", strconv.Itoa(limit))
+		// the limit this request was held to, which the client splits its mutations under
+		w.Header().Set("PhaseLock-Max-Mutations", strconv.Itoa(limit))
 		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -836,7 +836,7 @@ func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request) {
 		break
 	}
 
-	// the core answers for the commands that passed the check; the rest were rejected here
+	// the core answers for the mutations that passed the check; the rest were rejected here
 	var outcomes []any
 	if len(pc.offsets) > 0 {
 		var res result
@@ -860,17 +860,17 @@ func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request) {
 	w.Write(mpEncode(merged))
 }
 
-// decide submits a request's passing commands and answers their outcomes, in order.  When the
-// writer bounces the call at a proven command, because the sender's credentials changed after
-// its proof was checked, every proof from that command on is checked again against what lookup
-// answers now, and the rest of the call is submitted again, so the call's commands are still
-// decided in order.  A failure answers a result with a status, the outcomes of commands already
+// decide submits a request's passing mutations and answers their outcomes, in order.  When the
+// writer bounces the call at a proven mutation, because the sender's credentials changed after
+// its proof was checked, every proof from that mutation on is checked again against what lookup
+// answers now, and the rest of the call is submitted again, so the call's mutations are still
+// decided in order.  A failure answers a result with a status, the outcomes of mutations already
 // decided lost with it, as a lost reply's are.
 func (s *Server) decide(ctx context.Context, p principal, pc *prepared, verdicts []verdict) ([]any, result) {
 	var outcomes []any
 	first := 0
 	for attempt := 0; ; attempt++ {
-		// the call from its first undecided command
+		// the call from its first undecided mutation
 		body := pc.body[pc.offsets[first]:]
 		var vs []verdict
 		if verdicts != nil {
@@ -890,7 +890,7 @@ func (s *Server) decide(ctx context.Context, p principal, pc *prepared, verdicts
 			return outcomes, res
 		}
 
-		// the command after the outcomes bounced: check its proofs, and every later one, again
+		// the mutation after the outcomes bounced: check its proofs, and every later one, again
 		first += len(outs)
 		again, err := s.prove(ctx, "", res.hash, pc.proofs[first:], false)
 		if err != nil {
@@ -900,10 +900,19 @@ func (s *Server) decide(ctx context.Context, p principal, pc *prepared, verdicts
 	}
 }
 
+// handleSnapshot serves a blob of the selector, cut at one position.  A snapshot response is
+// either the blob inline or a text/plain pointer to it in a blob store: this server answers
+// inline, and a deployment backed by a blob store answers with a pointer.  Either way the origin's
+// response carries PhaseLock-Position and PhaseLock-Epoch, because a resumed download reads the
+// blob with a Range from its resume offset, so it never sees the blob's own header and learns the
+// cut's position and epoch only from the origin's response; and because a blob store owes only
+// the bytes, never PhaseLock headers.  The pointer is a 200 with a body rather than a 3xx redirect
+// because many HTTP clients follow redirects themselves and expose only the final response's
+// headers, which would lose the origin's.
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
-	ref := strings.TrimPrefix(r.URL.Path, "/snapshot/")
-	if !validRef(ref) {
-		http.Error(w, "malformed ref", http.StatusBadRequest)
+	selector := strings.TrimPrefix(r.URL.Path, "/snapshot/")
+	if !validSelector(selector) {
+		http.Error(w, "malformed selector", http.StatusBadRequest)
 		return
 	}
 	p, err := s.principalOf(r)
@@ -917,11 +926,11 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.drop(c)
-	if !covers(view.prefixes, ref) {
-		http.Error(w, "ref not visible", http.StatusForbidden)
+	if !covers(view.selectors, selector) {
+		http.Error(w, "selector not visible", http.StatusForbidden)
 		return
 	}
-	blob, position, err := s.core.snapshot(ref)
+	blob, position, err := s.core.snapshot(selector)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -930,36 +939,38 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(blob)))
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("PhaseLock-Position", fmt.Sprint(position))
+	w.Header().Set("PhaseLock-Epoch", s.epoch)
 	w.Write(blob)
 }
 
-// covers reports whether the view's refs grant the whole ref.
-func covers(prefixes []string, ref string) bool {
-	for _, prefix := range prefixes {
-		if matches(ref, prefix) {
+// covers reports whether the view's selectors grant the whole selector.
+func covers(selectors []string, selector string) bool {
+	for _, r := range selectors {
+		if matches(selector, r) {
 			return true
 		}
 	}
 	return false
 }
 
-// handleEvents serves a ref's events with after < position < before, for
-// a client tailing a snapshot.  The ref is the path after /events/: a
-// stream, a wildcard, or "*"; the view must cover all of it.  Either bound may be omitted: no after is the start of
-// the log, no before is the head.  The PhaseLock-Scanned header is the
-// client's next bound, to be used as-is: the last position delivered when
-// the page was full, the far bound when the range is exhausted, and the
-// last position delivered (or after itself) when the far bound is the
-// head, so that clients at the head ask for the same page.
-func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+// handleEdits serves a selector's edits with after < position < before, for a client tailing a
+// snapshot, one edits frame per position.  The selector is the path after /edits/: a slice, a
+// prefix selector, or "*"; the view must cover all of it.  Either bound may be omitted: no after
+// is the start of the log, no before is the head.  A page holds max edits and the rest of the last
+// one's position, since it never splits a mutation's edits, or fewer when the range runs out.  The
+// PhaseLock-Scanned header is the client's next bound, to be used as-is: the last position
+// delivered when the page was full, the far bound when the range is exhausted, and the last
+// position delivered (or after itself) when the far bound is the head, so that clients at the
+// head ask for the same page.
+func (s *Server) handleEdits(w http.ResponseWriter, r *http.Request) {
 	p, err := s.principalOf(r)
 	if err != nil {
 		s.unauthorized(w, err)
 		return
 	}
-	ref := strings.TrimPrefix(r.URL.Path, "/events/")
-	if !validRef(ref) {
-		http.Error(w, "malformed ref", http.StatusBadRequest)
+	selector := strings.TrimPrefix(r.URL.Path, "/edits/")
+	if !validSelector(selector) {
+		http.Error(w, "malformed selector", http.StatusBadRequest)
 		return
 	}
 	q := r.URL.Query()
@@ -977,14 +988,14 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reverse := q.Get("reverse") == "true"
-	limit := eventsPage
+	limit := editsPage
 	if m := q.Get("max"); m != "" {
 		n, err := strconv.Atoi(m)
 		if err != nil || n < 1 {
 			http.Error(w, "max must be a positive integer", http.StatusBadRequest)
 			return
 		}
-		limit = min(n, eventsPage)
+		limit = min(n, editsPage)
 	}
 	c, view := s.view(p, nil, true)
 	if view.status != 0 {
@@ -992,29 +1003,30 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.drop(c)
-	if !covers(view.prefixes, ref) {
-		http.Error(w, "ref not visible", http.StatusForbidden)
+	if !covers(view.selectors, selector) {
+		http.Error(w, "selector not visible", http.StatusForbidden)
 		return
 	}
-	items, err := s.core.readEvents(ref, after, before, reverse, limit)
+	items, err := s.core.readEdits(selector, after, before, reverse, limit)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	mutations := groupPositions(items)
 	scanned := before
 	if reverse {
 		scanned = after
 	} else if toHead {
 		scanned = after
 	}
-	if len(items) == limit || (toHead && !reverse && len(items) > 0) {
+	if len(items) >= limit || (toHead && !reverse && len(items) > 0) {
 		scanned = items[len(items)-1].position
 	}
 	w.Header().Set("Content-Type", "application/msgpack")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("PhaseLock-Scanned", strconv.FormatUint(scanned, 10))
-	for _, atom := range groupAtoms(items) {
-		w.Write(eventsFrame(atom, []string{"*"}))
+	for _, edits := range mutations {
+		w.Write(editsFrame(edits, []string{"*"}))
 	}
 }
 

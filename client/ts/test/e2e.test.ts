@@ -8,7 +8,8 @@ import { join } from 'node:path';
 import { decode, encode } from '@msgpack/msgpack';
 import { HTTPTransport } from '../src/http.js';
 import { AuthError, restoreSession, type Session } from '../src/session.js';
-import type { Backfill, Command, Connection, ConnectionHooks } from '../src/contract.js';
+import type { Backfill, Connection, ConnectionHooks, Mutation } from '../src/contract.js';
+import { editOps } from '../src/edits.js';
 
 const db = join(import.meta.dirname, '..', '..', '..', 'db');
 
@@ -16,14 +17,14 @@ const db = join(import.meta.dirname, '..', '..', '..', 'db');
 const quiet: ConnectionHooks = {
   onOpen() {},
   onView() {},
-  onEvents() {},
+  onEdits() {},
   onLive() {},
   onVouch() {},
   onEnd() {},
 };
 
-// a command in one session, its id a uuid made from its name
-function cmd(name: string, n: number, data: unknown): Command<Uint8Array> {
+// a mutation in one series, its id a uuid made from its name
+function mut(name: string, n: number, data: unknown): Mutation<Uint8Array> {
   const id = `00000000-0000-0000-0000-${name.padStart(12, '0')}`;
   return { id, series: 'e2e', n, data: encode(data) };
 }
@@ -72,7 +73,7 @@ describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
 
   async function run(
     conn: Connection,
-    ref: string,
+    selector: string,
     until: number,
     resume: Backfill['resume'] = null,
     signal = new AbortController().signal,
@@ -81,26 +82,30 @@ describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
       header: null as null | { position: number; seqs: Record<string, number> },
       values: [] as [string, Uint8Array][],
       skips: [] as number[],
+      checksums: [] as string[],
       tails: [] as [number, string, number][][],
     };
     const outcome = await conn.backfill({
-      ref,
+      selector,
       until,
       resume,
       signal,
       push: async (item) => {
-        if ('header' in item) got.header = item.header;
-        else if ('values' in item) {
-          got.values.push(...item.values);
+        if ('header' in item) {
+          got.header = item.header;
+        } else if ('page' in item) {
+          for (const [key, value] of editOps(item.page, false)) got.values.push([key, value!]);
           got.skips.push(item.skip);
-        } else if ('events' in item)
-          got.tails.push(item.events.map((e) => [e.position, e.stream, e.seq]));
+          got.checksums.push(item.checksum);
+        } else if ('edits' in item) {
+          got.tails.push(item.edits.map((e) => [e.position, e.slice, e.seq]));
+        }
       },
     });
     return { outcome, ...got };
   }
 
-  test('stream, commands, list, backfills, resume, stale, and one end', async () => {
+  test('stream, mutations, backfills, resume, stale, and one end', async () => {
     const log: unknown[][] = [];
     let ended = 0;
     let live: number | null = null;
@@ -116,12 +121,12 @@ describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
         onOpen: (e) => {
           epoch = e;
         },
-        onView: (t, position, refs) => {
+        onView: (t, position, selectors) => {
           viewToken = t;
-          log.push(['view', t.length > 0, position, refs]);
+          log.push(['view', t.length > 0, position, selectors]);
         },
-        onEvents: (evs) =>
-          log.push(['events', evs.map((e) => [e.position, e.stream, e.seq, decode(e.data)])]),
+        onEdits: (edits) =>
+          log.push(['edits', edits.map((e) => [e.position, e.slice, e.seq, e.lifecycle])]),
         onLive: (p) => {
           live = p;
         },
@@ -138,33 +143,30 @@ describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
     expect(live).toBe(0);
     expect(epoch).toMatch(/^[0-9a-f]{32}$/);
 
-    // commands: ok, ok, ok for a resend that is not run again, a structural reject
-    const res = await conn.sendCommands([
-      cmd('c1', 1, { type: 'add-patron', id: 'p1', name: 'Ann' }),
-      cmd('c2', 2, { type: 'add-patron', id: 'p2', name: 'Bob' }),
-      cmd('c1', 1, { type: 'add-patron', id: 'p1', name: 'Ann' }),
-      cmd('c3', 3, { type: 'nope' }),
+    // mutations: ok, ok, ok for a resend that is not run again, a structural reject
+    const res = await conn.sendMutations([
+      mut('c1', 1, { type: 'add-patron', id: 'p1', name: 'Ann' }),
+      mut('c2', 2, { type: 'add-patron', id: 'p2', name: 'Bob' }),
+      mut('c1', 1, { type: 'add-patron', id: 'p1', name: 'Ann' }),
+      mut('c3', 3, { type: 'nope' }),
     ]);
     expect(res.map((r) => r.kind)).toEqual(['ok', 'ok', 'ok', 'reject']);
-    const rename = await conn.sendCommands([
-      cmd('c4', 4, { type: 'rename-patron', id: 'p1', name: 'Anne' }),
+    const rename = await conn.sendMutations([
+      mut('c4', 4, { type: 'rename-patron', id: 'p1', name: 'Anne' }),
     ]);
     expect(rename[0].kind).toBe('ok');
     const cursor = (rename[0] as { position: number }).position;
 
     await new Promise((r) => setTimeout(r, 300));
     const delivered = log
-      .filter((l) => l[0] === 'events')
-      .flatMap((l) => l[1] as [number, string, number, unknown][]);
-    expect(delivered.map((e) => [e[1], e[2]])).toEqual([
-      ['patron:p1', 1],
-      ['patron:p1', 2],
-      ['patron:p2', 1],
-      ['patron:p2', 2],
-      ['patron:p1', 3],
+      .filter((l) => l[0] === 'edits')
+      .flatMap((l) => l[1] as [number, string, number, string][]);
+    expect(delivered.map((e) => [e[1], e[2], e[3]])).toEqual([
+      ['patron:p1', 1, 'birth'],
+      ['patron:p2', 1, 'birth'],
+      ['patron:p1', 2, 'normal'],
     ]);
     expect(delivered.at(-1)![0]).toBe(cursor);
-    expect((delivered[0][3] as { $sys: string }).$sys).toBe('birth');
 
     // a reconnect presenting the current token gets no view frame at all
     const again: unknown[][] = [];
@@ -176,8 +178,9 @@ describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
       ctl2.signal,
       {
         onOpen() {},
-        onView: (t, position, refs) => again.push(['view', t === viewToken, position, refs]),
-        onEvents() {},
+        onView: (t, position, selectors) =>
+          again.push(['view', t === viewToken, position, selectors]),
+        onEdits() {},
         onLive: (p) => again.push(['live', p]),
         onVouch() {},
         onEnd() {},
@@ -188,10 +191,10 @@ describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
     expect(again).toEqual([['live', cursor]]);
     ctl2.abort();
 
-    // a family backfill: header, values, an empty tail (the live cut is at the cursor)
+    // a family backfill: header, pages, an empty tail (the live cut is at the cursor)
     const fam = await run(conn, 'patron:*', cursor);
     expect(fam.outcome).toBe('done');
-    expect(fam.header).toEqual({ position: cursor, seqs: { 'patron:p1': 3, 'patron:p2': 2 } });
+    expect(fam.header).toEqual({ position: cursor, seqs: { 'patron:p1': 2, 'patron:p2': 1 } });
     expect(fam.values.map(([k]) => k)).toEqual([
       'patron:p1!holds',
       'patron:p1!messages',
@@ -203,12 +206,13 @@ describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
     expect((decode(fam.values[2][1]) as { name: string }).name).toBe('Anne');
     expect(fam.tails).toEqual([]);
 
-    // an exact ref, and a resume whose position still matches (nothing written since)
+    // an exact selector, and a resume whose position still matches (nothing written since)
     const p1 = await run(conn, 'patron:p1', cursor);
-    expect(p1.header!.seqs).toEqual({ 'patron:p1': 3 });
+    expect(p1.header!.seqs).toEqual({ 'patron:p1': 2 });
     const back = await run(conn, 'patron:p1', cursor, {
       position: cursor,
       skipBytes: p1.skips[0],
+      checksum: p1.checksums[0],
       fromPosition: cursor,
       snapshotDone: false,
       tailDone: false,
@@ -218,10 +222,11 @@ describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
     expect(back.values).toEqual([]);
 
     // stale: the position no longer matches after a write
-    await conn.sendCommands([cmd('c5', 5, { type: 'rename-patron', id: 'p2', name: 'Rob' })]);
+    await conn.sendMutations([mut('c5', 5, { type: 'rename-patron', id: 'p2', name: 'Rob' })]);
     const stale = await run(conn, 'patron:p1', cursor, {
       position: cursor,
       skipBytes: 30,
+      checksum: '',
       fromPosition: cursor,
       snapshotDone: false,
       tailDone: false,
@@ -275,7 +280,7 @@ describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
     expect(forged.ended).toBe(true);
 
     // an ended session fails a post at once, without sending
-    await expect(transport.post([cmd('c9', 9, { type: 'nope' })], forged)).rejects.toThrow(
+    await expect(transport.post([mut('c9', 9, { type: 'nope' })], forged)).rejects.toThrow(
       AuthError,
     );
     ctl.abort();

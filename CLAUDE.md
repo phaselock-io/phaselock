@@ -1,8 +1,48 @@
 # PhaseLock — repo guide
 
-PhaseLock is an event-sourcing sync engine: events live in the
-PhaseLock database (`db/`), TypeScript reducers derive state in the
-browser, in Node, and in the database, and live queries serve it.
+## What PhaseLock is
+
+PhaseLock is a sync engine.  An app changes data by sending
+**mutations**.  For each kind of mutation the app writes a **decider**,
+which runs in the database inside a serialized read-write transaction,
+may read any data, and either rejects the mutation or carries it out by
+editing keys directly.  It may also write a **predictor**, which runs
+the same logic on the client against local data, so the UI updates
+instantly and keeps working offline.  A decider is usually an
+authorization check plus a call to the predictor.
+
+Data is cut into **slices**: a slice is the set of keys under one
+prefix (`patron:acme,bob`), and a **slice type** is its declaration
+(`patron:{room},{patron}`).  A client holds a slice completely or not
+at all.  A **grantor** decides which slices each user may see.
+
+The database captures a decider's writes as **edits**, records them in
+the **edit log**, and distributes them to the clients holding the
+affected slices, whose sync engine **applies** them.  None of that is
+user code.  An edit is one mutation's writes to one slice; a mutation's
+edits commit together even when they span slices, and a client holding
+only some of those slices receives its part atomically.  Deleting a
+slice is itself an edit that a decider makes.
+
+Because the sync engine applies edits generically, every client, old
+builds included, holds the same state: state a buggy decider broke is
+fixed on the server and reaches installed clients without an update, and
+evolving an app concerns only the contract between state and queries.
+
+Naming:
+
+- A function is named with the plain verb: `grant`, `predict`,
+  `decide`.  Its type takes the agent noun: `Grantor`, `Predictor`,
+  `Decider`.  Prose uses the agent noun for the user's function ("the
+  decider rejects it").  US spelling: predictor, grantor.
+- Predictors and deciders exist per mutation, so a model has a table of
+  each, keyed by mutation.
+- Mutation and edit are plain nouns.  "Mutation" names both a declared
+  kind (`TryHold`) and an instance a client sends; there is no
+  "mutator".
+
+## Orientation
+
 Positioning and concepts: README.md. Status and planned work:
 ROADMAP.md.
 
@@ -12,12 +52,12 @@ Two kinds of work happen here; orient first:
   follow the `phaselock` skill at `agents/skills/phaselock/SKILL.md` and
   its reference files. That skill is the product documentation for
   agents; it also ships to end users, so keep it repo-agnostic when
-  editing it. The skill still describes the KurrentDB-shaped API and
-  needs its own rewrite. The PhaseLockDB-shaped API was more than half a
-  rewrite and assumes synchronous stores, which rules out IndexedDB and
-  implies OPFS with SQLite or a custom KV store in the browser. Until
-  the skill catches up, the current contract is the skeleton
-  (`typespec/ts/assets/skeleton.ts`) and `client/ts`.
+  editing it. The skill still describes the KurrentDB-shaped API, and
+  events and reducers, and needs its own rewrite. The PhaseLockDB-shaped
+  API was more than half a rewrite and assumes synchronous stores, which
+  rules out IndexedDB and implies OPFS with SQLite or a custom KV store
+  in the browser. Until the skill catches up, the current contract is
+  the skeleton (`typespec/ts/assets/skeleton.ts`) and `client/ts`.
 - **Changing PhaseLock itself** (`typespec/` — the TypeSpec vocabulary,
   the emitter, and its runtime skeleton): read `typespec/CLAUDE.md` for
   settled design decisions before touching anything there.
@@ -32,7 +72,7 @@ typespec/         The product: TypeSpec vocabulary (core/), the
 examples/
   todo-basic/     Smallest loop: browser engines + the v0 database (db/).
   library/        Full architecture on the v0 database: signed-in patrons
-                  and librarians, per-audience views, forecasts, and a
+                  and librarians, per-audience views, predictions, and a
                   cron daily sheet, hosted as a demo with a room per
                   visitor.
 client/ts/        @phaselock/client: the JS host's transport over HTTP
@@ -112,8 +152,8 @@ An example's `pnpm gen` regenerates every time it runs, so after work on
 
 - Generated files (`*.gen.ts`) are never hand-edited; change the `.tsp`
   or the emitter and regenerate.
-- A model package (the `.tsp`, its generated code, its reducers, and its
-  database's bundle source) depends on no host library: not
+- A model package (the `.tsp`, its generated code, its predictors and
+  deciders, and its database's bundle source) depends on no host library: not
   `@phaselock/client`, nor whatever runtime a client or the database
   brings, since one model serves every client app and the database.
   `@phaselock/plugins` is allowed, for the bundle source's plugin

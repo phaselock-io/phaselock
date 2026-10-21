@@ -1,4 +1,4 @@
-// Auth and Reject, which precommit handlers use to authorize and to reject
+// Auth and Reject, which deciders handlers use to authorize and to reject
 
 import { describe, expect, test } from 'vitest';
 

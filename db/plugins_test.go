@@ -7,80 +7,72 @@ import (
 	"time"
 )
 
-// reasons are the reasons of a patron's hold-failed events after a position, in log order.
-func (h *harness) reasons(token, patron string, after int64) []string {
+// messages are a patron's messages, which the notice plugin's requests and the cron hook add to.
+func (h *harness) messages(patron string) []string {
 	h.t.Helper()
-	evs, _, status := h.eventsRange(token, "patron:"+patron, after, -1, false, 0)
-	if status != 200 {
-		h.t.Fatalf("events: status %d", status)
+	v := h.snapshot(h.admin(), "patron:"+patron).records["patron:"+patron+"!messages"]
+	if v == nil {
+		return nil
 	}
-	var out []string
-	for _, ev := range evs {
-		if ev.data["type"] == "hold-failed" {
-			out = append(out, ev.data["reason"].(string))
-		}
-	}
-	return out
+	return strs(v)
 }
 
-func TestPluginRequestsLandInTheCommandsAtom(t *testing.T) {
+func TestPluginRequestsLandInTheMutationsEdit(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	before := h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
+	before := h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
 
-	// the requests in call order, then the handler's own output, all in one atom
-	at := h.accept(admin, cmd("c2", "notify", "patron", "p1", "reasons", []any{"first", "second"}))
-	if got := h.reasons(admin, "p1", before); strings.Join(got, ",") != "first,second,own" {
-		t.Fatalf("the atom's reasons: %v", got)
+	// the requests in call order, then the decider's own write, all in one edit of the mutation
+	h.accept(admin, mut("c2", "notify", "patron", "p1", "reasons", []any{"first", "second"}))
+	if got := h.messages("p1"); strings.Join(got, ",") != "first,second,own" {
+		t.Fatalf("the mutation's messages: %v", got)
 	}
-	evs, _, _ := h.eventsRange(admin, "patron:p1", before, -1, false, 0)
-	for _, ev := range evs {
-		if ev.commandid != "c2" {
-			t.Fatalf("an event of the atom carries command %q", ev.commandid)
-		}
+	evs, _, _ := h.editsRange(admin, "patron:p1", before, -1, false, 0)
+	if len(evs) != 1 || evs[0].mutation != "c2" {
+		t.Fatalf("the mutation's edits: %+v", evs)
 	}
 
-	// a command rejected after its requests leaves none of them
-	outs := h.commands(admin,
-		cmd("c3", "notify", "patron", "p1", "reasons", []any{"dropped"}, "reject", true),
-		cmd("c4", "notify", "patron", "p1", "reasons", []any{"after"}),
+	// a mutation rejected after its requests leaves none of them
+	outs := h.mutations(admin,
+		mut("c3", "notify", "patron", "p1", "reasons", []any{"dropped"}, "reject", true),
+		mut("c4", "notify", "patron", "p1", "reasons", []any{"after"}),
 	)
 	if outs[0].kind != "reject" || outs[0].reason != "rejected after its requests" {
 		t.Fatalf("expected the rejection, got %+v", outs[0])
 	}
 	if outs[1].kind != "ok" {
-		t.Fatalf("expected the next command to land, got %+v", outs[1])
+		t.Fatalf("expected the next mutation to land, got %+v", outs[1])
 	}
-	if got := h.reasons(admin, "p1", at); strings.Join(got, ",") != "after,own" {
-		t.Fatalf("the reasons after a rejection: %v", got)
+	if got := h.messages("p1"); strings.Join(got, ",") != "first,second,own,after,own" {
+		t.Fatalf("the messages after a rejection: %v", got)
 	}
 }
 
-func TestAMaySeeThatMakesAPluginRequestIsABug(t *testing.T) {
+func TestAGrantThatWritesIsABug(t *testing.T) {
 	h := start(t)
 	status, _, body := h.do("GET", "/stream?since=-1", h.token("requester"), nil)
-	if status != 500 || !strings.Contains(string(body), "maySee made a plugin request") {
-		t.Fatalf("a stream under a requesting maySee: %d %s", status, body)
+	if status != 500 || !strings.Contains(string(body), "this call reads only, and made a write") {
+		t.Fatalf("a connection under a writing grant: %d %s", status, body)
 	}
 
-	// the request it made reached no command's atom
+	// the write it made reached no mutation's edit
 	admin := h.admin()
-	before := h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
-	h.accept(admin, cmd("c2", "notify", "patron", "p1", "reasons", []any{"only"}))
-	if got := h.reasons(admin, "p1", before); strings.Join(got, ",") != "only,own" {
-		t.Fatalf("the reasons of the next command: %v", got)
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "notify", "patron", "p1", "reasons", []any{"only"}))
+	if got := h.messages("p1"); strings.Join(got, ",") != "only,own" {
+		t.Fatalf("the messages of the next mutation: %v", got)
 	}
 }
 
 func TestTheBundleHasCryptoRandomness(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	before := h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
-	h.accept(admin, cmd("c2", "notify", "patron", "p1", "reasons", []any{"uuid", "uuid"}))
-	got := h.reasons(admin, "p1", before)
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "notify", "patron", "p1", "reasons", []any{"uuid", "uuid"}))
+	got := h.messages("p1")
 	v4 := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 	if len(got) != 3 || !v4.MatchString(got[0]) || !v4.MatchString(got[1]) || got[0] == got[1] {
-		t.Fatalf("two fresh version 4 uuids, then the handler's own: %v", got)
+		t.Fatalf("two fresh version 4 uuids, then the decider's own: %v", got)
 	}
 }
 
@@ -104,35 +96,38 @@ func (h *harness) tick(name string, slot time.Time) {
 	}
 }
 
-func TestACronTickRunsItsHookAsOneAtom(t *testing.T) {
+func TestACronTickRunsItsHookAsOneMutation(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	before := h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
+	before := h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
 	slot := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 	h.tick("reap", slot)
 
-	// the request the hook made, then what it returned, one atom under a label of its own
-	evs, _, _ := h.eventsRange(admin, "patron:p1", before, -1, false, 0)
-	if len(evs) != 2 || evs[0].data["reason"] != "requested 2030-01-01T00:00:00.000Z" ||
-		evs[0].commandid != evs[1].commandid || evs[0].commandid == "" {
-		t.Fatalf("the tick's atom: %+v", evs)
+	// the request the hook made, then its own write, one edit under a label of its own
+	evs, _, _ := h.editsRange(admin, "patron:p1", before, -1, false, 0)
+	if len(evs) != 1 || len(evs[0].id) != 16 || evs[0].mutation == "c1" {
+		t.Fatalf("the tick's edit: %+v", evs)
 	}
-	reason := strings.Fields(evs[1].data["reason"].(string))
+	got := h.messages("p1")
+	if len(got) != 2 || got[0] != "requested 2030-01-01T00:00:00.000Z" {
+		t.Fatalf("the tick's messages: %v", got)
+	}
+	reason := strings.Fields(got[1])
 	if len(reason) != 3 || reason[0] != "reap" || reason[1] != "2030-01-01T00:00:00.000Z" {
-		t.Fatalf("the tick's own output: %v", reason)
+		t.Fatalf("the tick's own write: %v", reason)
 	}
-	if now, err := time.Parse(time.RFC3339, reason[2]); err != nil || !now.Equal(evs[1].servertime) {
-		t.Fatalf("the tick's now, against its atom's server time %v: %v", evs[1].servertime, reason[2])
+	if now, err := time.Parse(time.RFC3339, reason[2]); err != nil || !now.Equal(evs[0].servertime) {
+		t.Fatalf("the tick's now, against its edit's server time %v: %v", evs[0].servertime, reason[2])
 	}
 
 	// a slot at or below the mark was decided already, and a later one runs
 	h.tick("reap", slot)
 	h.tick("reap", slot.Add(-time.Hour))
-	if got := h.reasons(admin, "p1", before); len(got) != 2 {
+	if got := h.messages("p1"); len(got) != 2 {
 		t.Fatalf("a refired slot ran: %v", got)
 	}
 	h.tick("reap", slot.Add(time.Minute))
-	if got := h.reasons(admin, "p1", before); len(got) != 4 {
+	if got := h.messages("p1"); len(got) != 4 {
 		t.Fatalf("the next slot did not run: %v", got)
 	}
 }
@@ -140,7 +135,7 @@ func TestACronTickRunsItsHookAsOneAtom(t *testing.T) {
 func TestACronHookThatThrowsLeavesNothingButItsMark(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	before := h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
+	before := h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
 	slot := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 	r := h.srv.tick(h.entry("broken"), slot)
 	if r.status != 500 || !strings.Contains(r.errmsg, "the broken entry") {
@@ -149,8 +144,8 @@ func TestACronHookThatThrowsLeavesNothingButItsMark(t *testing.T) {
 
 	// the slot was decided, so it does not run again, and the log moved on without it
 	h.tick("broken", slot)
-	if at := h.accept(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Bea")); at != before+1 {
-		t.Fatalf("the next command landed at %d after %d", at, before)
+	if at := h.accept(admin, mut("c2", "rename-patron", "id", "p1", "name", "Bea")); at != before+1 {
+		t.Fatalf("the next mutation landed at %d after %d", at, before)
 	}
 }
 
@@ -173,7 +168,7 @@ func TestCronEntriesAreArmedOnceAtStartup(t *testing.T) {
 
 	// a restart keeps every mark, and the slot a tick decided stays decided
 	admin := h.admin()
-	before := h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
 	slot := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 	h.tick("reap", slot)
 	h.stop()
@@ -183,7 +178,7 @@ func TestCronEntriesAreArmedOnceAtStartup(t *testing.T) {
 		t.Fatalf("the marks after a restart: %v, from %v", again, marks)
 	}
 	h.tick("reap", slot)
-	if got := h.reasons(h.admin(), "p1", before); len(got) != 2 {
+	if got := h.messages("p1"); len(got) != 2 {
 		t.Fatalf("a decided slot ran again after a restart: %v", got)
 	}
 }

@@ -19,9 +19,9 @@ func main() {
 	devAuth := flag.Bool("dev-auth", false, "sign in as any existing account with no credential at /auth/token")
 	clientIPHeader := flag.String("client-ip-header", "", "the header a proxy sets to the client's address, "+
 		"such as CF-Connecting-IP; set only when nothing but the proxy can reach the listen address")
-	maxCommands := flag.Int("max-commands", 128, "the most commands one request may carry")
-	maxAnonymousCommands := flag.Int("max-anonymous-commands", 8,
-		"the most commands one request without a session may carry")
+	maxMutations := flag.Int("max-mutations", 128, "the most mutations one request may carry")
+	maxAnonymousMutations := flag.Int("max-anonymous-mutations", 8,
+		"the most mutations one request without a session may carry")
 	pathPrefix := flag.String("path-prefix", "/phaselock", "the path every route is under, so an "+
 		"origin shared with an app routes one prefix to the database; \"\" for the root")
 	tlsCert := flag.String("tls-cert", "", "serve HTTPS with the certificate in this PEM file, "+
@@ -57,7 +57,7 @@ func main() {
 	defer stop()
 
 	srv, err := Open(ctx, Options{DataDir: *data, Bundle: *bundle, DevAuth: *devAuth, BootstrapEnv: bootstrapEnv,
-		ClientIPHeader: *clientIPHeader, MaxCommands: *maxCommands, MaxAnonymousCommands: *maxAnonymousCommands,
+		ClientIPHeader: *clientIPHeader, MaxMutations: *maxMutations, MaxAnonymousMutations: *maxAnonymousMutations,
 		PathPrefix: *pathPrefix})
 	if err != nil {
 		log.Fatal(err)

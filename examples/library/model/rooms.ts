@@ -1,6 +1,6 @@
 /* Room stuff, for hosting the demo with many rooms in one database.  Every visitor gets a room of
    their own, a private copy of the library seeded with the demo's data, and shares it by sharing
-   its link.  A room lives for an hour from its creation; then the reaper erases every stream of
+   its link.  A room lives for an hour from its creation; then the reaper erases every slice of
    the room, and the next CreateRoom for its id seeds it afresh.
 
    A user id is `<room>.<id>`, two uuids joined by a dot, which is no separator of the key
@@ -9,12 +9,7 @@
 
 import type { Tick } from '@phaselock/plugins';
 
-import type {
-  LibraryDBOutput,
-  LibraryDBTxn,
-  RoomRegistrySliceReducers,
-  RoomSliceReducers,
-} from './model.gen';
+import type { LibraryDBTxn } from './model.gen';
 
 /** how long a room lives from its creation, before the reaper erases it */
 export const ROOM_LIFETIME_MS = 60 * 60 * 1000;
@@ -40,37 +35,30 @@ export function parseIdentity(identity: string): { room: string; login: string }
   return parts.length === 2 ? { room: parts[0], login: parts[1] } : null;
 }
 
-/** the room's own record, which every Engine in the room syncs */
-export const roomReducers: RoomSliceReducers = {
-  roomCreated: (txn, e) => {
-    txn.set.room_created(e.created);
-  },
-};
+/** A room is created: the registry records it, and so does the room's own record, which every
+    Engine in the room syncs. */
+export function recordRoom(txn: LibraryDBTxn, room: string, created: Date): void {
+  txn.set.room(room, created);
+  txn.set.room_created(room, created);
+}
 
-/** every room, which the database keeps to know which rooms to reap */
-export const roomRegistryReducers: RoomRegistrySliceReducers = {
-  roomCreated: (txn, e) => {
-    txn.set.room(e.room, e.created);
-  },
-  roomDeleted: (txn, e) => {
-    txn.del.room(e.room);
-  },
-};
-
-/** The reaper, a cron hook: every room an hour old ends, each of its streams with its history
-    erased, so its disk comes back.  A death of a stream that never lived writes nothing. */
-export function reapRooms(txn: LibraryDBTxn, tick: Tick): LibraryDBOutput[] {
-  const out: LibraryDBOutput[] = [];
-  for (const [{ room }, created] of txn.scan.room()) {
+/** The reaper, a cron hook: every room an hour old ends, each of its slices deleted with its
+    history erased, so its disk comes back.  Deleting a slice that never lived writes nothing. */
+export function reapRooms(txn: LibraryDBTxn, tick: Tick): void {
+  // the rooms, gathered before the registry forgets any of them
+  const rooms = [...txn.scan.room()];
+  for (const [{ room }, created] of rooms) {
     if (tick.now.getTime() - created.getTime() < ROOM_LIFETIME_MS) continue;
 
-    // the room's single streams, and each of its patrons'
-    const streams = [`book:${room}`, `admin:${room}`, `login:${room}`, `room:${room}`];
-    for (const { patron } of txn.scan.patron({ room }, { keys: true })) {
-      streams.push(`patron:${room},${patron}`);
-    }
-    for (const stream of streams) out.push({ stream, death: true, erase: true });
-    out.push({ stream: 'rooms', event: { type: 'room-deleted', room } });
+    // each of the room's patrons, gathered before their slices go
+    const patrons = [...txn.scan.patron({ room }, { keys: true })];
+    for (const { patron } of patrons) txn.deleteSlice.patron(room, patron, { erase: true });
+
+    // the room's single slices, and its place in the registry
+    txn.deleteSlice.book(room, { erase: true });
+    txn.deleteSlice.admin(room, { erase: true });
+    txn.deleteSlice.login(room, { erase: true });
+    txn.deleteSlice.room(room, { erase: true });
+    txn.del.room(room);
   }
-  return out;
 }

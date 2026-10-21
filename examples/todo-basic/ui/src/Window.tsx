@@ -1,4 +1,4 @@
-import type { TodoEngine, TodoEngineQueryTxn, TodoEvents } from '@todo-basic/model/ui';
+import type { TodoEngine, TodoEngineQueryTxn, TodoMutations } from '@todo-basic/model/ui';
 import { Badge, Card, Flex, Spin, Typography } from 'antd';
 
 import ListView, { InlineAdd, ListData } from './ListView';
@@ -34,8 +34,8 @@ export default function Window({ name, eng }: { name: string; eng: TodoEngine })
   const lists = useLocalQuery(eng, listsQuery);
   const connState = useLocalQuery(eng, connectionQuery) ?? 'connecting';
 
-  function send(command: TodoEvents) {
-    eng.sendCommand(command);
+  function send(mutation: TodoMutations) {
+    eng.sendMutation(mutation);
   }
 
   function addList(listName: string) {

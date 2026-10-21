@@ -1,10 +1,8 @@
-/* Stream names and keys against their slice's templates.  A template is a name, then, if it has
-   parameters, ":{param}" and ",{param}" for each further one: "chat:{org},{channel}",
-   "post:{id}", "meta".  A parameter the template ends with is terminal and holds the rest of the
-   string; every other parameter is a segment, a non-empty run of A-Z a-z 0-9 _ -.  A stream
-   name's terminal parameter is non-empty and may also hold '.' and '~'; a local key's may hold
-   anything a key may, the empty string included.  No key holds a control character
-   (U+0000-001F, U+007F-009F) or a lone surrogate. */
+/* Slice names and the characters of a key.  A slice name is a family, then, if it has parameters,
+   ':' and their values separated by ',': "chat:acme,general", "post:p1", "meta".  The family and
+   every value but the last is a segment, a non-empty run of A-Z a-z 0-9 _ -, and the last value
+   is non-empty and may also hold . and ~.  No key holds a control character (U+0000-001F,
+   U+007F-009F) or a lone surrogate. */
 
 #include "internal.h"
 
@@ -21,70 +19,40 @@ static bool segment_char(char c) {
     }
 }
 
-/* what a string fills a template as */
-typedef enum { AS_STREAM, AS_KEY, AS_PREFIX } fill_as;
+/* the end of the segment s begins with, or NULL when s does not begin with one */
+static const char *segment_end(const char *s) {
+    const char *p = s;
+    while (segment_char(*p)) p++;
+    return p == s ? NULL : p;
+}
 
-/* Whether s fills tpl: the template's literal text exactly, and a value per parameter.  As a
-   prefix, s fills tpl when it ends at the separator before a parameter, every parameter before
-   it filled, so "chat:" and "chat:acme," are prefixes of "chat:{org},{channel}" and "chat:ac"
-   and "chat:acme,general" are not. */
-static bool fills(const char *tpl, const char *s, fill_as as) {
-    while (*tpl) {
-        // a prefix may end at the separator before any parameter
-        if (as == AS_PREFIX && !*s && tpl[0] == '{') return true;
+bool slice_name_ok(const char *name) {
+    // the family, then its parameters or the end
+    const char *p = segment_end(name);
+    if (!p || (*p && *p != ':')) return false;
 
-        // literal text matches itself
-        if (*tpl != '{') {
-            if (*s != *tpl) return false;
-            s++, tpl++;
-            continue;
-        }
-
-        // a parameter: skip its name
-        tpl = strchr(tpl, '}');
-        if (!tpl) return false;
-        tpl++;
-
-        // if the parameter is terminal, it is the rest of s, which a prefix never reaches
-        if (!*tpl) {
-            if (as == AS_KEY) return true;
-            if (as == AS_PREFIX || !*s) return false;
-            for (; *s; s++)
-                if (!segment_char(*s) && *s != '.' && *s != '~') return false;
-            return true;
-        }
-
-        // otherwise it is a segment
-        const char *start = s;
-        while (segment_char(*s)) s++;
-        if (s == start) return false;
+    // each parameter: a segment followed by ',', or the last, which may also hold '.' and '~'
+    while (*p) {
+        const char *start = ++p;
+        while (segment_char(*p)) p++;
+        if (*p == ',' && p > start) continue;
+        while (segment_char(*p) || *p == '.' || *p == '~') p++;
+        if (*p || p == start) return false;
     }
-    return as != AS_PREFIX && !*s;
+    return true;
 }
 
-/* the length of a name's first segment, its family or its key name, which ends at its ':' */
-static size_t first_segment(const char *s) {
-    const char *colon = strchr(s, ':');
-    return colon ? (size_t)(colon - s) : strlen(s);
-}
+bool selector_prefix_ok(const char *prefix) {
+    // the family and its ':'
+    const char *p = segment_end(prefix);
+    if (!p || *p != ':') return false;
 
-const slice_names *slice_of(const jsrt *js, const char *stream) {
-    size_t n = first_segment(stream);
-    for (size_t i = 0; i < js->nslices; i++) {
-        const char *f = js->slices[i].family;
-        if (strlen(f) == n && memcmp(f, stream, n) == 0) return &js->slices[i];
+    // whole leading parameters, each a segment followed by ','
+    while (*++p) {
+        p = segment_end(p);
+        if (!p || *p != ',') return false;
     }
-    return NULL;
-}
-
-bool stream_fills(const jsrt *js, const char *name) {
-    const slice_names *sl = slice_of(js, name);
-    return sl && fills(sl->stream, name, AS_STREAM);
-}
-
-bool ref_prefix_fills(const jsrt *js, const char *prefix) {
-    const slice_names *sl = slice_of(js, prefix);
-    return sl && fills(sl->stream, prefix, AS_PREFIX);
+    return true;
 }
 
 /* QuickJS writes a key as UTF-8, except that a lone surrogate becomes ED A0-BF and a continuation
@@ -96,13 +64,4 @@ bool key_chars_ok(const char *key) {
         if (p[0] == 0xed && p[1] >= 0xa0) return false;
     }
     return true;
-}
-
-bool key_fills(const slice_names *sl, const char *key) {
-    size_t n = first_segment(key);
-    for (size_t i = 0; i < sl->keys.n; i++) {
-        const char *tpl = sl->keys.v[i];
-        if (first_segment(tpl) == n && memcmp(tpl, key, n) == 0) return fills(tpl, key, AS_KEY);
-    }
-    return false;
 }

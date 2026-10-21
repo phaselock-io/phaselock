@@ -8,18 +8,18 @@ the (planned) real DB, to power demos and full-stack development.
 The real db will have the following shape:
 
 - it will be a CGO project: a Go HTTP wrapper around a C db core.
-- the C core will use QuickJS, LDMB, a custom event log and dedup index
+- the C core will use QuickJS, LDMB, a custom edit log and dedup index
 - connections are received in Go, and JWT checked
-- commands are received in Go and passed byte-wise to the C core
+- mutations are received in Go and passed byte-wise to the C core
 - the C core will batch up incoming writes into transaction batches
 - for each batch:
   - lmdb write txn is opened
   - for each txn:
-    - command bytes are extracted to QuickJS, and checked for validity and authz
-    - duplicate commands are skipped; reused client-minted IDs are rejected
-    - user-provided precommit function processes commands, returns events
-    - events are appended to log file
-    - user-provided reducer function updates lmdb
+    - mutation bytes are extracted to QuickJS, checked for validity and authz
+    - duplicate mutations are skipped; reused client-minted IDs are rejected
+    - user-provided decider reads lmdb through a write buffer, writing into it
+    - the buffer's edits are appended to log file
+    - the buffer's edits are applied to lmdb, natively
   - log file is committed
   - lmdb txn is committed
   - dedup index is committed
@@ -36,7 +36,7 @@ Additional features will include:
   - a viewstamped replication layer for HA configurations
 
 According to exploratory benchmarks, we are hoping to support write capacities
-north of 100K events/second in the non-HA configuration.
+north of 100K edits/second in the non-HA configuration.
 
 This is gonna be _really_ cool.
 
@@ -48,16 +48,16 @@ demos:
 - it will be a CGO project: a Go HTTP wrapper around a C core.
 - the C core will use QuickJS, and SQLite for log, kv store, and dedup index
 - connections are received in Go, and JWT checked
-- commands are received in Go and passed byte-wise to the C core
+- mutations are received in Go and passed byte-wise to the C core
 - the C core will batch up incoming writes into transaction batches
 - for each batch:
   - sql txn is opened
   - for each txn:
-    - command bytes are extracted to QuickJS, and checked for validity and authz
-    - duplicate commands are skipped; reused client-minted IDs are rejected
-    - user-provided precommit function processes commands, returns events
-    - events are appended to sqlite log table
-    - user-provided reducer function updates sqlite kv table
+    - mutation bytes are extracted to QuickJS, checked for validity and authz
+    - duplicate mutations are skipped; reused client-minted IDs are rejected
+    - user-provided decider reads sqlite through a write buffer, writing into it
+    - the buffer's edits are appended to sqlite log table
+    - the buffer's edits are applied to sqlite kv table, natively
   - sql txn is committed
 
 Features not bothered with:
@@ -65,6 +65,7 @@ Features not bothered with:
   - ha configurations
   - live snapshots
   - memory conservation
+  - parallel execution
 
 This isn't the final shape we want,
 
@@ -79,145 +80,199 @@ plan above take precedence over it.
 ### Shape
 
 - Go HTTP layer over a C core, joined by cgo.  Go never decodes
-  msgpack on the data path: commands go to C as the bytes the client
-  sent, events come out of C as encoded `[envelope, data]` values, and
-  Go writes only container headers around them.  The auth endpoints
-  are Go-owned and decode their own small request bodies.
+  msgpack on the data path: mutations go to C as the bytes the client
+  sent, edits come out of C as their encoded wire arrays, and Go
+  writes only container headers around them.  The auth endpoints are
+  Go-owned and decode their own small request bodies.
 - SQLite for everything in C: the log, the KV store, the series
-  table, the known-streams table.  One write transaction per group
-  commit, WAL mode, synchronous=FULL.
+  table, the slices table.  One write transaction per group commit,
+  WAL mode, synchronous=FULL.
 - Threads in C: the txn loop (owns QuickJS, SQLite writer connection,
-  maySee registrations); a results pop thread on the Go side that
+  grant registrations); a results pop thread on the Go side that
   blocks in one cgo call; a reader thread with its own SQLite
-  connection for history reads, list, and snapshot cuts.  Handler
-  goroutines enqueue commands directly; no dedicated push thread.
-  Command outcomes, view changes, and lookup replies all come back
-  through the single results queue.
+  connection for history reads, edit reads, and snapshot cuts.
+  Handler goroutines enqueue mutations directly; no dedicated push
+  thread.  Mutation outcomes, view changes, and lookup replies all
+  come back through the single results queue.
 - The bundle is one JS file assigning `globalThis.__bundle` (see Bundle
   contract): the app's `db.ts` calling the generated `define{Database}`,
   bundled with the generated module.
-- Every typed value crosses through the conversion kernel
-  (`core/walk.c`): a source, either msgpack parsed by mpack's node API
-  or a tokenization of a QuickJS value, a walk over the registry the
+- Every typed value crosses through the conversion kernel (`walk.c`):
+  a source, either msgpack parsed by mpack's node API or a
+  tokenization of a QuickJS value, a walk over the registry the
   bundle carries, and a sink that builds JS values, writes msgpack
-  with mpack, or discards.  C builds rich values
-  straight from msgpack and walks the JS heap straight to msgpack, and
-  it checks every command on the handler's thread before anything
-  else happens to it.  The registry is compiled once at open; its
-  identities type every store key (`storeTypes`) and every stream's
-  events (`eventTypes`).  mpack writes the output; untyped values, the
-  outcomes and `lookup`'s traffic, still go through `mpjs.c`.
+  with mpack, or discards.  C builds rich values straight from
+  msgpack and walks the JS heap straight to msgpack, and it checks
+  every mutation on the handler's thread before anything else happens
+  to it.  The registry is compiled once at open from the bundle's
+  schema, `{nodes, ids, mutations}`; every read and write of the
+  store names one of its identities, the value's type.  mpack writes
+  the output; untyped values, the outcomes and `lookup`'s traffic,
+  still go through `mpjs.c`.
 - One context for the process, made in `main` from SIGINT and SIGTERM:
   every request runs under it (`http.Server.BaseContext`), so an open
-  stream ends the moment it does.  Shutdown then waits for handlers to
-  return, a cgo call or a hash in progress finishing first, stops the
-  hash workers, and closes the core, which commits the batch in hand.
-  The core outlives every handler, since a handler reaching a closed
-  core would be a use-after-free in C.
+  connection ends the moment it does.  Shutdown then waits for
+  handlers to return, a cgo call or a hash in progress finishing
+  first, stops the hash workers, and closes the core, which commits
+  the batch in hand.  The core outlives every handler, since a
+  handler reaching a closed core would be a use-after-free in C.
 
-### Log and atoms
+### Log and edits
 
-- The command is the atom.  A POST may carry several commands; each is
-  checked, pre-committed, folded, and acked independently and in
-  order.  Group commit batches atoms per fsync, and every log row
-  records the first position of its atom, which is how readers find
-  atom boundaries.  The check runs in the
-  handler's cgo call, against the commands union of the registry and
-  rejecting fields the model does not name, so a malformed command is
-  answered there and never reaches dedup, `expect`, or the writer; the
-  fields the database prepares for precommit (a `NewPassword`'s hash)
-  are collected by the check and replaced when the checked command is
-  written out for the writer thread.
-- Each command runs in a nested transaction, a SQLite savepoint inside
-  the group's transaction.  A reducer that throws while folding a
-  command's outputs is a bug, and it rolls back that command alone:
-  its events, births, deaths, and state writes are undone, the command
-  is rejected, and the rest of the group commits.
-- A rejection's reason, a precommit handler's `Reject`, reaches the
-  client as it is.  Any other failure is a bug: a throw from
-  precommit, a reducer, or lookup, a precommit output whose stream
-  does not fill its family's template, or a reducer write to a key no
-  key template fills.  The client is told `internal error`, and the
-  log gets the whole error with its stack, under the command's id.  A
-  dev bundle answers the client with the whole error too.  Stacks are
-  mapped through the bundle's source map when it carries one.
-- precommit returns either a rejection reason or a list of
-  `{stream, event}` pairs, any number per stream.  The C core stamps
-  every emitted event with the command's id; precommit never sees or
-  copies ids.  `{stream, death: true}` in the list ends a stream, and
-  `{stream, death: true, erase: true}` ends it and erases its history.
-- Envelope: `[position, stream, seq, commandid, servertime]`, least
-  important last.  Readers must ignore elements appended later.
-  `commandid` is the command's 16-byte label, as it arrived.
-- `seq` is dense per stream name across the whole log: 1 on the first
-  birth, and every later event on that name, including deaths and
-  rebirths, takes the next number.  A client keeps one integer per
-  known stream; an event whose seq is not last + 1 means it missed
-  events (a deletion, or a death and rebirth).  A birth or a death is
-  a reset: the stream's state is empty after it whatever came before,
-  so the client accepts one at any seq above the last, wipes the
-  stream, and chains from it.  Any other event after a gap drops the
-  stream and re-backfills it.  Densely numbered survivors are what
-  make gap detection complete under deletion: a deletion always
-  leaves later events behind, and they arrive in the client's own
-  history replay.
-- Births are implicit: the first event to an unknown stream is
-  preceded, in the same atom, by a system event with data
-  `{"$sys": "birth"}`.  A death is `{"$sys": "death"}` followed by
-  deletion of the stream's keys.  An erasure is a death that also
-  deletes every earlier event of the stream, in the death's own atom;
-  the death itself stays, as the stream's last event, and on the wire
-  it is a death like any other.  Dead streams stay in the
-  known-streams table as tombstones (name, birth, death); a new event
-  to a dead name is a rebirth with a new birth position.  A client
-  needs nothing of the erased events: the death is a reset, and a
-  rebirth starts from empty.
-- Store keys are plain strings: `<stream>!<local key>`, as in
-  `chat:acme,general!reply:t1,m5`; a key's stream is everything
-  before its first `!`.  A template is a name, then, if it has
-  parameters, `:{param}` and `,{param}` for each further one.  A
-  stream name fills its slice's family template
-  (`chat:{org},{channel}` names `chat:acme,general`; `login` names
-  itself), and a local key one of the slice's key templates
-  (`note:{id}` names `note:n1`).  The family or key name is the part
-  before the first `:`.  A parameter a template ends with is terminal
-  and holds the rest of the string; every other parameter is a
-  non-empty run of `A-Z a-z 0-9 _ -`.  A stream name's terminal
-  parameter is non-empty and may also hold `.` and `~`; a key's may
-  hold anything, the empty string included.  Each separator after a
-  parameter (`,` and `!`) sorts below every character the parameter
-  may hold, so a scan of a family visits its streams, and a scan of a
-  key template its keys, in the order of their parameters: `gen`
-  before `gen-2`.  The core rejects a precommit or bootstrap output
-  whose stream does not fill its family's template, and a reducer
-  write whose key fills none of its slice's key templates.
-- A ref names a set of streams: a stream name, a wildcard for every
-  stream whose name begins with its text before the `*`, or `*` for
-  every stream.  A wildcard covers the family alone or the family and
-  whole parameters other than the terminal one: `chat:*` and
-  `chat:acme,*`, never `chat:ac*` or `chat:acme,gen,*`.  That is the
-  wire form, used in URLs and `want`.  In the bundle, maySee returns
-  refs with a terminator on every entry: `chat:*`, `chat:acme,*`,
-  `*`, and `name!` for an exact stream, so a bare name is a malformed
-  ref and a bundle bug, never a grant.  The core strips the `!`.
+- The mutation is the atom.  A POST may carry several mutations; each
+  is checked, decided, committed, and acked independently and in
+  order.  Group commit batches mutations per fsync.  The check runs in
+  the handler's cgo call, against the mutations union of the registry
+  and rejecting fields the model does not name, so a malformed
+  mutation is answered there and never reaches dedup, `expect`, or
+  the writer; the fields the database prepares for the decider (a
+  `NewPassword`'s hash) are collected by the check and replaced when
+  the checked mutation is written out for the writer thread.
+- The decider runs over a read-write transaction whose writes go to a
+  write buffer (`buffer.c`), never to the store.  The buffer holds
+  each key written once, with its last value's msgpack bytes in store
+  format, or a deletion, and each slice deleted, with whether its
+  history goes too; deleting a slice drops the buffer's keys under
+  it.  Reads see the buffer over the store: a point read checks the
+  buffer first, and a scan walks the store as the pattern walk does,
+  merging the buffer's keys in at their place in key order, so a
+  decider reads its own writes.  A buffered key wins over the store's,
+  and a store key under a slice the buffer deleted reads as absent.
+  When the decider carries the mutation out, the buffer is the
+  mutation's edits; when it rejects the mutation or throws, the buffer
+  is discarded, and nothing reached the store.
+- An edit is one mutation's writes to one slice.  The core commits a
+  mutation's buffer as one edit per slice it touched, in slice name
+  order, all at the mutation's position: each edit is appended to the
+  log and applied to the store natively.  A mutation that edits
+  nothing takes no position.  The log keeps one row per edit: its
+  position, slice, seq, lifecycle, and wire encoding, keyed by
+  position and slice.
+- A rejection's reason, a decider's `Reject`, reaches the client as
+  it is.  Any other failure is a bug: a throw from a decider or
+  lookup, which includes a write the write gate refuses.  The client
+  is told `internal error`, and the log gets the whole error with its
+  stack, under the mutation's id.  A dev bundle answers the client
+  with the whole error too.  Stacks are mapped through the bundle's
+  source map when it carries one.
+- The write gate: a key written holds no control character or lone
+  surrogate, and its slice, the text before its first `!`, is a slice
+  name (Store keys), so a key with no `!`, or an engine-reserved key
+  beginning with `!`, is refused.  A slice deleted is a slice name.
+  The gate checks syntax alone, so a well-formed name in a family no
+  slice type declares, or with the wrong number of parameters, lands.
+  The local key is the app's: one that no key template names lands as
+  bytes that no typed accessor reads.
+- Envelope: `[position, slice, seq, id, servertime, lifecycle]`,
+  least important last.  Readers must ignore elements appended later.
+  `id` is the mutation's 16-byte label, as it arrived, as bin;
+  `servertime` is the msgpack timestamp; `lifecycle` is 0 for a
+  normal edit, 1 for a birth, and 2 for a death.
+- An edit on the wire is one msgpack array, its envelope, then its
+  payload's items flat:
 
-### Command dedup
+      [[position, slice, seq, id, servertime, lifecycle],
+       0, key, value, 1, key, ...]
+
+  The payload is a stream of operations, each a one-byte opcode and
+  the items it fixes: `0, key, value` sets a key, a nil value setting
+  null, and `1, key` deletes one.  Keys are whole store keys.  A
+  value is inline msgpack in store format, the bytes the decider's
+  write produced, which a host slices out as a byte span without
+  decoding it.  A key written twice in one mutation appears once,
+  with its last write.  An opcode a client does not know is an error.
+- The lifecycle comes from the buffer and the slice's row:
+
+  | The mutation                       | Live slice | Unborn or deleted |
+  |------------------------------------|------------|-------------------|
+  | sets keys of the slice             | normal     | birth             |
+  | only deletes keys of the slice     | normal     | no edit           |
+  | deletes the slice, then sets keys  | birth      | birth             |
+  | deletes the slice, sets none after | death      | no edit           |
+
+  A normal edit carries every write.  A birth clears the slice, then
+  sets keys, and carries the sets alone.  A death clears the slice
+  and carries no operations.
+- `seq` is dense per slice name across the whole log: 1 on the first
+  birth, and every later edit to that name, deaths and rebirths
+  included, takes the next number.  A client keeps one integer per
+  known slice; an edit whose seq is not last + 1 means it missed
+  edits (a deletion, or a death and rebirth).  A birth or a death is
+  a reset: the slice's state after it is the edit's sets alone,
+  whatever came before, so the client accepts one at any seq above
+  the last, wipes the slice, and chains from it.  Any other edit after
+  a gap drops the slice and re-backfills it.  Densely numbered
+  survivors are what make gap detection complete under deletion: a
+  deletion always leaves later edits behind, and they arrive in the
+  client's own history replay.
+- The slices table has one row per slice ever born: its name, its
+  seq, the position of its last birth, the position of its death or
+  null while it is live, and its byte counters, its edits' bytes in
+  the log and its keys' bytes in the store.  A deleted slice keeps its
+  row as a tombstone, and a new birth on its name revives it with a
+  new birth position.  An expectation's seq and a snapshot's slices
+  come from this table.
+- A death is a tombstone that retention never prunes.  An erasure,
+  `deleteSlice` with `erase`, deletes every earlier edit of the slice
+  from the log in the mutation's own commit; the death stays as the
+  slice's last record, or the birth when the mutation writes the
+  slice again, and on the wire an erasure is a death like any other.
+  A client needs nothing of the erased edits: the death is a reset,
+  and a rebirth starts from empty.
+- Store keys are plain strings: `<slice>!<local key>`, as in
+  `chat:acme,general!reply:t1,m5`; a key's slice is everything before
+  its first `!`.  A template is a name, then, if it has parameters,
+  `:{param}` and `,{param}` for each further one.  A slice name fills
+  its slice type's family template (`chat:{org},{channel}` names
+  `chat:acme,general`; `login` names itself), and a local key one of
+  the type's key templates (`note:{id}` names `note:n1`), which the
+  model declares and its generated accessors fill.  The family or key
+  name is the part before the first `:`.  A parameter a
+  template ends with is terminal and holds the rest of the string;
+  every other parameter is a non-empty run of `A-Z a-z 0-9 _ -`.  A
+  slice name's terminal parameter is non-empty and may also hold `.`
+  and `~`; a key's may hold anything, the empty string included.  The
+  database checks a slice name by this syntax alone: a family, a
+  non-empty run of `A-Z a-z 0-9 _ -`, then optionally `:` and values
+  separated by `,`, each non-empty, each but the last a run of the
+  family's characters, and the last free to hold `.` and `~` too.  The
+  family templates stay in the model's generated code.  Each
+  separator after a parameter (`,` and `!`) sorts below every
+  character the parameter may hold, so a scan of a family visits its
+  slices, and a scan of a key template its keys, in the order of their
+  parameters: `gen` before `gen-2`.
+- A slice selector names a set of slices: an exact selector, a slice
+  name, names one slice, and a prefix selector every slice whose name
+  begins with its text before the `*`, or every slice for `*`.  A
+  prefix selector covers the family alone or the family and whole
+  leading parameters, each a segment followed by `,`: `chat:*` and
+  `chat:acme,*`, never `chat:ac*` or `chat:acme.x,*`.  That is the
+  wire form, used in URLs and `want`.  In the bundle, the grantor
+  returns selectors with a terminator on every entry: `chat:*`,
+  `chat:acme,*`, `*`, and `name!` for an exact selector, so a bare
+  name is a malformed selector and a bundle bug, never a grant.  The
+  core strips the `!`.  It checks every selector by syntax alone, so
+  one naming a family no slice type declares, or the wrong number of
+  parameters, is well-formed and covers no slice.
+
+### Mutation dedup
 
 Series with one mark each, and no frames in the log; a fuller
 write-up of the dedup design is coming.
 
-- A command carries a series `S`, an opaque string of at most 64
+- A mutation carries a series `S`, an opaque string of at most 64
   bytes, and a number `n`, an integer from 1 to 2^53 - 1 that
-  increases within the series.  A command whose `S` and `n` are both
+  increases within the series.  A mutation whose `S` and `n` are both
   nil is unnumbered: it runs with no dedup and leaves no series
   state.
 - The series table has one row per series: the hex SHA-256 of `S`,
   `hwm`, the highest `n` decided, and `time`, the server time of its
   last decision.  Rows are kept forever: v0 has no horizon.  Cron's
   marks share the table (Cron).
-- The dedup check runs on the txn loop, after the command check and
-  before `expect` and precommit, against the group's open transaction.
-  A command sees every decision ahead of it in its group, so two
+- The dedup check runs on the txn loop, after the mutation check and
+  before `expect` and the decider, against the group's open
+  transaction.  A mutation sees every decision ahead of it in its
+  group, so two
   copies of one `(S, n)` in a group run once.
 
   | Case                     | Answer                               |
@@ -230,16 +285,15 @@ write-up of the dedup design is coming.
   are never pruned, so a series the table does not hold has decided
   nothing.
 
-- Every decision moves the mark: an accept, a precommit's `Reject`, a
-  bug's rejection, a conflict.  A command its savepoint rolled back
-  has its mark written after the rollback, in the group's transaction.
+- Every decision moves the mark: an accept, a decider's `Reject`, a
+  bug's rejection, a conflict.
 - Every reply is sent after its group commits, rejects included.
   `ok` carries a position at or after the decision, the log's head
   when it was decided or answered: a client that has read that far
   has its answer.  A reject's reason and a conflict's seqs reach only
-  the first reply; a resend of a rejected command gets `ok`.
+  the first reply; a resend of a rejected mutation gets `ok`.
 - The id is a label: the core checks its length, stamps it on the
-  atom's envelopes, and keys nothing on it.
+  envelopes of the mutation's edits, and keys nothing on it.
 - The log carries no frames.  A series row commits in the
   transaction of the group that decided it, so it is as durable as
   the log, and v0 has no retention that would need them; the final DB
@@ -264,10 +318,11 @@ Every frame is an array whose first element is a tag.
         PhaseLock-Position (the position the token is the view at)
       → 400 on malformed wants
 
-    ["view", token, position, refs]    the whole view: first, when the
+    ["view", token, position, selectors]    the whole view: first, when the
                                        presented token is not current,
                                        and on every change
-    ["events", [[env, data], ...]]     one atom, filtered to the view
+    ["edits", [edit, ...]]             one mutation's edits, filtered
+                                       to the view
     ["live", position]                 history done; live from here
     ["vouch", position]                heartbeat; converges the cursor
     ["end", code, reason]
@@ -276,65 +331,66 @@ Every frame is an array whose first element is a tag.
   position the replay reached; nothing after `live` repeats a position
   at or below it.  `since=-1` means bootstrap: history from the view's
   position, so everything above the position the view frame carries
-  arrives on the stream.  `live` is sent exactly once per connection and
-  carries the same convergence meaning as a vouch at that position.
-  A view frame may arrive during history when maySee changes; it
-  applies from that point on.  History is read in windows of the log,
-  each ending on an atom's end, and a window that ends past the last
-  events frame is followed by a vouch at its end, so a client whose
-  view matches little of the log still sees the replay advance.
+  arrives on the connection.  `live` is sent exactly once per
+  connection and carries the same convergence meaning as a vouch at
+  that position.  A view frame may arrive during history when the
+  grant changes; it applies from that point on.  History is read in
+  windows of the log's positions, and a window that ends past the
+  last edits frame is followed by a vouch at its end, so a client
+  whose view matches little of the log still sees the replay advance.
 - Server side, a replay of any length buffers nothing: the connection
-  registers its maySee up front, replays from the log unbuffered, then
+  registers its grant up front, replays from the log unbuffered, then
   starts receiving live commits and replays the small gap up to the
   first one, deduplicating by position.
-- Every deletion keeps at least the last event of every stream, even
-  deleted streams, whose last event is a deletion event.  With that floor
-  a replay from any checkpoint introduces every stream born since (its
-  surviving event hits the unknown-stream rule) and delivers every death,
-  so replay on a matching token is complete under any policy, and a
-  client that receives a gapped stream's survivors sees the gap through
-  seq.  A gap observed before a birth or death is tolerated by the
-  client, since the client would ignore earlier events anyway.  A gap on
-  a live stream, as may occur under retention policies, is repaired by an
-  exact-ref backfill, which implies a requirement that retention must not
-  delete an event of a live stream that is newer than its stream's latest
-  cut snapshot, and the latest available snapshot is always served to
-  backfill requests.  The exception to that rule is gaps that occur prior
-  to birth or death events, since the client would ignore those earlier
-  events anyway.  A server that would rather not replay a stream, because
-  retention gapped it for this client or because its byte counters say a
-  cut is cheaper, sends only the stream's last event: the seq jump is the
-  notice, and the client parks it, cuts, and drops it below the position,
-  the same path as any other gap.
-- `want` is a list of refs: what the client can fold.  No `want`
-  means `*`, everything maySee allows.
-- maySee that throws, or returns a ref that is malformed or does not
-  fill its family's template, fails closed: it grants nothing.  A
-  connection registering under it is refused with a 500, and a
-  connection it fails under when a commit re-runs it gets
-  `["end", "error", reason]` and is closed.  The reason is as for a
-  command's bug: `internal error`, or the whole error from a dev
-  bundle.
-- maySee returns refs (bundle form); the view is that set cut down to
-  the wants, the narrower of each pair that covers the other, and the
-  token is a hash of the view.  So the token names a principal and a
-  set of wants together, and a client whose wants changed presents a
-  token that is no longer current.  A view frame carries the whole
-  view, at the commit position it names, and is sent on every change
-  to it, even one that leaves coverage as it was (a ref inside a held
-  family), because the client can only keep its token current by
-  taking the set.  A maySee change outside the wants changes nothing
-  and sends nothing.  The client diffs the set against what it holds:
-  what is gone is cut by prefix, what is new is backfilled, and
-  whether anything changed is its computation.  Refs are never
-  expanded to streams: the client learns a family's members from its
-  blob and from births.
-- View changes are synchronous with the events they apply to.  `view`
+- Every deletion keeps at least the last edit of every slice, even
+  deleted slices, whose last edit is a death.  With that floor a
+  replay from any checkpoint introduces every slice born since (its
+  surviving edit hits the unknown-slice rule) and delivers every
+  death, so replay on a matching token is complete under any policy,
+  and a client that receives a gapped slice's survivors sees the gap
+  through seq.  A gap observed before a birth or death is tolerated
+  by the client, since the client would ignore earlier edits anyway.
+  A gap on a live slice, as may occur under retention policies, is
+  repaired by an exact-selector backfill, which implies a requirement that
+  retention must not delete an edit of a live slice that is newer
+  than its slice's latest cut snapshot, and the latest available
+  snapshot is always served to backfill requests.  The exception to
+  that rule is gaps that occur prior to birth or death edits, since
+  the client would ignore those earlier edits anyway.  A server that
+  would rather not replay a slice, because retention gapped it for
+  this client or because its byte counters say a cut is cheaper,
+  sends only the slice's last edit: the seq jump is the notice, and
+  the client parks it, cuts, and drops it below the position, the
+  same path as any other gap.
+- `want` is a list of selectors: what the client can apply, one per slice
+  type, `family:*` or the bare family of a type without parameters.
+  No `want` means `*`, everything the grantor allows.
+- A grantor that throws, writes, or returns a malformed selector fails
+  closed: it grants nothing.  A connection registering under it is
+  refused with a 500, and a connection it fails under when a commit
+  re-runs it gets `["end", "error", reason]` and is closed.  The
+  reason is as for a mutation's bug: `internal error`, or the whole
+  error from a dev bundle.
+- The grantor returns selectors (bundle form); the view is that set cut
+  down to the wants, the narrower of each pair that covers the other,
+  and the token is a hash of the view.  So the token names a
+  principal and a set of wants together, and a client whose wants
+  changed presents a token that is no longer current.  A view frame
+  carries the whole view, at the commit position it names, and is
+  sent on every change to it, even one that leaves coverage as it was
+  (a selector inside a held family), because the client can only keep its
+  token current by taking the set.  A grant change outside the wants
+  changes nothing and sends nothing.  The client diffs the set against
+  what it holds: what is gone is cut by prefix, what is new is
+  backfilled, and whether anything changed is its computation.  Selectors
+  are never expanded to slices: the client learns a family's members
+  from its blob and from births.
+- View changes are synchronous with the edits they apply to.  `view`
   is the client's stored token; the response headers carry the current
   token and the position it is the view at, and when the presented
   token is not current the first frame of the body is the view frame,
-  ahead of any history.  Every later change is a view frame in stream
-  order, ahead of the events of the commit that caused it.  History
+  ahead of any history.  Every later change is a view frame in log
+  order, ahead of the edits of the commit that caused it.  History
   from `since` is replayed under the current view, so a client's held
   set at its checkpoint plus the replay is complete whatever happened
   in between: a family revoked and regranted while the client was
@@ -343,160 +399,336 @@ Every frame is an array whose first element is a tag.
   what makes the content-hashed token sufficient and the in-band view
   correct, and it is why there is no separate list endpoint: an
   out-of-band answer could cross a view frame, and a client applying
-  it could cut a stream a later frame regranted or backfill a ref an
+  it could cut a slice a later frame regranted or backfill a selector an
   earlier frame revoked.  The client persists its view (token and
   position) only when a reconciliation commits, so a crash
   mid-reconciliation presents the old token again and gets the view
   again.
-- A commit produces frames only for the atoms a connection can see;
-  invisible commits produce nothing.  The heartbeat vouch, sent on a
-  fixed interval, is the only other cursor signal: it carries the
-  current position so a reconnect skips history the client could not
-  see, and a submitter whose command's events all landed in streams it
-  cannot see passes its ack position on the next heartbeat.
+- A commit produces frames only for the mutations a connection can
+  see, one edits frame per mutation holding every edit of it the
+  connection's view covers, so a client holding only some of a
+  mutation's slices receives its part at once; invisible commits
+  produce nothing.  The heartbeat vouch, sent on a fixed interval, is
+  the only other cursor signal: it carries the current position so a
+  reconnect skips history the client could not see, and a submitter
+  whose mutation's edits all landed in slices it cannot see passes
+  its ack position on the next heartbeat.
 
-    POST /commands                     body: [S, n, id, data, expect?]*
-      → msgpack array of outcomes, one per command, in order:
+    POST /mutations                    body: [S, n, id, data, expect?]*
+      → msgpack array of outcomes, one per mutation, in order:
         ["ok", position] | ["reject", reason]
-        | ["conflict", { stream: actualSeq }]
+        | ["conflict", { slice: actualSeq }]
         with a Server-Timing header, db;dur=<ms>: the database's own
         time, from the whole request in hand to its answer
       → 400 when the body is not a sequence of [S, n, id, data,
         expect?] values with S a string and n an integer, or both nil,
         and id 16 bytes of bin; nothing can be answered for such a
-        body, command by command
-      → 413 when the body carries more commands than the request's
+        body, mutation by mutation
+      → 413 when the body carries more mutations than the request's
         limit, refused before any is checked, with the limit in a
-        PhaseLock-Max-Commands header
+        PhaseLock-Max-Mutations header
 
-- Series, numbers, and the outcomes are under Command dedup.
-- A request carries at most 128 commands, and one without a session
-  at most 8 (`--max-commands`, `--max-anonymous-commands`).  A client
-  sends more as several requests, one after another, splitting again
-  under the limit a 413 names.
-- A command whose data fails the check gets `["reject", reason]`, the
-  reason naming the path (`$.title: missing required field`).  It
+- Series, numbers, and the outcomes are under Mutation dedup.
+- A request carries at most 128 mutations, and one without a session
+  at most 8 (`--max-mutations`, `--max-anonymous-mutations`).  A
+  client sends more as several requests, one after another, splitting
+  again under the limit a 413 names.
+- A mutation whose data fails the check gets `["reject", reason]`,
+  the reason naming the path (`$.title: missing required field`).  It
   never reached dedup, so it is not a decision and its series' mark
   does not move.
-- `expect` is optional concurrency control: a map from exact stream
-  name to the seq of the stream's last event as the client knows it
-  (0 for a stream it believes was never born).  The client always has
-  that value: it tracks seq per stream for gap detection, reads it
-  from every envelope, and gets it from a blob's streams map.  The
-  core compares each entry to the stream's actual seq
-  after the dedup check and before precommit; any
-  mismatch answers `conflict` listing the actual seq of every
-  mismatched stream, and the command never reaches user code or the
-  log.  A conflict is a decision, and moves its series' mark like
-  any other.  seq is the stream's clock, position the log's.  A conflict
-  means refresh and re-decide, where a reject is final.  It is opt-in
-  per command; offline-queued work should not carry expectations.
-- `expect` names at most 1024 streams, each once, with seqs from 0 to
-  2^53 - 1.  One that breaks this is checked with the data: the
-  command gets `["reject", reason]` and is not a decision.
-- An expectation answers a stream's seq, so it may name only streams
-  the sender's maySee covers when the command's turn comes.  Naming
-  any other rejects the command, alike whether or not the stream
+- `expect` is optional concurrency control: a map from exact slice
+  name to the seq of the slice's last edit as the client knows it (0
+  for a slice it believes was never born).  The client always has
+  that value: it tracks seq per slice for gap detection, reads it from
+  every envelope, and gets it from a blob's slices map.  The core
+  compares each entry to the slice's actual seq after the dedup check
+  and before the decider; any mismatch answers `conflict` listing the
+  actual seq of every mismatched slice, and the mutation never reaches
+  user code or the log.  A conflict is a decision, and moves its
+  series' mark like any other.  seq is the slice's clock, position
+  the log's.  A conflict means refresh and re-decide, where a reject
+  is final.  It is opt-in per mutation; offline-queued work should
+  not carry expectations.
+- `expect` names at most 1024 slices, each once and each a slice name
+  (Store keys), with seqs from 0 to 2^53 - 1.  One that breaks this
+  is checked with the data: the mutation gets `["reject", reason]`
+  and is not a decision.
+- An expectation answers a slice's seq, so it may name only slices
+  the sender's grant covers when the mutation's turn comes.  Naming
+  any other rejects the mutation, alike whether or not the slice
   exists; the reject is a decision.
 
-    GET /snapshot/<ref>          ref = stream, wildcard, or *
+    GET /snapshot/<selector>          selector = slice, prefix, or *
       → application/octet-stream: the blob (below), inline, with its
         Content-Length, not resumable; or
       → text/plain: one URL to fetch the blob from with Range; a 404
         or 410 there means re-request here
       The origin's response carries PhaseLock-Position, the log
-      position the blob describes; the blob store owes only the bytes.
-      A resuming client checks the position against the
-      one it is mid-download of; the tail read can be issued from the
-      header alone.  maySee must cover the whole ref.  v0 always
-      answers inline.
+      position the blob describes, and PhaseLock-Epoch, the log's
+      epoch; the blob store owes only the bytes.  A client checks the
+      epoch against its connection's, and a resuming client checks the
+      position against the one it is mid-download of; the tail read
+      can be issued from the header alone.  The grant must cover the
+      whole selector.
 
-    GET /events/<ref>[?after=W][&before=X][&reverse=true][&max=N]
-      → events frames for the ref with W < position < X, ascending by
-        default, at most N (default and cap 1000); header
-        PhaseLock-Scanned.  No after is the start of the log, no
-        before is the head.  maySee must cover the whole ref, as for a
-        snapshot.
+    GET /edits/<selector>[?after=W][&before=X][&reverse=true][&max=N]
+      → edits frames for the selector with W < position < X, one per
+        mutation, ascending by default: N edits (default and cap
+        1000) and the rest of the last one's mutation, or fewer when
+        the range runs out; header PhaseLock-Scanned.  No after is the
+        start of the log, no before is the head.  The grant must cover
+        the whole selector, as for a snapshot.
 
-- `/events` is the tail read behind a snapshot: load the blob, then
-  read the ref forward from the blob's position up to the first
+- A snapshot response is the blob inline or a pointer to it in a blob
+  store: v0 answers inline, and a deployment backed by a blob store
+  answers with a pointer.  Either way the origin's response carries
+  the position and the epoch.  A resumed download reads the blob with
+  a Range from its resume offset, so it never sees the blob's own
+  header and learns the cut's position and epoch only from the
+  origin's response; and a blob store owes only the bytes, never
+  PhaseLock headers.  The pointer is a 200 with a body rather than a
+  3xx redirect because many HTTP clients follow redirects themselves
+  and expose only the final response's headers, which would lose the
+  origin's.
+- `/edits` is the tail read behind a snapshot: load the blob, then
+  read the selector forward from the blob's position up to the first
   position the client parked, or to the head if nothing is parked,
-  apply, and unpark.  Both bounds are exclusive.  `PhaseLock-Scanned`
-  is the client's next bound, used as-is with no arithmetic: forward
-  it becomes the next `after`, reverse the next `before`.  On a full
-  page it is the last position delivered; on a short one it is the
-  far bound itself, which lets a resume skip log the server already
-  looked at for a quiet stream, except at the head, where it is the
-  last position delivered (or `after`, when nothing was) so that
-  clients at the head converge on one URL.
-- Gap detection is lazy and per stream.  The blob's streams map gives
-  the seq of every member at the cut, and every event carries its
-  seq, so a stream whose chain breaks, in the tail or later on the
-  live stream, is re-backfilled by itself with an exact-ref snapshot
-  and tail.  A family blob is therefore never invalidated as a whole;
-  it degrades one member at a time.  A chain is checked from its last
-  reset: of a stream's parked events, those before its last birth or
-  death are never reduced, the run from that reset is applied, and a
-  run with no reset must chain from the seq the blob or the held
-  state gives, or the stream is broken.  A stream the map does not
-  name was dead or unborn at the cut, so its parked events at or below
-  the blob's position are covered and never reduced, and its run above
-  the cut must start at a reset.
+  apply, and unpark.  Both bounds are exclusive.  A page never splits
+  the edits of one mutation, so a page's edit count says nothing about
+  whether more follow.  `PhaseLock-Scanned` is the client's next
+  bound, used as-is with no arithmetic: forward it becomes the next
+  `after`, reverse the next `before`.  On a full page it is the last
+  position delivered; on a short one it is the far bound itself,
+  which lets a resume skip log the server already looked at for a
+  quiet slice, except at the head, where it is the last position
+  delivered (or `after`, when nothing was) so that clients at the
+  head converge on one URL.
+- Gap detection is lazy and per slice.  The blob's slices map gives
+  the seq of every member at the cut, and every edit carries its
+  seq, so a slice whose chain breaks, in the tail or later on the
+  live connection, is re-backfilled by itself with an exact-selector
+  snapshot and tail.  A family blob is therefore never invalidated as
+  a whole; it degrades one member at a time.  A chain is checked from
+  its last reset: of a slice's parked edits, those before its last
+  birth or death are never applied, the run from that reset is
+  applied, and a run with no reset must chain from the seq the blob
+  or the held state gives, or the slice is broken.  A slice the map
+  does not name was deleted or unborn at the cut, so its parked edits
+  at or below the blob's position are covered and never applied, and
+  its run above the cut must start at a reset.
 - `reverse` is a general read option, not part of the backfill: it is
   how a person reads the log starting at the tail.  The backfill's
   tail reads forward from the cut.  Gaplessness could be proven by
-  reading backwards from the live cursor to the seq of the event
+  reading backwards from the live cursor to the seq of the edit
   from which the snapshot was cut; since the earliest seq in the tail
   was read last, and deletions happen forwards, there must not be any
   gaps.  What breaks that is the family backfill.  An overlapping
-  strategy for a family of streams would be difficult or impossible
-  to express to the /events endpoint, except by accepting substantial
+  strategy for a family of slices would be difficult or impossible
+  to express to the /edits endpoint, except by accepting substantial
   overread.  The forward read from the snapshots position, however,
   has no such overread properties, but does have its own downside.
   When reading forwards, gaps may appear at any position and the lack
-  of any events may be because no events have arrived or because the
+  of any edits may be because no edits have arrived or because the
   entire tail was pruned.  That can only be distinguished by the
-  eventual arrival of a later event, which should be very quick in
+  eventual arrival of a later edit, which should be very quick in
   the deleted tail case.
 
 Msgpack values are the JSON projection, with one extension: a date,
 the envelope's server time included, is the msgpack timestamp
 extension, at millisecond precision, and within a JS Date's range,
 ±8.64e15 ms of the epoch; a value holding a timestamp outside it fails
-its check.  Uuids are strings; there is no
-other ext, and the only bin is a command's id, in the command and in
-its envelopes.  Command data and event data are the same values the
-browser engine produces and consumes.
+its check.  Uuids are strings; there is no other ext, and the only
+bin is a mutation's id, in the mutation and in its edits' envelopes.
+Mutation data and stored values are the same values the browser
+engine produces and consumes, and a stored value travels in an edit
+or a blob as the bytes the store holds.
 
 ### Snapshot blob
 
-All integers big-endian.  Records sorted by key bytes.
+All integers big-endian.  Operations sorted by key bytes.
 
     magic     "PLSN"
     u8        version = 1
-    u32 hlen  + msgpack map { ref, position, fold,
-                              streams: { name: seq, ... },
-                              event_bytes?, state_bytes? }
+    u32 hlen  + msgpack map { selector, position, epoch,
+                              slices: { name: seq, ... },
+                              edit_bytes?, state_bytes? }
     u32       crc32c of the header bytes
-    record*   u32 klen, key, u32 vlen, value, u32 crc32c(key ‖ value)
-    u32       0xFFFFFFFF  (end marker in the klen slot)
-    u32       record count
-    u64       FNV-1a 64 over all record bytes
+    op*       0, key, value: a set operation, as in an edit's payload
+    u32       0xFFFFFFFF  (end marker, where the next opcode would be)
+    u32       operation count
+    u64       FNV-1a 64 over every operation's bytes
     u32       crc32c of the footer's preceding 12 bytes
 
-Max record size 16 MiB; a larger klen or vlen is corruption.  Keys are
-the store keys with the ref's scope intact (`patron:X!patron`).
-`streams` maps every live stream the ref covers to its seq at the cut,
-and is the authoritative list of what the blob holds; a live stream
-with no keys appears in the map and nowhere else, and a stream the
-map does not name was dead or unborn at the cut.  The optional header
-fields are the stream row's counters and appear only for an exact ref.
-A blob is cut in one read transaction, so every stream in it is at
-`position`.  That is a practical requirement, not a logical one: the
-client chains each stream by the seq the header gives it, so a blob
-assembled from parts cut at different positions would technicall work,
-but the client would have to tail from its lowest position, causing an
-unbounded waste of event downloads.
+The body is a run of set operations encoded as an edit's payload is:
+the opcode 0, the key as a msgpack str, and the value inline as the
+store holds it, so a client applies a blob with the same primitive as
+an edit.  An opcode is one byte, 0, and the end marker's first byte is
+0xFF, so a reader tells them apart at a glance.  A client cuts the body
+into pages of whole operations as it reads, and resumes a download
+from the offset after its last whole one.  Keys are the store keys
+with the selector's scope intact (`patron:X!patron`).  `slices` maps every
+live slice the selector covers to its seq at the cut, and is the
+authoritative list of what the blob holds; a live slice with no keys
+appears in the map and nowhere else, and a slice the map does not
+name was deleted or unborn at the cut.  `epoch` is the log's.  The
+optional header fields are the slice row's counters and appear only
+for an exact selector.  A blob is cut in one read transaction, so every
+slice in it is at `position`.  That is a practical requirement, not a
+logical one: the client chains each slice by the seq the header gives
+it, so a blob assembled from parts cut at different positions would
+technicall work, but the client would have to tail from its lowest
+position, causing an unbounded waste of edit downloads.
+
+### Protocol rules
+
+The rules a client Engine and the database hold each other to at the
+protocol boundary, whatever either's implementation: a client built on the
+same `Transport` contract must satisfy every one.  A client *holds* a slice
+at a seq when it has applied the slice's state through that seq, and
+*parks* an edit when it keeps it unapplied; a slice under an in-flight
+backfill is not held.  The conformance suite,
+`typespec/tests/src/engine/conformance/`, checks each rule in a group named
+for it; the database's own halves are checked by `server_test.go`, under
+the tests these rules name.
+
+Chaining:
+
+- P1.  A normal edit applies to a held slice only when its seq is one past
+  the held seq; an edit at or below the held seq changes nothing.
+- P2.  A birth or a death applies at any seq above the held seq, and to a
+  slice the client does not hold, since the slice's state after it is its
+  own writes alone; of a slice's run of edits, those before its last reset
+  never apply.
+- P3.  A normal edit that does not chain is parked, never applied on its
+  own.  On a held slice, a gap, the client replaces the slice with an
+  exact-selector backfill whose `until` is the edit's position, under the
+  in-flight selector covering it, if any.  On a slice it does not hold and
+  no in-flight backfill covers, a missed birth, it backfills the slice
+  additively by its exact selector, with the same `until`.  An edit of a
+  slice the client does not hold parks while an in-flight backfill covers
+  the slice.
+- P4.  At a land or an unfreeze, a slice's parked run applies only if it
+  continues the newest state put in place, the held seq or its blob's seq,
+  or starts over at a reset after its last gap.  A slice whose run breaks
+  applies none of it and is backfilled again alone, by its exact selector,
+  with `until` the checkpoint.
+- P5.  A slice a landing blob does not name was deleted or unborn at the
+  blob's cut: its parked edits at or below the cut never apply, its run
+  above the cut must start at a reset, and when nothing above the cut
+  applies, the client neither holds the slice nor keeps any state of it.
+
+Lifecycle:
+
+- P6.  A birth clears its slice, then applies its writes.  A birth of a
+  slice the client does not hold, outside every in-flight backfill, holds
+  the slice at the birth's seq with no backfill.
+- P7.  A death clears its slice, and the client forgets it, holding no
+  seq: its next birth starts it from empty, and its next normal edit is a
+  missed birth (P3).  A death of a slice the client does not hold costs no
+  backfill.  The database makes no edit for a delete of a slice that is
+  not live (`TestDeletingANonLiveSliceIsNoEdit`).
+
+View:
+
+- P8.  Once a view frame is processed, the client keeps nothing of a slice
+  the view does not cover, no state, held seq, or parked edit, and no
+  in-flight backfill whose selector the view does not wholly cover, nor its
+  header or parked pages.  The same holds at boot for whatever the build's
+  wants do not cover.  The database sends a view frame ahead of the edits
+  of the commit that caused it
+  (`TestAViewFrameLeadsTheEditsItGrantsIntoStreaming`).
+- P9.  A view frame backfills exactly the selectors it newly grants: a
+  selector that names a held slice, that an in-flight backfill covers, or
+  that the previous view covered with no backfill in flight over it as the
+  frame arrived gets none.  Each new backfill tails through the frame's
+  position (`until` is the position plus one); the first view's replace
+  the base and later ones are additive; and an in-flight selector a new
+  one covers becomes its child.  The view is persisted in the
+  reconciliation's own transaction, and every connect presents its token.
+
+Bootstrap:
+
+- P10.  A client with no checkpoint connects with `since` -1 and no token.
+  Once it has processed the bootstrap's view frame at V, its checkpoint is
+  V, so a reconnect presents `since` V; the frame's backfills cover every
+  position at or below V and the connection every position above it
+  (`TestBootstrapDeliversEverythingAboveTheViewPosition`).  An edit at V
+  that both deliver applies once.
+
+Cursor:
+
+- P11.  The checkpoint is the highest position of the edits, vouch, and
+  live frames processed, and of a bootstrap's view frame (P10); it never
+  moves back, commits with the frame that moved it, and is the `since` of
+  every connect.  The database sends a vouch or a live frame at N only
+  after every edit at or below N that the connection may see
+  (`TestAVouchNeverOvertakesAnEditItCovers`).
+- P12.  The checkpoint never skips an edit: every edit at or below it of a
+  slice the view covers is applied, parked, or below the `until` of an
+  in-flight backfill covering its slice, across reconnects and restarts,
+  so a reconnect from it loses nothing.
+- P13.  An outbox mutation the database answers `ok` at P leaves the
+  outbox, and its prediction the overlay, only once queries can show its
+  outcome: an edit carrying its id has applied, or the base holds every
+  edit at or below P that the client has received.  A reject or a conflict
+  releases it at once.
+- P14.  A checkpoint belongs to its log's epoch: the client takes no frame
+  from a connection whose epoch differs from its checkpoint's, and its
+  first connection's epoch becomes the checkpoint's.
+
+Freeze:
+
+- P15.  While a replacing backfill is in flight, the first view's or a
+  gap's repair, the base is frozen: every edit parks, no backfill lands,
+  queries keep the frozen base less what a view frame revokes, and the
+  checkpoint moves on.  The freeze ends in one transaction that lands every
+  clean ready backfill and every frozen edit, once every replacing backfill
+  lands in it or a view frame drops the last one.  An additive backfill
+  never freezes the base.
+
+Backfills:
+
+- P16.  A backfill lands once both halves of it and of every child are
+  done, in one transaction: its blob, each child's blob over it for the
+  child's slices, then the parked edits (P4); a slice held at or past its
+  blob's seq keeps its state.  After the land, no record, header, parked
+  page, or parked edit of the subtree remains.
+- P17.  A backfill whose snapshot starts over, after a `stale` outcome or
+  a repair, reads its tail again from the new snapshot's position, however
+  far an earlier attempt got; a retry after any other failure resumes from
+  its record, skipping a finished half.  Its `until` never changes.
+
+Convergence:
+
+- P18.  Every state the client shows of a held slice is one the server
+  had: the slice's last birth's writes and the normal edits after it,
+  through some seq.
+- P19.  Once the client has processed a live or vouch frame at the
+  server's head, with no backfill in flight, every slice the view covers
+  that is live at the server is held at its seq with its state, and no
+  other slice is held.
+
+Status:
+
+- P20.  `state` is `live` only after the current connection's live frame
+  and while no replacing backfill is in flight, and `syncing` while the
+  connection replays or the base is frozen; `frozen` is true exactly while
+  a replacing backfill is in flight.
+- P21.  On a fresh store, `hasBase` is false while the first view's
+  replacing backfills are in flight, and once true it stays true, across
+  restarts.  While it is false, a query that reads past the status waits,
+  and one that reads only the status answers.
+
+Atomicity:
+
+- P22.  A frame commits in one store transaction, and queries see it whole
+  or not at all: a mutation's edits to the slices a client holds reach
+  queries together.
+- P23.  A tail page never splits the edits of one mutation
+  (`TestAnEditsPageNeverSplitsAMutation`); the client parks each delivery
+  in one transaction and resumes a tail after the highest position it
+  parked, so a resumed tail never skips part of a mutation.
 
 ### Auth
 
@@ -510,8 +742,8 @@ unbounded waste of event downloads.
   `iat`, `exp`, `jti`, with the signing key's id as the header's
   `kid`; a token naming any other algorithm is refused.  Refresh is
   re-issue.  The token's `gen` is compared to the account's generation
-  on stream open and on every command; a mismatch is rejected, so a
-  generation bump logs out everywhere.
+  on connection open and on every mutation; a mismatch is rejected, so
+  a generation bump logs out everywhere.
 - A private key lives only in the memory of the process that signs
   with it.  The first signature after startup mints one, and so does
   the first signature once the current key has signed for a day, so
@@ -543,49 +775,49 @@ unbounded waste of event downloads.
   user}`; a null result means no account and fails like a moved
   generation, since a token speaks only for an existing account, dev
   tokens included.
-- A command's `NewPassword` fields, which the registry marks, are
-  hashed in the handler's cgo call, before precommit.  Precommit and
-  the log see only the hash.  Password-bearing commands are `@online`
-  in the model, so the generated client API never puts them in the
-  outbox.  The other prepared kinds (CaptchaToken, IdentityProof), and
-  `CommandAuth` proofs of any kind but `password`, are recognized, and
-  a command carrying one is rejected until their verification is
-  built.  A registry naming a kind the database does not know stops
-  it at startup: the bundle needs a newer database.
-- A `CommandAuth` proof of kind `password` proves the sender's own
+- A mutation's `NewPassword` fields, which the registry marks, are
+  hashed in the handler's cgo call, before the decider runs.  The
+  decider and the log see only the hash.  Password-bearing mutations
+  are `@online` in the model, so the generated client API never puts
+  them in the outbox.  The other prepared kinds (CaptchaToken,
+  IdentityProof), and `MutationAuth` proofs of any kind but `password`,
+  are recognized, and a mutation carrying one is rejected until their
+  verification is built.  A registry naming a kind the database does
+  not know stops it at startup: the bundle needs a newer database.
+- A `MutationAuth` proof of kind `password` proves the sender's own
   password.  Intake writes `{kind: "password"}` in its place and sets
   the password aside; Go asks `lookup` with `{kind: "token", user}`
   for the sender and checks the request's proofs against its
   `passwordHash` on the pool, within the client's budget, as a login
   does.  The anonymous principal and an account without a hash fail.
-  Each command's verdict, with the hash it was checked against,
-  travels to the writer beside the command and never reaches the log.
-- The writer checks a proven command after the dedup check and before
-  `expect` and precommit, so a failed proof never learns a stream's
-  seq, and a resend of a command that landed is answered by dedup
+  Each mutation's verdict, with the hash it was checked against,
+  travels to the writer beside the mutation and never reaches the log.
+- The writer checks a proven mutation after the dedup check and before
+  `expect` and the decider, so a failed proof never learns a slice's
+  seq, and a resend of a mutation that landed is answered by dedup
   however its proof checks now.  It calls `lookup` again in the
-  command's turn: when the hash is unchanged the verdict stands, and a
-  failed one is rejected as "invalid credentials", a decision like any
-  other.  When the hash changed, the writer bounces the call: it stops
-  at the command and answers the outcomes before it, and Go checks
-  every remaining proof against the new hash, outside the budget and
-  waiting for room on the pool, then submits the rest of the call
-  again.  The call's commands are still decided once each and in
-  order, and a call may prove a password its earlier command set.  A
-  fourth change in a row is `lookup`'s bug, and rejects the command as
-  one.  Every submit runs the generation check, so a token revoked
-  partway through a call is refused with 401, as a lost reply is, and
-  a resend dedups the commands already decided.
+  mutation's turn: when the hash is unchanged the verdict stands, and
+  a failed one is rejected as "invalid credentials", a decision like
+  any other.  When the hash changed, the writer bounces the call: it
+  stops at the mutation and answers the outcomes before it, and Go
+  checks every remaining proof against the new hash, outside the
+  budget and waiting for room on the pool, then submits the rest of
+  the call again.  The call's mutations are still decided once each
+  and in order, and a call may prove a password its earlier mutation
+  set.  A fourth change in a row is `lookup`'s bug, and rejects the
+  mutation as one.  Every submit runs the generation check, so a
+  token revoked partway through a call is refused with 401, as a lost
+  reply is, and a resend dedups the mutations already decided.
 - Every argon2id hash, at login and at intake, runs on a fixed pool of
   workers (`HashWorkers`, default `GOMAXPROCS`) behind a queue of twice
   that, so hashing's memory stays at the pool's size times one hash's.
   A full queue answers 503 at once, and a queued hash whose client has
   left is skipped.  Each client, by the address it connects from, has a
   budget of hashes, a token bucket (`AuthBurst` 10, refilled at
-  `AuthRate` 1 per second); past it, a login answers 429.  A command
+  `AuthRate` 1 per second); past it, a login answers 429.  A mutation
   request whose hash is refused, by a full pool or a spent budget, is
   refused whole with the same status, so its ids are still free to
-  retry; refusing one command would be a final rejection.
+  retry; refusing one mutation would be a final rejection.
 - An IPv6 client is budgeted by its /64, since a single host is
   commonly given a whole /64.  Behind a proxy, `--client-ip-header
   <name>` takes each client's address from a header the proxy sets to
@@ -606,24 +838,23 @@ unbounded waste of event downloads.
 
 ### Bootstrap
 
-- A fresh data directory starts from the bundle's optional
-  `bootstrap(ctx)`.  On startup with an empty log, the core runs it
-  once, and everything it emits lands as one atom through the
-  ordinary append-and-fold path: implicit births, dense seqs, a
-  command id the core mints, the server time, and the bundle's own
-  reducers folding it.  The atom may be large; a seed of demo data is
-  one commit.
-- `ctx` has three calls.  `emit(stream, event)` takes the same
-  stream-labelled event precommit returns.  `hashPassword(plain)`
-  returns the same salted argon2id hash intake produces, made at once,
-  since bootstrap runs before anything is served; it is the only
-  producer of a password hash besides intake.  `env(name)` reads only
-  the environment variables the operator names with `--bootstrap-env
-  NAME` (repeatable), and any other reads as the empty string, so a
-  production seed carries no secret in its source.
+- A fresh data directory starts from the app's optional bootstrap
+  slot, `bootstrap(txn, ctx)`.  On startup with an empty log, the core runs
+  it once over a write buffer, as a decider runs, and what it wrote
+  commits as one mutation's edits: births, dense seqs, a mutation id
+  the core mints, and the server time.  The mutation may be large; a
+  seed of demo data is one commit.
+- `txn` is the context a decider writes through.  `ctx` has two
+  calls.  `hashPassword(plain)` returns the same salted argon2id hash
+  intake produces, made at once, since bootstrap runs before anything
+  is served; it is the only producer of a password hash besides
+  intake.  `env(name)` reads only the environment variables the
+  operator names with `--bootstrap-env NAME` (repeatable), and any
+  other reads as the empty string, so a production seed carries no
+  secret in its source.
 - On a non-empty log `bootstrap` is skipped.  A throw, such as for a
-  variable the operator did not provide, or an emit to a malformed
-  stream, stops startup with the error; a half-initialized database
+  variable the operator did not provide, or a write the write gate
+  refuses, stops startup with the error; a half-initialized database
   would be worse.
 - The slot matters only to an empty log, so after the initial
   deployment it is optional: the seeded state lives in the log, and
@@ -633,13 +864,13 @@ unbounded waste of event downloads.
   environments from scratch, such as staging or tests, keeps it.
 - Bootstrap is how a database gets its first admin.  It is not a
   principal: it runs once, before any request, with the operator's
-  trust, and it emits events rather than commands, so precommit never
-  sees a request it would have to fake.  Demos seed their accounts
-  this way, since dev sign-in requires a real account.  The test
-  bundle seeds an admin only when a test names `BOOTSTRAP_ADMIN` and
-  `BOOTSTRAP_PASSWORD`; its `lookup` answers for the tests' standing
-  users, `root` (an admin) and `p1`, with no account in the log, so
-  the log of every other test starts empty.
+  trust, and it writes directly rather than sending mutations, so no
+  decider ever sees a request it would have to fake.  Demos seed their
+  accounts this way, since dev sign-in requires a real account.  The
+  test bundle seeds an admin only when a test names `BOOTSTRAP_ADMIN`
+  and `BOOTSTRAP_PASSWORD`; its `lookup` answers for the tests'
+  standing users, `root` (an admin) and `p1`, with no account in the
+  log, so the log of every other test starts empty.
 
 ### Cron
 
@@ -659,7 +890,7 @@ unbounded waste of event downloads.
   every entry without a row the current minute as its mark, so a new
   or renamed entry first fires at its first slot after that, and
   answers every entry's mark.
-- The scheduler (`server/cron.go`) wakes at the earliest next slot, or
+- The scheduler (`cron.go`) wakes at the earliest next slot, or
   after a minute at most, and fires each entry's latest slot at or
   before the wall clock's now, and only that one, so downtime fires
   each entry once.  The mark becomes the slot, never the time it
@@ -667,11 +898,12 @@ unbounded waste of event downloads.
   stepped backwards fires nothing until it passes the marks.
 - A tick runs on the txn loop, past intake.  A slot at or below the
   entry's mark was decided already.  Any other calls the host's
-  `tick`, which hands the install's `run` the command `{entry, slot,
-  now}`, with `now` the group's server time, and what the hook's
-  requests emitted and what it returned land as one atom under a label
-  the core mints.  The decision moves the mark, whatever the hook did:
-  a hook that throws is a bug, logged, and its atom is dropped.
+  `tick`, which hands the install's `run` the mutation `{entry, slot,
+  now}`, with `now` the group's server time, over a write buffer, as a
+  decider runs, and what the hook and its requests wrote commits as
+  one mutation's edits under a label the core mints.  The decision
+  moves the mark, whatever the hook did: a hook that throws is a bug,
+  logged, and its writes are discarded.
 - Restoring a backup rewinds the marks with the log, and each entry's
   latest slot past its mark fires again.
 
@@ -683,36 +915,45 @@ app's slots:
 
     globalThis.__bundle = {
       schema,                   // the database's registry data
-      precommit(txn, data, principal) → reason | [{stream, event} |
-                                                 {stream, death: true}],
-      reducers: { family: { reducer(txn, events, stream, pending),
-                            template, keys } },
-      maySee(txn, principal) → [ref...],
-      lookup(txn, ident) → null | { user, generation, passwordHash },
+      bindWrite(txn),
+      bindRead(txn),
+      decide(data, principal) → null | reason,
+      grant(principal) → [selector...],
+      lookup(ident) → null | { user, generation, passwordHash },
       bootstrap(ctx),           // optional; see Bootstrap
-      plugins: { name: { kind, config, run(txn, cmd) → [output...] } },
+      plugins: { name: { kind, config, run(mutation) } },
       dev,                      // the skeleton's DEV
       mapStack(stack, file, map) → stack,
     }
 
-- `data` is the command's data; `principal` is `{user}` with `user` null
-  for anonymous; `ident` is `{kind: "password", identity}` at
+- `data` is the mutation's data; `principal` is `{user}` with `user`
+  null for anonymous; `ident` is `{kind: "password", identity}` at
   login and the `token`/`refresh` shapes above otherwise.  The `token`
-  shape also answers for a `CommandAuth` proof, and the writer reads
-  its `passwordHash` again in the command's turn, so its answer should
-  change only when the account's credentials do.
-- The `txn` of precommit, maySee, lookup, and a plugin's `run` also
-  has `emit(outputs)`, which plugin code calls to add outputs to the
-  command running.  A command's atom is what was emitted while
-  precommit or `run` ran, in call order, then what it returned; a
-  rejection or a throw drops both.  maySee or lookup emitting is a
-  bug, which fails the slot.
+  shape also answers for a `MutationAuth` proof, and the writer reads
+  its `passwordHash` again in the mutation's turn, so its answer
+  should change only when the account's credentials do.
+- The bundle's contexts are built once, when it is defined, and
+  `host.js` binds them once, when the bundle loads, to one transaction
+  object whose calls reach whichever call into the bundle is running:
+  `get(key, type)`, `scan(req)`, `set(key, type, value)`, `del(key)`,
+  and `deleteSlice(slice, erase)`.  `bindWrite` binds the read-write
+  context of `decide`, `bootstrap`, and a plugin's `run`, and every
+  plugin, and `bindRead` the one context `grant` and `lookup` share.
+- `decide` answers null when it carried the mutation out, and the
+  reason when it rejected it; anything else is a bug.  It runs over
+  the read-write transaction of Log and edits, and so do `bootstrap`
+  and a plugin's `run`.  `grant` and `lookup` only read: a write
+  through their context throws `this call reads only, and made a
+  write`, and a write that reaches the core in their call throws
+  `<slot> reads only, and made a write`; either is a bug that fails
+  the slot.
 - `plugins` are the installed plugins by name.  `run`, present for a
-  plugin with commands of its own (a cron tick, a worker's result),
-  hands the plugin one command with the database's contexts bound to
-  `txn`, as precommit's are; the plugin calls the app's hooks from it.
-  A built-in is recognized by its `kind` and carries a `config` the
-  core reads; cron is the one the core knows (Cron).
+  plugin with mutations of its own (a cron tick, a worker's result),
+  hands the plugin one mutation.  A plugin's requests are writes
+  through the transaction it is bound to, so they commit with the
+  rest of the mutation's edits, or are discarded with them.  A built-in is recognized by its `kind` and
+  carries a `config` the core reads; cron is the one the core knows
+  (Cron).
 - The host installs `crypto.getRandomValues` and `crypto.randomUUID`
   over `getrandom(2)`, as browsers and Node have them.
 - The core defines `process.env.NODE_ENV` as `production` before
@@ -726,42 +967,36 @@ app's slots:
   through the bundle's own `mapStack`, so the mapping is the
   skeleton's and every host shares it.
 - Every slot is a plain synchronous function over rich JS values.
-  `txn` reads the store: `get(key, type)` answers the value or
-  undefined, and `scan(req)` answers one batch of a walk of the keys a
-  pattern picks out, `{entries, next}`, as the skeleton's `ReadTxn`
-  does.  A reducer's `txn` also has `set(key, type, value)` and
-  `del(key)`.  The core converts each value under the type the call
-  names, a registry identity, so a value that does not fit its type
-  fails the call.  A scan names one type too, or `false` for keys
-  only, so a scan with values picks out one key template's keys.
-- A scan walks the kv table in C (`core/scan.c`) the way the
-  skeleton's `walkPattern` does: a skip scan that places each key
-  against the pattern's fields and seeks past the keys that cannot
-  match, after stepping up to 16 keys toward the target, since a
-  SQLite seek costs about as much as 16 steps.  It reads one key past
-  the batch to tell whether more follow, and decodes only the batch's
-  values.  The skeleton's conformance fixture
-  (`typespec/tests/fixtures/scan-conformance.json`) runs against it in
-  `server/scan_test.go`.
-- A reducer's keys are local: the core prefixes `<stream>!`.  Its
-  `template` is the family template and `keys` the key templates, as
-  declared in the model.  Its scan is the skeleton's `LocalScan`: the
-  pattern's stream is its own, and `after` and the keys it answers are
-  local.  It reads the command's own transaction, so it sees the
-  reducer's writes.
-  precommit, maySee, and lookup see global keys.
-- maySee is registered per distinct `principal` and re-run when a
-  commit touches what it read: the keys it got, and for each scan
+  `get(key, type)` answers the value or undefined, and `scan(req)`
+  answers one batch of a walk of the keys a pattern picks out,
+  `{entries, next}`, as the skeleton's `ReadTxn` does.  Keys are
+  global, `<slice>!<local key>`.  The core converts each value under
+  the type the call names, a registry identity, so a value that does
+  not fit its type fails the call.  A scan names one type too, or
+  `false` for keys only, so a scan with values picks out one key
+  template's keys.
+- A scan walks the kv table in C (`scan.c`) the way the skeleton's
+  `walkPattern` does: a skip scan that places each key against the
+  pattern's fields and seeks past the keys that cannot match, after
+  stepping up to 16 keys toward the target, since a SQLite seek costs
+  about as much as 16 steps.  It reads one key past the batch to tell
+  whether more follow, and decodes only the batch's values.  Over a
+  write buffer, the walk merges in the buffer's keys that the pattern
+  picks out (Log and edits).  The skeleton's conformance fixture
+  (`typespec/tests/fixtures/scan-conformance.json`) runs against it
+  in `scan_test.go`.
+- The grantor is registered per distinct `principal` and re-run when
+  a commit touches what it read: the keys it got, and for each scan
   batch, the stretch of keys the walk covered, the skeleton's
   `ScanSpan` (its pattern, its direction, from just past the batch's
   `after` to its `next` or the walk's end).  A written key touches a
   key it got or one a span covers, as `spanCovers` decides.  A
-  deleted prefix, a dead stream's `<stream>!`, touches a key it got
-  under the prefix, or a span whenever the prefix could hold a key the
-  span covers: the prefix and the pattern's head agree, one starting
-  with the other, and the prefix's keys overlap the span's stretch.
-  A spurious re-run costs only time, so that test errs toward
-  re-running.
+  cleared prefix, a deleted or reborn slice's `<slice>!`, touches a
+  key it got under the prefix, or a span whenever the prefix could
+  hold a key the span covers: the prefix and the pattern's head agree,
+  one starting with the other, and the prefix's keys overlap the
+  span's stretch.  A spurious re-run costs only time, so that test
+  errs toward re-running.
 
 ### Layout and build
 
@@ -770,14 +1005,16 @@ The database is one Go module, `phaselock.io/phaselockdb`, rooted at
 directory, and calls C only in its own package, so the C core and the
 Go layer sit side by side.
 
-    db/*.c, *.h   the C core: pldb.c txn loop, queues, and the
-                  command check, store.c SQLite, scan.c key patterns
-                  and their walk, walk.c the conversion kernel,
-                  names.c stream names and keys against their
-                  templates, mpjs.c untyped msgpack<->JS, js.c QuickJS
-                  host, host.js the JS glue (embedded by Go), os.c the
-                  calls that differ by platform, scantest.c the scan
-                  conformance test's hold on the walk
+    db/*.c, *.h   the C core: pldb.c txn loop, queues, the mutation
+                  check, and the commit of edits, buffer.c a
+                  mutation's write buffer, store.c SQLite, scan.c key
+                  patterns and their walk, walk.c the conversion
+                  kernel, names.c the syntax of slice names, prefix
+                  selectors, and keys, mpjs.c untyped msgpack<->JS,
+                  js.c QuickJS host and the merging scan, host.js the
+                  JS glue (embedded by Go), os.c the calls that differ
+                  by platform, scantest.c the scan conformance test's
+                  hold on the walk
     db/*.go       the Go layer: core.go cgo binding and build flags,
                   server.go HTTP, auth.go tokens and passwords, keys.go
                   token keys, cron.go the cron scheduler, mp.go
@@ -820,6 +1057,6 @@ as errors.
 page on phaselock.io naming this repository's `db` directory, so the
 module's versions are the repository's `db/v*` tags.
 
-Reader-side calls (history, list, snapshot) share one SQLite reader
+Reader-side calls (history, edit reads, snapshot) share one SQLite reader
 connection behind a mutex rather than a dedicated thread; each runs in
 its own read transaction so a cut is consistent with its position.

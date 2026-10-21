@@ -1,25 +1,24 @@
 /**
  * What the TypeScript emitter generates from the slice vocabulary.  One model below exercises
- * every shape: a singleton slice, a slice with two parameters, a database-only slice, an engine
- * with one command and one with several, @online commands carrying intake types, and every kind
- * of @command output.  Runtime tests import the generated module; type tests compile snippets of
- * user code against it, asserting their errors with `// @ts-expect-error`.
+ * every shape: a singleton slice, a slice with two parameters, database-only slices, an engine
+ * with one mutation and one with several, and @online mutations carrying intake types.  Runtime
+ * tests import the generated module; type tests compile snippets of user code against it,
+ * asserting their errors with `// @ts-expect-error`.
  */
 
 import { beforeAll, describe, expect, it } from 'vitest';
 
 import {
-  type Command,
+  type Bundle,
   InMemStore,
   JS,
+  type Mutation,
   type ReadTxn,
-  type ReducerTxn,
   type RTxn,
   scanAll,
-  type ScanRequest,
   type Schema,
   type Session,
-  type WTxn,
+  type StoreScan,
 } from '../../../ts/assets/skeleton.ts';
 import { bootstrap, FakeServer, registry, settle } from '../engine/harness.ts';
 
@@ -29,143 +28,64 @@ const SOURCE = `
   alias Id = string;
 
   // the catalog: a singleton slice
-  interface CatalogSlice extends Slice<"catalog", CatalogEvents, {
+  interface CatalogSlice extends Slice<"catalog", {
     "item:{item}": Item;
     "count": int32;
   }> {}
 
   model Item { id: Id; title: string; added: utcDateTime; }
 
-  union CatalogEvents { ItemAdded, ItemRemoved, Noted }
-
-  model ItemAdded { type: "item-added"; id: Id; title: string; added: utcDateTime; }
-  model ItemRemoved { type: "item-removed"; id: Id; }
-
   // an inbox per org and user: a slice with two parameters
-  interface InboxSlice extends Slice<"inbox:{org},{user}", InboxEvents, {
+  interface InboxSlice extends Slice<"inbox:{org},{user}", {
     "profile": Profile;
     "note:{note}": string;
   }> {}
 
   model Profile { name: string; }
 
-  union InboxEvents { ProfileSet, Noted }
+  // secrets: a database-only slice
+  interface SecretSlice extends Slice<"secret:{user}", { "secret": PasswordHash }> {}
 
-  model ProfileSet { type: "profile-set"; name: string; }
+  // preferences: a database-only slice whose parameters share names with accessor arguments
+  interface PrefSlice extends Slice<"pref:{options}", { "pref:{value}": string }> {}
 
-  // folded by the catalog and by every inbox, and a passthrough command
-  @command(Noted)
-  model Noted { type: "noted"; note: Id; text: string; }
-
-  // secrets: a database-only slice with a single event
-  interface SecretSlice extends Slice<"secret:{user}", SecretSet, { "secret": PasswordHash }> {}
-
-  model SecretSet { type: "secret-set"; password: PasswordHash; }
-
-  @command(ItemAdded)
   model AddItem { type: "add-item"; id: Id; title: string; added: utcDateTime; }
-
-  @command(ItemRemoved | Noted)
   model RemoveItem { type: "remove-item"; id: Id; }
-
-  @command([ProfileSet, Noted])
   model SetProfile { type: "set-profile"; org: Id; user: Id; name: string; }
-
-  @command(Noted[])
-  model NoteMany { type: "note-many"; notes: Id[]; }
-
+  model Note { type: "note"; org: Id; user: Id; note: Id; text: string; }
   @online
-  @command([SecretSet, ProfileSet])
   model SignUp { type: "sign-up"; org: Id; user: Id; name: string; password: NewPassword; }
-
   @online
-  @command([Death, ItemRemoved[]])
-  model Leave { type: "leave"; check: CommandAuth; }
-
-  @command(Erasure)
+  model Leave { type: "leave"; org: Id; check: MutationAuth; }
   model Forget { type: "forget"; org: Id; user: Id; }
-
-  @command(ItemRemoved)
   model Sweep { type: "sweep"; id: Id; }
 
   interface ReaderEngine extends Engine<[CatalogSlice], AddItem> {}
 
-  union WriterCommands { AddItem, RemoveItem, SetProfile, NoteMany, Noted, Leave, Forget }
+  union WriterMutations { AddItem, RemoveItem, SetProfile, Note, Leave, Forget }
 
-  interface WriterEngine extends Engine<[CatalogSlice, InboxSlice], WriterCommands> {}
+  interface WriterEngine extends Engine<[CatalogSlice, InboxSlice], WriterMutations> {}
 
-  union DbCommands { Sweep, SignUp }
+  union DbMutations { Sweep, SignUp }
 
-  interface AppDB extends Database<[ReaderEngine, WriterEngine], [SecretSlice], DbCommands> {}
+  interface AppDB extends Database<[ReaderEngine, WriterEngine], [SecretSlice, PrefSlice], DbMutations> {}
 `;
 
 /* Snippets of user code, each type-checked as its own file against the generated module.  A
    snippet passes when it compiles with no diagnostics, so each error it expects is marked with
    `// @ts-expect-error` on the line before, and an expected error that does not happen fails. */
 const SNIPPETS: Record<string, string> = {
-  reducers: `
-    import type { CatalogSliceReducers, InboxSliceReducers } from './model.gen.ts';
-
-    export const catalog: CatalogSliceReducers = {
-      itemAdded: (txn, e) => txn.set.item(e.id, { id: e.id, title: e.title, added: e.added }),
-      itemRemoved: (txn, e) => txn.del.item(e.id),
-      noted: (txn, _e, pending) => {
-        const n: number = txn.get.count() ?? 0;
-        if (!pending) txn.set.count(n + 1);
-      },
-    };
-
-    // @ts-expect-error every event of the slice needs its handler
-    export const missing: CatalogSliceReducers = {
-      itemAdded: () => {},
-      itemRemoved: () => {},
-    };
-
-    export const extra: CatalogSliceReducers = {
-      itemAdded: () => {},
-      itemRemoved: () => {},
-      noted: () => {},
-      // @ts-expect-error a misspelled handler
-      itemAded: () => {},
-    };
-
-    export const inbox: InboxSliceReducers = {
-      profileSet: (txn, e) => {
-        const org: string = txn.params.org;
-        const user: string = txn.params.user;
-        // @ts-expect-error a parameter the family does not have
-        void txn.params.patron;
-        txn.set.profile({ name: e.name + ' of ' + org + '/' + user });
-        txn.update.profile((p) => {
-          p.name = p.name.trim();
-        });
-      },
-      noted: (txn, e) => {
-        txn.set.note(e.note, e.text);
-        // @ts-expect-error the stream binds the family's parameters
-        txn.get.note('acme', 'u1', e.note);
-        txn.del.note(e.note);
-
-        // a reducer scans its own stream by the template's own parameters
-        for (const [{ note }, text] of txn.scan.note({ note: { prefix: 'n' } })) {
-          txn.set.note(note, text.trim());
-        }
-        // @ts-expect-error the stream binds the family's parameters
-        txn.scan.note({ org: 'acme' });
-        // @ts-expect-error a template with no parameter of its own names one key of the stream
-        void txn.scan.profile;
-      },
-    };
-  `,
-
   contexts: `
     import type {
+      AppDBReadTxn,
       AppDBTxn,
       Item,
       PasswordHash,
       Profile,
       ReaderEngineQueryTxn,
+      ReaderEngineReadTxn,
       ReaderEngineTxn,
+      WriterEngineReadTxn,
       WriterEngineTxn,
     } from './model.gen.ts';
 
@@ -173,6 +93,7 @@ const SNIPPETS: Record<string, string> = {
     declare const readerQuery: ReaderEngineQueryTxn;
     declare const writer: WriterEngineTxn;
     declare const db: AppDBTxn;
+    declare const dbRead: AppDBReadTxn;
     declare function export_(s: string): void;
 
     export const item: Item | undefined = reader.get.item('i1');
@@ -182,8 +103,6 @@ const SNIPPETS: Record<string, string> = {
     export const profile: Profile | undefined = writer.get.profile('acme', 'u1');
     export const note: string | undefined = writer.get.note('acme', 'u1', 'n1');
     export const secret: PasswordHash | undefined = db.get.secret('u1');
-    // @ts-expect-error a global context is read-only
-    void db.set;
 
     // scans: a match by name on any of the varying parameters, each yielded by name
     for (const [{ org, user, note }, text] of writer.scan.note({ org: 'acme', note: { gte: 'a' } })) {
@@ -202,163 +121,163 @@ const SNIPPETS: Record<string, string> = {
     // @ts-expect-error a template whose family and key have no parameters names one key
     void reader.scan.count;
 
-    // the database's context passes wherever one of its engines' contexts is wanted
+    // writes: set, del, update, and deleteSlice, each taking the family's parameters first
+    writer.set.profile('acme', 'u1', { name: 'Ann' });
+    writer.set.note('acme', 'u1', 'n1', 'hi');
+    writer.del.note('acme', 'u1', 'n1');
+    export const renamed: string = writer.update.profile('acme', 'u1', (p) => (p.name = 'Bob'));
+    writer.deleteSlice.inbox('acme', 'u1');
+    writer.deleteSlice.inbox('acme', 'u1', { erase: true });
+    db.deleteSlice.catalog();
+    db.set.pref('dark', 'theme', 'on');
+    db.deleteSlice.pref('dark', { erase: true });
+    // @ts-expect-error erase is true or left out
+    writer.deleteSlice.inbox('acme', 'u1', { erase: false });
+    // @ts-expect-error a slice is named by every parameter of its family
+    writer.deleteSlice.inbox('acme');
+    // @ts-expect-error a value of the key's type
+    writer.set.profile('acme', 'u1', { title: 'Ann' });
+    // @ts-expect-error a value that is not updated in place has no update
+    void writer.update.count;
+
+    // the database's context passes wherever one of its engines' contexts is wanted, writes
+    // included
     export const asWriter: WriterEngineTxn = db;
     export const asReader: ReaderEngineTxn = db;
 
-    // a query reads the engine's slices and the Engine's status; a forecast reads no status, and
-    // the query context passes wherever the engine's context is wanted
+    // every context passes as a read context, and the database's as each engine's
+    export const readsWriter: WriterEngineReadTxn = writer;
+    export const readsQuery: ReaderEngineReadTxn = readerQuery;
+    export const readsDb: WriterEngineReadTxn = dbRead;
+    export const readsDbTxn: AppDBReadTxn = db;
+
+    // a read context writes nothing
+    // @ts-expect-error a read context has no set
+    void dbRead.set;
+
+    // a query reads the engine's slices and the Engine's status, and writes nothing
     export const hasBase: boolean = readerQuery.status.connection().hasBase;
     export const queried: Item | undefined = readerQuery.get.item('i1');
-    // @ts-expect-error a forecast reads no status
+    // @ts-expect-error a prediction reads no status
     void reader.status;
+    // @ts-expect-error a query writes nothing
     export const asReaderFromQuery: ReaderEngineTxn = readerQuery;
   `,
 
-  precommit: `
+  deciders: `
     import {
-      type AppDBPrecommit,
-      type Auth,
+      type AppDBDeciders,
       type AppDBTxn,
-      type NotedOutput,
+      type Auth,
       type PasswordHash,
       Reject,
       type Sweep,
-      type SweepOutput,
-      type WriterEngineForecasters,
+      type WriterEnginePredictors,
     } from './model.gen.ts';
 
-    // a forecaster shared with precommit, which authorizes and then calls it
-    const forecasters = {
-      addItem: (_txn, cmd) => ({
-        stream: 'catalog',
-        event: { type: 'item-added', id: cmd.id, title: cmd.title, added: cmd.added },
-      }),
-    } satisfies WriterEngineForecasters;
+    // a predictor shared with the decider, which authorizes and then calls it
+    const predictors = {
+      addItem: (txn, m) => {
+        txn.set.item(m.id, { id: m.id, title: m.title, added: m.added });
+      },
+    } satisfies WriterEnginePredictors;
 
     // a helper typed by the generated names
-    function sweep(auth: Auth, txn: AppDBTxn, cmd: Sweep): SweepOutput {
+    function sweep(auth: Auth, txn: AppDBTxn, m: Sweep): void {
       auth.authorize(auth.user === 'root', 'root only');
-      if (txn.get.item(cmd.id) === undefined) throw new Reject('no such item');
-      return { stream: 'catalog', event: { type: 'item-removed', id: cmd.id } };
+      if (txn.get.item(m.id) === undefined) throw new Reject('no such item');
+      txn.del.item(m.id);
     }
 
-    export const precommit: AppDBPrecommit = {
-      addItem: (auth, txn, cmd) => {
+    export const deciders: AppDBDeciders = {
+      addItem: (auth, txn, m) => {
         auth.authorize(auth.user !== null);
-        return forecasters.addItem(txn, cmd);
+        predictors.addItem(txn, m);
       },
-      removeItem: (auth, txn, cmd) => {
+      removeItem: (auth, txn, m) => {
         auth.authorizeAnyone();
-        if (txn.get.item(cmd.id) === undefined) {
-          return { stream: 'catalog', event: { type: 'noted', note: cmd.id, text: 'gone' } };
-        }
-        return { stream: 'catalog', event: { type: 'item-removed', id: cmd.id } };
+        txn.del.item(m.id);
       },
-      setProfile: (auth, _txn, cmd) => {
-        auth.authorize(auth.user === cmd.user);
-        const stream = \`inbox:\${cmd.org},\${cmd.user}\` as const;
-        return [
-          { stream, event: { type: 'profile-set', name: cmd.name } },
-          { stream, event: { type: 'noted', note: 'n1', text: 'profile set' } },
-        ];
+      setProfile: (auth, txn, m) => {
+        auth.authorize(auth.user === m.user);
+        txn.set.profile(m.org, m.user, { name: m.name });
       },
-      noteMany: (auth, _txn, cmd) => {
+      note: (auth, txn, m) => {
         auth.authorizeAnyone();
-        return cmd.notes.map((note): NotedOutput => ({
-          stream: 'catalog',
-          event: { type: 'noted', note, text: '' },
-        }));
+        txn.set.note(m.org, m.user, m.note, m.text);
       },
-      noted: (auth, _txn, cmd) => {
+      signUp: (auth, txn, m) => {
         auth.authorizeAnyone();
-        return { stream: 'catalog', event: cmd };
+        const hash: PasswordHash = m.password;
+        txn.set.secret(m.user, hash);
+        txn.set.profile(m.org, m.user, { name: m.name });
       },
-      signUp: (auth, _txn, cmd) => {
+      leave: (auth, txn, m) => {
+        auth.authorize(m.check.kind === 'password' && auth.user !== null);
+        txn.deleteSlice.inbox(m.org, auth.user!);
+      },
+      forget: (auth, txn, m) => {
         auth.authorizeAnyone();
-        const hash: PasswordHash = cmd.password;
-        return [
-          { stream: \`secret:\${cmd.user}\`, event: { type: 'secret-set', password: hash } },
-          { stream: \`inbox:\${cmd.org},\${cmd.user}\`, event: { type: 'profile-set', name: cmd.name } },
-        ];
-      },
-      leave: (auth, txn, cmd) => {
-        auth.authorize(cmd.check.kind === 'password');
-        const gone = txn.get.item('i1') === undefined ? [] : [{ stream: 'catalog' as const, event: { type: 'item-removed' as const, id: 'i1' } }];
-        return [{ stream: 'inbox:acme,' + auth.user, death: true }, gone];
-      },
-      forget: (auth, _txn, cmd) => {
-        auth.authorizeAnyone();
-        return { stream: \`inbox:\${cmd.org},\${cmd.user}\`, death: true, erase: true };
+        txn.deleteSlice.inbox(m.org, m.user, { erase: true });
       },
       sweep,
     };
   `,
 
-  precommitErrors: `
-    import type { AppDBPrecommit } from './model.gen.ts';
+  deciderErrors: `
+    import type { AppDBDeciders } from './model.gen.ts';
 
-    declare const ok: AppDBPrecommit;
+    declare const ok: AppDBDeciders;
     const { sweep: _sweep, ...rest } = ok;
 
-    // @ts-expect-error every command needs its handler
-    export const missing: AppDBPrecommit = rest;
+    // @ts-expect-error every mutation needs its decider
+    export const missing: AppDBDeciders = rest;
 
-    export const extra: AppDBPrecommit = {
+    export const extra: AppDBDeciders = {
       ...ok,
-      // @ts-expect-error a misspelled handler
+      // @ts-expect-error a misspelled decider
       sweeep: ok.sweep,
     };
 
-    export const wrong: Partial<AppDBPrecommit> = {
-      // @ts-expect-error a singleton slice's stream label is its family name
-      addItem: (_auth, _txn, cmd) => ({ stream: 'catalog:x', event: { ...cmd, type: 'item-added' } }),
-      // @ts-expect-error an event the output does not name
-      removeItem: (_auth, _txn, cmd) => ({ stream: 'catalog', event: { type: 'item-added', id: cmd.id, title: '', added: new Date() } }),
-      // @ts-expect-error a tuple output returns every item
-      setProfile: (_auth, _txn, cmd) => [{ stream: \`inbox:\${cmd.org},\${cmd.user}\`, event: { type: 'profile-set', name: cmd.name } }],
-      // @ts-expect-error a stream name built as a plain string
-      noted: (_auth, _txn, cmd) => ({ stream: 'catalog' + cmd.note, event: cmd }),
-      // @ts-expect-error a stream name with a parameter missing
-      signUp: (_auth, _txn, cmd) => [{ stream: \`secret:\${cmd.user}\`, event: { type: 'secret-set', password: cmd.password } }, { stream: \`inbox:\${cmd.org}\`, event: { type: 'profile-set', name: cmd.name } }],
-      // @ts-expect-error an event on a family that does not fold it
-      noteMany: (_auth, _txn, cmd) => cmd.notes.map((note) => ({ stream: \`secret:\${note}\` as const, event: { type: 'noted' as const, note, text: '' } })),
-      // @ts-expect-error a death is { stream, death: true }
-      leave: () => [{ stream: 'inbox:a,b', death: false }, []],
-      // @ts-expect-error an erasure is { stream, death: true, erase: true }
-      forget: () => ({ stream: 'inbox:a,b', death: true }),
+    export const wrong: Partial<AppDBDeciders> = {
+      // @ts-expect-error a mutation's own fields
+      removeItem: (_auth, _txn, m) => void m.title,
+      // @ts-expect-error a decider sees the prepared mutation, not the client's password
+      signUp: (_auth, txn, m: { user: string; password: number }) => txn.set.secret(m.user, ''),
     };
   `,
 
-  forecasters: `
-    import type { ReaderEngineForecasters, WriterEngineForecasters } from './model.gen.ts';
+  predictors: `
+    import type { ReaderEnginePredictors, WriterEnginePredictors } from './model.gen.ts';
 
-    export const reader: ReaderEngineForecasters = {
-      addItem: (txn, cmd) => {
-        if (txn.get.item(cmd.id) !== undefined) throw new Error('already added');
-        return { stream: 'catalog', event: { ...cmd, type: 'item-added' } };
+    export const reader: ReaderEnginePredictors = {
+      addItem: (txn, m) => {
+        if (txn.get.item(m.id) !== undefined) throw new Error('already added');
+        txn.set.item(m.id, { ...m });
       },
     };
 
-    // a table may leave commands out, which forecast nothing
-    export const writer: WriterEngineForecasters = {
-      noted: (txn, cmd) => {
-        void txn.get.profile('acme', 'u1');
-        return { stream: 'catalog', event: cmd };
+    // a table may leave mutations out, which predict nothing, and a predictor may mark what it
+    // writes as pending
+    export const writer: WriterEnginePredictors = {
+      note: (txn, m, pending) => {
+        void txn.get.profile(m.org, m.user);
+        txn.set.note(m.org, m.user, m.note, pending ? m.text + ' (sending)' : m.text);
       },
-      // @ts-expect-error an @online command is never forecast
-      leave: () => [],
+      forget: (txn, m) => txn.deleteSlice.inbox(m.org, m.user),
+      // @ts-expect-error an @online mutation is never predicted
+      leave: () => {},
     };
   `,
 
   intake: `
     import type {
-      CommandAuthResult,
+      MutationAuthResult,
       Leave,
-      LeaveForPrecommit,
+      LeaveForDecider,
       PasswordHash,
       SignUp,
-      SignUpForPrecommit,
+      SignUpForDecider,
     } from './model.gen.ts';
 
     // the client sends the wire types
@@ -369,28 +288,32 @@ const SNIPPETS: Record<string, string> = {
       name: 'Ann',
       password: 'hunter2',
     };
-    export const leave: Leave = { type: 'leave', check: { kind: 'password', password: 'hunter2' } };
+    export const leave: Leave = {
+      type: 'leave',
+      org: 'acme',
+      check: { kind: 'password', password: 'hunter2' },
+    };
 
-    // precommit sees the command as the database prepared it
-    declare const received: SignUpForPrecommit;
+    // the decider sees the mutation as the database prepared it
+    declare const received: SignUpForDecider;
     export const hash: PasswordHash = received.password;
-    declare const left: LeaveForPrecommit;
-    export const result: CommandAuthResult = left.check;
-    // @ts-expect-error the prepared command carries the result, not the client's proof
+    declare const left: LeaveForDecider;
+    export const result: MutationAuthResult = left.check;
+    // @ts-expect-error the prepared mutation carries the result, not the client's proof
     void left.check.password;
 
     // the results are plain aliases of their shapes
     export const text: string = hash;
     export const plain: PasswordHash = 'hunter2';
-    export const auth: CommandAuthResult = { kind: 'password' };
+    export const auth: MutationAuthResult = { kind: 'password' };
   `,
 
   sending: `
     import type {
       AddItem,
-      CommandResult,
       Item,
       Leave,
+      MutationResult,
       Query,
       ReaderEngine,
       WriterEngine,
@@ -401,14 +324,14 @@ const SNIPPETS: Record<string, string> = {
     declare const add: AddItem;
     declare const leave: Leave;
 
-    writer.sendCommand(add);
-    // @ts-expect-error an @online command never enters the outbox
-    writer.sendCommand(leave);
-    export const outcome: Promise<CommandResult> = writer.sendOnlineCommand(leave);
-    // @ts-expect-error a command that is not @online goes through the outbox
-    void writer.sendOnlineCommand(add);
-    // @ts-expect-error the reader engine sends no @online command
-    void reader.sendOnlineCommand(leave);
+    writer.sendMutation(add);
+    // @ts-expect-error an @online mutation never enters the outbox
+    writer.sendMutation(leave);
+    export const outcome: Promise<MutationResult> = writer.sendOnlineMutation(leave);
+    // @ts-expect-error a mutation that is not @online goes through the outbox
+    void writer.sendOnlineMutation(add);
+    // @ts-expect-error the reader engine sends no @online mutation
+    void reader.sendOnlineMutation(leave);
 
     export const q: Query<Item | undefined> = writer.newQuery((txn) => txn.get.item('i1'));
     export const loading: Query<boolean> = writer.newQuery(
@@ -418,41 +341,35 @@ const SNIPPETS: Record<string, string> = {
 
   engines: `
     import {
-      type CatalogSliceReducers,
-      type InboxSliceReducers,
-      type SecretSliceReducers,
+      type ReaderEnginePredictors,
       type Session,
       type StoreFactory,
       type Transport,
       WriterEngine,
+      type WriterEnginePredictors,
     } from './model.gen.ts';
 
-    declare const catalog: CatalogSliceReducers;
-    declare const inbox: InboxSliceReducers;
-    declare const secret: SecretSliceReducers;
     declare const transport: Transport;
     declare const session: Session;
     declare const store: StoreFactory;
+    declare const predictors: WriterEnginePredictors;
+    declare const readerPredictors: ReaderEnginePredictors;
 
-    export const engine = new WriterEngine(transport, { session, reducers: { catalog, inbox } });
-    export const anonymous = new WriterEngine(transport, {
-      session: null,
-      reducers: { catalog, inbox },
-      store,
-    });
+    export const engine = new WriterEngine(transport, { session, predictors });
+    export const anonymous = new WriterEngine(transport, { session: null, store });
+    // a table of a narrower engine predicts the mutations both send
+    export const narrow = new WriterEngine(transport, { session, predictors: readerPredictors });
     // @ts-expect-error the session is required, null for anonymous
-    new WriterEngine(transport, { reducers: { catalog, inbox } });
-    // @ts-expect-error every slice of the engine needs its reducers
-    new WriterEngine(transport, { session, reducers: { catalog } });
-    // @ts-expect-error a slice the engine does not sync
-    new WriterEngine(transport, { session, reducers: { catalog, inbox, secret } });
+    new WriterEngine(transport, { predictors });
+    // @ts-expect-error a predictor for a mutation the engine does not send
+    new WriterEngine(transport, { session, predictors: { sweep: () => {} } });
   `,
 
   posting: `
     import {
       type AddItem,
-      type CommandResult,
-      postAppCommand,
+      type MutationResult,
+      postAppMutation,
       type Session,
       type SignUp,
       type Transport,
@@ -463,14 +380,14 @@ const SNIPPETS: Record<string, string> = {
     declare const signUp: SignUp;
     declare const add: AddItem;
 
-    export const anonymous: Promise<CommandResult> = postAppCommand(transport, signUp);
-    export const signedIn: Promise<CommandResult> = postAppCommand(transport, add, { session });
-    // @ts-expect-error only the database's commands
-    void postAppCommand(transport, { type: 'not-a-command' });
+    export const anonymous: Promise<MutationResult> = postAppMutation(transport, signUp);
+    export const signedIn: Promise<MutationResult> = postAppMutation(transport, add, { session });
+    // @ts-expect-error only the database's mutations
+    void postAppMutation(transport, { type: 'not-a-mutation' });
   `,
 
   database: `
-    import { type AppDBBootstrapContext, type AppDBSlots, defineAppDB } from './model.gen.ts';
+    import { type AppDBGrantor, type AppDBSlots, defineAppDB } from './model.gen.ts';
 
     declare const slots: AppDBSlots;
     defineAppDB(slots);
@@ -479,19 +396,37 @@ const SNIPPETS: Record<string, string> = {
     const { bootstrap: _bootstrap, ...rest } = slots;
     defineAppDB(rest);
 
-    // @ts-expect-error the database's own slices need their reducers too
-    defineAppDB({ ...slots, reducers: { catalog: slots.reducers.catalog, inbox: slots.reducers.inbox } });
+    // bootstrap writes through its transaction
+    defineAppDB({
+      ...slots,
+      bootstrap: (txn, ctx) => {
+        txn.set.count(0);
+        txn.set.secret('root', ctx.hashPassword(ctx.env('PASSWORD')));
+        // @ts-expect-error a value of the key's type
+        txn.set.count('none');
+      },
+    });
 
-    declare const ctx: AppDBBootstrapContext;
-    ctx.emit('catalog', { type: 'item-added', id: 'i1', title: 'T', added: new Date() });
-    ctx.emit('secret:u1', { type: 'secret-set', password: ctx.hashPassword(ctx.env('PASSWORD')) });
-    // @ts-expect-error no slice folds such an event
-    ctx.emit('catalog', { type: 'bogus' });
+    // grant and lookup only read
+    export const grant: AppDBGrantor = (txn, principal) => {
+      // @ts-expect-error a grantor writes nothing
+      txn.set.count(1);
+      return txn.get.secret(principal.user ?? '') === undefined ? [] : ['catalog'];
+    };
+    defineAppDB({
+      ...slots,
+      grant,
+      lookup: (txn, ident) => {
+        // @ts-expect-error lookup writes nothing
+        txn.del.secret('u1');
+        return ident.kind === 'password' ? { user: ident.identity } : null;
+      },
+    });
   `,
+
   plugins: `
     import {
-      type AppDBPrecommit,
-      type AppDBSlots,
+      type AppDBDeciders,
       type DbMarker,
       type DbTypes,
       type PluginInstall,
@@ -499,11 +434,11 @@ const SNIPPETS: Record<string, string> = {
     } from './model.gen.ts';
 
     // a plugin with requests, as its package ships it: the request API, and an install whose
-    // handlers take the database's types from the slot the install lands in
+    // hooks take the database's types from the slot the install lands in
     type EmailPlugin = PluginInstall<{ send(requestId: string, to: string): void }>;
     declare const Email: {
-      install<DB extends DbTypes>(handlers: {
-        sent(txn: DB['txn'], requestId: string): DB['output'][];
+      install<DB extends DbTypes>(hooks: {
+        sent(txn: DB['txn'], requestId: string): void;
       }): EmailPlugin & DbMarker<DB>;
     };
 
@@ -512,31 +447,30 @@ const SNIPPETS: Record<string, string> = {
     type CronPlugin = PluginInstall<{}>;
     declare const Cron: {
       install<DB extends DbTypes>(
-        entries: Record<string, { spec: string; hook(txn: DB['txn'], tick: Tick): DB['output'][] }>,
+        entries: Record<string, { spec: string; hook(txn: DB['txn'], tick: Tick): void }>,
       ): CronPlugin & DbMarker<DB>;
     };
 
-    // the app's plugin set, named once for precommit and the database
+    // the app's plugin set, named once for the deciders and the database
     type MyPlugins = { email: EmailPlugin; cron: CronPlugin };
-    declare const reducers: AppDBSlots['reducers'];
-    declare const precommit: AppDBPrecommit<MyPlugins>;
+    declare const deciders: AppDBDeciders<MyPlugins>;
 
-    // precommit requests through the txn
-    export const sweep: AppDBPrecommit<MyPlugins>['sweep'] = (auth, txn, cmd) => {
+    // a decider requests through the txn
+    export const sweep: AppDBDeciders<MyPlugins>['sweep'] = (auth, txn, m) => {
       auth.authorizeAnyone();
-      txn.email.send(cmd.id, 'a@b');
+      txn.email.send(m.id, 'a@b');
       const _cron: {} = txn.cron;
       // @ts-expect-error not a request of the email plugin
-      txn.email.charge(cmd.id);
-      return { stream: 'catalog', event: { type: 'item-removed', id: cmd.id } };
+      txn.email.charge(m.id);
+      txn.del.item(m.id);
     };
 
-    // installs infer the database's types, so their handlers read the txn and request through it
+    // installs infer the database's types, so their hooks read and write the txn and request
+    // through it
     defineAppDB<MyPlugins>({
-      reducers,
-      precommit,
-      maySee: (txn) => {
-        // @ts-expect-error maySee's txn requests nothing
+      deciders,
+      grant: (txn) => {
+        // @ts-expect-error the grantor's txn requests nothing
         txn.email.send('r1', 'a@b');
         return [];
       },
@@ -545,20 +479,18 @@ const SNIPPETS: Record<string, string> = {
         email: Email.install({
           sent: (txn, requestId) => {
             txn.email.send(\`\${requestId}-again\`, 'a@b');
-            return [];
+            txn.set.note('acme', 'u1', requestId, 'sent');
           },
         }),
         cron: Cron.install({
           digest: {
             spec: '0 8 * * *',
-            hook: (txn, tick) => [
-              { stream: 'catalog', event: { type: 'item-removed', id: txn.get.item('i1')?.id ?? String(tick.slot.getTime()) } },
-            ],
+            hook: (txn, tick) => txn.del.item(txn.get.item('i1')?.id ?? String(tick.slot.getTime())),
           },
           bogus: {
             spec: '0 9 * * *',
-            // @ts-expect-error no slice folds such an event
-            hook: () => [{ stream: 'catalog', event: { type: 'bogus' } }],
+            // @ts-expect-error no such key
+            hook: (txn) => txn.set.bogus('x'),
           },
         }),
       },
@@ -566,53 +498,49 @@ const SNIPPETS: Record<string, string> = {
 
     // every plugin of the set is installed
     defineAppDB<MyPlugins>({
-      reducers,
-      precommit,
-      maySee: () => [],
+      deciders,
+      grant: () => [],
       lookup: () => null,
       // @ts-expect-error the set names cron, which is not installed
-      plugins: { email: Email.install({ sent: () => [] }) },
+      plugins: { email: Email.install({ sent: () => {} }) },
     });
 
     // a set that names plugins needs its plugins slot
     // @ts-expect-error no plugins slot
-    defineAppDB<MyPlugins>({ reducers, precommit, maySee: () => [], lookup: () => null });
+    defineAppDB<MyPlugins>({ deciders, grant: () => [], lookup: () => null });
 
     // and nothing outside the set is installed
     type MailOnly = { email: EmailPlugin };
-    declare const mailOnly: AppDBPrecommit<MailOnly>;
+    declare const mailOnly: AppDBDeciders<MailOnly>;
     defineAppDB<MailOnly>({
-      reducers,
-      precommit: mailOnly,
-      maySee: () => [],
+      deciders: mailOnly,
+      grant: () => [],
       lookup: () => null,
       plugins: {
-        email: Email.install({ sent: () => [] }),
+        email: Email.install({ sent: () => {} }),
         // @ts-expect-error cron is not in the set
         cron: Cron.install({}),
       },
     });
 
-    // a precommit written for another set than the database installs
+    // deciders written for another set than the database installs
     defineAppDB<MailOnly>({
-      reducers,
-      // @ts-expect-error its handlers expect cron on the txn
-      precommit,
-      maySee: () => [],
+      // @ts-expect-error its deciders expect cron on the txn
+      deciders,
+      grant: () => [],
       lookup: () => null,
-      plugins: { email: Email.install({ sent: () => [] }) },
+      plugins: { email: Email.install({ sent: () => {} }) },
     });
 
     // no plugin is named after a context field
-    type Shadowing = { get: EmailPlugin };
-    declare const shadowing: AppDBPrecommit<Shadowing>;
+    type Shadowing = { deleteSlice: EmailPlugin };
+    declare const shadowing: AppDBDeciders<Shadowing>;
     defineAppDB<Shadowing>({
-      reducers,
-      precommit: shadowing,
-      maySee: () => [],
+      deciders: shadowing,
+      grant: () => [],
       lookup: () => null,
-      // @ts-expect-error get is a context field
-      plugins: { get: Email.install({ sent: () => [] }) },
+      // @ts-expect-error deleteSlice is a context field
+      plugins: { deleteSlice: Email.install({ sent: () => {} }) },
     });
   `,
 };
@@ -634,13 +562,16 @@ function compiles(name: string): void {
   expect(diagnostics[name]).toEqual([]);
 }
 
-/** a ReducerTxn or ReadTxn over a map, recording each call */
+/** a WriteTxn over a map, recording each call */
 function fakeTxn(data: Map<string, unknown> = new Map()) {
   const calls: unknown[][] = [];
   const txn = {
     get(key: string, type: string): unknown {
       calls.push(['get', key, type]);
       return data.get(key);
+    },
+    scan(): StoreScan {
+      throw new Error('a fake transaction does not scan');
     },
     set(key: string, type: string, value: unknown): void {
       calls.push(['set', key, type, value]);
@@ -650,162 +581,30 @@ function fakeTxn(data: Map<string, unknown> = new Map()) {
       calls.push(['del', key]);
       data.delete(key);
     },
+    deleteSlice(slice: string, erase: boolean): void {
+      calls.push(['deleteSlice', slice, erase]);
+      for (const key of [...data.keys()]) if (key.startsWith(`${slice}!`)) data.delete(key);
+    },
   };
   return { txn, calls, data };
 }
 
-const added = new Date('2024-01-02T03:04:05Z');
-const itemAdded = { type: 'item-added', id: 'i1', title: 'T', added };
-const itemRemoved = { type: 'item-removed', id: 'i1' };
-const noted = { type: 'noted', note: 'n1', text: 'hi' };
-
-/** a catalog handler table that records each call */
-function catalogRecorder(seen: unknown[][]) {
-  return {
-    itemAdded: (txn: any, e: any, pending: boolean) => seen.push(['itemAdded', e, pending, txn]),
-    itemRemoved: (txn: any, e: any, pending: boolean) => seen.push(['itemRemoved', e, pending]),
-    noted: (txn: any, e: any, pending: boolean) => seen.push(['noted', e, pending]),
-  };
+/** a generated context, bound to txn */
+function bound(created: { ctx: any; $ref: { txn: unknown } }, txn: unknown): any {
+  created.$ref.txn = txn;
+  return created.ctx;
 }
 
-describe('reducer contexts', () => {
-  it('folds every stream through one context, bound to its transaction and parameters in turn', () => {
-    const seen: unknown[] = [];
-    const reducer = M.inboxSliceReducer({
-      profileSet: (t: any) => seen.push(t, { ...t.params }, t.get.profile()),
-      noted: () => {},
-    });
-    const one = fakeTxn(new Map([['profile', 'one']]));
-    const two = fakeTxn(new Map([['profile', 'two']]));
-    reducer.reducer(one.txn, [{ type: 'profile-set', name: 'Ann' }], 'inbox:acme,u1', false);
-    reducer.reducer(two.txn, [{ type: 'profile-set', name: 'Bob' }], 'inbox:acme,u2', false);
-    expect(seen[3]).toBe(seen[0]);
-    expect(seen.slice(1, 3)).toEqual([{ org: 'acme', user: 'u1' }, 'one']);
-    expect(seen.slice(4)).toEqual([{ org: 'acme', user: 'u2' }, 'two']);
-  });
+const added = new Date('2024-01-02T03:04:05Z');
 
-  it('generates one reducer context per slice, over its local key templates', () => {
-    const { txn, calls } = fakeTxn();
-    const reducer = M.catalogSliceReducer({
-      itemAdded: (t: any, e: any) => {
-        t.set.item(e.id, { id: e.id, title: e.title, added: e.added });
-        t.set.count(1);
-      },
-      itemRemoved: () => {},
-      noted: () => {},
-    });
-    reducer.reducer(txn, [itemAdded], 'catalog', false);
-    expect(calls).toEqual([
-      ['set', 'item:i1', 'Item', { id: 'i1', title: 'T', added }],
-      ['set', 'count', 'catalog/count', 1],
-    ]);
-  });
-
-  it("gives reducer accessors only the local template's own parameters (get.patron())", () => {
-    const { txn, calls } = fakeTxn();
-    const reducer = M.inboxSliceReducer({
-      profileSet: (t: any) => t.get.profile(),
-      noted: (t: any, e: any) => t.get.note(e.note),
-    });
-    reducer.reducer(txn, [{ type: 'profile-set', name: 'Ann' }, noted], 'inbox:acme,u1', false);
-    expect(calls).toEqual([
-      ['get', 'profile', 'Profile'],
-      ['get', 'note:n1', 'inbox/note'],
-    ]);
-    compiles('reducers');
-  });
-
-  it('generates get, set, del, and update accessors, get answering undefined when absent', () => {
-    const { txn, data } = fakeTxn();
-    const seen: unknown[] = [];
-    const reducer = M.inboxSliceReducer({
-      profileSet: (t: any, e: any) => {
-        seen.push(t.get.profile());
-        t.set.profile({ name: e.name });
-        seen.push(t.update.profile((p: any) => (p.name = p.name.toUpperCase())));
-        seen.push(t.get.profile());
-      },
-      noted: (t: any) => t.del.profile(),
-    });
-    reducer.reducer(txn, [{ type: 'profile-set', name: 'ann' }], 'inbox:acme,u1', false);
-    expect(seen).toEqual([undefined, 'ANN', { name: 'ANN' }]);
-    expect(data.get('profile')).toEqual({ name: 'ANN' });
-
-    reducer.reducer(txn, [noted], 'inbox:acme,u1', false);
-    expect(data.has('profile')).toBe(false);
-
-    // an update of an absent key throws, as any reducer may when its state is not as expected
-    expect(() =>
-      M.inboxSliceReducer({
-        profileSet: (t: any) => t.update.profile((p: any) => p),
-        noted: () => {},
-      }).reducer(txn, [{ type: 'profile-set', name: 'x' }], 'inbox:acme,u1', false),
-    ).toThrow('profile');
-  });
-
-  it('gives each SliceReducer its family template and its key templates', () => {
-    const reducer = M.inboxSliceReducer({ profileSet: () => {}, noted: () => {} });
-    expect(reducer.template).toBe('inbox:{org},{user}');
-    expect(reducer.keys).toEqual(['note:{note}', 'profile']);
-  });
-
-  it('generates a handler table per slice: one reducer handler per event type', () => {
-    expect(text).toContain('export type CatalogSliceReducers = {');
-    expect(text).toContain('export type InboxSliceReducers = {');
-    expect(text).toContain('export type SecretSliceReducers = {');
-    compiles('reducers');
-  });
-
-  it("dispatches a run of events on each event's discriminant in the generated wrapper", () => {
-    const seen: unknown[][] = [];
-    const reducer = M.catalogSliceReducer(catalogRecorder(seen));
-    const { txn } = fakeTxn();
-    reducer.reducer(txn, [noted, itemAdded, itemRemoved, noted], 'catalog', true);
-    expect(seen.map(([name, e, pending]) => [name, e, pending])).toEqual([
-      ['noted', noted, true],
-      ['itemAdded', itemAdded, true],
-      ['itemRemoved', itemRemoved, true],
-      ['noted', noted, true],
-    ]);
-
-    // a slice whose events are a single model
-    const secrets: unknown[] = [];
-    M.secretSliceReducer({ secretSet: (_t: any, e: any) => secrets.push(e) }).reducer(
-      txn,
-      [{ type: 'secret-set', password: 'h' }],
-      'secret:u1',
-      false,
-    );
-    expect(secrets).toEqual([{ type: 'secret-set', password: 'h' }]);
-  });
-
-  it('parses the stream name into typed params and hands them to the handlers', () => {
-    const params: unknown[] = [];
-    const { txn } = fakeTxn();
-    M.inboxSliceReducer({
-      profileSet: (t: any) => params.push(t.params),
-      noted: (t: any) => params.push(t.params),
-    }).reducer(txn, [noted], 'inbox:acme,u.1', false);
-    M.catalogSliceReducer({
-      itemAdded: () => {},
-      itemRemoved: () => {},
-      noted: (t: any) => params.push(t.params),
-    }).reducer(txn, [noted], 'catalog', false);
-
-    // the final parameter may hold dots
-    expect(params).toEqual([{ org: 'acme', user: 'u.1' }, {}]);
-  });
-});
-
-describe('global contexts', () => {
-  it('keeps one context per binding, reading through the transaction it was last bound to', () => {
+describe('contexts', () => {
+  it('keeps one context, reading through the transaction its box was last assigned', () => {
     const one = fakeTxn(new Map([['catalog!count', 1]]));
     const two = fakeTxn(new Map([['catalog!count', 2]]));
-    const binding = M.createAppDBTxn();
-    const ctx = binding.bind(one.txn);
+    const { ctx, $ref } = M.createAppDBTxn();
+    $ref.txn = one.txn;
     expect(ctx.get.count()).toBe(1);
-    expect(binding.bind(two.txn)).toBe(ctx);
-    expect(binding.ctx).toBe(ctx);
+    $ref.txn = two.txn;
     expect(ctx.get.count()).toBe(2);
   });
 
@@ -815,33 +614,44 @@ describe('global contexts', () => {
     );
   });
 
-  it('generates a read-only global context per engine, over its slices', () => {
+  it("generates an engine's predict context, which reads and writes its slices", () => {
     const { txn } = fakeTxn();
-    expect(Object.keys(M.createReaderEngineTxn().bind(txn).get).sort()).toEqual(['count', 'item']);
-    expect(Object.keys(M.createWriterEngineTxn().bind(txn).get).sort()).toEqual([
+    const ctx = bound(M.createWriterEngineTxn(), txn);
+    expect(Object.keys(ctx).sort()).toEqual(['del', 'deleteSlice', 'get', 'scan', 'set', 'update']);
+    expect(Object.keys(ctx.get).sort()).toEqual(['count', 'item', 'note', 'profile']);
+    expect(Object.keys(ctx.set).sort()).toEqual(['count', 'item', 'note', 'profile']);
+    expect(Object.keys(ctx.update).sort()).toEqual(['item', 'profile']);
+    expect(Object.keys(ctx.deleteSlice).sort()).toEqual(['catalog', 'inbox']);
+    expect(Object.keys(bound(M.createReaderEngineTxn(), txn).get).sort()).toEqual([
       'count',
       'item',
-      'note',
-      'profile',
     ]);
-    expect(Object.keys(M.createWriterEngineTxn().bind(txn)).sort()).toEqual(['get', 'scan']);
     compiles('contexts');
   });
 
-  it('generates a read-only global context per database, over all of its slices', () => {
+  it("generates an engine's query context, which reads its slices and the Engine's status", () => {
     const { txn } = fakeTxn();
-    expect(Object.keys(M.createAppDBTxn().bind(txn).get).sort()).toEqual([
+    const ctx = bound(M.createWriterEngineQueryTxn(), txn);
+    expect(Object.keys(ctx).sort()).toEqual(['get', 'scan', 'status']);
+  });
+
+  it("generates a database's context over all of its slices", () => {
+    const { txn } = fakeTxn();
+    const ctx = bound(M.createAppDBTxn(), txn);
+    expect(Object.keys(ctx.get).sort()).toEqual([
       'count',
       'item',
       'note',
+      'pref',
       'profile',
       'secret',
     ]);
+    expect(Object.keys(ctx.deleteSlice).sort()).toEqual(['catalog', 'inbox', 'pref', 'secret']);
   });
 
-  it("gives global accessors the family's parameters, then the local key's", () => {
+  it("gives accessors the family's parameters, then the local key's", () => {
     const { txn, calls } = fakeTxn();
-    const ctx = M.createAppDBTxn().bind(txn);
+    const ctx = bound(M.createAppDBTxn(), txn);
     ctx.get.item('i1');
     ctx.get.count();
     ctx.get.profile('acme', 'u1');
@@ -856,9 +666,56 @@ describe('global contexts', () => {
     ]);
   });
 
+  it('writes keys through set and del, and deletes slices through deleteSlice', () => {
+    const { txn, calls } = fakeTxn();
+    const ctx = bound(M.createWriterEngineTxn(), txn);
+    ctx.set.item('i1', { id: 'i1', title: 'T', added });
+    ctx.set.count(1);
+    ctx.set.note('acme', 'u1', 'n1', 'hi');
+    ctx.del.note('acme', 'u1', 'n1');
+    ctx.deleteSlice.catalog();
+    ctx.deleteSlice.inbox('acme', 'u1');
+    ctx.deleteSlice.inbox('acme', 'u2', { erase: true });
+    expect(calls).toEqual([
+      ['set', 'catalog!item:i1', 'Item', { id: 'i1', title: 'T', added }],
+      ['set', 'catalog!count', 'catalog/count', 1],
+      ['set', 'inbox:acme,u1!note:n1', 'inbox/note', 'hi'],
+      ['del', 'inbox:acme,u1!note:n1'],
+      ['deleteSlice', 'catalog', false],
+      ['deleteSlice', 'inbox:acme,u1', false],
+      ['deleteSlice', 'inbox:acme,u2', true],
+    ]);
+  });
+
+  it('updates a value in place and sets it, answering what fn returns; an absent key throws', () => {
+    const { txn, data } = fakeTxn();
+    const ctx = bound(M.createWriterEngineTxn(), txn);
+    ctx.set.profile('acme', 'u1', { name: 'ann' });
+    expect(ctx.update.profile('acme', 'u1', (p: any) => (p.name = p.name.toUpperCase()))).toBe(
+      'ANN',
+    );
+    expect(data.get('inbox:acme,u1!profile')).toEqual({ name: 'ANN' });
+    expect(() => ctx.update.profile('acme', 'u2', (p: any) => p)).toThrow(
+      'update of absent key inbox:acme,u2!profile',
+    );
+  });
+
+  it('renames an accessor argument that a template parameter already names', () => {
+    const { txn, calls } = fakeTxn();
+    const ctx = bound(M.createAppDBTxn(), txn);
+    ctx.set.pref('dark', 'theme', 'on');
+    ctx.deleteSlice.pref('dark', { erase: true });
+    expect(calls).toEqual([
+      ['set', 'pref:dark!pref:theme', 'pref/pref', 'on'],
+      ['deleteSlice', 'pref:dark', true],
+    ]);
+    expect(text).toContain('pref: (options: string, value: string, $value: string) =>');
+    expect(text).toContain('pref: (options: string, $options?: DeleteSliceOptions) =>');
+  });
+
   it('checks each parameter against its place in its template', () => {
     const { txn, calls } = fakeTxn();
-    const ctx = M.createAppDBTxn().bind(txn);
+    const ctx = bound(M.createAppDBTxn(), txn);
 
     // a terminal family parameter may hold . and ~, and a terminal key parameter anything
     ctx.get.note('acme', 'u.1~x', 'a!b,c:d');
@@ -879,6 +736,11 @@ describe('global contexts', () => {
     expect(() => ctx.get.profile('acme', 'u,1')).toThrow('profile: user "u,1"');
     expect(() => ctx.get.profile('acme', '')).toThrow('profile: user ""');
     expect(() => ctx.get.secret('u*')).toThrow('secret: user "u*"');
+    expect(() => ctx.set.profile('acme', 'u!1', { name: 'x' })).toThrow('profile: user "u!1"');
+
+    // a slice's name is checked as its keys' are
+    expect(() => ctx.deleteSlice.inbox('ac,me', 'u1')).toThrow('inbox: org "ac,me"');
+    expect(() => ctx.deleteSlice.inbox('acme', 'u!1')).toThrow('inbox: user "u!1"');
     expect(calls).toHaveLength(2);
   });
 
@@ -891,7 +753,7 @@ describe('global contexts', () => {
       ['acme-2', 'gen', '2026-10'],
     ];
     const { txn, calls } = fakeTxn();
-    const ctx = M.createAppDBTxn().bind(txn);
+    const ctx = bound(M.createAppDBTxn(), txn);
     for (const [org, user, note] of tuples) ctx.get.note(org, user, note);
     const keys = calls.map(([, key]) => key as string);
     expect(keys[0]).toBe('inbox:acme,gen!note:2026-10');
@@ -902,7 +764,7 @@ describe('global contexts', () => {
       for (const key of [...keys].reverse()) w.set(key, '.json', JS, key);
     });
     const pattern = {
-      stream: { family: 'inbox', params: [null, null] },
+      slice: { family: 'inbox', params: [null, null] },
       name: 'note',
       local: [null],
     };
@@ -928,27 +790,6 @@ describe('scan accessors', () => {
       txn.scan({ ...req, values: req.type === false ? false : { type: req.type, rep: JS } }),
   });
 
-  /** a ReducerTxn over a store transaction for one stream's keys, as the Engine hands a reducer one */
-  const reducerOf = (txn: WTxn, stream: string): ReducerTxn => {
-    const at = `${stream}!`;
-    return {
-      get: (key, type) => txn.get(at + key, type, JS),
-      set: (key, type, value) => txn.set(at + key, type, JS, value),
-      del: (key) => txn.del(at + key),
-      scan: (req) => {
-        const values: ScanRequest['values'] =
-          req.type === false ? false : { type: req.type, rep: JS };
-        const after = req.after === undefined ? undefined : at + req.after;
-        const pattern = { stream, name: req.name, local: req.local };
-        const { entries, next } = txn.scan({ ...req, pattern, values, after });
-        return {
-          entries: entries.map(([k, v]) => [k.slice(at.length), v]),
-          next: next === null ? null : next.slice(at.length),
-        };
-      },
-    };
-  };
-
   const keys = [
     'inbox:acme,gen!note:2026-10',
     'inbox:acme,gen!note:2026-10-06',
@@ -957,16 +798,17 @@ describe('scan accessors', () => {
     'inbox:acme,gen!profile',
   ];
 
-  it('generates a scan accessor for each template with a parameter that varies in its context', () => {
+  it('generates a scan accessor for each template with a parameter', () => {
     const { txn } = fakeTxn();
-    expect(Object.keys(M.createWriterEngineTxn().bind(txn).scan).sort()).toEqual([
+    expect(Object.keys(bound(M.createWriterEngineTxn(), txn).scan).sort()).toEqual([
       'item',
       'note',
       'profile',
     ]);
-    expect(Object.keys(M.createAppDBTxn().bind(txn).scan).sort()).toEqual([
+    expect(Object.keys(bound(M.createAppDBTxn(), txn).scan).sort()).toEqual([
       'item',
       'note',
+      'pref',
       'profile',
       'secret',
     ]);
@@ -976,7 +818,7 @@ describe('scan accessors', () => {
   it('walks a match by parameter name, yielding every parameter by name with the value', () => {
     const store = notes(...keys);
     const got = store.read((r) => {
-      const ctx = M.createAppDBTxn().bind(readOf(r));
+      const ctx = bound(M.createWriterEngineQueryTxn(), readOf(r));
       return {
         org: [...ctx.scan.note({ org: 'acme', note: { gte: '2026-10' } })],
         reversed: [...ctx.scan.note({ user: { prefix: 'gen' } }, { reverse: true })],
@@ -997,26 +839,10 @@ describe('scan accessors', () => {
     expect(got.keys).toEqual([{ org: 'acme-2', user: 'gen', note: 'b' }]);
   });
 
-  it("walks a reducer's own stream by the template's own parameters", () => {
-    const store = notes(...keys);
-    const seen: unknown[] = [];
-    const reducer = M.inboxSliceReducer({
-      profileSet: () => {},
-      noted: (t: any) => seen.push(...t.scan.note({ note: { lt: 'b' } })),
-    });
-    store.write((w) =>
-      reducer.reducer(reducerOf(w, 'inbox:acme,gen'), [noted], 'inbox:acme,gen', false),
-    );
-    expect(seen).toEqual([
-      [{ note: '2026-10' }, 'inbox:acme,gen!note:2026-10'],
-      [{ note: '2026-10-06' }, 'inbox:acme,gen!note:2026-10-06'],
-    ]);
-  });
-
   it('checks an exact value as get checks the parameter, and every value for lone surrogates', () => {
     const store = notes(...keys);
     store.read((r) => {
-      const ctx = M.createAppDBTxn().bind(readOf(r));
+      const ctx = bound(M.createWriterEngineQueryTxn(), readOf(r));
       expect(() => [...ctx.scan.note({ org: 'ac,me' })]).toThrow(
         'note: org "ac,me" is not a non-empty run of A-Z a-z 0-9 _ -',
       );
@@ -1038,172 +864,143 @@ describe('scan accessors', () => {
   });
 });
 
-/** precommit handlers that authorize anyone and pass each command's events through */
-function passthrough() {
+/** deciders that authorize anyone and carry each mutation out */
+function openDeciders() {
   const open =
-    (out: (cmd: any) => unknown) =>
-    (auth: any, _txn: any, cmd: any): unknown => {
+    (carry: (txn: any, m: any) => void) =>
+    (auth: any, txn: any, m: any): void => {
       auth.authorizeAnyone();
-      return out(cmd);
+      carry(txn, m);
     };
   return {
-    addItem: open((c) => ({ stream: 'catalog', event: { ...c, type: 'item-added' } })),
-    removeItem: open((c) => ({ stream: 'catalog', event: { type: 'item-removed', id: c.id } })),
-    setProfile: open((c) => [
-      { stream: `inbox:${c.org},${c.user}`, event: { type: 'profile-set', name: c.name } },
-      { stream: `inbox:${c.org},${c.user}`, event: { type: 'noted', note: 'p', text: c.name } },
-    ]),
-    noteMany: open((c) =>
-      c.notes.map((note: string) => ({
-        stream: 'catalog',
-        event: { type: 'noted', note, text: '' },
-      })),
-    ),
-    noted: open((c) => ({ stream: 'catalog', event: c })),
-    signUp: open((c) => [
-      { stream: `secret:${c.user}`, event: { type: 'secret-set', password: c.password } },
-      { stream: `inbox:${c.org},${c.user}`, event: { type: 'profile-set', name: c.name } },
-    ]),
-    forget: open((c) => ({ stream: `inbox:${c.org},${c.user}`, death: true, erase: true })),
-    leave: open(() => [
-      { stream: 'inbox:acme,u1', death: true },
-      [
-        { stream: 'catalog', event: itemRemoved },
-        { stream: 'catalog', event: { type: 'item-removed', id: 'i2' } },
-      ],
-    ]),
-    sweep: open((c) => ({ stream: 'catalog', event: { type: 'item-removed', id: c.id } })),
+    addItem: open((txn, m) => txn.set.item(m.id, { id: m.id, title: m.title, added: m.added })),
+    removeItem: open((txn, m) => txn.del.item(m.id)),
+    setProfile: open((txn, m) => txn.set.profile(m.org, m.user, { name: m.name })),
+    note: open((txn, m) => txn.set.note(m.org, m.user, m.note, m.text)),
+    signUp: open((txn, m) => txn.set.secret(m.user, m.password)),
+    leave: open((txn, m) => txn.deleteSlice.inbox(m.org, 'u1')),
+    forget: open((txn, m) => txn.deleteSlice.inbox(m.org, m.user, { erase: true })),
+    sweep: open((txn, m) => txn.del.item(m.id)),
   };
 }
 
-/** a database bundle over passthrough handlers, with some replaced */
-function bundle(precommit: Record<string, unknown> = {}) {
-  const seen: unknown[][] = [];
-  return M.defineAppDB({
-    reducers: {
-      catalog: catalogRecorder(seen),
-      inbox: { profileSet: () => {}, noted: () => {} },
-      secret: { secretSet: () => {} },
-    },
-    precommit: { ...passthrough(), ...precommit },
-    maySee: (_txn: any, principal: any) => [`inbox:acme,${principal.user}!`, 'catalog!'],
+/** the slots of a database over open deciders, with some replaced */
+function slotsWith(deciders: Record<string, unknown> = {}, plugins?: Record<string, unknown>) {
+  return {
+    deciders: { ...openDeciders(), ...deciders },
+    grant: (_txn: any, principal: any) => [`inbox:acme,${principal.user}!`, 'catalog'],
     lookup: (_txn: any, ident: any) =>
       ident.kind === 'password' ? { user: ident.identity } : null,
-  });
+    ...(plugins === undefined ? {} : { plugins }),
+  };
+}
+
+/** a database bundle over open deciders, with some replaced */
+function bundle(deciders: Record<string, unknown> = {}) {
+  return M.defineAppDB(slotsWith(deciders));
 }
 
 const anyone = { user: null };
 
-describe('precommit', () => {
-  it('generates a precommit interface with one handler per @command model', () => {
-    expect(text).toContain('export type AppDBPrecommit<P = {}> = {');
-    compiles('precommit');
+describe('deciders', () => {
+  it('generates a decider table with one decider per mutation', () => {
+    expect(text).toContain('export type AppDBDeciders<P = {}> = {');
+    compiles('deciders');
   });
 
-  it('keys the handlers by the camelCased model name', () => {
+  it('dispatches each mutation to the decider keyed by its camelCased model name', () => {
     const seen: string[] = [];
     const b = bundle({
-      noteMany: (auth: any, _txn: any, cmd: any) => {
+      setProfile: (auth: any, _txn: any, m: any) => {
         auth.authorizeAnyone();
-        seen.push(`noteMany ${cmd.notes.join(',')}`);
-        return [];
+        seen.push(`setProfile ${m.name}`);
       },
-      sweep: (auth: any, _txn: any, cmd: any) => {
+      sweep: (auth: any, _txn: any, m: any) => {
         auth.authorizeAnyone();
-        seen.push(`sweep ${cmd.id}`);
-        return { stream: 'catalog', event: itemRemoved };
+        seen.push(`sweep ${m.id}`);
       },
     });
-    const { txn } = fakeTxn();
-    b.precommit(txn, { type: 'sweep', id: 'i9' }, anyone);
-    b.precommit(txn, { type: 'note-many', notes: ['a', 'b'] }, anyone);
-    expect(seen).toEqual(['sweep i9', 'noteMany a,b']);
+    b.bindWrite(fakeTxn().txn);
+    b.decide({ type: 'sweep', id: 'i9' }, anyone);
+    b.decide({ type: 'set-profile', org: 'acme', user: 'u1', name: 'Ann' }, anyone);
+    expect(seen).toEqual(['sweep i9', 'setProfile Ann']);
   });
 
-  it('types each handler as (auth, txn, cmd), with cmd the command as precommit sees it', () => {
+  it('runs a decider as (auth, txn, mutation), and answers null when it carried it out', () => {
     const { txn, calls } = fakeTxn(new Map([['catalog!item:i1', { id: 'i1' }]]));
     const got: unknown[] = [];
     const b = bundle({
-      removeItem: (auth: any, ctx: any, cmd: any) => {
+      removeItem: (auth: any, ctx: any, m: any) => {
         auth.authorize(auth.user === 'u1');
-        got.push(auth.user, ctx.get.item(cmd.id), cmd);
-        return { stream: 'catalog', event: itemRemoved };
+        got.push(auth.user, ctx.get.item(m.id), m);
+        ctx.del.item(m.id);
       },
     });
     const data = { type: 'remove-item', id: 'i1' };
-    b.precommit(txn, data, { user: 'u1' });
+    b.bindWrite(txn);
+    expect(b.decide(data, { user: 'u1' })).toBeNull();
     expect(got).toEqual(['u1', { id: 'i1' }, data]);
-    expect(calls).toEqual([['get', 'catalog!item:i1', 'Item']]);
+    expect(calls).toEqual([
+      ['get', 'catalog!item:i1', 'Item'],
+      ['del', 'catalog!item:i1'],
+    ]);
   });
 
-  it("types each handler's return from its @command output, each event stream-labelled", () => {
-    expect(text).toContain('export type SetProfileOutput = [');
-    compiles('precommitErrors');
+  it("lets a decider hand its own transaction to the engine's predictor", () => {
+    compiles('deciders');
+    const predictor = M.writerEnginePredictor({
+      addItem: (txn: any, m: any, pending?: true) =>
+        txn.set.item(m.id, { id: m.id, title: pending ? 'pending' : m.title, added: m.added }),
+    });
+    const b = bundle({
+      addItem: (auth: any, txn: any, m: any) => {
+        auth.authorizeAnyone();
+        predictor(txn, m);
+      },
+    });
+    const { txn, calls } = fakeTxn();
+    b.bindWrite(txn);
+    b.decide({ type: 'add-item', id: 'i1', title: 'T', added }, anyone);
+    expect(calls).toEqual([['set', 'catalog!item:i1', 'Item', { id: 'i1', title: 'T', added }]]);
   });
 
-  it("types a singleton slice's stream label as its literal family name", () => {
-    expect(text).toMatch(/export type AddItemOutput = \{ stream: "catalog"; event: ItemAdded \};/);
-  });
-
-  it("types an event folded by several slices with any of those slices' streams", () => {
-    expect(text).toContain(
-      'export type NotedOutput = { stream: "catalog" | `inbox:${string},${string}`; event: Noted };',
-    );
-  });
-
-  it("types a parameterized slice's stream label as its family template", () => {
-    expect(text).toContain('{ stream: `secret:${string}`; event: SecretSet }');
-  });
-
-  it('types a Death output as { stream, death: true }', () => {
-    expect(text).toContain('{ stream: string; death: true }');
-  });
-
-  it('types an Erasure output as { stream, death: true, erase: true }', () => {
-    expect(text).toContain('{ stream: string; death: true; erase: true }');
-  });
-
-  it('flattens tuple and array outputs into the list the wrapper returns', () => {
+  it('deletes slices through the transaction, erasing their history or not', () => {
     const b = bundle();
-    const { txn } = fakeTxn();
-    const leave = { type: 'leave', check: { kind: 'password' } };
-    expect(b.precommit(txn, leave, anyone)).toEqual([
-      { stream: 'inbox:acme,u1', death: true },
-      { stream: 'catalog', event: itemRemoved },
-      { stream: 'catalog', event: { type: 'item-removed', id: 'i2' } },
-    ]);
-    const note = { type: 'noted', note: 'n1', text: 'hi' };
-    expect(b.precommit(txn, note, anyone)).toEqual([{ stream: 'catalog', event: note }]);
-    const forget = { type: 'forget', org: 'acme', user: 'u1' };
-    expect(b.precommit(txn, forget, anyone)).toEqual([
-      { stream: 'inbox:acme,u1', death: true, erase: true },
+    const { txn, calls } = fakeTxn();
+    b.bindWrite(txn);
+    b.decide({ type: 'forget', org: 'acme', user: 'u1' }, anyone);
+    b.decide({ type: 'leave', org: 'acme', check: { kind: 'password' } }, anyone);
+    expect(calls).toEqual([
+      ['deleteSlice', 'inbox:acme,u1', true],
+      ['deleteSlice', 'inbox:acme,u1', false],
     ]);
   });
 
-  it('makes a missing handler and a misspelled extra handler compile errors', () => {
-    compiles('precommitErrors');
+  it('makes a missing decider and a misspelled extra decider compile errors', () => {
+    compiles('deciderErrors');
   });
 
-  it('rejects a handler that returns without an authorization decision (fail closed)', () => {
+  it('rejects a decider that returns without an authorization decision (fail closed)', () => {
     const { txn } = fakeTxn();
     const sweep = { type: 'sweep', id: 'i1' };
+    const over = (b: Bundle) => (b.bindWrite(txn), b);
 
-    // in dev mode, a loud error naming the handler
-    const silent = bundle({ sweep: () => ({ stream: 'catalog', event: itemRemoved }) });
-    expect(() => silent.precommit(txn, sweep, anyone)).toThrow(/sweep/);
+    // in dev mode, a loud error naming the decider
+    const silent = bundle({ sweep: () => {} });
+    expect(() => over(silent).decide(sweep, anyone)).toThrow(/sweep/);
 
     // a failed authorization and a Reject are rejections, answered with their reasons
     const denied = bundle({
       sweep: (auth: any) => auth.authorize(auth.user !== null, 'signed-in users only'),
     });
-    expect(denied.precommit(txn, sweep, anyone)).toBe('signed-in users only');
+    expect(over(denied).decide(sweep, anyone)).toBe('signed-in users only');
     const rejected = bundle({
       sweep: (auth: any) => {
         auth.authorizeAnyone();
         throw new M.Reject('no such item');
       },
     });
-    expect(rejected.precommit(txn, sweep, anyone)).toBe('no such item');
+    expect(over(rejected).decide(sweep, anyone)).toBe('no such item');
 
     // any other throw is a bug, and goes to the host
     const buggy = bundle({
@@ -1211,18 +1008,89 @@ describe('precommit', () => {
         throw new Error('oops');
       },
     });
-    expect(() => buggy.precommit(txn, sweep, anyone)).toThrow('oops');
+    expect(() => over(buggy).decide(sweep, anyone)).toThrow('oops');
+  });
+});
+
+describe('predictors', () => {
+  it('generates a predictor table per engine, with no entry for an @online mutation', () => {
+    expect(text).toContain('export type WriterEnginePredictors = {');
+    expect(text).not.toMatch(/leave\?: Predictor/);
+    compiles('predictors');
+  });
+
+  it('dispatches each mutation to its predictor, passing pending on, and skips the rest', () => {
+    const seen: unknown[] = [];
+    const predictor = M.writerEnginePredictor({
+      note: (_txn: any, m: any, pending?: true) => seen.push(['note', m.note, pending]),
+    });
+    const { txn } = fakeTxn();
+    predictor(txn, { type: 'note', org: 'acme', user: 'u1', note: 'n1', text: '' }, true);
+    predictor(txn, { type: 'remove-item', id: 'i1' }, true);
+    predictor(txn, { type: 'leave', org: 'acme', check: { kind: 'password' } }, true);
+    predictor(txn, { type: 'note', org: 'acme', user: 'u1', note: 'n2', text: '' });
+    expect(seen).toEqual([
+      ['note', 'n1', true],
+      ['note', 'n2', undefined],
+    ]);
+  });
+});
+
+describe('grant, lookup, and bootstrap', () => {
+  it('runs grant and lookup over one read context, whose writes throw', () => {
+    compiles('database');
+    const seen: unknown[] = [];
+    const b = M.defineAppDB({
+      ...slotsWith(),
+      grant: (txn: any, principal: any) => {
+        seen.push(txn.get.secret(principal.user));
+        txn.set.count(1);
+        return [];
+      },
+      lookup: (txn: any) => {
+        txn.deleteSlice.catalog();
+        return null;
+      },
+    });
+    const { txn, calls } = fakeTxn(new Map([['secret:u1!secret', 'h']]));
+    b.bindRead(txn);
+    expect(() => b.grant({ user: 'u1' })).toThrow('this call reads only, and made a write');
+    expect(() => b.lookup({ kind: 'token', user: 'u1' })).toThrow(
+      'this call reads only, and made a write',
+    );
+    expect(seen).toEqual(['h']);
+    expect(calls).toEqual([['get', 'secret:u1!secret', 'PasswordHash']]);
+  });
+
+  it('answers what grant and lookup answer', () => {
+    const b = bundle();
+    b.bindRead(fakeTxn().txn);
+    expect(b.grant({ user: 'u1' })).toEqual(['inbox:acme,u1!', 'catalog']);
+    expect(b.lookup({ kind: 'password', identity: 'ann' })).toEqual({ user: 'ann' });
+  });
+
+  it('runs bootstrap over the database context, writing through its transaction', () => {
+    const b = M.defineAppDB({
+      ...slotsWith(),
+      bootstrap: (txn: any, ctx: any) => txn.set.secret('root', ctx.hashPassword('pw')),
+    });
+    const { txn, calls } = fakeTxn();
+    b.bindWrite(txn);
+    b.bootstrap!({ hashPassword: (p: string) => `#${p}`, env: () => '' });
+    expect(calls).toEqual([['set', 'secret:root!secret', 'PasswordHash', '#pw']]);
+    expect(bundle().bootstrap).toBeUndefined();
   });
 });
 
 describe('intake types', () => {
-  it('types a command on the client with wire types (NewPassword as string)', () => {
+  it('types a mutation on the client with wire types (NewPassword as string)', () => {
     expect(text).toContain('export type NewPassword = string;');
     compiles('intake');
   });
 
-  it('types the same command in precommit with results (a PasswordHash)', () => {
-    expect(text).toContain('export type SignUpForPrecommit = {');
+  it('types the same mutation for its decider with results (a PasswordHash)', () => {
+    expect(text).toContain('export type SignUpForDecider = {');
+    expect(text).toContain('signUp: Decider<AppDBTxn<P>, SignUpForDecider>;');
     compiles('intake');
   });
 
@@ -1241,42 +1109,42 @@ describe('intake types', () => {
   });
 });
 
-describe('sending commands', () => {
-  it('accepts @online commands only through sendOnlineCommand and the rest only through sendCommand', () => {
+describe('sending mutations', () => {
+  it('accepts @online mutations only through sendOnlineMutation and the rest only through sendMutation', () => {
     compiles('sending');
   });
 
-  it("posts any of the database's commands outside any Engine, each in a series of its own", async () => {
+  it("posts any of the database's mutations outside any Engine, each in a series of its own", async () => {
     compiles('posting');
 
     // the registry is built once for the transport, from the database's registry data, and each
-    // command goes alone under a fresh id, numbered 1 in a fresh series
+    // mutation goes alone under a fresh id, numbered 1 in a fresh series
     const schemas: unknown[] = [];
-    const posts: [Command<Uint8Array>[], unknown][] = [];
+    const posts: [Mutation<Uint8Array>[], unknown][] = [];
     const transport = {
       buildRegistry: (schema: Schema) => (schemas.push(schema), registry),
       connect: () => {
         throw new Error('a post never connects');
       },
-      post: (commands: Command<Uint8Array>[], session?: Session | null) => {
-        posts.push([commands, session]);
+      post: (mutations: Mutation<Uint8Array>[], session?: Session | null) => {
+        posts.push([mutations, session]);
         return Promise.resolve([{ kind: 'ok' as const, position: 3 }]);
       },
     };
     const session = { token: 't', user: 'ann', exp: 0, ended: false };
-    expect(await M.postAppCommand(transport, { type: 'sweep', id: 'i1' }, { session })).toEqual({
+    expect(await M.postAppMutation(transport, { type: 'sweep', id: 'i1' }, { session })).toEqual({
       kind: 'ok',
       position: 3,
     });
-    await M.postAppCommand(transport, { type: 'add-item', id: 'i2', title: 'T', added });
+    await M.postAppMutation(transport, { type: 'add-item', id: 'i2', title: 'T', added });
     expect(schemas).toEqual([M.appDBSchema]);
     const [[[first], signedIn], [[second], anonymous]] = posts;
     expect(signedIn).toBe(session);
     expect(anonymous).toBeNull();
-    for (const c of [first, second]) {
-      expect(c.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4/);
-      expect(c.series).toMatch(/^[A-Za-z0-9_-]{22}$/);
-      expect(c.n).toBe(1);
+    for (const m of [first, second]) {
+      expect(m.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4/);
+      expect(m.series).toMatch(/^[A-Za-z0-9_-]{22}$/);
+      expect(m.n).toBe(1);
     }
     expect(first.series).not.toBe(second.series);
     expect(JSON.parse(new TextDecoder().decode(first.data))).toEqual({ type: 'sweep', id: 'i1' });
@@ -1285,28 +1153,28 @@ describe('sending commands', () => {
 
 describe('plugins', () => {
   /** An install whose plugin's one request records its argument, recording each create, with the
-      context it was given, and each bind.  With commands, its plugin has a config, and runs a
-      command by recording it and answering one output. */
-  function recorder(kind = 'recorder', commands = false) {
+      context it was given, and each bind.  With mutations, its plugin has a config, and runs a
+      mutation by recording it and deleting the item it names. */
+  function recorder(kind = 'recorder', mutations = false) {
     const created: string[] = [];
-    const contexts: unknown[] = [];
+    const contexts: any[] = [];
     const sent: string[] = [];
     const bound: unknown[] = [];
     const ran: string[] = [];
     const install = {
       kind,
-      create: (name: string, ctx: unknown) => {
+      create: (name: string, ctx: any) => {
         created.push(name);
         contexts.push(ctx);
-        const run = (cmd: any) => {
-          ran.push(`${name} ${cmd.id}`);
-          return [{ stream: 'catalog', event: { type: 'item-removed', id: cmd.id } }];
+        const run = (m: any) => {
+          ran.push(`${name} ${m.id}`);
+          ctx.del.item(m.id);
         };
         return {
           name,
           api: { send: (id: string) => sent.push(`${name} ${id}`) },
           bind: (txn: unknown) => bound.push(txn),
-          ...(commands ? { run, config: { entries: [name] } } : {}),
+          ...(mutations ? { run, config: { entries: [name] } } : {}),
         };
       },
       db: (db: unknown) => db,
@@ -1314,102 +1182,101 @@ describe('plugins', () => {
     return { install, created, contexts, sent, bound, ran };
   }
 
-  /** the slots bundle() passes, with plugins */
-  function slotsWith(plugins: Record<string, unknown>, precommit: Record<string, unknown> = {}) {
-    return {
-      reducers: {
-        catalog: catalogRecorder([]),
-        inbox: { profileSet: () => {}, noted: () => {} },
-        secret: { secretSet: () => {} },
-      },
-      precommit: { ...passthrough(), ...precommit },
-      maySee: () => [],
-      lookup: () => null,
-      plugins,
-    };
-  }
-
-  it('types the plugin set shared by precommit and the database, and each install against it', () => {
+  it('types the plugin set shared by the deciders and the database, and each install against it', () => {
     compiles('plugins');
   });
 
   it('creates every plugin under its name when the database is defined', () => {
     const { install, created } = recorder();
-    const b = M.defineAppDB(slotsWith({ supportMail: install, alertsMail: install }));
+    const b = M.defineAppDB(slotsWith({}, { supportMail: install, alertsMail: install }));
     expect(created).toEqual(['supportMail', 'alertsMail']);
     expect(Object.keys(b.plugins)).toEqual(['supportMail', 'alertsMail']);
     expect(b.plugins.alertsMail).toEqual({ kind: 'recorder' });
   });
 
-  it("creates every plugin over the database's context, the txn precommit gets", () => {
+  it("creates every plugin over the database's context, the txn the deciders get", () => {
     const { install, contexts } = recorder();
     let seen: unknown;
     const b = M.defineAppDB(
       slotsWith(
-        { supportMail: install, alertsMail: install },
         {
           sweep: (auth: any, txn: any) => {
             auth.authorizeAnyone();
             seen = txn;
-            return [];
           },
         },
+        { supportMail: install, alertsMail: install },
       ),
     );
-    b.precommit(fakeTxn().txn, { type: 'sweep', id: 'i9' }, anyone);
+    b.bindWrite(fakeTxn().txn);
+    b.decide({ type: 'sweep', id: 'i9' }, anyone);
     expect(contexts).toHaveLength(2);
     for (const ctx of contexts) expect(ctx).toBe(seen);
   });
 
-  it("runs a plugin's own command after binding every plugin to the transaction", () => {
+  it("runs a plugin's own mutation over the transaction bindWrite bound every plugin to", () => {
     const { install: mail, bound: mailBound } = recorder();
     const { install: cron, ran, bound: cronBound } = recorder('cron', true);
-    const b = M.defineAppDB(slotsWith({ mail, cron }));
+    const b = M.defineAppDB(slotsWith({}, { mail, cron }));
     expect(b.plugins.mail).toEqual({ kind: 'recorder' });
     expect(b.plugins.cron.config).toEqual({ entries: ['cron'] });
-    const { txn } = fakeTxn();
-    expect(b.plugins.cron.run!(txn, { id: 'tick1' })).toEqual([
-      { stream: 'catalog', event: { type: 'item-removed', id: 'tick1' } },
-    ]);
+    const { txn, calls } = fakeTxn();
+    b.bindWrite(txn);
+    b.plugins.cron.run!({ id: 'tick1' });
     expect(ran).toEqual(['cron tick1']);
+    expect(calls).toEqual([['del', 'catalog!item:tick1']]);
     expect(mailBound).toEqual([txn]);
     expect(cronBound).toEqual([txn]);
   });
 
-  it("attaches each plugin's request API to the txn under its name, binding every plugin on entry", () => {
+  it("attaches each plugin's request API to the txn under its name", () => {
     const { install, sent, bound } = recorder();
     const b = M.defineAppDB(
       slotsWith(
-        { supportMail: install, alertsMail: install },
         {
-          sweep: (auth: any, txn: any, cmd: any) => {
+          sweep: (auth: any, txn: any, m: any) => {
             auth.authorizeAnyone();
-            txn.alertsMail.send(cmd.id);
-            return [];
+            txn.alertsMail.send(m.id);
           },
         },
+        { supportMail: install, alertsMail: install },
       ),
     );
     const { txn } = fakeTxn();
-    expect(b.precommit(txn, { type: 'sweep', id: 'i9' }, anyone)).toEqual([]);
+    b.bindWrite(txn);
+    expect(b.decide({ type: 'sweep', id: 'i9' }, anyone)).toBeNull();
     expect(sent).toEqual(['alertsMail i9']);
     expect(bound).toEqual([txn, txn]);
   });
 
-  it('binds every plugin to the transaction of maySee and lookup too', () => {
-    const { install, bound } = recorder();
-    const b = M.defineAppDB(slotsWith({ mail: install }));
-    const one = fakeTxn();
-    const two = fakeTxn();
-    b.maySee(one.txn, anyone);
-    b.lookup(two.txn, { kind: 'token', user: 'u1' });
-    expect(bound).toEqual([one.txn, two.txn]);
+  it('binds every plugin through bindWrite alone, never to the read context', () => {
+    const { install, bound, contexts } = recorder();
+    const b = M.defineAppDB({
+      ...slotsWith({}, { mail: install }),
+      grant: (txn: any) => (txn === contexts[0] ? ['shared'] : []),
+    });
+    const read = fakeTxn();
+    const write = fakeTxn();
+    b.bindRead(read.txn);
+    expect(bound).toEqual([]);
+    b.bindWrite(write.txn);
+    expect(bound).toEqual([write.txn]);
+    expect(b.grant(anyone)).toEqual([]);
   });
 
   it('refuses a plugin named after a context field, or __proto__', () => {
-    for (const name of ['get', 'scan', 'status', '__proto__']) {
+    for (const name of [
+      'get',
+      'scan',
+      'set',
+      'del',
+      'update',
+      'deleteSlice',
+      'status',
+      '__proto__',
+    ]) {
       const { install } = recorder();
-      expect(() => M.defineAppDB(slotsWith({ [name]: install }))).toThrow(
+      expect(() => M.defineAppDB(slotsWith({}, { [name]: install }))).toThrow(
         `a plugin may not be named ${name}`,
       );
     }
@@ -1418,7 +1285,7 @@ describe('plugins', () => {
   it('refuses a plugin name that is not a JS identifier without $', () => {
     for (const name of ['my$mail', 'my-mail', '1mail', '']) {
       const { install } = recorder();
-      expect(() => M.defineAppDB(slotsWith({ [name]: install }))).toThrow(
+      expect(() => M.defineAppDB(slotsWith({}, { [name]: install }))).toThrow(
         `plugin name ${JSON.stringify(name)} is not a JS identifier without $`,
       );
     }
@@ -1429,85 +1296,58 @@ describe('plugins', () => {
   });
 });
 
-describe('schema and bundle', () => {
-  it("generates storeTypes from every slice's key templates", () => {
-    expect(M.writerEngineSchema.storeTypes).toEqual({
-      'catalog/item': 'Item',
-      'catalog/count': 'catalog/count',
-      'inbox/profile': 'Profile',
-      'inbox/note': 'inbox/note',
-    });
-    expect(M.appDBSchema.storeTypes['secret/secret']).toBe('PasswordHash');
+describe('slices, schema, and bundle', () => {
+  it('puts the schema, the slots, the plugins, and DEV in the bundle', () => {
+    const b = bundle();
+    expect(Object.keys(b).sort()).toEqual([
+      'bindRead',
+      'bindWrite',
+      'bootstrap',
+      'decide',
+      'dev',
+      'grant',
+      'lookup',
+      'mapStack',
+      'plugins',
+      'schema',
+    ]);
+    expect(b.schema).toBe(M.appDBSchema);
+    expect(b.dev).toBe(true);
+    expect((globalThis as any).__bundle).toBe(b);
   });
 
-  it("generates eventTypes from each slice's family to its events union", () => {
-    expect(M.appDBSchema.eventTypes).toEqual({
-      catalog: 'CatalogEvents',
-      inbox: 'InboxEvents',
-      secret: 'SecretSet',
-    });
+  it('names the mutations union in each schema', () => {
+    expect(M.writerEngineSchema.mutations).toBe('WriterMutations');
+    expect(M.appDBSchema.mutations).toBe('AppDBMutation');
   });
 
-  it('generates the engine subclass taking its reducers and forecaster, deriving its wants', async () => {
+  it('generates the engine subclass over its slice types and predictors', async () => {
     compiles('engines');
-    compiles('forecasters');
+    compiles('predictors');
 
-    // an engine over the catalog, whose forecaster adds the item at once
+    // an engine over the catalog, whose predictor adds the item at once
     const errors: unknown[] = [];
     const server = new FakeServer();
-    const reg = { ...registry, storeTypes: { 'catalog/item': 'Item', 'catalog/count': 'count' } };
     const abort = new AbortController();
-    const transport = { ...server.transport, buildRegistry: () => reg };
-    const engine = new M.WriterEngine(transport, {
+    const engine = new M.WriterEngine(server.transport, {
       session: null,
-      reducers: {
-        catalog: {
-          itemAdded: (txn: any, e: any) => txn.set.item(e.id, { id: e.id, title: e.title }),
-          itemRemoved: (txn: any, e: any) => txn.del.item(e.id),
-          noted: () => {},
-        },
-        inbox: { profileSet: () => {}, noted: () => {} },
-      },
-      forecasters: {
-        addItem: (_txn: any, cmd: any) => ({
-          stream: 'catalog',
-          event: { type: 'item-added', id: cmd.id, title: cmd.title, added: cmd.added },
-        }),
+      predictors: {
+        addItem: (txn: any, m: any) => txn.set.item(m.id, { id: m.id, title: m.title }),
       },
       signal: abort.signal,
       onError: (e: unknown) => errors.push(e),
     });
     expect(server.conn.wants).toEqual(['catalog', 'inbox:*']);
 
-    // live, and the forecast shows through a query on the engine's context
+    // live, and the prediction shows through a query on the engine's context
     const rig = { server, engine, data: {}, abort };
     await bootstrap(rig as any, ['catalog'], { catalog: { position: 10, seqs: {}, values: [] } });
     const q = engine.newQuery((txn: any) => txn.get.item('i1'));
-    engine.sendCommand({ type: 'add-item', id: 'i1', title: 'T', added });
+    engine.sendMutation({ type: 'add-item', id: 'i1', title: 'T', added });
     await settle();
     expect(q.latest).toEqual({ id: 'i1', title: 'T' });
     expect(errors).toEqual([]);
     abort.abort();
     await settle();
-  });
-
-  it('types the bootstrap slot: emit(stream, event) typed like precommit outputs', () => {
-    compiles('database');
-    const emitted: unknown[] = [];
-    const b = M.defineAppDB({
-      reducers: {
-        catalog: catalogRecorder([]),
-        inbox: { profileSet: () => {}, noted: () => {} },
-        secret: { secretSet: () => {} },
-      },
-      precommit: passthrough(),
-      maySee: () => [],
-      lookup: () => null,
-      bootstrap: (ctx: any) => ctx.emit('catalog', itemAdded),
-    });
-    b.bootstrap({ emit: (stream: string, event: unknown) => emitted.push([stream, event]) });
-    expect(emitted).toEqual([['catalog', itemAdded]]);
-    expect((globalThis as any).__bundle).toBe(b);
-    expect(b.schema).toBe(M.appDBSchema);
   });
 });

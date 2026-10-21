@@ -182,7 +182,7 @@ func (s *Server) verifyFor(ctx context.Context, client string, check func() bool
 
 // recheck runs a password check again after the credentials it was checked against changed:
 // outside any client's budget, since the change was not the check's doing, and waiting for room
-// on the pool, since its call may already have decided commands
+// on the pool, since its call may already have decided mutations
 func (s *Server) recheck(ctx context.Context, check func() bool) (bool, error) {
 	var ok bool
 	err := s.hashes.queue(ctx, func() { ok = check() })

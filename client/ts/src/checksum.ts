@@ -44,6 +44,18 @@ export class Fnv64 {
     this.#h = [h0, h1, h2, h3];
   }
 
+  /** the running state as 16 hex digits, the digest so far, which resume continues from */
+  state(): string {
+    return Array.from(this.digest(), (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  static resume(state: string): Fnv64 {
+    if (!/^[0-9a-f]{16}$/.test(state)) throw new Error(`bad FNV-1a 64 state ${state}`);
+    const fnv = new Fnv64();
+    fnv.#h = [3, 2, 1, 0].map((i) => parseInt(state.slice(i * 4, i * 4 + 4), 16));
+    return fnv;
+  }
+
   /** big-endian digest */
   digest(): Uint8Array {
     const [h0, h1, h2, h3] = this.#h;

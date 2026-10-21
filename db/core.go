@@ -52,34 +52,33 @@ type principal struct {
 	gen       int64 // -1 skips the generation check
 }
 
-// item is one event of the log: its encoded [envelope, data] value, and atom the first position
-// of the atom it belongs to.
+// item is one edit of the log: its wire encoding, the slice it edits, and the position of its
+// mutation, which the mutation's other edits share.
 type item struct {
-	stream   string
-	atom     uint64
+	slice    string
 	position uint64
 	data     []byte
 }
 
 type result struct {
-	kind     int
-	status   int
-	reqid    uint64
-	conn     uint64
-	position uint64
-	items    []item
-	buf      []byte
-	token    string
-	prefixes []string
-	marks    []int64 // every cron entry's mark, in Unix seconds
-	errmsg   string
-	// an outcome that stopped at a proven command whose credentials changed: buf holds the
+	kind      int
+	status    int
+	reqid     uint64
+	conn      uint64
+	position  uint64
+	items     []item
+	buf       []byte
+	token     string
+	selectors []string
+	marks     []int64 // every cron entry's mark, in Unix seconds
+	errmsg    string
+	// an outcome that stopped at a proven mutation whose credentials changed: buf holds the
 	// outcomes before it, and hash what lookup answers now, nil for none
 	bounce bool
 	hash   *string
 }
 
-// verdict is a command's proof as checked: whether it carries one, and if so whether it passed
+// verdict is a mutation's proof as checked: whether it carries one, and if so whether it passed
 // against hash, the password hash lookup answered for the sender's token, nil for none
 type verdict struct {
 	state int
@@ -173,7 +172,7 @@ func cbytes(b []byte) (*C.uint8_t, C.size_t) {
 	return (*C.uint8_t)(unsafe.Pointer(&b[0])), C.size_t(len(b))
 }
 
-// submit hands the writer prepared commands with their verdicts, one per command or none, and
+// submit hands the writer prepared mutations with their verdicts, one per mutation or none, and
 // the number of times the call has bounced
 func (c *core) submit(reqid uint64, p principal, body []byte, verdicts []verdict, attempt int) {
 	var arr *C.pldb_verdict
@@ -291,8 +290,7 @@ func goItems(arr *C.pldb_item, n C.size_t) []item {
 	out := make([]item, int(n))
 	for i := range out {
 		out[i] = item{
-			stream:   C.GoString(slice[i].stream),
-			atom:     uint64(slice[i].atom),
+			slice:    C.GoString(slice[i].slice),
 			position: uint64(slice[i].position),
 			data:     C.GoBytes(unsafe.Pointer(slice[i].data), C.int(slice[i].len)),
 		}
@@ -305,13 +303,13 @@ func (c *core) pop() result {
 	r := C.pldb_pop(c.db)
 	defer C.pldb_result_free(r)
 	out := result{
-		kind:     int(r.kind),
-		status:   int(r.status),
-		reqid:    uint64(r.reqid),
-		conn:     uint64(r.conn),
-		position: uint64(r.position),
-		items:    goItems(r.items, r.nitems),
-		prefixes: goStrings(r.prefixes, r.nprefixes),
+		kind:      int(r.kind),
+		status:    int(r.status),
+		reqid:     uint64(r.reqid),
+		conn:      uint64(r.conn),
+		position:  uint64(r.position),
+		items:     goItems(r.items, r.nitems),
+		selectors: goStrings(r.selectors, r.nselectors),
 	}
 	if r.buf != nil {
 		out.buf = C.GoBytes(unsafe.Pointer(r.buf), C.int(r.len))
@@ -335,20 +333,20 @@ func (c *core) pop() result {
 // prepared is a request as the core checked and prepared it
 type prepared struct {
 	body    []byte
-	reasons []string // one per command of the request, "" for one that passed
-	// for each passing command, in body order: its start in body, and the password of each
-	// CommandAuth proof it carries
+	reasons []string // one per mutation of the request, "" for one that passed
+	// for each passing mutation, in body order: its start in body, and the password of each
+	// MutationAuth proof it carries
 	offsets []int
 	proofs  [][]string
 }
 
-var errTooMany = errors.New("the request carries more commands than the database takes in one")
+var errTooMany = errors.New("the request carries more mutations than the database takes in one")
 
-// prepare checks every command of a request against the bundle's registry and prepares the
-// fields the database replaces before precommit, hashing passwords on the pool for client under
-// ctx, and setting each CommandAuth proof's password aside for the caller to check.  It returns
-// errTooMany for a request of more than max commands, checking none of them, and errBusy or
-// errLimited when a hash was refused, which refuses the whole request.
+// prepare checks every mutation of a request against the bundle's registry and prepares the
+// fields the database replaces before the decider runs, hashing passwords on the pool for client
+// under ctx, and setting each MutationAuth proof's password aside for the caller to check.  It
+// returns errTooMany for a request of more than max mutations, checking none of them, and errBusy
+// or errLimited when a hash was refused, which refuses the whole request.
 func (c *core) prepare(s *Server, ctx context.Context, client string, body []byte, max int) (*prepared, error) {
 	call := cgo.NewHandle(&hashCall{s: s, ctx: ctx, client: client})
 	defer call.Delete()
@@ -373,7 +371,7 @@ func (c *core) prepare(s *Server, ctx context.Context, client string, body []byt
 		pc.body = C.GoBytes(unsafe.Pointer(out.body), C.int(out.len))
 	}
 
-	// each passing command's start, and the index in body order of each command of the request
+	// each passing mutation's start, and the index in body order of each mutation of the request
 	order := make([]int, int(out.n))
 	if out.n > 0 {
 		reasons := unsafe.Slice(out.reasons, int(out.n))
@@ -388,17 +386,18 @@ func (c *core) prepare(s *Server, ctx context.Context, client string, body []byt
 		}
 	}
 
-	// each proof's password, under its command
+	// each proof's password, under its mutation
 	pc.proofs = make([][]string, len(pc.offsets))
 	if out.nproofs > 0 {
 		for _, p := range unsafe.Slice(out.proofs, int(out.nproofs)) {
-			j := order[int(p.command)]
+			j := order[int(p.mutation)]
 			pc.proofs[j] = append(pc.proofs[j], C.GoString(p.password))
 		}
 	}
 	return pc, nil
 }
 
+// readLog reads the log's edits with from <= position <= to.
 func (c *core) readLog(from, to uint64) ([]item, error) {
 	if from > to {
 		return nil, nil
@@ -412,62 +411,35 @@ func (c *core) readLog(from, to uint64) ([]item, error) {
 	return goItems(items, n), nil
 }
 
-// readAtoms reads the log from `from` through `to` and on to the end of the atom that `to`
-// falls in, so a window over the log never ends partway through an atom.  `from` must be the
-// first position of an atom.
-func (c *core) readAtoms(from, to uint64) ([]item, error) {
-	items, err := c.readLog(from, to)
-	if err != nil || len(items) == 0 {
-		return items, err
-	}
-
-	// peek at the next position, then read on a batch at a time while the atom continues
-	step := uint64(1)
-	for {
-		last := items[len(items)-1]
-		more, err := c.readLog(last.position+1, last.position+step)
-		if err != nil {
-			return nil, err
-		}
-		n := 0
-		for n < len(more) && more[n].atom == last.atom {
-			n++
-		}
-		items = append(items, more[:n]...)
-		if n == 0 || n < len(more) {
-			return items, nil
-		}
-		step = coldBatch
-	}
-}
-
-func (c *core) readEvents(ref string, from, to uint64, reverse bool, limit int) ([]item, error) {
+// readEdits reads a selector's edits with from < position < to, ascending or descending: limit of
+// them and the rest of the last one's position, or fewer when the range runs out.
+func (c *core) readEdits(selector string, from, to uint64, reverse bool, limit int) ([]item, error) {
 	if from+1 >= to {
 		return nil, nil
 	}
-	cref := C.CString(ref)
-	defer C.free(unsafe.Pointer(cref))
+	cselector := C.CString(selector)
+	defer C.free(unsafe.Pointer(cselector))
 	rev := C.int(0)
 	if reverse {
 		rev = 1
 	}
 	var items *C.pldb_item
 	var n C.size_t
-	if C.pldb_read_events(c.db, cref, C.uint64_t(from), C.uint64_t(to), rev, C.size_t(limit), &items, &n) != 0 {
-		return nil, errors.New("read_events failed")
+	if C.pldb_read_edits(c.db, cselector, C.uint64_t(from), C.uint64_t(to), rev, C.size_t(limit), &items, &n) != 0 {
+		return nil, errors.New("read_edits failed")
 	}
 	defer C.pldb_items_free(items, n)
 	return goItems(items, n), nil
 }
 
-func (c *core) snapshot(ref string) ([]byte, uint64, error) {
-	cref := C.CString(ref)
-	defer C.free(unsafe.Pointer(cref))
+func (c *core) snapshot(selector string) ([]byte, uint64, error) {
+	cselector := C.CString(selector)
+	defer C.free(unsafe.Pointer(cselector))
 	var out *C.uint8_t
 	var outlen C.size_t
 	var position C.uint64_t
-	if C.pldb_snapshot(c.db, cref, &out, &outlen, &position) != 0 {
-		return nil, 0, fmt.Errorf("snapshot %s failed", ref)
+	if C.pldb_snapshot(c.db, cselector, &out, &outlen, &position) != 0 {
+		return nil, 0, fmt.Errorf("snapshot %s failed", selector)
 	}
 	defer C.pldb_free(unsafe.Pointer(out))
 	return C.GoBytes(unsafe.Pointer(out), C.int(outlen)), uint64(position), nil

@@ -1,6 +1,6 @@
 /* The QuickJS host: loads host.js and the bundle, compiles the bundle's registry, exposes
-   the store natives, which convert every value through it, and calls the bundle's slots
-   through __host. */
+   the store natives, which convert every value through it and read through the write buffer of
+   the call running, and calls the bundle's slots through __host. */
 
 #include <errno.h>
 
@@ -44,7 +44,7 @@ static void capture_exception(jsrt *js) {
     JS_FreeValue(ctx, exc);
 }
 
-/* a name (a key, a stream, a variable) as a C string, or NULL with an exception; *nul says the
+/* a name (a key, a slice, a variable) as a C string, or NULL with an exception; *nul says the
    name holds U+0000, where the C string stops short */
 static char *name_arg(JSContext *ctx, JSValueConst v, bool *nul) {
     size_t len;
@@ -86,6 +86,21 @@ static JSValue decode_stored(JSContext *ctx, jsrt *js, const char *key, long typ
     return v;
 }
 
+/* Answer a read through the write buffer: 1 with the buffered value, or with *val NULL for a
+   key the buffer deleted or whose slice it deleted; 0 when the store answers. */
+static int buffered(const jsrt *js, const char *key, size_t n, const uint8_t **val, size_t *len) {
+    if (!js->wb) return 0;
+    const wentry *e = wbuf_find(js->wb, key, n);
+    if (e) {
+        *val = e->val;
+        *len = e->len;
+        return 1;
+    }
+    if (!wbuf_deleted(js->wb, key, n)) return 0;
+    *val = NULL;
+    return 1;
+}
+
 static JSValue native_get(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     jsrt *js = rt_of(ctx);
     bool nul;
@@ -103,6 +118,17 @@ static JSValue native_get(JSContext *ctx, JSValueConst this_val, int argc, JSVal
         return JS_EXCEPTION;
     }
     if (js->track_rkeys) strlist_push(js->track_rkeys, key);
+
+    // the write buffer's answer, if it has one
+    const uint8_t *bval;
+    size_t blen;
+    if (buffered(js, key, strlen(key), &bval, &blen)) {
+        JSValue v = bval ? decode_stored(ctx, js, key, type, bval, blen) : JS_UNDEFINED;
+        free(key);
+        return v;
+    }
+
+    // otherwise the store's
     uint8_t *val;
     size_t len;
     int rc = store_get(js->st, key, &val, &len);
@@ -120,10 +146,25 @@ static JSValue native_get(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     return v;
 }
 
-/* whether a reducer may write key: only a reducer writes, and only to a key that holds no control
-   character or lone surrogate and fills one of its slice's key templates; throws when not.  nul
-   says the key holds U+0000 where the C string stops. */
-static bool key_writable(JSContext *ctx, jsrt *js, const char *key, bool nul) {
+/* whether the call running may write: one with a write buffer; throws when not */
+static bool writing(JSContext *ctx, jsrt *js) {
+    if (js->wb) return true;
+    JS_ThrowTypeError(ctx, "%s reads only, and made a write", js->slot ? js->slot : "this call");
+    return false;
+}
+
+/* whether slice, as its C string, is a slice name; throws when not.  nul says it holds U+0000
+   where the C string stops. */
+static bool slice_writable(JSContext *ctx, const char *slice, bool nul) {
+    if (!nul && slice_name_ok(slice)) return true;
+    JS_ThrowTypeError(ctx, "%s is not a slice name", slice);
+    return false;
+}
+
+/* Whether key may be written: it holds no control character or lone surrogate, and its slice, the
+   text before its first '!', is a slice name; throws when not.  nul says the key holds U+0000
+   where the C string stops. */
+static bool key_writable(JSContext *ctx, const char *key, bool nul) {
     if (nul) {
         JS_ThrowTypeError(ctx, "a key beginning %s holds U+0000", key);
         return false;
@@ -132,18 +173,29 @@ static bool key_writable(JSContext *ctx, jsrt *js, const char *key, bool nul) {
         JS_ThrowTypeError(ctx, "key %s holds a control character or a lone surrogate", key);
         return false;
     }
-    const slice_names *sl = js->reducing;
-    if (sl && strlen(key) >= js->reducing_skip && key_fills(sl, key + js->reducing_skip)) return true;
-    JS_ThrowTypeError(ctx, "key %s fills none of its slice's key templates", key);
+
+    // the key's slice, which must be a slice name
+    const char *bang = strchr(key, '!');
+    bool ok = false;
+    if (bang) {
+        char *slice = xmalloc((size_t)(bang - key) + 1);
+        memcpy(slice, key, (size_t)(bang - key));
+        slice[bang - key] = 0;
+        ok = slice_name_ok(slice);
+        free(slice);
+    }
+    if (ok) return true;
+    JS_ThrowTypeError(ctx, "key %s has no slice name before its first '!'", key);
     return false;
 }
 
 static JSValue native_set(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     jsrt *js = rt_of(ctx);
+    if (!writing(ctx, js)) return JS_EXCEPTION;
     bool nul;
     char *key = name_arg(ctx, argv[0], &nul);
     if (!key) return JS_EXCEPTION;
-    if (!key_writable(ctx, js, key, nul)) {
+    if (!key_writable(ctx, key, nul)) {
         free(key);
         return JS_EXCEPTION;
     }
@@ -152,6 +204,8 @@ static JSValue native_set(JSContext *ctx, JSValueConst this_val, int argc, JSVal
         free(key);
         return JS_EXCEPTION;
     }
+
+    // the value in store format, into the buffer
     buf b = {0};
     char err[512];
     if (walk_to_mpack(&js->env, js->sc, argv[2], type, false, &b, err, sizeof err)) {
@@ -160,34 +214,41 @@ static JSValue native_set(JSContext *ctx, JSValueConst this_val, int argc, JSVal
         buf_free(&b);
         return e;
     }
-    int rc = store_set(js->st, key, b.p, b.len);
+    wbuf_put(js->wb, key, strlen(key), b.p ? b.p : (const uint8_t *)"", b.len);
     buf_free(&b);
-    if (rc) {
-        JSValue e = JS_ThrowInternalError(ctx, "store set %s: %s", key, store_err(js->st));
-        free(key);
-        return e;
-    }
-    if (js->track_wkeys) strlist_push(js->track_wkeys, key);
     free(key);
     return JS_UNDEFINED;
 }
 
 static JSValue native_del(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     jsrt *js = rt_of(ctx);
+    if (!writing(ctx, js)) return JS_EXCEPTION;
     bool nul;
     char *key = name_arg(ctx, argv[0], &nul);
     if (!key) return JS_EXCEPTION;
-    if (!key_writable(ctx, js, key, nul)) {
+    if (!key_writable(ctx, key, nul)) {
         free(key);
         return JS_EXCEPTION;
     }
-    if (store_del(js->st, key)) {
-        JSValue e = JS_ThrowInternalError(ctx, "store del %s: %s", key, store_err(js->st));
-        free(key);
-        return e;
-    }
-    if (js->track_wkeys) strlist_push(js->track_wkeys, key);
+    wbuf_put(js->wb, key, strlen(key), NULL, 0);
     free(key);
+    return JS_UNDEFINED;
+}
+
+/* __pl_delete_slice(slice, erase): every key under the slice goes, and with erase its history */
+static JSValue native_delete_slice(JSContext *ctx, JSValueConst this_val, int argc,
+                                   JSValueConst *argv) {
+    jsrt *js = rt_of(ctx);
+    if (!writing(ctx, js)) return JS_EXCEPTION;
+    bool nul;
+    char *slice = name_arg(ctx, argv[0], &nul);
+    if (!slice) return JS_EXCEPTION;
+    if (!slice_writable(ctx, slice, nul)) {
+        free(slice);
+        return JS_EXCEPTION;
+    }
+    wbuf_delete_slice(js->wb, slice, JS_ToBool(ctx, argv[1]) == 1);
+    free(slice);
     return JS_UNDEFINED;
 }
 
@@ -205,9 +266,8 @@ typedef struct batch_ctx {
     size_t last_n;
 } batch_ctx;
 
-/* take a key into the batch with its value, or note that more follow a full batch */
-static int batch_visit(void *arg, const char *key, size_t n) {
-    batch_ctx *b = arg;
+/* take a key into the batch with its value's bytes, or note that more follow a full batch */
+static int batch_take(batch_ctx *b, const char *key, size_t n, const uint8_t *val, size_t len) {
     if (b->n == b->limit) {
         b->more = true;
         return 0;
@@ -216,8 +276,6 @@ static int batch_visit(void *arg, const char *key, size_t n) {
     // the key's value, decoded under the batch's type
     JSValue v = JS_UNDEFINED;
     if (b->type >= 0) {
-        size_t len;
-        const uint8_t *val = store_cursor_value(b->js->st, &len);
         v = decode_stored(b->ctx, b->js, key, b->type, val, len);
         if (JS_IsException(v)) return -1;
     }
@@ -233,6 +291,62 @@ static int batch_visit(void *arg, const char *key, size_t n) {
     b->last[n] = 0;
     b->last_n = n;
     return 1;
+}
+
+/* a store key the walk visits, with the cursor on it, into the batch */
+static int batch_visit(void *arg, const char *key, size_t n) {
+    batch_ctx *b = arg;
+    size_t len;
+    const uint8_t *val = b->type >= 0 ? store_cursor_value(b->js->st, &len) : NULL;
+    return batch_take(b, key, n, val, val ? len : 0);
+}
+
+/* A walk of the store merged with the write buffer's entries, in walk order: the buffer's entries
+   that the pattern picks out go into the batch at their place among the store's keys, and a
+   store key the buffer holds, or whose slice it deleted, is passed over, since the buffer's
+   answer wins. */
+typedef struct merge_ctx {
+    batch_ctx *b;
+    const wbuf *wb;
+    const pattern *p;
+    bool reverse;
+    size_t at;  // forward, the next entry; reversed, one past it
+    size_t end; // forward, the entries' end; reversed, the first entry
+} merge_ctx;
+
+/* the next entry in walk order that the pattern picks out and that is not a deletion, or NULL */
+static const wentry *merge_peek(merge_ctx *m) {
+    while (m->at != m->end) {
+        const wentry *e = &m->wb->v[m->reverse ? m->at - 1 : m->at];
+        if (e->val && pattern_matches(m->p, e->key, e->n)) return e;
+        m->at = m->reverse ? m->at - 1 : m->at + 1;
+    }
+    return NULL;
+}
+
+/* take the entry merge_peek answered */
+static int merge_take(merge_ctx *m, const wentry *e) {
+    m->at = m->reverse ? m->at - 1 : m->at + 1;
+    return batch_take(m->b, e->key, e->n, e->val, e->len);
+}
+
+static int merge_visit(void *arg, const char *key, size_t n) {
+    merge_ctx *m = arg;
+
+    // the entries ahead of the store's key in walk order go first
+    const wentry *e;
+    while ((e = merge_peek(m))) {
+        size_t k = e->n < n ? e->n : n;
+        int d = k ? memcmp(e->key, key, k) : 0;
+        if (d == 0) d = e->n < n ? -1 : e->n > n ? 1 : 0;
+        if (m->reverse ? d <= 0 : d >= 0) break;
+        int rc = merge_take(m, e);
+        if (rc <= 0) return rc;
+    }
+
+    // the store's key, unless the buffer answers for it
+    if (wbuf_find(m->wb, key, n) || wbuf_deleted(m->wb, key, n)) return 1;
+    return batch_visit(m->b, key, n);
 }
 
 /* the text of a request's after, its length in *n, or NULL for none; *failed says it threw */
@@ -252,10 +366,36 @@ static char *after_arg(JSContext *ctx, JSValueConst req, size_t *n, bool *failed
     return out;
 }
 
+/* a walk of the store merged with the call's write buffer, into the batch; answers as
+   pattern_walk does */
+static int merged_walk(jsrt *js, const pattern *p, bool reverse, const char *after,
+                       size_t after_n, batch_ctx *b) {
+    // the buffer's entries in key order, from just past after in walk order
+    wbuf_sort(js->wb);
+    merge_ctx m = {b, js->wb, p, reverse, 0, js->wb->n};
+    if (reverse) {
+        m.at = after ? wbuf_seek(js->wb, after, after_n, false) : js->wb->n;
+        m.end = 0;
+    } else if (after) {
+        m.at = wbuf_seek(js->wb, after, after_n, true);
+    }
+
+    // the store's keys with the entries among them, then the entries past the store's last
+    if (pattern_walk(js->st, p, reverse, after, after_n, js->scan_budget, merge_visit, &m)) {
+        return -1;
+    }
+    const wentry *e;
+    while (!b->more && (e = merge_peek(&m))) {
+        if (merge_take(&m, e) < 0) return -1;
+    }
+    return 0;
+}
+
 /* One batch of a walk of the keys a pattern picks out, the skeleton's ReadScan answered with
    {entries, next}: the keys from just past after, with their values decoded under the type the
    request names, or keys only for a type of false.  It reads one key past the batch to tell
-   whether more follow.  While maySee runs, the batch's span is its read-set. */
+   whether more follow.  A call with a write buffer walks the buffer merged with the store.  While
+   the grantor runs, the batch's span is its read-set. */
 static JSValue native_scan(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     jsrt *js = rt_of(ctx);
     JSValueConst req = argv[0];
@@ -307,9 +447,16 @@ static JSValue native_scan(JSContext *ctx, JSValueConst this_val, int argc, JSVa
     }
     b.limit = limit >= (double)SIZE_MAX ? SIZE_MAX : (size_t)limit;
 
-    // walk one key past the batch, to tell whether more follow
+    // walk one key past the batch, to tell whether more follow, through the write buffer when the
+    // call has one
     b.entries = JS_NewArray(ctx);
-    if (pattern_walk(js->st, p, reverse, after, after_n, js->scan_budget, batch_visit, &b)) {
+    int rc;
+    if (js->wb && !wbuf_empty(js->wb)) {
+        rc = merged_walk(js, p, reverse, after, after_n, &b);
+    } else {
+        rc = pattern_walk(js->st, p, reverse, after, after_n, js->scan_budget, batch_visit, &b);
+    }
+    if (rc) {
         if (!JS_HasException(ctx)) JS_ThrowInternalError(ctx, "store scan: %s", store_err(js->st));
         JS_FreeValue(ctx, b.entries);
         free(b.last);
@@ -318,7 +465,7 @@ static JSValue native_scan(JSContext *ctx, JSValueConst this_val, int argc, JSVa
         return JS_EXCEPTION;
     }
 
-    // the batch, and what it walked for maySee's read-set
+    // the batch, and what it walked for the grantor's read-set
     JSValue out = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, out, "entries", b.entries);
     JS_SetPropertyStr(ctx, out, "next", b.more ? JS_NewStringLen(ctx, b.last, b.last_n) : JS_NULL);
@@ -501,59 +648,20 @@ static int load_schema(jsrt *js, JSValueConst bundle, char *err, size_t errlen) 
     return rc;
 }
 
-static int strings_of(jsrt *js, JSValueConst arr, strlist *out);
-
-/* every reducer's templates, from the bundle's SliceReducers; a template must name its own
-   family */
-static int load_slices(jsrt *js, JSValueConst bundle, char *err, size_t errlen) {
-    JSContext *ctx = js->ctx;
-    JSValue reducers = JS_GetPropertyStr(ctx, bundle, "reducers");
-    JSPropertyEnum *tab = NULL;
-    uint32_t n = 0;
-    if (!JS_IsObject(reducers) ||
-        JS_GetOwnPropertyNames(ctx, &tab, &n, reducers, JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        JS_FreeValue(ctx, reducers);
-        snprintf(err, errlen, "bundle has no reducers");
-        return -1;
-    }
-    js->slices = calloc(n ? n : 1, sizeof *js->slices);
-    if (!js->slices) die("out of memory");
-
-    // each reducer's family template and key templates
-    int rc = 0;
-    for (uint32_t i = 0; i < n && !rc; i++) {
-        slice_names *sl = &js->slices[js->nslices++];
-        const char *family = JS_AtomToCString(ctx, tab[i].atom);
-        sl->family = xstrdup(family ? family : "");
-        if (family) JS_FreeCString(ctx, family);
-        JSValue slice = JS_GetProperty(ctx, reducers, tab[i].atom);
-        JSValue tpl = JS_GetPropertyStr(ctx, slice, "template");
-        JSValue keys = JS_GetPropertyStr(ctx, slice, "keys");
-        const char *t = JS_IsString(tpl) ? JS_ToCString(ctx, tpl) : NULL;
-        if (t) sl->stream = xstrdup(t);
-        if (!t || JS_IsArray(ctx, keys) != 1 || strings_of(js, keys, &sl->keys)) {
-            snprintf(err, errlen, "bundle reducer %s has no template or key templates", sl->family);
-            rc = -1;
-        } else if (slice_of(js, sl->stream) != sl) {
-            snprintf(err, errlen, "bundle reducer %s has the template %s", sl->family, sl->stream);
-            rc = -1;
-        }
-        if (t) JS_FreeCString(ctx, t);
-        JS_FreeValue(ctx, keys);
-        JS_FreeValue(ctx, tpl);
-        JS_FreeValue(ctx, slice);
-    }
-    JS_FreePropertyEnum(ctx, tab, n);
-    JS_FreeValue(ctx, reducers);
-    return rc;
-}
-
 /* what a bundle expects of its environment and QuickJS lacks */
 static const char ENV_SHIM[] =
     "if (typeof globalThis.process === 'undefined') {"
     "  globalThis.process = { env: { NODE_ENV: 'production' } };"
     "}";
+
+/* call __host[name](args...) ; returns JS_EXCEPTION with js->err set */
+static JSValue call_host(jsrt *js, const char *name, int argc, JSValueConst *argv) {
+    JSValue fn = JS_GetPropertyStr(js->ctx, js->host, name);
+    JSValue r = JS_Call(js->ctx, fn, js->host, argc, argv);
+    JS_FreeValue(js->ctx, fn);
+    if (JS_IsException(r)) capture_exception(js);
+    return r;
+}
 
 int js_open(jsrt *js, const char *host, size_t hostlen, const char *bundle_path, store *st,
             char *err, size_t errlen) {
@@ -570,6 +678,8 @@ int js_open(jsrt *js, const char *host, size_t hostlen, const char *bundle_path,
     JS_SetPropertyStr(js->ctx, global, "__pl_get", JS_NewCFunction(js->ctx, native_get, "__pl_get", 2));
     JS_SetPropertyStr(js->ctx, global, "__pl_set", JS_NewCFunction(js->ctx, native_set, "__pl_set", 3));
     JS_SetPropertyStr(js->ctx, global, "__pl_del", JS_NewCFunction(js->ctx, native_del, "__pl_del", 1));
+    JS_SetPropertyStr(js->ctx, global, "__pl_delete_slice",
+                      JS_NewCFunction(js->ctx, native_delete_slice, "__pl_delete_slice", 2));
     JS_SetPropertyStr(js->ctx, global, "__pl_scan", JS_NewCFunction(js->ctx, native_scan, "__pl_scan", 1));
     JS_SetPropertyStr(js->ctx, global, "__pl_hash", JS_NewCFunction(js->ctx, native_hash, "__pl_hash", 1));
     JS_SetPropertyStr(js->ctx, global, "__pl_env", JS_NewCFunction(js->ctx, native_env, "__pl_env", 1));
@@ -605,7 +715,6 @@ int js_open(jsrt *js, const char *host, size_t hostlen, const char *bundle_path,
         return -1;
     }
     int rc = load_schema(js, bundle, err, errlen);
-    if (!rc) rc = load_slices(js, bundle, err, errlen);
 
     // its mode and its stack mapper
     JSValue dev = JS_GetPropertyStr(js->ctx, bundle, "dev");
@@ -613,18 +722,22 @@ int js_open(jsrt *js, const char *host, size_t hostlen, const char *bundle_path,
     JS_FreeValue(js->ctx, dev);
     js->map_stack = JS_GetPropertyStr(js->ctx, bundle, "mapStack");
     JS_FreeValue(js->ctx, bundle);
+
+    // its contexts, bound once to host.js's transaction
+    if (!rc) {
+        JSValue r = call_host(js, "load", 0, NULL);
+        if (JS_IsException(r)) {
+            snprintf(err, errlen, "bundle: %s", js->err);
+            rc = -1;
+        }
+        JS_FreeValue(js->ctx, r);
+    }
     return rc;
 }
 
 void js_close(jsrt *js) {
     if (!js->ctx) return;
     strlist_free(&js->env_names);
-    for (size_t i = 0; i < js->nslices; i++) {
-        free(js->slices[i].family);
-        free(js->slices[i].stream);
-        strlist_free(&js->slices[i].keys);
-    }
-    free(js->slices);
     free(js->bundle_file);
     JS_FreeValue(js->ctx, js->source_map);
     JS_FreeValue(js->ctx, js->map_stack);
@@ -633,15 +746,6 @@ void js_close(jsrt *js) {
     JS_FreeContext(js->ctx);
     JS_FreeRuntime(js->rt);
     js->ctx = NULL;
-}
-
-/* call __host[name](args...) ; returns JS_EXCEPTION with js->err set */
-static JSValue call_host(jsrt *js, const char *name, int argc, JSValueConst *argv) {
-    JSValue fn = JS_GetPropertyStr(js->ctx, js->host, name);
-    JSValue r = JS_Call(js->ctx, fn, js->host, argc, argv);
-    JS_FreeValue(js->ctx, fn);
-    if (JS_IsException(r)) capture_exception(js);
-    return r;
 }
 
 JSValue js_principal(jsrt *js, const char *user) {
@@ -682,89 +786,59 @@ static int strings_of(jsrt *js, JSValueConst arr, strlist *out) {
     return 0;
 }
 
-/* the outputs a precommit or bootstrap answered, [{stream, event} | {stream, death: true,
-   erase?: true}], each event's bytes under the type its stream's family folds; takes r */
-static int parse_outputs(jsrt *js, JSValue r, pc_result *out) {
-    JSContext *ctx = js->ctx;
-    JSValue lenv = JS_GetPropertyStr(ctx, r, "length");
-    int64_t n = 0;
-    JS_ToInt64(ctx, &n, lenv);
-    JS_FreeValue(ctx, lenv);
-    out->items = xmalloc(sizeof(pc_item) * (n ? n : 1));
-    memset(out->items, 0, sizeof(pc_item) * (n ? n : 1));
-    for (int64_t i = 0; i < n; i++) {
-        JSValue item = JS_GetPropertyUint32(ctx, r, (uint32_t)i);
-        pc_item *pi = &out->items[out->n];
-        JSValue sv = JS_GetPropertyStr(ctx, item, "stream");
-        bool nul = false;
-        pi->stream = JS_IsString(sv) ? name_arg(ctx, sv, &nul) : NULL;
-        JS_FreeValue(ctx, sv);
-        JSValue dv = JS_GetPropertyStr(ctx, item, "death");
-        pi->death = JS_ToBool(ctx, dv) == 1;
-        JS_FreeValue(ctx, dv);
-        JSValue ev = JS_GetPropertyStr(ctx, item, "erase");
-        pi->erase = pi->death && JS_ToBool(ctx, ev) == 1;
-        JS_FreeValue(ctx, ev);
-        pi->event = JS_GetPropertyStr(ctx, item, "event");
-        out->n++;
-        JS_FreeValue(ctx, item);
-        if (!pi->stream) {
-            snprintf(js->err, sizeof js->err, "precommit item without a stream");
-            JS_FreeValue(ctx, r);
-            return -1;
-        }
-        if (nul) {
-            snprintf(js->err, sizeof js->err, "precommit emitted to a stream beginning %s, holding U+0000",
-                     pi->stream);
-            JS_FreeValue(ctx, r);
-            return -1;
-        }
-        if (pi->death) continue;
-
-        // the event's bytes, under the type its stream's family folds
-        long type = schema_event_type(js->sc, pi->stream);
-        if (type < 0) {
-            snprintf(js->err, sizeof js->err, "precommit emitted to %s, a stream of no slice", pi->stream);
-            JS_FreeValue(ctx, r);
-            return -1;
-        }
-        char why[512];
-        if (walk_to_mpack(&js->env, js->sc, pi->event, type, false, &pi->bytes, why, sizeof why)) {
-            snprintf(js->err, sizeof js->err, "precommit's event for %s: %s", pi->stream, why);
-            JS_FreeValue(ctx, r);
-            return -1;
-        }
-    }
-    JS_FreeValue(ctx, r);
-    return 0;
+/* call a slot that writes, over wb, naming it for its errors */
+static JSValue call_writing(jsrt *js, wbuf *wb, const char *slot, int argc, JSValueConst *argv) {
+    js->wb = wb;
+    js->slot = slot;
+    JSValue r = call_host(js, slot, argc, argv);
+    js->wb = NULL;
+    js->slot = NULL;
+    return r;
 }
 
-int js_precommit(jsrt *js, JSValueConst data, JSValueConst principal, pc_result *out) {
+/* call __host[name], which runs a slot that only reads, naming the slot for the error of a
+   write it makes */
+static JSValue call_reading(jsrt *js, const char *name, const char *slot, int argc,
+                            JSValueConst *argv) {
+    js->slot = slot;
+    JSValue r = call_host(js, name, argc, argv);
+    js->slot = NULL;
+    return r;
+}
+
+int js_decide(jsrt *js, wbuf *wb, JSValueConst data, JSValueConst principal, char **reason) {
     JSContext *ctx = js->ctx;
-    memset(out, 0, sizeof *out);
+    *reason = NULL;
     JSValueConst args[2] = {data, principal};
-    JSValue r = call_host(js, "precommit", 2, args);
+    JSValue r = call_writing(js, wb, "decide", 2, args);
     if (JS_IsException(r)) return -1;
-    if (JS_IsString(r)) {
-        // a reason is text to show, which a U+0000 in it ends
-        bool nul;
-        out->reason = name_arg(ctx, r, &nul);
+
+    // null carried the mutation out, and a reason, text to show, which a U+0000 in it ends,
+    // rejected it
+    if (JS_IsNull(r)) return 0;
+    if (!JS_IsString(r)) {
         JS_FreeValue(ctx, r);
-        return 0;
+        snprintf(js->err, sizeof js->err, "decide answered neither null nor a reason");
+        return -1;
     }
-    return parse_outputs(js, r, out);
+    bool nul;
+    *reason = name_arg(ctx, r, &nul);
+    JS_FreeValue(ctx, r);
+    if (*reason) return 0;
+    capture_exception(js);
+    return -1;
 }
 
-int js_bootstrap(jsrt *js, pc_result *out) {
-    memset(out, 0, sizeof *out);
-    JSValue r = call_host(js, "bootstrap", 0, NULL);
+int js_bootstrap(jsrt *js, wbuf *wb) {
+    JSValue r = call_writing(js, wb, "bootstrap", 0, NULL);
     if (JS_IsException(r)) return -1;
-    return parse_outputs(js, r, out);
+    JS_FreeValue(js->ctx, r);
+    return 0;
 }
 
 int js_cron_entries(jsrt *js, strlist *out) {
     JSContext *ctx = js->ctx;
-    JSValue r = call_host(js, "cronEntries", 0, NULL);
+    JSValue r = call_reading(js, "cronEntries", "cronEntries", 0, NULL);
     if (JS_IsException(r)) return -1;
     JSValue lenv = JS_GetPropertyStr(ctx, r, "length");
     int64_t n = 0;
@@ -780,45 +854,20 @@ int js_cron_entries(jsrt *js, strlist *out) {
     return rc;
 }
 
-int js_tick(jsrt *js, const char *install, const char *entry, int64_t slot, int64_t now,
-            pc_result *out) {
+int js_tick(jsrt *js, wbuf *wb, const char *install, const char *entry, int64_t slot,
+            int64_t now) {
     JSContext *ctx = js->ctx;
-    memset(out, 0, sizeof *out);
     JSValue args[4] = {JS_NewString(ctx, install), JS_NewString(ctx, entry),
                        JS_NewFloat64(ctx, (double)slot), JS_NewFloat64(ctx, (double)now)};
-    JSValue r = call_host(js, "tick", 4, args);
+    JSValue r = call_writing(js, wb, "tick", 4, (JSValueConst *)args);
     for (int i = 0; i < 4; i++) JS_FreeValue(ctx, args[i]);
     if (JS_IsException(r)) return -1;
-    return parse_outputs(js, r, out);
-}
-
-void pc_result_free(jsrt *js, pc_result *r) {
-    free(r->reason);
-    for (size_t i = 0; i < r->n; i++) {
-        free(r->items[i].stream);
-        JS_FreeValue(js->ctx, r->items[i].event);
-        buf_free(&r->items[i].bytes);
-    }
-    free(r->items);
-    memset(r, 0, sizeof *r);
-}
-
-int js_reduce(jsrt *js, const char *family, const char *stream, JSValueConst events) {
-    JSContext *ctx = js->ctx;
-    JSValue args[3] = {JS_NewString(ctx, family), JS_NewString(ctx, stream), JS_DupValue(ctx, events)};
-    js->reducing = slice_of(js, stream);
-    js->reducing_skip = strlen(stream) + 1;
-    JSValue r = call_host(js, "reduce", 3, args);
-    js->reducing = NULL;
-    for (int i = 0; i < 3; i++) JS_FreeValue(ctx, args[i]);
-    if (JS_IsException(r)) return -1;
-    int ran = JS_ToBool(ctx, r);
     JS_FreeValue(ctx, r);
-    return ran;
+    return 0;
 }
 
-int js_maysee(jsrt *js, JSValueConst principal, strlist *out) {
-    JSValue r = call_host(js, "maySee", 1, &principal);
+int js_grant(jsrt *js, JSValueConst principal, strlist *out) {
+    JSValue r = call_reading(js, "grant", "grant", 1, &principal);
     if (JS_IsException(r)) return -1;
     int rc = strings_of(js, r, out);
     JS_FreeValue(js->ctx, r);
@@ -832,7 +881,7 @@ int js_lookup(jsrt *js, const uint8_t *ident, size_t len, buf *out) {
         capture_exception(js);
         return -1;
     }
-    JSValue r = call_host(js, "lookup", 1, &arg);
+    JSValue r = call_reading(js, "lookup", "lookup", 1, (JSValueConst *)&arg);
     JS_FreeValue(ctx, arg);
     if (JS_IsException(r)) return -1;
     int rc = 0;
@@ -845,7 +894,7 @@ int js_lookup(jsrt *js, const uint8_t *ident, size_t len, buf *out) {
 }
 
 int64_t js_generation(jsrt *js, JSValueConst principal) {
-    JSValue r = call_host(js, "generation", 1, &principal);
+    JSValue r = call_reading(js, "generation", "lookup", 1, &principal);
     if (JS_IsException(r)) return -2;
     int64_t g = -1;
     JS_ToInt64(js->ctx, &g, r);
@@ -855,7 +904,7 @@ int64_t js_generation(jsrt *js, JSValueConst principal) {
 
 int js_password_hash(jsrt *js, JSValueConst principal, char **out) {
     *out = NULL;
-    JSValue r = call_host(js, "passwordHash", 1, &principal);
+    JSValue r = call_reading(js, "passwordHash", "lookup", 1, &principal);
     if (JS_IsException(r)) return -1;
     if (JS_IsString(r)) {
         const char *s = JS_ToCString(js->ctx, r);

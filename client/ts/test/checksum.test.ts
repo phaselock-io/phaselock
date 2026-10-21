@@ -55,4 +55,21 @@ describe('Fnv64', () => {
       expect(hex(f.digest())).toBe(fnvRef(bytes));
     }
   });
+
+  test('state exports the digest so far, and resume continues from it', () => {
+    const whole = utf8.encode('foobar');
+    const f = new Fnv64();
+    f.update(whole.subarray(0, 3));
+    expect(f.state()).toBe(fnvRef(whole.subarray(0, 3)));
+    const g = Fnv64.resume(f.state());
+    g.update(whole.subarray(3));
+    expect(hex(g.digest())).toBe('85944171f73967e8');
+  });
+
+  test.each(['', 'cbf29ce48422232', 'cbf29ce484222325f', 'CBF29CE484222325', 'xbf29ce484222325'])(
+    'resume refuses a malformed state: %j',
+    (state) => {
+      expect(() => Fnv64.resume(state)).toThrow(/bad FNV-1a 64 state/);
+    },
+  );
 });

@@ -1,35 +1,43 @@
-// The transport contract and the envelope types.  These are declared in the generated
-// skeleton too, which has no imports; they are duplicated here verbatim, and structural typing
-// lines the two up.  Changing them costs a change in every client in every language.  The
-// skeleton takes a session as an opaque object; this library's is its Session class.
+// The transport contract, the edit envelope, and the Registry.  These are declared in the
+// generated skeleton too, which has no imports; they are duplicated here, and structural typing
+// lines the two up.  Changing them costs a change in every client in every language.  This is a
+// JS-native host, so raw bytes, which the skeleton leaves opaque, are a Uint8Array here; and the
+// skeleton takes a session as an opaque object, where this library's is its Session class.
 
 import type { Session } from './session.js';
 
-/** Command wraps command data T with the client-minted id it will carry through the log, and
-    the series and number the database dedups it by: an Engine numbers its commands in a series
-    it mints, and the database runs each number once.  An unnumbered command has neither. */
-export type Command<T> = {
+/** Mutation wraps mutation data T with the client-minted id it will carry through the log, and
+    the series and number the database dedups it by: an Engine numbers its mutations in a series
+    it mints, and the database runs each number once.  An unnumbered mutation has neither. */
+export type Mutation<T> = {
   id: string;
   series: string | null;
   n: number | null;
   data: T;
 };
 
-/** DbEvent is event data T with the envelope the DB stamped on it when it was committed:
-    [position, stream, seq, id, servertime] on the wire, the server time a msgpack timestamp.  The
-    id is the command's. */
-export type DbEvent<T> = {
-  id: string;
-  data: T;
+/** Where an edit stands in its slice's life.  A normal edit applies its writes.  A birth clears
+    the slice, then applies its writes.  A death clears the slice and writes nothing.  A birth or
+    a death is a reset, which a client chains on at any seq above its last. */
+export type Lifecycle = 'normal' | 'birth' | 'death';
+
+/** What the database stamped on an edit when it committed it: the log position of its mutation,
+    the slice it edits and its seq there, the mutation's id, the server time, and where the edit
+    stands in the slice's life.  A mutation that edits three slices makes three edits at one
+    position. */
+export type EditEnvelope = {
   position: number;
-  stream: string;
+  slice: string;
   seq: number;
+  id: string;
   servertime: Date;
+  lifecycle: Lifecycle;
 };
 
-/** WireEvent is an event as a connection delivers it: the envelope decoded for routing, data as
-    the bytes the server sent, and the whole wire pair `[env, data]` so parking it is a slice. */
-export type WireEvent = DbEvent<Uint8Array> & { raw: Uint8Array };
+/** WireEdit is an edit as a connection delivers it: the envelope decoded for routing, and the
+    whole edit as it came, which the Engine parks or hands to its store to apply, never reading
+    its payload. */
+export type WireEdit = EditEnvelope & { raw: Uint8Array };
 
 /** A cancellation signal, as the Engine and its connections use one: whether it has fired and why,
     and a listener for when it does.  A browser's or Node's AbortSignal is one. */
@@ -41,20 +49,24 @@ export interface Signal {
 }
 
 export type Backfill = {
-  // what ref are we backfilling (stream name or prefix)
-  ref: string;
+  // what selector are we backfilling (slice name or prefix)
+  selector: string;
   // the tail's exclusive upper bound: the cursor when this backfill started.  Anything at or
-  // above it arrives on the live stream and is parked.  Retries keep the original value.
+  // above it arrives on the live connection and is parked.  Retries keep the original value.
   until: number;
   // what a previous attempt got through, or null for a fresh backfill.  A finished half is
   // skipped outright.  Otherwise skipBytes > 0 resumes the blob download, and the header's
   // position must then equal position or the outcome is 'stale'; skipBytes === 0 fetches from
-  // the start and accepts any position.  The tail starts at max(fromPosition, header position),
-  // so a newer blob overrides the floor.  It reads forward, which may result in gaps if retention
-  // pruning happens concurrently, so it must be checked for gaps just before landing.
+  // the start and accepts any position.  Either way a blob from another log, its epoch not the
+  // connection's, is 'stale'.  The tail starts at max(fromPosition, header position), so a newer
+  // blob overrides the floor.  It reads forward, which may result in gaps if retention
+  // pruning happens concurrently, so it must be checked for gaps just before landing.  The
+  // checksum is the last parked page's, handed back so a resumed download continues its check;
+  // it is '' when skipBytes is 0.
   resume: null | {
     position: number;
     skipBytes: number;
+    checksum: string;
     fromPosition: number;
     snapshotDone: boolean;
     tailDone: boolean;
@@ -66,31 +78,33 @@ export type Backfill = {
 };
 
 /** One delivery of a backfill: the blob's whole length in bytes, when its response states one;
-    the blob's header (its cut position and the seq of every stream in it); a batch of values with
-    the byte offset after them; a page of tail events with the position its scan reached; or the
-    end of either half.  The length and the scan feed the Engine's progress status alone.  A
-    download without a resume pushes its header before anything else but its length, since the
-    header is what the rest is parked against. */
+    the blob's header, its cut position and the seq of every slice in it, which names every slice
+    the blob holds; a page of the blob's set operations, whole ones, with the byte offset after
+    it, to resume past, and the transport's running check over every page delivered so far; a run
+    of tail edits with the position its scan reached; or the end of either half.  The length and
+    the scan feed the Engine's progress status alone, and the checksum is opaque to it, kept only
+    to hand back on a resume.  A download without a resume pushes its header before anything else
+    but its length, since the header is what the rest is parked against. */
 export type BackfillItem =
   | { length: number }
   | { header: { position: number; seqs: Record<string, number> } }
-  | { values: [string, Uint8Array][]; skip: number }
-  | { valuesDone: true }
-  | { events: WireEvent[]; scanned: number }
-  | { eventsDone: true };
+  | { page: Uint8Array; skip: number; checksum: string }
+  | { pagesDone: true }
+  | { edits: WireEdit[]; scanned: number }
+  | { editsDone: true };
 
-/** What the database answers for a command.  `ok` means it was decided at or before position, so
-    a client that has reduced that far can read the outcome from its state.  A reject's reason
-    and a conflict's current seqs come only in the first answer to a decision, and a resend of
-    either is answered `ok`. */
-export type CommandResult =
+/** What the database answers for a mutation.  `ok` means it was decided at or before position,
+    so a client that has applied that far can read the outcome from its state.  A reject's reason
+    and a conflict's current seqs, by slice, come only in the first answer to a decision, and a
+    resend of either is answered `ok`. */
+export type MutationResult =
   | { kind: 'ok'; position: number }
   | { kind: 'reject'; reason: string }
   | { kind: 'conflict'; current: Record<string, number> };
 
-// 'stale' when the snapshot vanished, or a resumed fetch's PhaseLock-Position differs from
-// resume.position; the Engine discards what it parked and starts over.  Any other failure rejects,
-// and the Engine may retry with resume as persisted.
+// 'stale' when the snapshot vanished, when its epoch is not the connection's, or when a resumed
+// fetch's PhaseLock-Position differs from resume.position; the Engine discards what it parked and
+// starts over.  Any other failure rejects, and the Engine may retry with resume as persisted.
 export type BackfillOutcome = 'done' | 'stale';
 
 export interface Connection {
@@ -98,7 +112,7 @@ export interface Connection {
   // Calls are applied in call order, and within a call, array order.  A call that fails also
   // fails every call behind it, unsent, and ends the connection, so the next connection's resend
   // keeps the Engine's order.  Retrying before giving up is the connection's choice.
-  sendCommands(commands: Command<Uint8Array>[]): Promise<CommandResult[]>;
+  sendMutations(mutations: Mutation<Uint8Array>[]): Promise<MutationResult[]>;
 }
 
 export interface ConnectionHooks {
@@ -106,11 +120,13 @@ export interface ConnectionHooks {
   // every position on this connection belongs to, and the head, the log's position as the
   // connection opened
   onOpen(epoch: string, head: number): void;
-  // the whole view: token is its hash, position the commit it is the view at, refs the set.
-  // Sent first when the presented token was not current, and on every change, in stream order
-  // ahead of the events it applies to.  The Engine diffs refs against what it holds.
-  onView(token: string, position: number, refs: string[]): void;
-  onEvents(events: WireEvent[]): void;
+  // the whole view: token is its hash, position the commit it is the view at, selectors the set.
+  // Sent first when the presented token was not current, and on every change, in log order
+  // ahead of the edits it applies to.  The Engine diffs selectors against what it holds.
+  onView(token: string, position: number, selectors: string[]): void;
+  // the edits of one frame, in log order; a mutation's edits to the slices this connection holds
+  // arrive in one frame
+  onEdits(edits: WireEdit[]): void;
   // history done; live from here (sent once per connection)
   onLive(position: number): void;
   onVouch(position: number): void;
@@ -120,14 +136,15 @@ export interface ConnectionHooks {
 }
 
 /** A Transport is how a host reaches one database: the host's Registry, built from generated
-    registry data; one connection per connect attempt; and commands posted outside any
+    registry data; one connection per connect attempt; and mutations posted outside any
     connection.  It keeps no identity: each call names the session it speaks for, or null for
     anonymous. */
 export interface Transport {
   buildRegistry(schema: Schema): Registry;
   // One Connection per attempt: since is the Engine's checkpoint (-1 to bootstrap), and the
-  // connection reports exactly one onEnd.  The signal is its lifetime; aborting it ends the
-  // connection and rejects any backfill or send in flight.
+  // connection reports exactly one onEnd.  wants are the selectors of the Engine's slice types, one
+  // each, which the database cuts the view down to.  The signal is its lifetime; aborting it ends
+  // the connection and rejects any backfill or send in flight.
   connect(
     since: number,
     view: string | null, // the Engine's stored view token; null to bootstrap
@@ -136,14 +153,15 @@ export interface Transport {
     hooks: ConnectionHooks,
     session: Session | null,
   ): Connection;
-  // Commands outside any connection, answered with their outcomes in order, in as many requests
-  // as the database's limit on commands per request calls for, one after another.  A transport
-  // may retry a failed request when every command in it is numbered, since the database answers
+  // Mutations outside any connection, answered with their outcomes in order, in as many requests
+  // as the database's limit on mutations per request calls for, one after another.  A transport
+  // may retry a failed request when every mutation in it is numbered, since the database answers
   // a resend of one that landed as decided, and never retries one that is not.
-  post(commands: Command<Uint8Array>[], session?: Session | null): Promise<CommandResult[]>;
+  post(mutations: Mutation<Uint8Array>[], session?: Session | null): Promise<MutationResult[]>;
 }
 
-// the store's value bundles and the Registry, with the registry data a host builds one from
+// the store's value representations and the Registry, with the registry data a host builds one
+// from
 
 /** The representations a value can be in: JS is the rich JS value, HOST the host language's,
     MSGPACK the bytes.  Every get names the one it wants and every set the one it gives; a store
@@ -153,28 +171,32 @@ export const HOST = 2;
 export const MSGPACK = 3;
 export type Rep = typeof JS | typeof HOST | typeof MSGPACK;
 
-/** Registry converts between representations of typed values and names the types the store
-    holds.  Types are model names from the TypeSpec, plus three reserved names: `.json` for the
-    Engine's own shapes; `.command` for the outbox envelope, `{id, data}` with `data` already the
-    command's wire bytes, so it needs no vocabulary to read; and `.event` for a parked event, the
-    wire pair `[env, data]` in `msgpack` and a DbEvent in `js`, its `data` converted through the
-    union of the stream's slice. */
+/** Registry converts between representations of typed values.  Types are model names from the
+    TypeSpec, plus four reserved names.  `.json` is the Engine's own shapes.  `.mutation` is an
+    outbox row, a Mutation<Uint8Array> whose `data` is already the mutation's wire bytes, so it
+    needs no vocabulary to read.  `.edits` is a parked edit, the raw edit in `msgpack` and its
+    EditEnvelope alone in `js`; it converts from `msgpack` only.  `.page` is a parked snapshot
+    page, bytes that only a store's applySnapshot reads, which no Registry converts. */
 export interface Registry {
   /** a value of type `type`, given in one representation, in another */
   convert(type: string, value: unknown, from: Rep, to: Rep): unknown;
-  /** the commands union this engine may submit */
-  commands: string;
-  /** a family, a stream name before its first ':', to the slice's events union */
-  eventTypes: Record<string, string>;
-  /** family/name, a key's family and its local key's name, to the store value's type */
-  storeTypes: Record<string, string>;
+  /** The operations of a raw edit, its envelope skipped, or of a snapshot page, in order, for a
+      JS-native store to apply: each a key and its value's bytes, sliced out undecoded, or
+      undefined for a deletion.  An opcode it does not know throws. */
+  ops(bytes: Uint8Array, edit: boolean): EditOp[];
+  /** the mutations union this engine may send */
+  mutations: string;
 }
+
+/** one operation of an edit or a snapshot page: a set, with its value's msgpack bytes, a nil
+    setting null, or a deletion, with undefined */
+export type EditOp = [key: string, value: Uint8Array | undefined];
 
 /** One type of the model, as the generated registry describes it; children are indices into
     the same node table.  A struct lists its fields in declaration order, and names the one it
     writes first, the field a union tells it apart from its other members by, or -1; a union
     carries the solver's decision tree; an intake node names a field the database prepares for
-    precommit, over the wire type a client sends.  The identities of a struct, record, array,
+    the decider, over the wire type a client sends.  The identities of a struct, record, array,
     tuple, or union are its name, or null when the type has none. */
 export type SchemaNode =
   | ['null']
@@ -211,14 +233,11 @@ export type SchemaSolution =
 
 /** The type registry as data, generated per engine and per database: the model's types as a
     node table, the type identities the Registry answers for and their nodes, and what the
-    Registry's `commands`, `eventTypes`, and `storeTypes` are.  Every engine and database of one
-    model shares one node table.  A host walks it to convert values; the reserved identities are
-    the host's own. */
+    Registry's `mutations` is.  Every engine and database of one model shares one node table.  A
+    host walks it to convert values; the reserved identities are the host's own. */
 export type Schema = {
   nodes: SchemaNode[];
   ids: Record<string, number>;
-  /** the commands union, or null for a database with no commands */
-  commands: string | null;
-  eventTypes: Record<string, string>;
-  storeTypes: Record<string, string>;
+  /** the mutations union, or null for a database with no mutations */
+  mutations: string | null;
 };

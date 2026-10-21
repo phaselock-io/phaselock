@@ -1,20 +1,20 @@
 // The Registry of a JS host: the generated registry data compiled into linked plans, and a walk
 // over them converting msgpack bytes to rich values and back, checked against the schema in both
-// directions, plus the Engine's reserved identities.
+// directions, plus the Engine's reserved identities and the operations of edits and pages.
 
 import {
-  type Command,
-  type DbEvent,
+  type EditOp,
   JS,
   MSGPACK,
+  type Mutation,
   type Registry,
   type Rep,
   type Schema,
   type SchemaNode,
   type SchemaSolution,
 } from './contract.js';
+import { editOps, readEnvelope } from './edits.js';
 import { decodeAny, encodeAny, Reader, setEntry, Writer } from './msgpack.js';
-import { uuidBytes, uuidString } from './uuid.js';
 
 const utf8 = new TextEncoder();
 
@@ -26,9 +26,20 @@ export class ConvertError extends Error {
   }
 }
 
-/** what a walk does with a field the schema does not name: a command's are rejected, since
-    the database rejects them too; anything else's are dropped */
+/* A union value that matches none of its members, which is how an unknown member reads, since
+   the solver's union forms make one match nothing.  Under the drop policy an optional field
+   holding one is absent, and an array's or a record's element holding one is left out; anywhere
+   else the failure bubbles up, and at the top the conversion fails. */
+class UnknownMember extends ConvertError {}
+
+/** What a walk does with what the schema does not name: a mutation's foreign fields and unknown
+    members are errors, since the database rejects them too.  Anything else is read under the
+    server's schema, which may be newer than this one, so a foreign field is dropped, and so is
+    an unknown member wherever a value can be absent. */
 type Policy = 'reject' | 'drop';
+
+// what readOrDrop answers for a value it dropped
+const DROPPED = Symbol('dropped');
 
 // plan kinds
 const NULL = 0;
@@ -121,8 +132,18 @@ class Walk {
   policy: Policy = 'drop';
 
   fail(message: string): never {
+    throw new ConvertError(this.#at(message));
+  }
+
+  // a union value that matched none of its members
+  failMember(message: string): never {
+    throw new UnknownMember(this.#at(message));
+  }
+
+  // the message, naming the path
+  #at(message: string): string {
     const path = this.path.map((p) => (typeof p === 'number' ? `[${p}]` : `.${p}`)).join('');
-    throw new ConvertError(`$${path}: ${message}`);
+    return `$${path}: ${message}`;
   }
 
   // reading //////////////////////////////////////////////////////////////////
@@ -163,7 +184,8 @@ class Walk {
           if (r.kind() !== 'str') this.fail('expected a string key');
           const key = r.str();
           this.path.push(key);
-          setEntry(out, key, this.read(r, p.child));
+          const v = this.readOrDrop(r, p.child);
+          if (v !== DROPPED) setEntry(out, key, v);
           this.path.pop();
         }
         return out;
@@ -171,10 +193,11 @@ class Walk {
       case ARRAY: {
         const count = r.tryArrayHeader();
         if (count < 0) this.fail('expected an array');
-        const out = new Array<unknown>(count);
+        const out: unknown[] = [];
         for (let k = 0; k < count; k++) {
           this.path.push(k);
-          out[k] = this.read(r, p.child);
+          const v = this.readOrDrop(r, p.child);
+          if (v !== DROPPED) out.push(v);
           this.path.pop();
         }
         return out;
@@ -198,6 +221,23 @@ class Walk {
       }
       default:
         return this.read(r, p.child);
+    }
+  }
+
+  // a value that may be left out: under the drop policy, one holding an unknown member answers
+  // DROPPED, with the cursor past it and the path as it was
+  readOrDrop(r: Reader, p: Plan): unknown {
+    if (this.policy === 'reject') return this.read(r, p);
+    const at = r.pos;
+    const depth = this.path.length;
+    try {
+      return this.read(r, p);
+    } catch (e: unknown) {
+      if (!(e instanceof UnknownMember)) throw e;
+      this.path.length = depth;
+      r.pos = at;
+      r.skip();
+      return DROPPED;
     }
   }
 
@@ -243,6 +283,7 @@ class Walk {
       const f = r.keyIndex(p.keyBytes, hint);
       if (f === -2) this.fail('expected a string key');
       if (f < 0) {
+        // a foreign field, under the policy
         if (this.policy === 'reject') {
           this.path.push(r.lastKey());
           this.fail('unknown field');
@@ -259,7 +300,9 @@ class Walk {
         if (many[f]) this.fail('repeated field');
         many[f] = 1;
       }
-      out[key] = this.read(r, p.types[f]);
+      // an optional field holding an unknown member is absent
+      const v = p.optional[f] ? this.readOrDrop(r, p.types[f]) : this.read(r, p.types[f]);
+      if (v !== DROPPED) out[key] = v;
       this.path.pop();
       hint = f + 1 < nf ? f + 1 : 0;
     }
@@ -286,39 +329,39 @@ class Walk {
       case JSONTYPE: {
         const jt = this.jsonTypeAt(r, subj);
         const sub = s.byType[jt] ?? s.any;
-        if (sub === null) this.fail(`type ${JT_NAMES[jt]} not allowed here`);
+        if (sub === null) this.failMember(`type ${JT_NAMES[jt]} not allowed here`);
         return this.readUnion(r, sub, obj, subj, root);
       }
       case LITERAL: {
         const i = this.literalAt(r, s, subj);
-        if (i < 0) this.fail(`unexpected value ${this.valueAt(r, subj)}`);
+        if (i < 0) this.failMember(`unexpected value ${this.valueAt(r, subj)}`);
         return this.readUnion(r, s.subs[i], obj, subj, root);
       }
       case LENGTH: {
         r.pos = subj;
-        if (r.kind() !== 'array') this.fail('expected an array');
+        if (r.kind() !== 'array') this.failMember('expected an array');
         const len = r.arrayHeader();
         const sub = s.lengths.get(len) ?? s.dflt;
-        if (sub === null) this.fail(`unexpected length ${len}`);
+        if (sub === null) this.failMember(`unexpected length ${len}`);
         return this.readUnion(r, sub, obj, subj, root);
       }
       case INDEX: {
         r.pos = subj;
-        if (r.kind() !== 'array') this.fail('expected an array');
+        if (r.kind() !== 'array') this.failMember('expected an array');
         const len = r.arrayHeader();
-        if (s.at >= len) this.fail(`missing index ${s.at}`);
+        if (s.at >= len) this.failMember(`missing index ${s.at}`);
         for (let k = 0; k < s.at; k++) r.skip();
         const at = r.pos;
         return this.readUnion(r, s.sub!, at, at, root);
       }
       case FIELD: {
         const at = this.findField(r, obj, s.keyBytes);
-        if (at < 0) this.fail(`missing discriminator ${JSON.stringify(s.key)}`);
+        if (at < 0) this.failMember(`missing discriminator ${JSON.stringify(s.key)}`);
         return this.readUnion(r, s.sub!, obj, at, root);
       }
       default: {
         const i = this.findAnyField(r, obj, s.keyBytes);
-        if (i < 0) this.fail(`none of the fields ${s.keys.join(', ')}`);
+        if (i < 0) this.failMember(`none of the fields ${s.keys.join(', ')}`);
         return this.readUnion(r, s.subs[i], obj, obj, root);
       }
     }
@@ -730,11 +773,11 @@ function compile(schema: Schema): Plan[] {
   return plans;
 }
 
-/* An outbox row, `.command`, is [id, series, n, command], the series and n nil for an
-   unnumbered command and the command nested as the msgpack value its wire bytes are, so a row
+/* An outbox row, `.mutation`, is [id, series, n, mutation], the series and n nil for an
+   unnumbered mutation and the mutation nested as the msgpack value its wire bytes are, so a row
    reads back as those bytes with no vocabulary. */
 
-function readCommand(bytes: Uint8Array): Command<Uint8Array> {
+function readMutation(bytes: Uint8Array): Mutation<Uint8Array> {
   const r = new Reader(bytes);
   if (r.arrayHeader() !== 4) throw new Error('malformed outbox row');
   const id = r.str();
@@ -751,34 +794,19 @@ function readCommand(bytes: Uint8Array): Command<Uint8Array> {
   return { id, series, n, data };
 }
 
-function writeCommand(c: Command<Uint8Array>): Uint8Array {
+function writeMutation(m: Mutation<Uint8Array>): Uint8Array {
   const w = new Writer();
   w.arrayHeader(4);
-  w.str(c.id);
-  if (c.series === null || c.n === null) {
+  w.str(m.id);
+  if (m.series === null || m.n === null) {
     w.nil();
     w.nil();
   } else {
-    w.str(c.series);
-    w.int(c.n);
+    w.str(m.series);
+    w.int(m.n);
   }
-  w.raw(c.data);
+  w.raw(m.data);
   return w.bytes();
-}
-
-/** the family of a stream name: the part before the first colon */
-function familyOf(stream: string): string {
-  const colon = stream.indexOf(':');
-  return colon < 0 ? stream : stream.slice(0, colon);
-}
-
-/** whether the map at the cursor is a system event, `{$sys: ...}`, without consuming it */
-function isSystemEvent(r: Reader): boolean {
-  const saved = r.pos;
-  let sys = false;
-  if (r.kind() === 'map' && r.mapHeader() > 0 && r.kind() === 'str') sys = r.str() === '$sys';
-  r.pos = saved;
-  return sys;
 }
 
 // each node table's plans, compiled once and shared by every Registry over it, since every schema
@@ -786,9 +814,7 @@ function isSystemEvent(r: Reader): boolean {
 const compiled = new WeakMap<readonly SchemaNode[], Plan[]>();
 
 class Registry_ implements Registry {
-  readonly commands: string;
-  readonly eventTypes: Record<string, string>;
-  readonly storeTypes: Record<string, string>;
+  readonly mutations: string;
   // each type identity's plan
   readonly #plans = new Map<string, Plan>();
   // one walk, one cursor, and one buffer every conversion uses, reset first
@@ -797,9 +823,7 @@ class Registry_ implements Registry {
   readonly #writer = new Writer();
 
   constructor(schema: Schema) {
-    this.commands = schema.commands ?? '';
-    this.eventTypes = schema.eventTypes;
-    this.storeTypes = schema.storeTypes;
+    this.mutations = schema.mutations ?? '';
     let plans = compiled.get(schema.nodes);
     if (plans === undefined) {
       plans = compile(schema);
@@ -818,25 +842,32 @@ class Registry_ implements Registry {
   #begin(type: string): Walk {
     const walk = this.#walk;
     if (walk.path.length > 0) walk.path.length = 0;
-    walk.policy = type === this.commands ? 'reject' : 'drop';
+    walk.policy = type === this.mutations ? 'reject' : 'drop';
     return walk;
   }
 
   convert(type: string, value: unknown, from: Rep, to: Rep): unknown {
     if (from === to) return value;
+    if (type === '.page') throw new ConvertError('a snapshot page is never converted');
     if (from === MSGPACK && to === JS) return this.#toJs(type, value as Uint8Array);
     if (from === JS && to === MSGPACK) return this.#toBytes(type, value);
     throw new ConvertError(`no conversion of ${type} from ${from} to ${to}`);
   }
 
+  ops(bytes: Uint8Array, edit: boolean): EditOp[] {
+    return editOps(bytes, edit);
+  }
+
   #toJs(type: string, bytes: Uint8Array): unknown {
     if (type === '.json') return decodeAny(bytes);
-    if (type === '.command') return readCommand(bytes);
+    if (type === '.mutation') return readMutation(bytes);
     const r = this.#reader;
     r.reset(bytes);
     const walk = this.#begin(type);
     try {
-      const v = type === '.event' ? this.#readEvent(r, walk) : walk.read(r, this.#plan(type));
+      // a parked edit reads as its envelope alone, its payload unread
+      if (type === '.edits') return readEnvelope(r);
+      const v = walk.read(r, this.#plan(type));
       if (!r.done) walk.fail('trailing bytes after the value');
       return v;
     } catch (e: unknown) {
@@ -845,66 +876,14 @@ class Registry_ implements Registry {
     }
   }
 
-  // the wire pair [env, data], data typed by its stream's family, system events untouched
-  #readEvent(r: Reader, walk: Walk): DbEvent<unknown> {
-    if (r.kind() !== 'array') walk.fail('expected an event pair');
-    const pair = r.arrayHeader();
-    if (pair < 2) walk.fail('event without data');
-    if (r.kind() !== 'array') walk.fail('expected an envelope');
-    const env = r.arrayHeader();
-    if (env < 5) walk.fail('short envelope');
-    const position = walk.readInt(r);
-    if (r.kind() !== 'str') walk.fail('stream: expected a string');
-    const stream = r.str();
-    const seq = walk.readInt(r);
-    if (r.kind() !== 'bin') walk.fail('id: expected bin');
-    const id = uuidString(r.bin());
-    if (r.kind() !== 'ext') walk.fail('servertime: expected a timestamp');
-    const servertime = r.timestamp();
-    for (let k = 5; k < env; k++) r.skip();
-
-    // the data, under the type its family folds
-    let data: unknown;
-    if (isSystemEvent(r)) {
-      data = r.any();
-    } else {
-      const family = familyOf(stream);
-      const type = this.eventTypes[family];
-      if (type === undefined) walk.fail(`stream ${stream}: no events type for family ${family}`);
-      data = walk.read(r, this.#plan(type));
-    }
-    for (let k = 2; k < pair; k++) r.skip();
-    return { id, data, position, stream, seq, servertime };
-  }
-
   #toBytes(type: string, v: unknown): Uint8Array {
     if (type === '.json') return encodeAny(v);
-    if (type === '.command') return writeCommand(v as Command<Uint8Array>);
+    if (type === '.mutation') return writeMutation(v as Mutation<Uint8Array>);
+    if (type === '.edits') throw new ConvertError('.edits converts from msgpack only');
     const w = this.#writer;
     w.reset();
-    const walk = this.#begin(type);
-    if (type === '.event') this.#writeEvent(w, walk, v as DbEvent<unknown>);
-    else walk.write(w, this.#plan(type), v);
+    this.#begin(type).write(w, this.#plan(type), v);
     return w.bytes();
-  }
-
-  #writeEvent(w: Writer, walk: Walk, ev: DbEvent<unknown>): void {
-    w.arrayHeader(2);
-    w.arrayHeader(5);
-    w.int(ev.position);
-    w.str(ev.stream);
-    w.int(ev.seq);
-    w.bin(uuidBytes(ev.id));
-    if (!(ev.servertime instanceof Date)) walk.fail('servertime: expected a Date');
-    w.timestamp(ev.servertime);
-    const data = ev.data;
-    if (typeof data === 'object' && data !== null && '$sys' in data) {
-      w.any(data);
-    } else {
-      const type = this.eventTypes[familyOf(ev.stream)];
-      if (type === undefined) walk.fail(`stream ${ev.stream}: no events type for its family`);
-      walk.write(w, this.#plan(type), data);
-    }
   }
 }
 

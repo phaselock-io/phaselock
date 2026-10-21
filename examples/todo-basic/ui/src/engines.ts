@@ -1,5 +1,5 @@
 import { HTTPTransport } from '@phaselock/client';
-import { TodoEngine, todoReducers } from '@todo-basic/model/ui';
+import { TodoEngine } from '@todo-basic/model/ui';
 
 // the database, under /phaselock, which every Engine here reaches through the dev server's proxy
 // (vite.config.ts)
@@ -11,11 +11,10 @@ import.meta.hot?.dispose(() => controller.abort());
 
 /** connect() returns an Engine that syncs database state to an in-memory store */
 function connect(): TodoEngine {
-  // this demo has no forecasters, so it doesn't do optimistic updates
+  // this demo has no predictors, so it doesn't do optimistic updates
   return new TodoEngine(transport, {
     // this demo has no users, so every Engine syncs as anonymous
     session: null,
-    reducers: { todo: todoReducers },
     signal: controller.signal,
     onError: (err) => console.error('the engine ended:', err),
   });

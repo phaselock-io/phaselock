@@ -1,47 +1,52 @@
-// The bundle the server tests run: the test model's reducers, precommit, maySee, and lookup.
+// The bundle the server tests run: the test model's deciders, grantor, lookup, and bootstrap.
 
 import { Cron, type CronPlugin } from '@phaselock/plugins';
 import {
-  type AccountSliceReducers,
-  type BookSliceReducers,
   type DbMarker,
   type DbTypes,
   defineTestDB,
-  type PatronSliceReducers,
   type PluginInstall,
   type Principal,
   type ReadTxn,
   Reject,
-  type ShelfSliceReducers,
-  type TestDBPrecommit,
+  type TestDBDeciders,
+  type TestDBReadTxn,
   type TestDBTxn,
   type TestDBTypes,
+  type WriteTxn,
 } from './model.gen.ts';
 
 // the database's randomness, which the host installs
 declare const crypto: { randomUUID(): string };
 
 /* The users the tests sign in as without creating an account first.  root is an admin, and r1 is
-   audited: its every maySee run changes its view, so a test sees each run as a view frame. */
-const TEST_USERS = ['root', 'p1', 'r1', 'requester', 'flaky'];
+   audited: its every grant run changes its view, so a test sees each run as a view frame. */
+const TEST_USERS = ['root', 'p1', 'r1', 'requester', 'raw-requester', 'flaky'];
 const ROOT = 'root';
 const AUDITED = 'r1';
-// a user whose maySee makes a plugin request, which no maySee may
-const REQUESTER = 'requester';
+// a user whose grant writes, which a grantor, reading only, may not
+const WRITER = 'requester';
 // a user whose lookup answers a different password hash on every read, which is lookup's bug
 const FLAKY = 'flaky';
 
+/* A user whose grant, and an identity whose lookup, write through the raw transaction plugins are
+   bound to, which the wrapper at the end of this file holds.  Those writes pass the bundle's
+   read-only context, so only the database's own check refuses them. */
+const RAW_WRITER = 'raw-requester';
+const RAW_LOOKUP = 'raw-lookup';
+let writeTxn: WriteTxn | undefined;
+
 // whether the principal is root or an account flagged admin
-const isAdmin = (txn: TestDBTxn, p: Principal): boolean =>
+const isAdmin = (txn: TestDBReadTxn, p: Principal): boolean =>
   p.user === ROOT || (p.user !== null && txn.get.account(p.user)?.admin === true);
 const isSelf = (p: Principal, user: string): boolean => p.user !== null && p.user === user;
 
 // scans //
 
-/* Precommit and the reducers scan through their typed contexts.  maySee scans through the raw
-   ReadTxn the database hands it, which the wrapper at the end of this file holds while it runs,
-   one entry per batch: every batch after the first resumes from the key the last one ended
-   with, so maySee's read-set spans many batches of one walk. */
+/* The deciders scan through their typed contexts.  The grantor scans through the raw ReadTxn the
+   database binds the read context to, which the wrapper at the end of this file holds, one entry
+   per batch: every batch after the first resumes from the key the last one ended with, so the
+   grantor's read-set spans many batches of one walk. */
 let readTxn: ReadTxn | undefined;
 
 // the keys of every shelf that lends to a patron, fetched a batch of one at a time
@@ -50,7 +55,11 @@ function lendsTo(patron: string): string[] {
   let after: string | undefined;
   for (;;) {
     const { entries, next } = readTxn!.scan({
-      pattern: { stream: { family: 'shelf', params: [null] }, name: 'lend', local: [{ eq: patron }] },
+      pattern: {
+        slice: { family: 'shelf', params: [null] },
+        name: 'lend',
+        local: [{ eq: patron }],
+      },
       type: false,
       after,
       limit: 1,
@@ -61,87 +70,46 @@ function lendsTo(patron: string): string[] {
   }
 }
 
-// the count of maySee's runs for audited principals
+// the count of the grantor's runs for audited principals
 let auditedRuns = 0;
-
-// reducers //
-
-const book: BookSliceReducers = {
-  addBook: (txn, e) => txn.set.book(e.id, { id: e.id, title: e.title, added: e.added }),
-  holdOpened: (txn, e) =>
-    txn.update.book(e.book, (b) => {
-      b.hold = true;
-    }),
-};
-
-const patron: PatronSliceReducers = {
-  addPatron: (txn, e) => {
-    txn.set.patron({ id: e.id, name: e.name });
-    txn.set.holds({});
-    txn.set.messages([]);
-  },
-  renamePatron: (txn, e) =>
-    txn.update.patron((p) => {
-      p.name = e.name;
-    }),
-  patronHold: (txn, e) =>
-    txn.update.holds((holds) => {
-      holds[e.book] = true;
-    }),
-  holdFailed: (txn, e) =>
-    txn.update.messages((messages) => {
-      messages.push(e.reason);
-    }),
-};
-
-const shelf: ShelfSliceReducers = {
-  shelved: (txn, e) => {
-    txn.set.copy(e.book, { book: e.book, title: e.title });
-    // the copies as the reducer's own scan sees them, the one set just above included
-    txn.set.shelved([...txn.scan.copy({}, { keys: true })].map(({ book }) => `copy:${book}`));
-  },
-  lend: (txn, e) => txn.set.lend(e.patron, e.patron),
-};
-
-const account: AccountSliceReducers = {
-  accountCreated: (txn, e) =>
-    txn.set.account({ user: e.user, hash: e.hash, admin: e.admin, generation: 0, views: [] }),
-  passwordSet: (txn, e) =>
-    txn.update.account((a) => {
-      a.hash = e.hash;
-    }),
-  sessionsRevoked: (txn) =>
-    txn.update.account((a) => {
-      a.generation += 1;
-    }),
-  viewGranted: (txn, e) =>
-    txn.update.account((a) => {
-      if (!a.views.includes(e.prefix)) a.views.push(e.prefix);
-    }),
-  viewRevoked: (txn, e) =>
-    txn.update.account((a) => {
-      a.views = a.views.filter((p) => p !== e.prefix);
-    }),
-};
 
 // plugins //
 
-/* A plugin's install as its package would ship one, written out by hand.  Its one request emits a
-   hold failure to the patron's stream, standing in for the streams of its own a plugin emits to,
-   which would carry its install name. */
-type NoticePlugin = PluginInstall<{ post(patron: string, reason: string): void }>;
+/* A plugin's install as its package would ship one, written out by hand.  Its one request adds a
+   reason to a patron's messages, through the transaction it is bound to, standing in for the
+   writes to a slice of its own that a plugin's requests make.  The reason "stray" writes instead
+   to a patron key that no key template names, which lands as inert bytes.  A reason "set {key}"
+   writes the key it names as it stands, and "delete {slice}" deletes the slice it names, so a
+   test hands the write gate any key or slice name. */
+type NoticePlugin = PluginInstall<{
+  post(patron: string, reason: string): void;
+}>;
 
 function installNotice<DB extends DbTypes>(): NoticePlugin & DbMarker<DB> {
   return {
     kind: 'notice',
     create(name) {
-      let raw: ReadTxn | undefined;
+      let raw: WriteTxn | undefined;
       return {
         name,
         api: {
           post(patron, reason) {
-            const event = { type: 'hold-failed', book: '', reason };
-            raw!.emit!([{ stream: `patron:${patron}`, event }]);
+            if (reason === 'stray') {
+              raw!.set(`patron:${patron}!stray`, 'patron/messages', [reason]);
+              return;
+            }
+            if (reason.startsWith('set ')) {
+              raw!.set(reason.slice('set '.length), 'patron/messages', [reason]);
+              return;
+            }
+            if (reason.startsWith('delete ')) {
+              raw!.deleteSlice(reason.slice('delete '.length), false);
+              return;
+            }
+            const key = `patron:${patron}!messages`;
+            const messages = (raw!.get(key, 'patron/messages') as string[] | undefined) ?? [];
+            messages.push(reason);
+            raw!.set(key, 'patron/messages', messages);
           },
         },
         bind(txn) {
@@ -160,13 +128,15 @@ const cron = Cron.install<TestDBTypes<TestPlugins>>({
   reap: {
     spec: '0 0 1 1 *',
     hook: (txn, tick) => {
-      if (txn.get.patron('p1') === undefined) return [];
+      if (txn.get.patron('p1') === undefined) return;
       txn.notice.post('p1', `requested ${tick.slot.toISOString()}`);
       const reason = `${tick.name} ${tick.slot.toISOString()} ${tick.now.toISOString()}`;
-      return { stream: 'patron:p1', event: { type: 'hold-failed', book: '', reason } };
+      txn.update.messages('p1', (messages) => {
+        messages.push(reason);
+      });
     },
   },
-  zoned: { spec: 'CRON_TZ=America/New_York 0 0 1 1 *', hook: () => [] },
+  zoned: { spec: 'CRON_TZ=America/New_York 0 0 1 1 *', hook: () => {} },
   broken: {
     spec: '0 0 1 1 *',
     hook: () => {
@@ -177,141 +147,183 @@ const cron = Cron.install<TestDBTypes<TestPlugins>>({
 
 type TestPlugins = { notice: NoticePlugin; cron: CronPlugin };
 
-// precommit //
+// deciders //
 
-function requirePatron(txn: TestDBTxn, id: string): void {
+function requirePatron(txn: TestDBReadTxn, id: string): void {
   if (txn.get.patron(id) === undefined) throw new Reject('no such patron');
 }
 
-function requireAccount(txn: TestDBTxn, user: string): void {
+function requireAccount(txn: TestDBReadTxn, user: string): void {
   if (txn.get.account(user) === undefined) throw new Reject('no such account');
 }
 
-const precommit: TestDBPrecommit<TestPlugins> = {
-  addBook: (auth, txn, cmd) => {
+// a patron's keys as they start
+function seedPatron(txn: TestDBTxn, id: string, name: string): void {
+  txn.set.patron(id, { id, name });
+  txn.set.holds(id, {});
+  txn.set.messages(id, []);
+}
+
+const deciders: TestDBDeciders<TestPlugins> = {
+  addBook: (auth, txn, m) => {
     auth.authorize(isAdmin(txn, auth));
-    if (txn.get.book(cmd.id) !== undefined) throw new Reject('book exists');
-    return { stream: 'book', event: cmd };
+    if (txn.get.book(m.id) !== undefined) throw new Reject('book exists');
+    txn.set.book(m.id, { id: m.id, title: m.title, added: m.added });
   },
-  addPatron: (auth, txn, cmd) => {
+  addPatron: (auth, txn, m) => {
     auth.authorize(isAdmin(txn, auth));
-    if (txn.get.patron(cmd.id) !== undefined) throw new Reject('patron exists');
-    return { stream: `patron:${cmd.id}`, event: cmd };
+    if (txn.get.patron(m.id) !== undefined) throw new Reject('patron exists');
+    seedPatron(txn, m.id, m.name);
   },
-  renamePatron: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(txn, auth) || isSelf(auth, cmd.id));
-    requirePatron(txn, cmd.id);
-    return { stream: `patron:${cmd.id}`, event: cmd };
+  renamePatron: (auth, txn, m) => {
+    auth.authorize(isAdmin(txn, auth) || isSelf(auth, m.id));
+    requirePatron(txn, m.id);
+    txn.update.patron(m.id, (p) => {
+      p.name = m.name;
+    });
   },
-  removePatron: (auth, txn, cmd) => {
+  removePatron: (auth, txn, m) => {
     auth.authorize(isAdmin(txn, auth));
-    requirePatron(txn, cmd.id);
-    return { stream: `patron:${cmd.id}`, death: true };
+    requirePatron(txn, m.id);
+    txn.deleteSlice.patron(m.id);
   },
-  forgetPatron: (auth, txn, cmd) => {
+  forgetPatron: (auth, txn, m) => {
     auth.authorize(isAdmin(txn, auth));
-    requirePatron(txn, cmd.id);
-    return { stream: `patron:${cmd.id}`, death: true, erase: true };
+    requirePatron(txn, m.id);
+    txn.deleteSlice.patron(m.id, { erase: true });
   },
-  tryHold: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(txn, auth) || isSelf(auth, cmd.patron));
-    const b = txn.get.book(cmd.book);
+  resetPatron: (auth, txn, m) => {
+    auth.authorize(isAdmin(txn, auth));
+    requirePatron(txn, m.id);
+    txn.deleteSlice.patron(m.id);
+    // the deleted slice reads as empty
+    if (txn.get.patron(m.id) !== undefined) throw new Error('a deleted slice still reads');
+    seedPatron(txn, m.id, m.name);
+  },
+  tryHold: (auth, txn, m) => {
+    auth.authorize(isAdmin(txn, auth) || isSelf(auth, m.patron));
+    const b = txn.get.book(m.book);
     if (b === undefined) throw new Reject('no such book');
-    requirePatron(txn, cmd.patron);
-    const stream = `patron:${cmd.patron}` as const;
+    requirePatron(txn, m.patron);
     if (b.hold) {
-      return { stream, event: { type: 'hold-failed', book: cmd.book, reason: 'already held' } };
+      txn.update.messages(m.patron, (messages) => {
+        messages.push('already held');
+      });
+      return;
     }
-    return [
-      { stream: 'book', event: { type: 'hold-opened', book: cmd.book } },
-      { stream, event: { type: 'patron-hold', book: cmd.book } },
-    ];
+    txn.update.book(m.book, (book) => {
+      book.hold = true;
+    });
+    txn.update.holds(m.patron, (holds) => {
+      holds[m.book] = true;
+    });
   },
-  shelve: (auth, txn, cmd) => {
+  shelve: (auth, txn, m) => {
     auth.authorize(isAdmin(txn, auth));
-    const b = txn.get.book(cmd.book);
+    const b = txn.get.book(m.book);
     if (b === undefined) throw new Reject('no such book');
-    const copies = txn.scan.copy({ branch: cmd.branch });
+    const copies = txn.scan.copy({ branch: m.branch });
     if ([...copies].some(([, c]) => c.title === b.title)) throw new Reject('title on shelf');
-    return {
-      stream: `shelf:${cmd.branch}`,
-      event: { type: 'shelved', book: cmd.book, title: b.title },
-    };
+    txn.set.copy(m.branch, m.book, { book: m.book, title: b.title });
+    // the copies as the decider's own scan sees them, the one set just above included
+    const shelved = [...txn.scan.copy({ branch: m.branch }, { keys: true })];
+    txn.set.shelved(
+      m.branch,
+      shelved.map(({ book }) => `copy:${book}`),
+    );
   },
-  lend: (auth, txn, cmd) => {
+  lend: (auth, txn, m) => {
     auth.authorize(isAdmin(txn, auth));
-    return { stream: `shelf:${cmd.branch}`, event: cmd };
+    txn.set.lend(m.branch, m.patron, m.patron);
   },
-  closeShelf: (auth, txn, cmd) => {
+  closeShelf: (auth, txn, m) => {
     auth.authorize(isAdmin(txn, auth));
-    return { stream: `shelf:${cmd.branch}`, death: true };
+    txn.deleteSlice.shelf(m.branch);
   },
-  createAccount: (auth, txn, cmd) => {
+  createAccount: (auth, txn, m) => {
     auth.authorizeAnyone();
-    if (txn.get.account(cmd.user) !== undefined) throw new Reject('account exists');
+    if (txn.get.account(m.user) !== undefined) throw new Reject('account exists');
     // only an admin creates an admin
-    const admin = isAdmin(txn, auth) && cmd.admin === true;
-    return {
-      stream: `account:${cmd.user}`,
-      event: { type: 'account-created', user: cmd.user, hash: cmd.password, admin },
-    };
+    const admin = isAdmin(txn, auth) && m.admin === true;
+    txn.set.account(m.user, {
+      user: m.user,
+      hash: m.password,
+      admin,
+      generation: 0,
+      views: [],
+    });
   },
-  changePassword: (auth, txn, cmd) => {
-    auth.authorize(isSelf(auth, cmd.user));
-    requireAccount(txn, cmd.user);
-    return { stream: `account:${cmd.user}`, event: { type: 'password-set', hash: cmd.password } };
+  changePassword: (auth, txn, m) => {
+    auth.authorize(isSelf(auth, m.user));
+    requireAccount(txn, m.user);
+    txn.update.account(m.user, (a) => {
+      a.hash = m.password;
+    });
   },
-  setPassword: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(txn, auth) || isSelf(auth, cmd.user));
-    requireAccount(txn, cmd.user);
-    return { stream: `account:${cmd.user}`, event: { type: 'password-set', hash: cmd.password } };
+  setPassword: (auth, txn, m) => {
+    auth.authorize(isAdmin(txn, auth) || isSelf(auth, m.user));
+    requireAccount(txn, m.user);
+    txn.update.account(m.user, (a) => {
+      a.hash = m.password;
+    });
   },
-  revokeSessions: (auth, txn, cmd) => {
-    auth.authorize(isAdmin(txn, auth) || isSelf(auth, cmd.user));
-    requireAccount(txn, cmd.user);
-    return { stream: `account:${cmd.user}`, event: { type: 'sessions-revoked' } };
+  revokeSessions: (auth, txn, m) => {
+    auth.authorize(isAdmin(txn, auth) || isSelf(auth, m.user));
+    requireAccount(txn, m.user);
+    txn.update.account(m.user, (a) => {
+      a.generation += 1;
+    });
   },
-  grantView: (auth, txn, cmd) => {
+  grantView: (auth, txn, m) => {
     auth.authorize(isAdmin(txn, auth));
-    requireAccount(txn, cmd.user);
-    return { stream: `account:${cmd.user}`, event: { type: 'view-granted', prefix: cmd.prefix } };
+    requireAccount(txn, m.user);
+    txn.update.account(m.user, (a) => {
+      if (!a.views.includes(m.prefix)) a.views.push(m.prefix);
+    });
   },
-  revokeView: (auth, txn, cmd) => {
+  revokeView: (auth, txn, m) => {
     auth.authorize(isAdmin(txn, auth));
-    requireAccount(txn, cmd.user);
-    return { stream: `account:${cmd.user}`, event: { type: 'view-revoked', prefix: cmd.prefix } };
+    requireAccount(txn, m.user);
+    txn.update.account(m.user, (a) => {
+      a.views = a.views.filter((p) => p !== m.prefix);
+    });
   },
-  authenticatedCommand: (auth, txn, cmd) => {
-    // precommit sees what the proof proved, never the proof
-    const seen = JSON.stringify(cmd.check);
-    if (seen !== '{"kind":"password"}') throw new Reject(`precommit saw ${seen}`);
-    auth.authorize(isSelf(auth, cmd.user));
-    requireAccount(txn, cmd.user);
-    return { stream: `account:${cmd.user}`, event: { type: 'sessions-revoked' } };
+  authenticatedMutation: (auth, txn, m) => {
+    // the decider sees what the proof proved, never the proof
+    const seen = JSON.stringify(m.check);
+    if (seen !== '{"kind":"password"}') throw new Reject(`the decider saw ${seen}`);
+    auth.authorize(isSelf(auth, m.user));
+    requireAccount(txn, m.user);
+    txn.update.account(m.user, (a) => {
+      a.generation += 1;
+    });
   },
-  notify: (auth, txn, cmd) => {
+  notify: (auth, txn, m) => {
     auth.authorize(isAdmin(txn, auth));
-    requirePatron(txn, cmd.patron);
+    requirePatron(txn, m.patron);
     // a request per reason, "uuid" standing for a fresh random one
-    for (const reason of cmd.reasons) {
-      txn.notice.post(cmd.patron, reason === 'uuid' ? crypto.randomUUID() : reason);
+    for (const reason of m.reasons) {
+      txn.notice.post(m.patron, reason === 'uuid' ? crypto.randomUUID() : reason);
     }
-    if (cmd.reject === true) throw new Reject('rejected after its requests');
-    const own = { type: 'hold-failed', book: '', reason: 'own' } as const;
-    return { stream: `patron:${cmd.patron}`, event: own };
+    if (m.reject === true) throw new Reject('rejected after its requests');
+    txn.update.messages(m.patron, (messages) => {
+      messages.push('own');
+    });
   },
 };
 
 // the bundle //
 
 const bundle = defineTestDB<TestPlugins>({
-  reducers: { book, patron, shelf, account },
-  precommit,
-  maySee: (txn, principal) => {
+  deciders,
+  grant: (txn, principal) => {
     if (principal.user === null) return ['book!'];
-    if (principal.user === REQUESTER) {
-      // maySee's txn offers no plugins, so only a cast reaches the one precommit sees
-      (txn as TestDBTxn<TestPlugins>).notice.post('p1', 'from maySee');
+    if (principal.user === WRITER) {
+      // the grantor's txn offers no writes, so only a cast reaches them
+      (txn as unknown as TestDBTxn).set.messages('p1', ['from grant']);
+    }
+    if (principal.user === RAW_WRITER) {
+      writeTxn!.set('patron:p1!messages', 'patron/messages', ['from grant']);
     }
     if (isAdmin(txn, principal)) return ['*'];
     const out = ['book!', `patron:${principal.user}!`];
@@ -324,6 +336,9 @@ const bundle = defineTestDB<TestPlugins>({
   },
   lookup: (txn, ident) => {
     const user = ident.kind === 'password' ? ident.identity : ident.user;
+    if (user === RAW_LOOKUP) {
+      writeTxn!.set('patron:p1!messages', 'patron/messages', ['from lookup']);
+    }
     const a = txn.get.account(user);
     if (a !== undefined) {
       return { user: a.user, generation: a.generation, passwordHash: a.hash };
@@ -333,22 +348,31 @@ const bundle = defineTestDB<TestPlugins>({
     return TEST_USERS.includes(user) ? { user, generation: 0 } : null;
   },
   // an admin account, when the operator names its user and password
-  bootstrap: (ctx) => {
+  bootstrap: (txn, ctx) => {
     const user = ctx.env('BOOTSTRAP_ADMIN');
     if (user === '') return;
     const hash = ctx.hashPassword(ctx.env('BOOTSTRAP_PASSWORD'));
-    ctx.emit(`account:${user}`, { type: 'account-created', user, hash, admin: true });
+    txn.set.account(user, {
+      user,
+      hash,
+      admin: true,
+      generation: 0,
+      views: [],
+    });
   },
   plugins: { notice: installNotice(), cron },
 });
 
-// maySee, holding its transaction while it runs
-const { maySee: maySeeSlot } = bundle;
-bundle.maySee = (txn, principal) => {
+// the raw transaction the read context is bound to, which the grantor scans through
+const { bindRead } = bundle;
+bundle.bindRead = (txn) => {
   readTxn = txn;
-  try {
-    return maySeeSlot(txn, principal);
-  } finally {
-    readTxn = undefined;
-  }
+  bindRead(txn);
+};
+
+// the raw transaction the write context is bound to, which the grantor and lookup write through
+const { bindWrite } = bundle;
+bundle.bindWrite = (txn) => {
+  writeTxn = txn;
+  bindWrite(txn);
 };

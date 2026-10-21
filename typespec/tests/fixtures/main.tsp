@@ -3,7 +3,7 @@
 // The models here are chosen to exercise every solver / codegen branch independently of the
 // demos: plain identity decode, date decode (required + optional), nested-struct recursion,
 // arrays, tuples, records, discriminated unions (by `type` and by `[type, v]`), one-of unions,
-// string- and int-literal unions, plus a Slice, commands, and an Engine so the context and engine
+// string- and int-literal unions, plus a Slice, mutations, and an Engine so the context and engine
 // generation paths are exercised too.  The TypeScript emitter reads this source.
 
 import "@phaselock/typespec-core";
@@ -134,27 +134,26 @@ model Toggled {
   on: true;
 }
 
-// --- engine events / commands -----------------------------------------------
+// --- mutations -------------------------------------------------------------
 
 // distinct member set from Greek so it interns to a different union
-union Events {
+union Letters {
   Alpha,
   Beta,
   Other,
 }
 
-@command(Alpha | Beta)
 model DoThing {
   type: "do-thing";
   when: utcDateTime;
+  letter: Letters;
 }
 
-@command(Other)
 model Undo {
   type: "undo";
 }
 
-union Commands {
+union Mutations {
   DoThing,
   Undo,
 }
@@ -164,11 +163,10 @@ union Commands {
 interface DemoSlice
   extends Slice<
     "demo",
-    Events,
     {
       `plain:{id}`: Plain;
       `timed:{id}`: Timed;
     }
   > {}
 
-interface DemoEngine extends Engine<[DemoSlice], Commands> {}
+interface DemoEngine extends Engine<[DemoSlice], Mutations> {}

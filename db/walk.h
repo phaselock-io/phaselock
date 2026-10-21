@@ -74,23 +74,21 @@ int jstok_tokenize(jsenv *env, JSValueConst v, pl_tokbuf *tb, char *err, size_t 
 
 typedef struct schema schema;
 
-/* Compile the registry data from a tokenized JS object ({nodes, ids, commands, eventTypes,
-   storeTypes}).  Fails on a malformed table and on an intake kind this database cannot run.
-   Returns NULL with a message. */
+/* Compile the registry data from a tokenized JS object ({nodes, ids, mutations}).  Fails on a
+   malformed table and on an intake kind this database cannot run.  Returns NULL with a
+   message. */
 schema *schema_compile(const pl_tokbuf *tb, char *err, size_t errlen);
 void schema_free(schema *sc);
 /* a type identity's node, -1 when unknown */
 long schema_lookup(const schema *sc, const char *id, size_t len);
-/* the commands union's node, -1 when the database has no commands */
-long schema_commands(const schema *sc);
-/* the node of a stream's events union, from its family; -1 for an unknown family */
-long schema_event_type(const schema *sc, const char *stream);
+/* the mutations union's node, -1 when the database has no mutations */
+long schema_mutations(const schema *sc);
 
 /* walks /////////////////////////////////////////////////////////////////// */
 
-/* One field the database prepares for precommit, met by a check: its kind, its key, its value,
+/* One field the database prepares for the decider, met by a check: its kind, its key, its value,
    and the result to write in its place, which the caller fills in: a string the list owns, or a
-   CommandAuthResult's kind, written as {kind}. */
+   MutationAuthResult's kind, written as {kind}. */
 typedef struct intake {
     const char *kind;
     char key[256];
@@ -107,7 +105,7 @@ typedef struct intake_list {
 void intake_list_free(intake_list *l);
 
 /* Check a msgpack value against a type.  strict rejects fields the schema does not name, as a
-   command's are; otherwise they are dropped.  When il is given, every prepared field of the
+   mutation's are; otherwise they are dropped.  When il is given, every prepared field of the
    top-level value is appended to it.  Returns 0, or -1 with the first error, which names the
    path. */
 int walk_check(const schema *sc, mpack_node_t node, long type, bool strict, intake_list *il,
@@ -125,7 +123,7 @@ int walk_write(const schema *sc, mpack_node_t node, long type, bool strict, cons
 JSValue walk_to_js(JSContext *ctx, const schema *sc, mpack_node_t node, long type, bool strict,
                    char *err, size_t errlen);
 
-/* Build the JS value of a command walk_write prepared: walked strictly under type as
+/* Build the JS value of a mutation walk_write prepared: walked strictly under type as
    walk_to_js walks it, except that each prepared field of the top-level value holds the result
    written in its place and is converted as it is. */
 JSValue walk_prepared_to_js(JSContext *ctx, const schema *sc, mpack_node_t node, long type,

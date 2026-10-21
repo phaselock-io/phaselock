@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -121,39 +122,39 @@ func (h *harness) token(identity string) string {
 func (h *harness) admin() string { return h.token("root") }
 func (h *harness) epoch() string { return h.srv.epoch }
 
-// command is one command to post: unnumbered unless in names its series and number.
-type command struct {
+// mutation is one mutation to post: unnumbered unless in names its series and number.
+type mutation struct {
 	id     string
 	series string
 	n      int64
 	data   map[string]any
 }
 
-func cmd(id, typ string, kv ...any) command {
+func mut(id, typ string, kv ...any) mutation {
 	data := map[string]any{"type": typ}
 	for i := 0; i+1 < len(kv); i += 2 {
 		data[kv[i].(string)] = kv[i+1]
 	}
-	return command{id: id, data: data}
+	return mutation{id: id, data: data}
 }
 
-// in sends the command as number n of a series.
-func (c command) in(series string, n int64) command {
+// in sends the mutation as number n of a series.
+func (c mutation) in(series string, n int64) mutation {
 	c.series = series
 	c.n = n
 	return c
 }
 
-// label is a test's command id as the 16 bytes on the wire: its name, padded with zeros.
+// label is a test's mutation id as the 16 bytes on the wire: its name, padded with zeros.
 func label(id string) []byte {
 	if len(id) > 16 {
-		panic("command id too long: " + id)
+		panic("mutation id too long: " + id)
 	}
 	return append([]byte(id), make([]byte, 16-len(id))...)
 }
 
-// encode is the command as the wire carries it, with expect when it is not nil.
-func (c command) encode(expect map[string]any) []byte {
+// encode is the mutation as the wire carries it, with expect when it is not nil.
+func (c mutation) encode(expect map[string]any) []byte {
 	var series, n any
 	if c.series != "" {
 		series, n = c.series, c.n
@@ -165,23 +166,23 @@ func (c command) encode(expect map[string]any) []byte {
 	return mpEncode(v)
 }
 
-// commands posts commands and returns the outcomes.
-func (h *harness) commands(token string, cmds ...command) []outcome {
+// mutations posts mutations and returns the outcomes.
+func (h *harness) mutations(token string, muts ...mutation) []outcome {
 	h.t.Helper()
-	status, outs := h.commandsStatus(token, cmds...)
+	status, outs := h.mutationsStatus(token, muts...)
 	if status != 200 {
-		h.t.Fatalf("commands: status %d", status)
+		h.t.Fatalf("mutations: status %d", status)
 	}
 	return outs
 }
 
-func (h *harness) commandsStatus(token string, cmds ...command) (int, []outcome) {
+func (h *harness) mutationsStatus(token string, muts ...mutation) (int, []outcome) {
 	h.t.Helper()
 	var body []byte
-	for _, c := range cmds {
+	for _, c := range muts {
 		body = append(body, c.encode(nil)...)
 	}
-	status, _, out := h.do("POST", "/commands", token, body)
+	status, _, out := h.do("POST", "/mutations", token, body)
 	if status != 200 {
 		return status, nil
 	}
@@ -217,29 +218,29 @@ type outcome struct {
 	current  map[string]int64
 }
 
-// expecting posts one command with an expect map and returns its outcome.
-func (h *harness) expecting(token string, c command, expect map[string]any) outcome {
+// expecting posts one mutation with an expect map and returns its outcome.
+func (h *harness) expecting(token string, c mutation, expect map[string]any) outcome {
 	h.t.Helper()
 	body := c.encode(expect)
-	status, _, out := h.do("POST", "/commands", token, body)
+	status, _, out := h.do("POST", "/mutations", token, body)
 	if status != 200 {
-		h.t.Fatalf("commands: status %d", status)
+		h.t.Fatalf("mutations: status %d", status)
 	}
 	return decodeOutcomes(h.t, out)[0]
 }
 
-// accept posts one command that must be accepted, and returns its position.
-func (h *harness) accept(token string, c command) int64 {
+// accept posts one mutation that must be accepted, and returns its position.
+func (h *harness) accept(token string, c mutation) int64 {
 	h.t.Helper()
-	outs := h.commands(token, c)
+	outs := h.mutations(token, c)
 	if outs[0].kind != "ok" {
 		h.t.Fatalf("expected ok for %s, got %+v", c.id, outs[0])
 	}
 	return outs[0].position
 }
 
-// stream is an open /stream connection.
-type stream struct {
+// connection is an open /stream connection.
+type connection struct {
 	t      *testing.T
 	resp   *http.Response
 	frames chan any
@@ -249,24 +250,24 @@ type stream struct {
 	first []any
 }
 
-func (h *harness) stream(token string, since int64, wants ...string) *stream {
+func (h *harness) connect(token string, since int64, wants ...string) *connection {
 	h.t.Helper()
-	return h.streamOpen(token, since, "", nil, wants...)
+	return h.connectOpen(token, since, "", nil, wants...)
 }
 
-// streamView opens a stream presenting a stored view token.
-func (h *harness) streamView(token string, since int64, view string) *stream {
+// connectView opens a connection presenting a stored view token.
+func (h *harness) connectView(token string, since int64, view string) *connection {
 	h.t.Helper()
-	return h.streamOpen(token, since, view, nil)
+	return h.connectOpen(token, since, view, nil)
 }
 
-// streamPaused opens a stream whose reader waits on start before reading.
-func (h *harness) streamPaused(token string, since int64, start chan struct{}, wants ...string) *stream {
+// connectPaused opens a connection whose reader waits on start before reading.
+func (h *harness) connectPaused(token string, since int64, start chan struct{}, wants ...string) *connection {
 	h.t.Helper()
-	return h.streamOpen(token, since, "", start, wants...)
+	return h.connectOpen(token, since, "", start, wants...)
 }
 
-func (h *harness) streamOpen(token string, since int64, view string, start chan struct{}, wants ...string) *stream {
+func (h *harness) connectOpen(token string, since int64, view string, start chan struct{}, wants ...string) *connection {
 	h.t.Helper()
 	q := fmt.Sprintf("/stream?since=%d", since)
 	if view != "" {
@@ -289,9 +290,9 @@ func (h *harness) streamOpen(token string, since int64, view string, start chan 
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		h.t.Fatalf("stream: status %d: %s", resp.StatusCode, body)
+		h.t.Fatalf("connect: status %d: %s", resp.StatusCode, body)
 	}
-	s := &stream{t: h.t, resp: resp, frames: make(chan any, 64), errs: make(chan error, 1), header: resp.Header}
+	s := &connection{t: h.t, resp: resp, frames: make(chan any, 64), errs: make(chan error, 1), header: resp.Header}
 	go func() {
 		if start != nil {
 			<-start
@@ -307,9 +308,9 @@ func (h *harness) streamOpen(token string, since int64, view string, start chan 
 		}
 	}()
 	h.t.Cleanup(s.close)
-	// a stream opened without presenting a token gets the view frame first;
-	// keep it aside so tests see the same frames as a client with the
-	// current token, unless they asked for the raw stream
+	// a connection opened without presenting a token gets the view frame first; keep it aside so
+	// tests see the same frames as a client with the current token, unless they asked for the raw
+	// frames
 	if view == "" && start == nil {
 		if f := s.next(); f[0] == "view" {
 			s.first = f
@@ -320,10 +321,10 @@ func (h *harness) streamOpen(token string, since int64, view string, start chan 
 	return s
 }
 
-func (s *stream) close() { s.resp.Body.Close() }
+func (s *connection) close() { s.resp.Body.Close() }
 
-// next returns the next frame or fails; a frame read before the stream ended comes first.
-func (s *stream) next() []any {
+// next returns the next frame or fails; a frame read before the connection ended comes first.
+func (s *connection) next() []any {
 	s.t.Helper()
 	select {
 	case f := <-s.frames:
@@ -334,7 +335,7 @@ func (s *stream) next() []any {
 	case f := <-s.frames:
 		return f.([]any)
 	case err := <-s.errs:
-		s.t.Fatalf("stream ended: %v", err)
+		s.t.Fatalf("connection ended: %v", err)
 	case <-time.After(5 * time.Second):
 		s.t.Fatalf("timeout waiting for frame")
 	}
@@ -342,7 +343,7 @@ func (s *stream) next() []any {
 }
 
 // nextTagged skips vouches until a frame with the tag arrives.
-func (s *stream) nextTagged(tag string) []any {
+func (s *connection) nextTagged(tag string) []any {
 	s.t.Helper()
 	for i := 0; i < 50; i++ {
 		f := s.next()
@@ -358,7 +359,7 @@ func (s *stream) nextTagged(tag string) []any {
 }
 
 // live expects the once-per-connection live frame and returns its position.
-func (s *stream) live() int64 {
+func (s *connection) live() int64 {
 	s.t.Helper()
 	f := s.next()
 	if f[0] != "live" {
@@ -367,7 +368,7 @@ func (s *stream) live() int64 {
 	return asInt(f[1])
 }
 
-func (s *stream) quiet() {
+func (s *connection) quiet() {
 	s.t.Helper()
 	select {
 	case f := <-s.frames:
@@ -378,33 +379,80 @@ func (s *stream) quiet() {
 	}
 }
 
-// event is one decoded [envelope, data] value.
-type event struct {
+// an edit's lifecycle, as its envelope carries it
+const (
+	normal = 0
+	birth  = 1
+	death  = 2
+)
+
+// edit is one decoded edit: its envelope, and its payload's operations in order, with its sets
+// by key and its deletions
+type edit struct {
 	position   int64
-	stream     string
+	slice      string
 	seq        int64
-	id         []byte // the command id as it arrived
-	commandid  string // the id as a test names it: its bytes without label's zeros
+	id         []byte // the mutation id as it arrived
+	mutation   string // the id as a test names it: its bytes without label's zeros
 	servertime time.Time
-	data       map[string]any
+	lifecycle  int64
+	ops        []editOp
+	sets       map[string]any
+	dels       []string
 }
 
-func events(f []any) []event {
-	var out []event
-	for _, ev := range f[1].([]any) {
-		pair := ev.([]any)
-		env := pair[0].([]any)
-		out = append(out, event{
-			position:   asInt(env[0]),
-			stream:     env[1].(string),
-			seq:        asInt(env[2]),
-			id:         env[3].([]byte),
-			commandid:  strings.TrimRight(string(env[3].([]byte)), "\x00"),
-			servertime: env[4].(time.Time),
-			data:       pair[1].(map[string]any),
-		})
+// editOp is one operation of an edit's payload: a set of key to value, or a deletion of key
+type editOp struct {
+	del   bool
+	key   string
+	value any
+}
+
+// decodeEdit decodes an edit's wire array: the envelope, then the payload's items flat
+func decodeEdit(v any) edit {
+	arr := v.([]any)
+	env := arr[0].([]any)
+	e := edit{
+		position:   asInt(env[0]),
+		slice:      env[1].(string),
+		seq:        asInt(env[2]),
+		id:         env[3].([]byte),
+		mutation:   strings.TrimRight(string(env[3].([]byte)), "\x00"),
+		servertime: env[4].(time.Time),
+		lifecycle:  asInt(env[5]),
+		sets:       map[string]any{},
+	}
+	for i := 1; i < len(arr); {
+		key := arr[i+1].(string)
+		switch asInt(arr[i]) {
+		case 0:
+			e.ops = append(e.ops, editOp{key: key, value: arr[i+2]})
+			e.sets[key] = arr[i+2]
+			i += 3
+		case 1:
+			e.ops = append(e.ops, editOp{del: true, key: key})
+			e.dels = append(e.dels, key)
+			i += 2
+		default:
+			panic(fmt.Sprintf("unknown opcode %v", arr[i]))
+		}
+	}
+	return e
+}
+
+// edits are the edits of an edits frame
+func edits(f []any) []edit {
+	var out []edit
+	for _, v := range f[1].([]any) {
+		out = append(out, decodeEdit(v))
 	}
 	return out
+}
+
+// field is a field of the value an edit sets at key, nil when it sets none
+func (e edit) field(key, name string) any {
+	v, _ := e.sets[key].(map[string]any)
+	return v[name]
 }
 
 func asInt(v any) int64 {
@@ -438,30 +486,30 @@ func strs(v any) []string {
 
 // tests ////////////////////////////////////////////////////////////////////
 
-func TestCommandsOkReject(t *testing.T) {
+func TestMutationsOkReject(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
 
-	outs := h.commands(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune").in("s1", 1))
+	outs := h.mutations(admin, mut("c1", "add-book", "id", "b1", "title", "Dune").in("s1", 1))
 	if outs[0].kind != "ok" || outs[0].position < 1 {
 		t.Fatalf("expected ok, got %+v", outs[0])
 	}
 	first := outs[0].position
 
 	// a resend is decided already, at or before the position it is answered with
-	outs = h.commands(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune").in("s1", 1))
+	outs = h.mutations(admin, mut("c1", "add-book", "id", "b1", "title", "Dune").in("s1", 1))
 	if outs[0].kind != "ok" || outs[0].position < first {
 		t.Fatalf("expected ok at %d or later, got %+v", first, outs[0])
 	}
 
-	// precommit rejection, structural rejection, and a later ack in one post
-	outs = h.commands(admin,
-		cmd("c2", "add-book", "id", "b1", "title", "Dune again"),
-		cmd("c3", "add-book", "id", "b2"),
-		cmd("c4", "add-book", "id", "b2", "title", "Emma"),
+	// decider rejection, structural rejection, and a later ack in one post
+	outs = h.mutations(admin,
+		mut("c2", "add-book", "id", "b1", "title", "Dune again"),
+		mut("c3", "add-book", "id", "b2"),
+		mut("c4", "add-book", "id", "b2", "title", "Emma"),
 	)
 	if outs[0].kind != "reject" || outs[0].reason != "book exists" {
-		t.Fatalf("expected precommit reject, got %+v", outs[0])
+		t.Fatalf("expected decider reject, got %+v", outs[0])
 	}
 	if outs[1].kind != "reject" || !strings.Contains(outs[1].reason, "$.title: missing required field") {
 		t.Fatalf("expected structural reject, got %+v", outs[1])
@@ -471,7 +519,7 @@ func TestCommandsOkReject(t *testing.T) {
 	}
 
 	// anonymous is a principal; the bundle says it may not add books
-	outs = h.commands("", cmd("c5", "add-book", "id", "b3", "title", "Nope"))
+	outs = h.mutations("", mut("c5", "add-book", "id", "b3", "title", "Nope"))
 	if outs[0].kind != "reject" || outs[0].reason != "unauthorized" {
 		t.Fatalf("expected unauthorized, got %+v", outs[0])
 	}
@@ -480,75 +528,75 @@ func TestCommandsOkReject(t *testing.T) {
 func TestSeriesDedup(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	dune := func(id string) command { return cmd(id, "add-book", "id", "b1", "title", "Dune") }
+	dune := func(id string) mutation { return mut(id, "add-book", "id", "b1", "title", "Dune") }
 
 	// two copies of one (S, n) in one group: the first runs, and the second sees its decision,
 	// where running it again would have been rejected
-	outs := h.commands(admin, dune("c1").in("s1", 1), dune("c1").in("s1", 1))
+	outs := h.mutations(admin, dune("c1").in("s1", 1), dune("c1").in("s1", 1))
 	if outs[0].kind != "ok" || outs[1].kind != "ok" || outs[1].position != outs[0].position {
 		t.Fatalf("copies in one group: %+v", outs)
 	}
 
 	// a reject is a decision: its resend is decided already, and its reason is gone
-	if o := h.commands(admin, dune("c2").in("s1", 2))[0]; o.kind != "reject" || o.reason != "book exists" {
+	if o := h.mutations(admin, dune("c2").in("s1", 2))[0]; o.kind != "reject" || o.reason != "book exists" {
 		t.Fatalf("first reply of a reject: %+v", o)
 	}
-	if o := h.commands(admin, dune("c2").in("s1", 2))[0]; o.kind != "ok" {
+	if o := h.mutations(admin, dune("c2").in("s1", 2))[0]; o.kind != "ok" {
 		t.Fatalf("resent reject: %+v", o)
 	}
 
-	// so is a conflict, and an atom a reducer's failure rolled back
-	emma := cmd("c3", "add-book", "id", "b3", "title", "Emma").in("s1", 3)
+	// so is a conflict, and a mutation whose decider threw
+	emma := mut("c3", "add-book", "id", "b3", "title", "Emma").in("s1", 3)
 	if o := h.expecting(admin, emma, map[string]any{"book": 0}); o.kind != "conflict" {
 		t.Fatalf("first reply of a conflict: %+v", o)
 	}
-	if o := h.commands(admin, emma)[0]; o.kind != "ok" {
+	if o := h.mutations(admin, emma)[0]; o.kind != "ok" {
 		t.Fatalf("resent conflict: %+v", o)
 	}
-	nul := cmd("c4", "add-book", "id", "b1\x00x", "title", "Emma").in("s1", 4)
-	if o := h.commands(admin, nul)[0]; o.kind != "reject" || !strings.Contains(o.reason, "holds U+0000") {
-		t.Fatalf("first reply of a rolled-back atom: %+v", o)
+	nul := mut("c4", "add-book", "id", "b1\x00x", "title", "Emma").in("s1", 4)
+	if o := h.mutations(admin, nul)[0]; o.kind != "reject" || !strings.Contains(o.reason, "holds U+0000") {
+		t.Fatalf("first reply of a decider's throw: %+v", o)
 	}
-	if o := h.commands(admin, nul)[0]; o.kind != "ok" {
-		t.Fatalf("resent rolled-back atom: %+v", o)
+	if o := h.mutations(admin, nul)[0]; o.kind != "ok" {
+		t.Fatalf("resent decider's throw: %+v", o)
 	}
 
 	// numbers may skip, and a number at or below the mark is decided already, run or not
-	head := h.accept(admin, cmd("c5", "add-book", "id", "b5", "title", "Persuasion").in("s1", 10))
-	if o := h.commands(admin, cmd("c6", "add-book", "id", "b6", "title", "Sanditon").in("s1", 7))[0]; o.kind != "ok" || o.position != head {
+	head := h.accept(admin, mut("c5", "add-book", "id", "b5", "title", "Persuasion").in("s1", 10))
+	if o := h.mutations(admin, mut("c6", "add-book", "id", "b6", "title", "Sanditon").in("s1", 7))[0]; o.kind != "ok" || o.position != head {
 		t.Fatalf("a number below the mark: %+v", o)
 	}
 
-	// none of the resends reached the log: the book stream holds b1 and b5 alone
-	evs, _, _ := h.eventsRange(admin, "book", -1, -1, false, 100)
-	if len(evs) != 3 || evs[1].data["id"] != "b1" || evs[2].data["id"] != "b5" {
-		t.Fatalf("the book stream: %+v", evs)
+	// none of the resends reached the log: the book slice holds b1 and b5 alone
+	evs, _, _ := h.editsRange(admin, "book", -1, -1, false, 100)
+	if len(evs) != 2 || evs[0].sets["book!book:b1"] == nil || evs[1].sets["book!book:b5"] == nil {
+		t.Fatalf("the book slice: %+v", evs)
 	}
 
 	// an unknown series runs from whatever number it starts at, and the numbers below it are
 	// then decided already
-	h.accept(admin, cmd("c7", "add-book", "id", "b7", "title", "Emma").in("s2", 5))
-	if o := h.commands(admin, cmd("c8", "add-book", "id", "b8", "title", "Sanditon").in("s2", 1))[0]; o.kind != "ok" {
+	h.accept(admin, mut("c7", "add-book", "id", "b7", "title", "Emma").in("s2", 5))
+	if o := h.mutations(admin, mut("c8", "add-book", "id", "b8", "title", "Sanditon").in("s2", 1))[0]; o.kind != "ok" {
 		t.Fatalf("a number below an unknown series' first: %+v", o)
 	}
-	if o := h.commands(admin, dune("c8").in("s2", 6))[0]; o.kind != "reject" {
+	if o := h.mutations(admin, dune("c8").in("s2", 6))[0]; o.kind != "reject" {
 		t.Fatalf("the next number of a series that started past 1: %+v", o)
 	}
 
-	// an unnumbered command runs every time it is sent
+	// an unnumbered mutation runs every time it is sent
 	for range 2 {
-		if o := h.commands(admin, dune("c9"))[0]; o.kind != "reject" || o.reason != "book exists" {
-			t.Fatalf("an unnumbered command: %+v", o)
+		if o := h.mutations(admin, dune("c9"))[0]; o.kind != "reject" || o.reason != "book exists" {
+			t.Fatalf("an unnumbered mutation: %+v", o)
 		}
 	}
 }
 
-func TestBootstrapAndLiveAtoms(t *testing.T) {
+func TestLiveEdits(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(admin, mut("c1", "add-book", "id", "b1", "title", "Dune"))
 
-	s := h.stream(admin, -1)
+	s := h.connect(admin, -1)
 	if s.header.Get("PhaseLock-Protocol") != "1" || len(s.header.Get("PhaseLock-Epoch")) != 32 {
 		t.Fatalf("bad headers: %v", s.header)
 	}
@@ -557,146 +605,146 @@ func TestBootstrapAndLiveAtoms(t *testing.T) {
 	}
 	live := s.live()
 
-	// a new patron: birth then the event, one atom, one frame
-	pos := h.accept(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
-	f := s.nextTagged("events")
-	evs := events(f)
-	if len(evs) != 2 {
-		t.Fatalf("expected birth + event, got %v", evs)
+	// a new patron: one birth edit, its writes in key order, one frame
+	pos := h.accept(admin, mut("c2", "add-patron", "id", "p1", "name", "Ann"))
+	evs := edits(s.nextTagged("edits"))
+	if len(evs) != 1 {
+		t.Fatalf("expected one edit, got %+v", evs)
 	}
-	if evs[0].data["$sys"] != "birth" || evs[0].stream != "patron:p1" {
-		t.Fatalf("expected birth on patron:p1, got %+v", evs[0])
+	e := evs[0]
+	if e.slice != "patron:p1" || e.lifecycle != birth || e.seq != 1 || e.position != pos || pos != live+1 {
+		t.Fatalf("the birth: live=%d ack=%d %+v", live, pos, e)
 	}
-	if evs[1].data["type"] != "add-patron" || evs[1].stream != "patron:p1" {
-		t.Fatalf("expected add-patron, got %+v", evs[1])
+	var keys []string
+	for _, op := range e.ops {
+		keys = append(keys, op.key)
 	}
-	if evs[0].position != live+1 || evs[1].position != live+2 || evs[1].position != pos {
-		t.Fatalf("positions: live=%d ack=%d evs=%+v", live, pos, evs)
+	if strings.Join(keys, ",") != "patron:p1!holds,patron:p1!messages,patron:p1!patron" ||
+		e.field("patron:p1!patron", "name") != "Ann" {
+		t.Fatalf("the birth's writes: %+v", e.ops)
 	}
-	if evs[0].seq != 1 || evs[1].seq != 2 {
-		t.Fatalf("seq is dense per stream from the birth: %+v", evs)
+	if e.mutation != "c2" {
+		t.Fatalf("the edit carries the mutation id: %+v", e)
 	}
-	for _, e := range evs {
-		if e.commandid != "c2" {
-			t.Fatalf("every event carries the command id: %+v", e)
-		}
-		if e.servertime.Before(time.Now().Add(-time.Minute)) || e.servertime.After(time.Now()) {
-			t.Fatalf("servertime looks wrong: %+v", e)
-		}
+	if e.servertime.Before(time.Now().Add(-time.Minute)) || e.servertime.After(time.Now()) {
+		t.Fatalf("servertime looks wrong: %+v", e)
 	}
 
-	// a multi-stream atom arrives as one frame
-	h.accept(admin, cmd("c3", "try-hold", "id", "h1", "book", "b1", "patron", "p1"))
-	evs = events(s.nextTagged("events"))
-	if len(evs) != 2 || evs[0].stream != "book" || evs[1].stream != "patron:p1" {
-		t.Fatalf("expected book + patron events, got %+v", evs)
+	// a mutation that edits two slices arrives as one frame, its edits at one position
+	pos = h.accept(admin, mut("c3", "try-hold", "id", "h1", "book", "b1", "patron", "p1"))
+	evs = edits(s.nextTagged("edits"))
+	if len(evs) != 2 || evs[0].slice != "book" || evs[1].slice != "patron:p1" {
+		t.Fatalf("expected book + patron edits, got %+v", evs)
 	}
-	if evs[0].commandid != "c3" || evs[1].commandid != "c3" {
-		t.Fatalf("shared command id: %+v", evs)
+	for _, e := range evs {
+		if e.mutation != "c3" || e.position != pos || e.lifecycle != normal || e.seq != 2 {
+			t.Fatalf("the hold's edits: %+v", evs)
+		}
 	}
-	if evs[0].seq != 3 || evs[1].seq != 3 {
-		t.Fatalf("seq per stream: book birth=1 add=2 hold=%d; patron birth=1 add=2 hold=%d", evs[0].seq, evs[1].seq)
+	if evs[0].field("book!book:b1", "hold") != true || evs[1].field("patron:p1!holds", "b1") != true {
+		t.Fatalf("the hold's writes: %+v", evs)
 	}
 }
 
-func TestLiveMultiAtomCommit(t *testing.T) {
+func TestLiveMultiMutationCommit(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	pos := h.accept(admin, cmd("c0", "add-book", "id", "b0", "title", "Zero"))
-	s := h.stream(admin, -1)
+	pos := h.accept(admin, mut("c0", "add-book", "id", "b0", "title", "Zero"))
+	s := h.connect(admin, -1)
 	if s.header.Get("PhaseLock-Position") != fmt.Sprint(pos) {
 		t.Fatalf("PhaseLock-Position %q, want %d", s.header.Get("PhaseLock-Position"), pos)
 	}
 	s.nextTagged("live")
-	// one POST, two commands, one group commit: two atoms on the wire
-	body := append(cmd("c1", "add-patron", "id", "p1", "name", "Ann").encode(nil),
-		cmd("c2", "add-patron", "id", "p2", "name", "Bob").encode(nil)...)
-	if status, _, _ := h.do("POST", "/commands", admin, body); status != 200 {
-		t.Fatalf("commands: status %d", status)
+	// one POST, two mutations, one group commit: two frames on the wire
+	body := append(mut("c1", "add-patron", "id", "p1", "name", "Ann").encode(nil),
+		mut("c2", "add-patron", "id", "p2", "name", "Bob").encode(nil)...)
+	if status, _, _ := h.do("POST", "/mutations", admin, body); status != 200 {
+		t.Fatalf("mutations: status %d", status)
 	}
-	first := events(s.nextTagged("events"))
-	second := events(s.nextTagged("events"))
-	if first[0].stream != "patron:p1" || second[0].stream != "patron:p2" {
-		t.Fatalf("expected both atoms live: %+v then %+v", first, second)
+	first := edits(s.nextTagged("edits"))
+	second := edits(s.nextTagged("edits"))
+	if first[0].slice != "patron:p1" || second[0].slice != "patron:p2" {
+		t.Fatalf("expected both mutations live: %+v then %+v", first, second)
 	}
 }
 
 func TestHistoryReplay(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
-	p2 := h.accept(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
-	p3 := h.accept(admin, cmd("c3", "rename-patron", "id", "p1", "name", "Anne"))
+	h.accept(admin, mut("c1", "add-book", "id", "b1", "title", "Dune"))
+	p2 := h.accept(admin, mut("c2", "add-patron", "id", "p1", "name", "Ann"))
+	p3 := h.accept(admin, mut("c3", "rename-patron", "id", "p1", "name", "Anne"))
 
-	// from genesis: book birth+add, patron birth+add, rename
-	s := h.stream(admin, 0)
-	var all []event
-	for len(all) < 5 {
-		all = append(all, events(s.nextTagged("events"))...)
+	// from genesis: the book's birth, the patron's birth, the rename
+	s := h.connect(admin, 0)
+	var all []edit
+	for len(all) < 3 {
+		all = append(all, edits(s.nextTagged("edits"))...)
 	}
-	want := []string{"book", "book", "patron:p1", "patron:p1", "patron:p1"}
-	wantSeq := []int64{1, 2, 1, 2, 3}
+	want := []string{"book", "patron:p1", "patron:p1"}
+	wantSeq := []int64{1, 1, 2}
+	wantLife := []int64{birth, birth, normal}
 	for i, e := range all {
-		if e.stream != want[i] || e.position != int64(i+1) || e.seq != wantSeq[i] {
-			t.Fatalf("history[%d] = %+v, want stream %s pos %d seq %d", i, e, want[i], i+1, wantSeq[i])
+		if e.slice != want[i] || e.position != int64(i+1) || e.seq != wantSeq[i] || e.lifecycle != wantLife[i] {
+			t.Fatalf("history[%d] = %+v, want slice %s pos %d seq %d", i, e, want[i], i+1, wantSeq[i])
 		}
 	}
 	if s.live() != p3 {
 		t.Fatalf("live frame should carry the position history ended at")
 	}
 	// then live
-	h.accept(admin, cmd("c4", "rename-patron", "id", "p1", "name", "Annie"))
-	evs := events(s.nextTagged("events"))
-	if evs[0].data["name"] != "Annie" {
+	h.accept(admin, mut("c4", "rename-patron", "id", "p1", "name", "Annie"))
+	evs := edits(s.nextTagged("edits"))
+	if evs[0].field("patron:p1!patron", "name") != "Annie" {
 		t.Fatalf("expected live rename, got %+v", evs)
 	}
 
-	// resume after p2: only the rename atom, at p3
-	s2 := h.stream(admin, p2)
-	evs = events(s2.nextTagged("events"))
-	if len(evs) != 1 || evs[0].position != p3 || evs[0].data["name"] != "Anne" {
+	// resume after p2: only the rename, at p3
+	s2 := h.connect(admin, p2)
+	evs = edits(s2.nextTagged("edits"))
+	if len(evs) != 1 || evs[0].position != p3 || evs[0].field("patron:p1!patron", "name") != "Anne" {
 		t.Fatalf("resume from %d: got %+v", p2, evs)
 	}
-	s2.nextTagged("events") // the live rename
+	s2.nextTagged("edits") // the live rename
 	s2.live()
 }
 
 func TestViewAndWants(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
-	h.accept(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
-	h.accept(admin, cmd("c3", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, mut("c1", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(admin, mut("c2", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c3", "add-patron", "id", "p2", "name", "Bob"))
 
-	// a patron sees the book shard and its own shard, from history
+	// a patron sees the book slice and its own slice, from history
 	ann := h.token("p1")
-	s := h.stream(ann, 0)
-	var all []event
-	for len(all) < 4 {
-		all = append(all, events(s.nextTagged("events"))...)
+	s := h.connect(ann, 0)
+	var all []edit
+	for len(all) < 2 {
+		all = append(all, edits(s.nextTagged("edits"))...)
 	}
 	for _, e := range all {
-		if e.stream != "book" && e.stream != "patron:p1" {
-			t.Fatalf("leaked event: %+v", e)
+		if e.slice != "book" && e.slice != "patron:p1" {
+			t.Fatalf("leaked edit: %+v", e)
 		}
 	}
-	// the replay ended on p2's invisible events, which a vouch covers
-	if f := s.next(); f[0] != "vouch" || asInt(f[1]) != 6 {
-		t.Fatalf("expected a vouch at 6 past the last frame, got %v", f)
+	// the replay ended on p2's invisible edit, which a vouch covers
+	if f := s.next(); f[0] != "vouch" || asInt(f[1]) != 3 {
+		t.Fatalf("expected a vouch at 3 past the last frame, got %v", f)
 	}
 	s.live()
-	// other patrons' events are invisible and produce no frame at all
-	h.accept(admin, cmd("c4", "rename-patron", "id", "p2", "name", "Robert"))
+	// other patrons' edits are invisible and produce no frame at all
+	h.accept(admin, mut("c4", "rename-patron", "id", "p2", "name", "Robert"))
 	s.quiet()
-	h.accept(admin, cmd("c5", "rename-patron", "id", "p1", "name", "Anne"))
-	evs := events(s.nextTagged("events"))
-	if evs[0].stream != "patron:p1" {
-		t.Fatalf("expected own event, got %+v", evs)
+	h.accept(admin, mut("c5", "rename-patron", "id", "p1", "name", "Anne"))
+	evs := edits(s.nextTagged("edits"))
+	if evs[0].slice != "patron:p1" {
+		t.Fatalf("expected own edit, got %+v", evs)
 	}
 
-	// wants narrow the view: the frame carries maySee cut down to the wants,
-	// and the token hashes that set, so it differs from the unrestricted one
-	s2 := h.stream(ann, -1, "book")
+	// wants narrow the view: the frame carries the grant cut down to the wants, and the token
+	// hashes that set, so it differs from the unrestricted one
+	s2 := h.connect(ann, -1, "book")
 	if s2.first == nil || strings.Join(strs(s2.first[3]), ",") != "book" {
 		t.Fatalf("narrowed view frame: %v", s2.first)
 	}
@@ -704,54 +752,54 @@ func TestViewAndWants(t *testing.T) {
 		t.Fatalf("token should reflect the wants")
 	}
 	s2.live()
-	h.accept(admin, cmd("c6", "rename-patron", "id", "p1", "name", "Annie"))
+	h.accept(admin, mut("c6", "rename-patron", "id", "p1", "name", "Annie"))
 	s2.quiet()
-	h.accept(admin, cmd("c7", "add-book", "id", "b2", "title", "Emma"))
-	evs = events(s2.nextTagged("events"))
-	if evs[0].stream != "book" {
-		t.Fatalf("expected book event, got %+v", evs)
+	h.accept(admin, mut("c7", "add-book", "id", "b2", "title", "Emma"))
+	evs = edits(s2.nextTagged("edits"))
+	if evs[0].slice != "book" {
+		t.Fatalf("expected book edit, got %+v", evs)
 	}
 
 	// the narrower of a want and a grant is kept, and a want nothing grants
 	// vanishes: patron:* against patron:p1 is patron:p1, author:* is nothing
-	s4 := h.stream(ann, -1, "patron:*", "author:*")
+	s4 := h.connect(ann, -1, "patron:*", "author:*")
 	if s4.first == nil || strings.Join(strs(s4.first[3]), ",") != "patron:p1" {
 		t.Fatalf("intersected view frame: %v", s4.first)
 	}
 	s4.live()
-	s5 := h.stream(admin, -1, "patron:*")
+	s5 := h.connect(admin, -1, "patron:*")
 	if s5.first == nil || strings.Join(strs(s5.first[3]), ",") != "patron:*" {
 		t.Fatalf("admin view cut down to a family: %v", s5.first)
 	}
 	s5.live()
 
-	// anonymous sees only the book shard
-	s3 := h.stream("", -1)
+	// anonymous sees only the book slice
+	s3 := h.connect("", -1)
 	s3.live()
-	h.accept(admin, cmd("c8", "rename-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c8", "rename-patron", "id", "p1", "name", "Ann"))
 	s3.quiet()
 }
 
-func TestMaySeeInvalidation(t *testing.T) {
+func TestGrantInvalidation(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
-	h.accept(admin, cmd("c2", "add-patron", "id", "p2", "name", "Bob"))
-	h.accept(admin, cmd("c3", "create-account", "user", "p1", "password", "hunter2"))
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, mut("c3", "create-account", "user", "p1", "password", "hunter2"))
 
 	ann := h.token("p1")
-	s := h.stream(ann, -1)
+	s := h.connect(ann, -1)
 	s.live()
 	token0 := s.header.Get("PhaseLock-View")
 	// two connections of the same principal with narrower wants
-	sb := h.stream(ann, -1, "book")
+	sb := h.connect(ann, -1, "book")
 	sb.live()
-	sp := h.stream(ann, -1, "patron:*")
+	sp := h.connect(ann, -1, "patron:*")
 	sp.live()
 
-	// granting a view rewrites maySee's read-set key: a view frame arrives,
-	// before any events of the same commit, carrying the whole set of refs
-	grantPos := h.accept(admin, cmd("c4", "grant-view", "user", "p1", "prefix", "patron:p2!"))
+	// granting a view rewrites the grantor's read-set key: a view frame arrives,
+	// before any edits of the same commit, carrying the whole set of selectors
+	grantPos := h.accept(admin, mut("c4", "grant-view", "user", "p1", "prefix", "patron:p2!"))
 	f := s.nextTagged("view")
 	if f[1].(string) == token0 {
 		t.Fatalf("token should change on grant")
@@ -761,139 +809,141 @@ func TestMaySeeInvalidation(t *testing.T) {
 		t.Fatalf("view position %v, want %d", f[2], grantPos)
 	}
 	if got := strings.Join(strs(f[3]), ","); got != "book,patron:p1,patron:p2" {
-		t.Fatalf("grant frame refs: %v", got)
+		t.Fatalf("grant frame selectors: %v", got)
 	}
 	token1 := f[1].(string)
 	// the grant is inside one connection's wants and outside the other's: the
 	// first gets its own view, the second's view is as it was, so no frame
 	f = sp.nextTagged("view")
 	if got := strings.Join(strs(f[3]), ","); got != "patron:p1,patron:p2" {
-		t.Fatalf("grant frame refs under wants: %v", got)
+		t.Fatalf("grant frame selectors under wants: %v", got)
 	}
 	sb.quiet()
 
-	// now p2's events flow
-	h.accept(admin, cmd("c5", "rename-patron", "id", "p2", "name", "Robert"))
-	evs := events(s.nextTagged("events"))
-	if evs[0].stream != "patron:p2" {
-		t.Fatalf("expected granted stream, got %+v", evs)
+	// now p2's edits flow
+	h.accept(admin, mut("c5", "rename-patron", "id", "p2", "name", "Robert"))
+	evs := edits(s.nextTagged("edits"))
+	if evs[0].slice != "patron:p2" {
+		t.Fatalf("expected the granted slice, got %+v", evs)
 	}
 
 	// a connection presenting a stale token gets the view frame first, with
-	// the current refs; one presenting the current token goes straight to live
-	s2 := h.streamView(ann, -1, token0)
+	// the current selectors; one presenting the current token goes straight to live
+	s2 := h.connectView(ann, -1, token0)
 	v := s2.nextTagged("view")
 	if v[1].(string) != token1 || fmt.Sprint(asInt(v[2])) != s2.header.Get("PhaseLock-Position") {
-		t.Fatalf("first view frame: %v (stream token %v)", v, token1)
+		t.Fatalf("first view frame: %v (connection token %v)", v, token1)
 	}
 	if got := strings.Join(strs(v[3]), ","); got != "book,patron:p1,patron:p2" {
-		t.Fatalf("first view refs: %v", got)
+		t.Fatalf("first view selectors: %v", got)
 	}
 	s2.resp.Body.Close()
-	s3 := h.streamView(ann, -1, token1)
+	s3 := h.connectView(ann, -1, token1)
 	if f := s3.next(); f[0] != "live" {
 		t.Fatalf("current token: expected live first, got %v", f)
 	}
 	s3.resp.Body.Close()
 
-	// revocation: a view frame, and the same commit's events are withheld
-	h.accept(admin, cmd("c6", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
+	// revocation: a view frame, and the same commit's edits are withheld
+	h.accept(admin, mut("c6", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
 	f = s.nextTagged("view")
 	if got := strings.Join(strs(f[3]), ","); got != "book,patron:p1" {
-		t.Fatalf("revoke frame refs: %v", got)
+		t.Fatalf("revoke frame selectors: %v", got)
 	}
 	if f[1].(string) != token0 {
 		t.Fatalf("token should return to the original after revoke")
 	}
-	h.accept(admin, cmd("c7", "rename-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, mut("c7", "rename-patron", "id", "p2", "name", "Bob"))
 	s.quiet()
 
-	// refs are never expanded: a family grant is one ref, and the client
+	// selectors are never expanded: a family grant is one selector, and the client
 	// learns the members from the blob
-	h.accept(admin, cmd("c8", "add-patron", "id", "p3", "name", "Cy"))
-	h.accept(admin, cmd("c9", "grant-view", "user", "p1", "prefix", "patron:*"))
+	h.accept(admin, mut("c8", "add-patron", "id", "p3", "name", "Cy"))
+	h.accept(admin, mut("c9", "grant-view", "user", "p1", "prefix", "patron:*"))
 	f = s.nextTagged("view")
 	if got := strings.Join(strs(f[3]), ","); got != "book,patron:*,patron:p1" {
-		t.Fatalf("wildcard grant frame refs: %v", got)
+		t.Fatalf("wildcard grant frame selectors: %v", got)
 	}
 	tokenFamily := f[1].(string)
 	// every change to the set is sent, even one that leaves coverage as it
 	// was: patron:p2 is inside the held patron:*
-	h.accept(admin, cmd("c9b", "grant-view", "user", "p1", "prefix", "patron:p2!"))
+	h.accept(admin, mut("c9b", "grant-view", "user", "p1", "prefix", "patron:p2!"))
 	f = s.nextTagged("view")
 	if got := strings.Join(strs(f[3]), ","); got != "book,patron:*,patron:p1,patron:p2" || f[1].(string) == tokenFamily {
 		t.Fatalf("grant inside a held family: %v", f)
 	}
-	h.accept(admin, cmd("c9c", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
+	h.accept(admin, mut("c9c", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
 	f = s.nextTagged("view")
 	if f[1].(string) != tokenFamily {
 		t.Fatalf("revoke inside a held family: %v", f)
 	}
-	h.accept(admin, cmd("c10", "add-patron", "id", "p4", "name", "Di"))
-	evs = events(s.nextTagged("events"))
-	if evs[0].stream != "patron:p4" || evs[0].data["$sys"] != "birth" {
-		t.Fatalf("births under a held wildcard arrive in-stream: %+v", evs)
+	h.accept(admin, mut("c10", "add-patron", "id", "p4", "name", "Di"))
+	evs = edits(s.nextTagged("edits"))
+	if evs[0].slice != "patron:p4" || evs[0].lifecycle != birth {
+		t.Fatalf("births under a held wildcard arrive on the connection: %+v", evs)
 	}
-	h.accept(admin, cmd("c11", "revoke-view", "user", "p1", "prefix", "patron:*"))
+	h.accept(admin, mut("c11", "revoke-view", "user", "p1", "prefix", "patron:*"))
 	f = s.nextTagged("view")
 	if got := strings.Join(strs(f[3]), ","); got != "book,patron:p1" {
-		t.Fatalf("wildcard revoke frame refs: %v", got)
+		t.Fatalf("wildcard revoke frame selectors: %v", got)
 	}
 }
 
-func TestAnErasureDeletesTheStreamsHistory(t *testing.T) {
+func TestAnErasureDeletesTheSlicesHistory(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
-	h.accept(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne"))
-	h.accept(admin, cmd("c3", "add-patron", "id", "p2", "name", "Bob"))
-	pos := h.accept(admin, cmd("c4", "forget-patron", "id", "p1"))
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "rename-patron", "id", "p1", "name", "Anne"))
+	h.accept(admin, mut("c3", "add-patron", "id", "p2", "name", "Bob"))
+	pos := h.accept(admin, mut("c4", "forget-patron", "id", "p1"))
 
-	// the death is all that remains of the stream, at its seq; the other stream is untouched
-	evs, _, _ := h.eventsRange(admin, "patron:p1", -1, -1, false, 0)
-	if len(evs) != 1 || evs[0].data["$sys"] != "death" || evs[0].seq != 4 || evs[0].position != pos {
+	// the death is all that remains of the slice, at its seq; the other slice is untouched
+	evs, _, _ := h.editsRange(admin, "patron:p1", -1, -1, false, 0)
+	if len(evs) != 1 || evs[0].lifecycle != death || len(evs[0].ops) != 0 || evs[0].seq != 3 ||
+		evs[0].position != pos {
 		t.Fatalf("after erasure: %+v", evs)
 	}
-	if evs, _, _ := h.eventsRange(admin, "patron:p2", -1, -1, false, 0); len(evs) != 2 {
-		t.Fatalf("other stream: %+v", evs)
+	if evs, _, _ := h.editsRange(admin, "patron:p2", -1, -1, false, 0); len(evs) != 1 {
+		t.Fatalf("other slice: %+v", evs)
 	}
 
-	// the stream's state is gone, and its event bytes are the death's alone
+	// the slice's state is gone, and its edit bytes are the death's alone: the /edits page of one
+	// edit is the edit inside ["edits", [edit]], whose framing is 8 bytes
 	dead := h.snapshot(admin, "patron:p1")
-	deathBytes := int64(len(mpEncode(map[string]any{"$sys": "death"})))
-	if len(dead.records) != 0 || asInt(dead.header["event_bytes"]) != deathBytes {
-		t.Fatalf("dead stream: %v %v", dead.records, dead.header)
+	_, _, page := h.do("GET", "/edits/patron:p1", admin, nil)
+	if len(dead.records) != 0 || asInt(dead.header["edit_bytes"]) != int64(len(page)-8) {
+		t.Fatalf("dead slice: %v %v, the death %d bytes", dead.records, dead.header, len(page)-8)
 	}
 
 	// a replay from the start delivers the death alone, whose seq shows the gap
-	s := h.stream(admin, 0)
-	var p1 []event
+	s := h.connect(admin, 0)
+	var p1 []edit
 	for {
 		f := s.next()
 		if f[0] == "live" {
 			break
 		}
-		if f[0] != "events" {
+		if f[0] != "edits" {
 			continue
 		}
-		for _, e := range events(f) {
-			if e.stream == "patron:p1" {
+		for _, e := range edits(f) {
+			if e.slice == "patron:p1" {
 				p1 = append(p1, e)
 			}
 		}
 	}
-	if len(p1) != 1 || p1[0].seq != 4 {
+	if len(p1) != 1 || p1[0].seq != 3 {
 		t.Fatalf("replayed: %+v", p1)
 	}
 
-	// a rebirth takes the next seq, and a plain death keeps its stream's history
-	h.accept(admin, cmd("c5", "add-patron", "id", "p1", "name", "Ann"))
-	evs, _, _ = h.eventsRange(admin, "patron:p1", -1, -1, false, 0)
-	if len(evs) != 3 || evs[1].data["$sys"] != "birth" || evs[1].seq != 5 {
+	// a rebirth takes the next seq, and a plain death keeps its slice's history
+	h.accept(admin, mut("c5", "add-patron", "id", "p1", "name", "Ann"))
+	evs, _, _ = h.editsRange(admin, "patron:p1", -1, -1, false, 0)
+	if len(evs) != 2 || evs[1].lifecycle != birth || evs[1].seq != 4 {
 		t.Fatalf("after rebirth: %+v", evs)
 	}
-	h.accept(admin, cmd("c6", "remove-patron", "id", "p2"))
-	if evs, _, _ := h.eventsRange(admin, "patron:p2", -1, -1, false, 0); len(evs) != 3 {
+	h.accept(admin, mut("c6", "remove-patron", "id", "p2"))
+	if evs, _, _ := h.editsRange(admin, "patron:p2", -1, -1, false, 0); len(evs) != 2 {
 		t.Fatalf("after a plain death: %+v", evs)
 	}
 }
@@ -901,45 +951,203 @@ func TestAnErasureDeletesTheStreamsHistory(t *testing.T) {
 func TestBirthDeath(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
-	h.accept(admin, cmd("c2", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "add-patron", "id", "p2", "name", "Bob"))
 
 	// a bootstrap presents no token and gets the view frame first
-	s := h.stream(admin, -1)
-	if v := s.first; v == nil || strings.Join(strs(v[3]), ",") != "*" || asInt(v[2]) != 4 {
+	s := h.connect(admin, -1)
+	if v := s.first; v == nil || strings.Join(strs(v[3]), ",") != "*" || asInt(v[2]) != 2 {
 		t.Fatalf("first view frame: %v", v)
 	}
 	s.live()
-	pos := h.accept(admin, cmd("c3", "remove-patron", "id", "p1"))
-	evs := events(s.nextTagged("events"))
-	if len(evs) != 1 || evs[0].data["$sys"] != "death" || evs[0].stream != "patron:p1" || evs[0].position != pos {
+	pos := h.accept(admin, mut("c3", "remove-patron", "id", "p1"))
+	evs := edits(s.nextTagged("edits"))
+	if len(evs) != 1 || evs[0].lifecycle != death || evs[0].slice != "patron:p1" || evs[0].position != pos ||
+		len(evs[0].ops) != 0 {
 		t.Fatalf("expected death, got %+v", evs)
 	}
-	if evs[0].seq != 3 {
+	if evs[0].seq != 2 {
 		t.Fatalf("death takes the next seq: %+v", evs)
 	}
 
-	// the dead stream is gone from the family's blob and its keys are gone
-	if fam := h.snapshot(admin, "patron:*"); len(fam.streams) != 1 || fam.streams["patron:p2"] != 2 {
-		t.Fatalf("streams after death: %v", fam.streams)
+	// the deleted slice is gone from the family's blob and its keys are gone
+	if fam := h.snapshot(admin, "patron:*"); len(fam.slices) != 1 || fam.slices["patron:p2"] != 1 {
+		t.Fatalf("slices after death: %v", fam.slices)
 	}
 	blob := h.snapshot(admin, "patron:p1")
 	if len(blob.records) != 0 {
-		t.Fatalf("dead stream still has state: %v", blob.records)
+		t.Fatalf("deleted slice still has state: %v", blob.records)
 	}
 
-	// rebirth under the same name
-	h.accept(admin, cmd("c4", "add-patron", "id", "p1", "name", "Ann II"))
-	evs = events(s.nextTagged("events"))
-	if len(evs) != 2 || evs[0].data["$sys"] != "birth" || evs[1].data["name"] != "Ann II" {
+	// rebirth under the same name, its seqs dense across the death
+	h.accept(admin, mut("c4", "add-patron", "id", "p1", "name", "Ann II"))
+	evs = edits(s.nextTagged("edits"))
+	if len(evs) != 1 || evs[0].lifecycle != birth || evs[0].field("patron:p1!patron", "name") != "Ann II" {
 		t.Fatalf("expected rebirth, got %+v", evs)
 	}
-	if evs[0].seq != 4 || evs[1].seq != 5 {
+	if evs[0].seq != 3 {
 		t.Fatalf("seq continues across lives: %+v", evs)
 	}
 	blob = h.snapshot(admin, "patron:p1")
 	if blob.records["patron:p1!patron"] == nil {
-		t.Fatalf("reborn stream has no state: %v", blob.records)
+		t.Fatalf("reborn slice has no state: %v", blob.records)
+	}
+}
+
+// a mutation that deletes a slice and writes it again makes one edit, a birth, which clears the
+// slice and carries only what was written after the deletion
+func TestADeletionAndRewriteIsOneBirth(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(admin, mut("c2", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c3", "try-hold", "id", "h1", "book", "b1", "patron", "p1"))
+	s := h.connect(admin, -1)
+	s.live()
+
+	pos := h.accept(admin, mut("c4", "reset-patron", "id", "p1", "name", "Bea"))
+	evs := edits(s.nextTagged("edits"))
+	if len(evs) != 1 || evs[0].lifecycle != birth || evs[0].seq != 3 || evs[0].position != pos {
+		t.Fatalf("the reset: %+v", evs)
+	}
+	if len(evs[0].dels) != 0 || len(evs[0].ops) != 3 || evs[0].field("patron:p1!patron", "name") != "Bea" {
+		t.Fatalf("the reset's writes: %+v", evs[0].ops)
+	}
+	if holds := h.snapshot(admin, "patron:p1").records["patron:p1!holds"]; len(holds.(map[string]any)) != 0 {
+		t.Fatalf("the hold survived the reset: %v", holds)
+	}
+}
+
+// deleting a slice that is unborn, or already deleted, is no edit, and a mutation that edits
+// nothing takes no position
+func TestDeletingANonLiveSliceIsNoEdit(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	head := h.accept(admin, mut("c1", "add-book", "id", "b1", "title", "Dune"))
+	if at := h.accept(admin, mut("c2", "close-shelf", "branch", "x")); at != head {
+		t.Fatalf("closing an unborn shelf landed at %d after %d", at, head)
+	}
+	h.accept(admin, mut("c3", "lend", "branch", "x", "patron", "p1"))
+	closed := h.accept(admin, mut("c4", "close-shelf", "branch", "x"))
+	if at := h.accept(admin, mut("c5", "close-shelf", "branch", "x")); at != closed {
+		t.Fatalf("closing a closed shelf landed at %d after %d", at, closed)
+	}
+	evs, _, _ := h.editsRange(admin, "shelf:x", -1, -1, false, 0)
+	if len(evs) != 2 || evs[0].lifecycle != birth || evs[1].lifecycle != death {
+		t.Fatalf("the shelf's edits: %+v", evs)
+	}
+}
+
+// a key a mutation writes twice appears in its edit once, with its last value
+func TestAKeyWrittenTwiceIsOneOperation(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	pos := h.accept(admin, mut("c2", "notify", "patron", "p1", "reasons", []any{"first", "second"}))
+	evs, _, _ := h.editsRange(admin, "patron:p1", pos-1, -1, false, 0)
+	if len(evs) != 1 || len(evs[0].ops) != 1 || strings.Join(strs(evs[0].sets["patron:p1!messages"]), ",") != "first,second,own" {
+		t.Fatalf("the notice's edit: %+v", evs)
+	}
+}
+
+// a decider that throws after writing, or writes a key under no slice name, leaves nothing
+func TestAFailedDeciderLeavesNothing(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	head := h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+
+	// a key with a control character fails its write
+	o := h.mutations(admin, mut("c2", "add-book", "id", "b\x01", "title", "Dune"))[0]
+	if o.kind != "reject" || !strings.Contains(o.reason, "control character") {
+		t.Fatalf("a key with a control character: %+v", o)
+	}
+
+	// a key under no slice name fails its write, after another write
+	o = h.mutations(admin, mut("c5", "notify", "patron", "p1", "reasons", []any{"first", "set patron:p1,!messages"}))[0]
+	if o.kind != "reject" || !strings.Contains(o.reason, "key patron:p1,!messages has no slice name before its first '!'") {
+		t.Fatalf("a key under no slice name: %+v", o)
+	}
+
+	// so does deleting a slice by a malformed name
+	o = h.mutations(admin, mut("c6", "notify", "patron", "p1", "reasons", []any{"first", "delete patron:p1/x"}))[0]
+	if o.kind != "reject" || !strings.Contains(o.reason, "patron:p1/x is not a slice name") {
+		t.Fatalf("deleting a malformed slice name: %+v", o)
+	}
+
+	// a rejection after writes, the plugin's requests among them
+	o = h.mutations(admin, mut("c3", "notify", "patron", "p1", "reasons", []any{"x"}, "reject", true))[0]
+	if o.kind != "reject" {
+		t.Fatalf("a rejection after writes: %+v", o)
+	}
+	if at := h.accept(admin, mut("c4", "close-shelf", "branch", "none")); at != head {
+		t.Fatalf("the failures took positions: %d after %d", at, head)
+	}
+	if m := h.snapshot(admin, "patron:p1").records["patron:p1!messages"]; len(m.([]any)) != 0 {
+		t.Fatalf("a rejection's writes landed: %v", m)
+	}
+}
+
+// a key of a declared slice that no key template names lands as inert bytes beside its slice's keys
+func TestAKeyNoTemplateNamesLands(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "notify", "patron", "p1", "reasons", []any{"stray"}))
+	records := h.snapshot(admin, "patron:p1").records
+	if got := strs(records["patron:p1!stray"]); strings.Join(got, ",") != "stray" {
+		t.Fatalf("the stray key: %v", records["patron:p1!stray"])
+	}
+	if got := strs(records["patron:p1!messages"]); strings.Join(got, ",") != "own" {
+		t.Fatalf("the messages beside it: %v", records["patron:p1!messages"])
+	}
+}
+
+// The write gate checks a key's slice, and a slice deleted, by the syntax of a slice name alone: a
+// well-formed name lands whatever its family and number of parameters, and a malformed one fails
+// its write.
+func TestTheWriteGateChecksSliceNamesBySyntax(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+
+	// a key in a family no slice type declares, and one under too many parameters, land
+	h.accept(admin, mut("c2", "notify", "patron", "p1", "reasons", []any{"set nope:a!k", "set patron:p1,x!k"}))
+	for slice, key := range map[string]string{"nope:a": "nope:a!k", "patron:p1,x": "patron:p1,x!k"} {
+		if got := strs(h.snapshot(admin, slice).records[key]); strings.Join(got, ",") != "set "+key {
+			t.Fatalf("the key %s: %v", key, got)
+		}
+	}
+
+	// and their slices delete
+	h.accept(admin, mut("c3", "notify", "patron", "p1", "reasons", []any{"delete nope:a", "delete patron:p1,x"}))
+	for _, slice := range []string{"nope:a", "patron:p1,x"} {
+		if b := h.snapshot(admin, slice); len(b.records) != 0 || len(b.slices) != 0 {
+			t.Fatalf("the deleted slice %s: %v %v", slice, b.records, b.slices)
+		}
+	}
+
+	// a key under no slice name fails its write
+	for i, key := range []string{
+		"patron:p1",      // no '!'
+		"!seq:patron:p1", // an engine-reserved key
+		":p1!k",          // an empty family
+		"patron:!k",      // an empty parameter
+		"patron:a,,b!k",  // an empty parameter between two others
+		"patron:p/1!k",   // a character no parameter holds
+		"patron:a.b,c!k", // a '.' in a parameter before the last
+	} {
+		o := h.mutations(admin, mut(fmt.Sprintf("k%d", i), "notify", "patron", "p1", "reasons", []any{"set " + key}))[0]
+		if o.kind != "reject" || !strings.Contains(o.reason, "key "+key+" has no slice name before its first '!'") {
+			t.Fatalf("writing %q: %+v", key, o)
+		}
+	}
+
+	// and a malformed slice name fails its deletion
+	for i, slice := range []string{"", "patron:", "patron:p1!", "patron:p/1", "patron:a.b,c", "patron:*"} {
+		o := h.mutations(admin, mut(fmt.Sprintf("d%d", i), "notify", "patron", "p1", "reasons", []any{"delete " + slice}))[0]
+		if o.kind != "reject" || !strings.Contains(o.reason, slice+" is not a slice name") {
+			t.Fatalf("deleting %q: %+v", slice, o)
+		}
 	}
 }
 
@@ -947,18 +1155,18 @@ func TestBirthDeath(t *testing.T) {
 
 type blob struct {
 	header   map[string]any
-	streams  map[string]int64
+	slices   map[string]int64
 	position int64
 	records  map[string]any
 	raw      map[string][]byte
 	keys     []string
 }
 
-func (h *harness) snapshot(token, ref string) blob {
+func (h *harness) snapshot(token, selector string) blob {
 	h.t.Helper()
-	status, hdr, out := h.do("GET", "/snapshot/"+ref, token, nil)
+	status, hdr, out := h.do("GET", "/snapshot/"+selector, token, nil)
 	if status != 200 {
-		h.t.Fatalf("snapshot %s: status %d: %s", ref, status, out)
+		h.t.Fatalf("snapshot %s: status %d: %s", selector, status, out)
 	}
 	if hdr.Get("Content-Length") != fmt.Sprint(len(out)) {
 		h.t.Fatalf("Content-Length %q for a %d-byte blob", hdr.Get("Content-Length"), len(out))
@@ -967,16 +1175,80 @@ func (h *harness) snapshot(token, ref string) blob {
 	if fmt.Sprint(b.position) != hdr.Get("PhaseLock-Position") {
 		h.t.Fatalf("position header %q != blob %d", hdr.Get("PhaseLock-Position"), b.position)
 	}
-	// every stream with a record is in the streams map
+	if hdr.Get("PhaseLock-Epoch") != b.header["epoch"] {
+		h.t.Fatalf("epoch header %q != blob %v", hdr.Get("PhaseLock-Epoch"), b.header["epoch"])
+	}
+	// every slice with a key is in the slices map
 	for _, k := range b.keys {
-		if _, ok := b.streams[k[:strings.Index(k, "!")]]; !ok {
-			h.t.Fatalf("record %s for a stream missing from %v", k, b.streams)
+		if _, ok := b.slices[k[:strings.Index(k, "!")]]; !ok {
+			h.t.Fatalf("key %s of a slice missing from %v", k, b.slices)
 		}
 	}
 	return b
 }
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
+
+// mpSize is the length of the msgpack value b starts with
+func mpSize(t *testing.T, b []byte) int {
+	t.Helper()
+	c := b[0]
+	be := func(n int) int {
+		v := 0
+		for i := 1; i <= n; i++ {
+			v = v<<8 | int(b[i])
+		}
+		return v
+	}
+	items := func(at, n int) int {
+		for range n {
+			at += mpSize(t, b[at:])
+		}
+		return at
+	}
+	switch {
+	case c <= 0x7f, c >= 0xe0, c == 0xc0, c == 0xc2, c == 0xc3:
+		return 1
+	case c >= 0xa0 && c <= 0xbf:
+		return 1 + int(c&0x1f)
+	case c >= 0x90 && c <= 0x9f:
+		return items(1, int(c&0x0f))
+	case c >= 0x80 && c <= 0x8f:
+		return items(1, 2*int(c&0x0f))
+	}
+	switch c {
+	case 0xcc, 0xd0:
+		return 2
+	case 0xcd, 0xd1:
+		return 3
+	case 0xca, 0xce, 0xd2:
+		return 5
+	case 0xcb, 0xcf, 0xd3:
+		return 9
+	case 0xd9, 0xc4:
+		return 2 + be(1)
+	case 0xda, 0xc5:
+		return 3 + be(2)
+	case 0xdb, 0xc6:
+		return 5 + be(4)
+	case 0xd6:
+		return 6
+	case 0xd7:
+		return 10
+	case 0xc7:
+		return 3 + be(1)
+	case 0xdc:
+		return items(3, be(2))
+	case 0xdd:
+		return items(5, be(4))
+	case 0xde:
+		return items(3, 2*be(2))
+	case 0xdf:
+		return items(5, 2*be(4))
+	}
+	t.Fatalf("msgpack byte %x", c)
+	return 0
+}
 
 func parseBlob(t *testing.T, b []byte) blob {
 	t.Helper()
@@ -988,37 +1260,34 @@ func parseBlob(t *testing.T, b []byte) blob {
 		t.Fatalf("header crc mismatch")
 	}
 	header := mpDecodeOne(t, b[9:9+hlen]).(map[string]any)
-	out := blob{header: header, streams: map[string]int64{}, position: asInt(header["position"]), records: map[string]any{}, raw: map[string][]byte{}}
-	for name, seq := range header["streams"].(map[string]any) {
-		out.streams[name] = asInt(seq)
+	out := blob{header: header, slices: map[string]int64{}, position: asInt(header["position"]), records: map[string]any{}, raw: map[string][]byte{}}
+	for name, seq := range header["slices"].(map[string]any) {
+		out.slices[name] = asInt(seq)
 	}
+
+	// the set operations, back to back, up to the end marker
 	p := 13 + int(hlen)
-	recStart := p
+	opsStart := p
 	var count uint32
-	for {
-		klen := binary.BigEndian.Uint32(b[p:])
-		if klen == 0xFFFFFFFF {
-			break
+	for binary.BigEndian.Uint32(b[p:]) != 0xFFFFFFFF {
+		if b[p] != 0 {
+			t.Fatalf("opcode %x in a snapshot", b[p])
 		}
-		if klen > 16<<20 {
-			t.Fatalf("klen too large")
-		}
-		key := string(b[p+4 : p+4+int(klen)])
-		q := p + 4 + int(klen)
-		vlen := binary.BigEndian.Uint32(b[q:])
-		val := b[q+4 : q+4+int(vlen)]
-		q += 4 + int(vlen)
-		crc := binary.BigEndian.Uint32(b[q:])
-		if crc != crc32.Checksum(append([]byte(key), val...), castagnoli) {
-			t.Fatalf("record crc mismatch for %s", key)
-		}
+		p++
+		kn := mpSize(t, b[p:])
+		key := mpDecodeOne(t, b[p:p+kn]).(string)
+		p += kn
+		vn := mpSize(t, b[p:])
+		val := b[p : p+vn]
+		p += vn
 		out.records[key] = mpDecodeOne(t, val)
 		out.raw[key] = val
 		out.keys = append(out.keys, key)
-		p = q + 4
 		count++
 	}
-	recEnd := p
+	opsEnd := p
+
+	// the footer: the count, the hash of the operations' bytes, and its crc
 	footer := b[p+4:]
 	if len(footer) != 16 {
 		t.Fatalf("footer length %d", len(footer))
@@ -1026,14 +1295,14 @@ func parseBlob(t *testing.T, b []byte) blob {
 	if binary.BigEndian.Uint32(footer[0:4]) != count {
 		t.Fatalf("footer count %d != %d", binary.BigEndian.Uint32(footer[0:4]), count)
 	}
-	if binary.BigEndian.Uint64(footer[4:12]) != fnv1a(b[recStart:recEnd]) {
+	if binary.BigEndian.Uint64(footer[4:12]) != fnv1a(b[opsStart:opsEnd]) {
 		t.Fatalf("content hash mismatch")
 	}
 	if binary.BigEndian.Uint32(footer[12:16]) != crc32.Checksum(footer[0:12], castagnoli) {
 		t.Fatalf("footer crc mismatch")
 	}
 	if !sort.StringsAreSorted(out.keys) {
-		t.Fatalf("records not sorted: %v", out.keys)
+		t.Fatalf("keys not sorted: %v", out.keys)
 	}
 	return out
 }
@@ -1050,38 +1319,44 @@ func fnv1a(b []byte) uint64 {
 func TestSnapshots(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
-	h.accept(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
-	pos := h.accept(admin, cmd("c3", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, mut("c1", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(admin, mut("c2", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c3", "rename-patron", "id", "p1", "name", "Anne"))
+	pos := h.accept(admin, mut("c4", "add-patron", "id", "p2", "name", "Bob"))
 
 	one := h.snapshot(admin, "patron:p1")
-	if one.header["ref"] != "patron:p1" || one.position < pos || one.header["fold"] != h.epoch() {
+	if one.header["selector"] != "patron:p1" || one.position < pos || one.header["epoch"] != h.epoch() {
 		t.Fatalf("header: %v", one.header)
+	}
+
+	// the snapshot response's epoch, which the blob's matches, is the stream's
+	if epoch := h.connect(admin, -1).header.Get("PhaseLock-Epoch"); one.header["epoch"] != epoch {
+		t.Fatalf("snapshot epoch %v, stream epoch %q", one.header["epoch"], epoch)
 	}
 	if strings.Join(one.keys, ",") != "patron:p1!holds,patron:p1!messages,patron:p1!patron" {
 		t.Fatalf("keys: %v", one.keys)
 	}
-	if one.records["patron:p1!patron"].(map[string]any)["name"] != "Ann" {
+	if one.records["patron:p1!patron"].(map[string]any)["name"] != "Anne" {
 		t.Fatalf("value: %v", one.records)
 	}
 
-	// a family blob holds every instance, contiguous per instance, and
-	// names every live member with its seq
+	// a family blob holds every slice, contiguous per slice, and names every live member with
+	// its seq
 	fam := h.snapshot(admin, "patron:*")
 	if len(fam.keys) != 6 || !strings.HasPrefix(fam.keys[0], "patron:p1!") || !strings.HasPrefix(fam.keys[5], "patron:p2!") {
 		t.Fatalf("family keys: %v", fam.keys)
 	}
-	if len(fam.streams) != 2 || fam.streams["patron:p1"] != 2 || fam.streams["patron:p2"] != 2 {
-		t.Fatalf("family streams: %v", fam.streams)
+	if len(fam.slices) != 2 || fam.slices["patron:p1"] != 2 || fam.slices["patron:p2"] != 1 {
+		t.Fatalf("family slices: %v", fam.slices)
 	}
-	if one.streams["patron:p1"] != 2 || len(one.streams) != 1 {
-		t.Fatalf("exact streams: %v", one.streams)
+	if one.slices["patron:p1"] != 2 || len(one.slices) != 1 {
+		t.Fatalf("exact slices: %v", one.slices)
 	}
 
-	// the empty ref is everything
+	// the selector "*" is everything
 	all := h.snapshot(admin, "*")
-	if len(all.keys) != 7 || len(all.streams) != 3 || all.header["ref"] != "*" {
-		t.Fatalf("everything: %d keys, streams %v", len(all.keys), all.streams)
+	if len(all.keys) != 7 || len(all.slices) != 3 || all.header["selector"] != "*" {
+		t.Fatalf("everything: %d keys, slices %v", len(all.keys), all.slices)
 	}
 	if status, _, _ := h.do("GET", "/snapshot/*", h.token("p1"), nil); status != 403 {
 		t.Fatalf("everything for p1: status %d", status)
@@ -1093,10 +1368,16 @@ func TestSnapshots(t *testing.T) {
 	if len(book.keys) != 1 {
 		t.Fatalf("book keys: %v", book.keys)
 	}
-	later := h.accept(admin, cmd("c4", "add-book", "id", "b2", "title", "Emma"))
+	later := h.accept(admin, mut("c5", "add-book", "id", "b2", "title", "Emma"))
 	book2 := h.snapshot(admin, "book")
 	if len(book2.keys) != 2 || book2.position < later {
 		t.Fatalf("book after write: %v @ %d", book2.keys, book2.position)
+	}
+
+	// a value travels in store format: the blob holds the bytes the edit carried
+	evs, _, _ := h.editsRange(admin, "book", later-1, -1, false, 0)
+	if !reflect.DeepEqual(mpDecodeOne(t, book2.raw["book!book:b2"]), evs[0].sets["book!book:b2"]) {
+		t.Fatalf("the blob's value %v, the edit's %v", book2.records["book!book:b2"], evs[0].sets)
 	}
 
 	// snapshots are authorized against the view
@@ -1112,10 +1393,10 @@ func TestSnapshots(t *testing.T) {
 func TestPasswordAuth(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-patron", "id", "ann", "name", "Ann"))
+	h.accept(admin, mut("c1", "add-patron", "id", "ann", "name", "Ann"))
 
 	// anyone may create an account; the password is hashed at intake
-	h.accept("", cmd("c2", "create-account", "user", "ann", "password", "hunter2"))
+	h.accept("", mut("c2", "create-account", "user", "ann", "password", "hunter2"))
 	acct := h.snapshot(admin, "account:ann").records["account:ann!account"].(map[string]any)
 	hash := acct["hash"].(string)
 	if hash == "hunter2" || !strings.HasPrefix(hash, "$") {
@@ -1142,15 +1423,15 @@ func TestPasswordAuth(t *testing.T) {
 	}
 
 	// the token acts as ann
-	outs := h.commands(tok, cmd("c3", "rename-patron", "id", "ann", "name", "Anne"))
+	outs := h.mutations(tok, mut("c3", "rename-patron", "id", "ann", "name", "Anne"))
 	if outs[0].kind != "ok" {
 		t.Fatalf("rename as ann: %+v", outs[0])
 	}
-	outs = h.commands(tok, cmd("c4", "add-book", "id", "b1", "title", "Dune"))
+	outs = h.mutations(tok, mut("c4", "add-book", "id", "b1", "title", "Dune"))
 	if outs[0].kind != "reject" || outs[0].reason != "unauthorized" {
 		t.Fatalf("ann is not an admin: %+v", outs[0])
 	}
-	s := h.stream(tok, -1)
+	s := h.connect(tok, -1)
 	s.live()
 
 	// refresh re-issues
@@ -1163,8 +1444,8 @@ func TestPasswordAuth(t *testing.T) {
 		t.Fatalf("refresh should mint a new token")
 	}
 
-	// password change through the ordinary command path, as the user
-	h.accept(tok2, cmd("c5", "set-password", "user", "ann", "password", "correct horse"))
+	// password change through the ordinary mutation path, as the user
+	h.accept(tok2, mut("c5", "set-password", "user", "ann", "password", "correct horse"))
 	status, _, _ = h.do("POST", "/auth/token", "", mpEncode(map[string]any{
 		"kind": "password", "identity": "ann", "password": "hunter2",
 	}))
@@ -1178,10 +1459,10 @@ func TestPasswordAuth(t *testing.T) {
 		t.Fatalf("new password rejected")
 	}
 
-	// logout everywhere: existing tokens die on commands, streams, refresh
-	h.accept(tok2, cmd("c6", "revoke-sessions", "user", "ann"))
-	if status, _ := h.commandsStatus(tok2, cmd("c7", "rename-patron", "id", "ann", "name", "x")); status != 401 {
-		t.Fatalf("stale token accepted for commands: %d", status)
+	// logout everywhere: existing tokens die on mutations, connections, refresh
+	h.accept(tok2, mut("c6", "revoke-sessions", "user", "ann"))
+	if status, _ := h.mutationsStatus(tok2, mut("c7", "rename-patron", "id", "ann", "name", "x")); status != 401 {
+		t.Fatalf("stale token accepted for mutations: %d", status)
 	}
 	req, _ := http.NewRequest("GET", h.web.URL+"/stream?since=-1", nil)
 	req.Header.Set("Authorization", "Bearer "+tok2)
@@ -1191,7 +1472,7 @@ func TestPasswordAuth(t *testing.T) {
 	}
 	resp.Body.Close()
 	if resp.StatusCode != 401 {
-		t.Fatalf("stale token accepted for stream: %d", resp.StatusCode)
+		t.Fatalf("stale token accepted for a connection: %d", resp.StatusCode)
 	}
 	status, _, _ = h.do("POST", "/auth/token", tok2, mpEncode(map[string]any{"kind": "refresh"}))
 	if status != 401 {
@@ -1205,10 +1486,10 @@ func TestPasswordAuth(t *testing.T) {
 		t.Fatalf("login after revoke: %d", status)
 	}
 	tok3 := mpDecodeOne(t, out).(map[string]any)["token"].(string)
-	h.accept(tok3, cmd("c8", "rename-patron", "id", "ann", "name", "Ann"))
+	h.accept(tok3, mut("c8", "rename-patron", "id", "ann", "name", "Ann"))
 
 	// an account an admin creates as an admin is one
-	h.accept(admin, cmd("c9", "create-account", "user", "boss", "password", "pw", "admin", true))
+	h.accept(admin, mut("c9", "create-account", "user", "boss", "password", "pw", "admin", true))
 	status, _, out = h.do("POST", "/auth/token", "", mpEncode(map[string]any{
 		"kind": "password", "identity": "boss", "password": "pw",
 	}))
@@ -1216,7 +1497,7 @@ func TestPasswordAuth(t *testing.T) {
 		t.Fatalf("boss login: %d", status)
 	}
 	boss := mpDecodeOne(t, out).(map[string]any)["token"].(string)
-	h.accept(boss, cmd("c10", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(boss, mut("c10", "add-book", "id", "b1", "title", "Dune"))
 }
 
 // token keys ////////////////////////////////////////////////////////////////
@@ -1268,10 +1549,10 @@ func (h *harness) kids() []string {
 	return out
 }
 
-// works answers whether a token is accepted for a command
+// works answers whether a token is accepted for a mutation
 func (h *harness) works(token string) bool {
 	h.t.Helper()
-	status, _ := h.commandsStatus(token, cmd("w-"+token[len(token)-8:], "rename-patron", "id", "nobody", "name", "x"))
+	status, _ := h.mutationsStatus(token, mut("w-"+token[len(token)-8:], "rename-patron", "id", "nobody", "name", "x"))
 	return status == 200
 }
 
@@ -1299,7 +1580,7 @@ func TestTokensAreEd25519AndNameTheirKey(t *testing.T) {
 		"other claims": parts[0] + "." + b64.EncodeToString([]byte(`{"sub":"p1","gen":0,"exp":9999999999}`)) + "." + parts[2],
 	}
 	for name, f := range forged {
-		if status, _ := h.commandsStatus(f, cmd("f", "rename-patron", "id", "x", "name", "x")); status != 401 {
+		if status, _ := h.mutationsStatus(f, mut("f", "rename-patron", "id", "x", "name", "x")); status != 401 {
 			t.Fatalf("a token with %s: %d", name, status)
 		}
 	}
@@ -1405,13 +1686,13 @@ func TestDevAuthCanBeDisabled(t *testing.T) {
 	}
 }
 
-// a command's answer reports the database's own time, as Server-Timing
-func TestCommandsServerTiming(t *testing.T) {
+// a mutation's answer reports the database's own time, as Server-Timing
+func TestMutationsServerTiming(t *testing.T) {
 	h := start(t)
-	body := cmd("c1", "add-patron", "id", "p1", "name", "Ann").encode(nil)
-	status, header, _ := h.do("POST", "/commands", h.admin(), body)
+	body := mut("c1", "add-patron", "id", "p1", "name", "Ann").encode(nil)
+	status, header, _ := h.do("POST", "/mutations", h.admin(), body)
 	if status != 200 {
-		t.Fatalf("commands: status %d", status)
+		t.Fatalf("mutations: status %d", status)
 	}
 	if st := header.Get("Server-Timing"); !regexp.MustCompile(`^db;dur=\d+\.\d\d$`).MatchString(st) {
 		t.Fatalf("Server-Timing: %q", st)
@@ -1445,30 +1726,30 @@ func TestRestartKeepsEverything(t *testing.T) {
 	dir := t.TempDir()
 	h := startIn(t, dir)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
-	pos := h.accept(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann").in("s1", 1))
-	h.accept("", cmd("c3", "create-account", "user", "p1", "password", "pw"))
+	h.accept(admin, mut("c1", "add-book", "id", "b1", "title", "Dune"))
+	pos := h.accept(admin, mut("c2", "add-patron", "id", "p1", "name", "Ann").in("s1", 1))
+	h.accept("", mut("c3", "create-account", "user", "p1", "password", "pw"))
 	h.stop()
 
 	h = startIn(t, dir)
 	admin = h.admin()
-	// dedup survives: the resend is not run again, which precommit would reject
-	outs := h.commands(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann").in("s1", 1))
+	// dedup survives: the resend is not run again, which the decider would reject
+	outs := h.mutations(admin, mut("c2", "add-patron", "id", "p1", "name", "Ann").in("s1", 1))
 	if outs[0].kind != "ok" || outs[0].position < pos {
 		t.Fatalf("dedup lost across restart: %+v", outs[0])
 	}
 	// history survives and positions continue
-	s := h.stream(admin, 0)
-	var all []event
-	for len(all) < 6 {
-		all = append(all, events(s.nextTagged("events"))...)
+	s := h.connect(admin, 0)
+	var all []edit
+	for len(all) < 3 {
+		all = append(all, edits(s.nextTagged("edits"))...)
 	}
-	if all[5].stream != "account:p1" || all[5].position != 6 {
+	if all[2].slice != "account:p1" || all[2].position != 3 {
 		t.Fatalf("history after restart: %+v", all)
 	}
-	next := h.accept(admin, cmd("c4", "add-patron", "id", "p2", "name", "Bob"))
-	if next != 8 {
-		t.Fatalf("positions should continue at 7,8: got %d", next)
+	next := h.accept(admin, mut("c4", "add-patron", "id", "p2", "name", "Bob"))
+	if next != 4 {
+		t.Fatalf("positions should continue at 4: got %d", next)
 	}
 	// state survives
 	if h.snapshot(admin, "patron:p1").records["patron:p1!patron"] == nil {
@@ -1530,7 +1811,7 @@ func TestMsgpackCodec(t *testing.T) {
 }
 
 // injectingWriter is a response writer that runs a callback inside its first body write, which
-// the stream handler makes with the view registered and the connection not yet streaming, and
+// the connection handler makes with the view registered and the connection not yet streaming, and
 // that ends the request at the live frame
 type injectingWriter struct {
 	t      *testing.T
@@ -1559,118 +1840,123 @@ func (w *injectingWriter) Write(b []byte) (int, error) {
 func TestBootstrapDeliversEverythingAboveTheViewPosition(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c0", "add-patron", "id", "p0", "name", "Ann"))
+	h.accept(admin, mut("c0", "add-patron", "id", "p0", "name", "Ann"))
 
 	// a commit lands after the view is registered and before the connection streams, inside
 	// the view frame's write
 	ctx, cancel := context.WithCancel(t.Context())
 	var pos int64
 	w := &injectingWriter{t: t, header: http.Header{}, cancel: cancel, inject: func() {
-		pos = h.accept(admin, cmd("c1", "rename-patron", "id", "p0", "name", "Anne"))
+		pos = h.accept(admin, mut("c1", "rename-patron", "id", "p0", "name", "Anne"))
 	}}
 	req := httptest.NewRequest("GET", "/stream?since=-1", nil).WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer "+admin)
 	h.srv.handleStream(w, req)
 
-	// the view frame, then the commit's events, then live at its position
+	// the view frame, then the commit's edits, then live at its position
 	if len(w.frames) != 3 {
-		t.Fatalf("expected view, events, live, got %v", w.frames)
+		t.Fatalf("expected view, edits, live, got %v", w.frames)
 	}
 	if w.frames[0][0] != "view" || asInt(w.frames[0][2]) != pos-1 {
 		t.Fatalf("expected the view at %d, got %v", pos-1, w.frames[0])
 	}
-	if w.frames[1][0] != "events" || events(w.frames[1])[0].position != pos {
-		t.Fatalf("expected the events at %d, got %v", pos, w.frames[1])
+	if w.frames[1][0] != "edits" || edits(w.frames[1])[0].position != pos {
+		t.Fatalf("expected the edits at %d, got %v", pos, w.frames[1])
 	}
 	if w.frames[2][0] != "live" || asInt(w.frames[2][1]) != pos {
 		t.Fatalf("expected live at %d, got %v", pos, w.frames[2])
 	}
 }
 
-func TestColdReplayKeepsAtomsWhole(t *testing.T) {
-	h := startWith(t, t.Context(), Options{MaxCommands: coldBatch})
+func TestColdReplayKeepsMutationsWhole(t *testing.T) {
+	h := startWith(t, t.Context(), Options{MaxMutations: coldBatch})
 	admin := h.admin()
 
-	// a one-event atom shifts the two-event atoms after it off the window grid, so one of them
-	// spans positions coldBatch and coldBatch+1
-	h.accept(admin, cmd("c0", "add-patron", "id", "p0", "name", "Ann"))
-	h.accept(admin, cmd("c1", "rename-patron", "id", "p0", "name", "Anne"))
-	var cmds []command
-	for i := 1; i <= coldBatch/2; i++ {
-		cmds = append(cmds, cmd(fmt.Sprintf("a%d", i), "add-patron", "id", fmt.Sprintf("p%d", i), "name", "x"))
+	// a book and a hold on it per pair of positions, so the hold at coldBatch+1, which edits two
+	// slices, opens the replay's second window
+	h.accept(admin, mut("c0", "add-patron", "id", "p0", "name", "Ann"))
+	var muts []mutation
+	for i := 1; i <= coldBatch/2+1; i++ {
+		book := fmt.Sprintf("b%d", i)
+		muts = append(muts, mut("a"+book, "add-book", "id", book, "title", book),
+			mut("h"+book, "try-hold", "id", book, "book", book, "patron", "p0"))
 	}
-	h.commands(admin, cmds...)
+	for len(muts) > 0 {
+		n := min(len(muts), coldBatch)
+		h.mutations(admin, muts[:n]...)
+		muts = muts[n:]
+	}
 
-	// every frame is one whole atom: no command id spans two frames
-	s := h.stream(admin, 0)
+	// every frame is one whole mutation: its edits share a position and an id no other frame has
+	s := h.connect(admin, 0)
 	seen := map[string]bool{}
-	straddled := false
+	whole := false
 	for {
 		f := s.next()
 		if f[0] == "live" {
 			break
 		}
-		if f[0] != "events" {
+		if f[0] != "edits" {
 			continue
 		}
-		evs := events(f)
-		id := evs[0].commandid
+		evs := edits(f)
+		id := evs[0].mutation
 		if seen[id] {
-			t.Fatalf("atom %s split across frames", id)
+			t.Fatalf("mutation %s split across frames", id)
 		}
 		seen[id] = true
 		for _, e := range evs {
-			if e.commandid != id {
-				t.Fatalf("frame mixes atoms %s and %s", id, e.commandid)
+			if e.mutation != id || e.position != evs[0].position {
+				t.Fatalf("frame mixes mutations: %+v", evs)
 			}
 		}
-		if evs[0].position == coldBatch && evs[len(evs)-1].position == coldBatch+1 {
-			straddled = true
+		if evs[0].position == coldBatch+1 && len(evs) == 2 {
+			whole = true
 		}
 	}
-	if !straddled {
-		t.Fatalf("no atom spanned positions %d and %d", coldBatch, coldBatch+1)
+	if !whole {
+		t.Fatalf("no hold of two edits at position %d", coldBatch+1)
 	}
 }
 
 func TestLongCatchupNoOverflow(t *testing.T) {
-	h := startWith(t, t.Context(), Options{MaxCommands: 1500})
+	h := startWith(t, t.Context(), Options{MaxMutations: 1500})
 	admin := h.admin()
 	name := strings.Repeat("x", 2000)
-	var cmds []command
+	var muts []mutation
 	for i := 0; i < 1500; i++ {
-		cmds = append(cmds, cmd(fmt.Sprintf("h%d", i), "add-patron", "id", fmt.Sprintf("p%d", i), "name", name))
+		muts = append(muts, mut(fmt.Sprintf("h%d", i), "add-patron", "id", fmt.Sprintf("p%d", i), "name", name))
 	}
-	outs := h.commands(admin, cmds...)
+	outs := h.mutations(admin, muts...)
 	history := outs[len(outs)-1].position
-	if history != 3000 {
-		t.Fatalf("expected 3000 history positions, got %d", history)
+	if history != 1500 {
+		t.Fatalf("expected 1500 history positions, got %d", history)
 	}
 
 	// the reader stays paused so the cold catchup blocks on the socket
 	// while more commits land
 	startReading := make(chan struct{})
-	s := h.streamPaused(admin, 0, startReading)
+	s := h.connectPaused(admin, 0, startReading)
 	var last int64
 	for i := 0; i < 300; i++ {
-		last = h.accept(admin, cmd(fmt.Sprintf("l%d", i), "rename-patron", "id", "p1", "name", fmt.Sprint(i)))
+		last = h.accept(admin, mut(fmt.Sprintf("l%d", i), "rename-patron", "id", "p1", "name", fmt.Sprint(i)))
 	}
 	close(startReading)
 
 	// every position arrives exactly once, in order, across cold
-	// catchup, hot catchup, live frame, and live streaming
+	// catchup, hot catchup, live frame, and live frames
 	next := int64(1)
 	sawLive := false
 	for next <= last {
 		f := s.next()
 		switch f[0] {
-		case "events":
-			for _, e := range events(f) {
+		case "edits":
+			for _, e := range edits(f) {
 				if e.position != next {
 					t.Fatalf("expected position %d, got %d (live seen: %v)", next, e.position, sawLive)
 				}
-				next++
 			}
+			next++
 		case "live":
 			if sawLive {
 				t.Fatalf("live frame twice")
@@ -1688,52 +1974,47 @@ func TestLongCatchupNoOverflow(t *testing.T) {
 		t.Fatalf("no live frame")
 	}
 	// still connected and still live
-	pos := h.accept(admin, cmd("final", "rename-patron", "id", "p1", "name", "done"))
-	if evs := events(s.nextTagged("events")); evs[0].position != pos {
-		t.Fatalf("expected live event at %d, got %+v", pos, evs)
+	pos := h.accept(admin, mut("final", "rename-patron", "id", "p1", "name", "done"))
+	if evs := edits(s.nextTagged("edits")); evs[0].position != pos {
+		t.Fatalf("expected live edit at %d, got %+v", pos, evs)
 	}
 }
 
-func TestStreamByteCounters(t *testing.T) {
+func TestSliceByteCounters(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
-	h.accept(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne"))
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "rename-patron", "id", "p1", "name", "Anne"))
 
-	s := h.stream(admin, 0)
-	var evs []event
-	for len(evs) < 3 {
-		evs = append(evs, events(s.nextTagged("events"))...)
-	}
-	var eventBytes int64
-	for _, e := range evs {
-		eventBytes += int64(len(mpEncode(e.data)))
-	}
+	// the slice's edits as the log holds them: the /edits page, less each frame's 8 bytes of
+	// ["edits", [edit]]
+	_, _, page := h.do("GET", "/edits/patron:p1", admin, nil)
+	editBytes := int64(len(page) - 2*8)
 
 	blob := h.snapshot(admin, "patron:p1")
 	var stateBytes int64
 	for _, k := range blob.keys {
 		stateBytes += int64(len(k)) + int64(len(blob.raw[k]))
 	}
-	if blob.streams["patron:p1"] != 3 || len(blob.streams) != 1 {
-		t.Fatalf("streams in header: %v", blob.streams)
+	if blob.slices["patron:p1"] != 2 || len(blob.slices) != 1 {
+		t.Fatalf("slices in header: %v", blob.slices)
 	}
-	if asInt(blob.header["event_bytes"]) != eventBytes {
-		t.Fatalf("event_bytes %v, expected %d", blob.header["event_bytes"], eventBytes)
+	if asInt(blob.header["edit_bytes"]) != editBytes {
+		t.Fatalf("edit_bytes %v, expected %d", blob.header["edit_bytes"], editBytes)
 	}
 	if asInt(blob.header["state_bytes"]) != stateBytes || stateBytes == 0 {
 		t.Fatalf("state_bytes %v, expected %d", blob.header["state_bytes"], stateBytes)
 	}
 
-	// family blobs carry no per-stream counters
+	// family blobs carry no per-slice counters
 	if _, ok := h.snapshot(admin, "patron:*").header["state_bytes"]; ok {
-		t.Fatalf("family blob should not carry stream counters")
+		t.Fatalf("family blob should not carry slice counters")
 	}
 
-	// death zeroes state and still counts its own event bytes
-	h.accept(admin, cmd("c3", "remove-patron", "id", "p1"))
+	// a death zeroes state and still counts its own edit's bytes
+	h.accept(admin, mut("c3", "remove-patron", "id", "p1"))
 	dead := h.snapshot(admin, "patron:p1")
-	if asInt(dead.header["state_bytes"]) != 0 || asInt(dead.header["event_bytes"]) <= eventBytes {
+	if asInt(dead.header["state_bytes"]) != 0 || asInt(dead.header["edit_bytes"]) <= editBytes {
 		t.Fatalf("after death: %v", dead.header)
 	}
 }
@@ -1741,104 +2022,121 @@ func TestStreamByteCounters(t *testing.T) {
 func TestExpectAndConflict(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann")) // seq 1, 2
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann")) // seq 1
 
-	// expectations are the stream's seq: exact, so a met one passes and
+	// expectations are the slice's seq: exact, so a met one passes and
 	// the same one then conflicts, reporting the actual seq
-	o := h.expecting(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne").in("s1", 1), map[string]any{"patron:p1": 2})
+	o := h.expecting(admin, mut("c2", "rename-patron", "id", "p1", "name", "Anne").in("s1", 1), map[string]any{"patron:p1": 1})
 	if o.kind != "ok" {
 		t.Fatalf("matching expect: %+v", o)
 	}
-	o = h.expecting(admin, cmd("c3", "rename-patron", "id", "p1", "name", "Annie"), map[string]any{"patron:p1": 2})
-	if o.kind != "conflict" || o.current["patron:p1"] != 3 {
+	o = h.expecting(admin, mut("c3", "rename-patron", "id", "p1", "name", "Annie"), map[string]any{"patron:p1": 1})
+	if o.kind != "conflict" || o.current["patron:p1"] != 2 {
 		t.Fatalf("stale expect: %+v", o)
 	}
-	// a conflicting command never entered the log
+	// a conflicting mutation never entered the log
 	if got := h.snapshot(admin, "patron:p1").records["patron:p1!patron"].(map[string]any)["name"]; got != "Anne" {
-		t.Fatalf("conflict should not fold: %v", got)
+		t.Fatalf("a conflict should not write: %v", got)
 	}
 
-	// 0 asserts a stream was never born
-	o = h.expecting(admin, cmd("c4", "add-book", "id", "b1", "title", "Dune"), map[string]any{"book": 0})
+	// 0 asserts a slice was never born
+	o = h.expecting(admin, mut("c4", "add-book", "id", "b1", "title", "Dune"), map[string]any{"book": 0})
 	if o.kind != "ok" {
-		t.Fatalf("expect 0 on unborn stream: %+v", o)
+		t.Fatalf("expect 0 on an unborn slice: %+v", o)
 	}
-	o = h.expecting(admin, cmd("c5", "add-patron", "id", "p2", "name", "Bob"), map[string]any{"patron:p2": 1})
+	o = h.expecting(admin, mut("c5", "add-patron", "id", "p2", "name", "Bob"), map[string]any{"patron:p2": 1})
 	if o.kind != "conflict" || o.current["patron:p2"] != 0 {
-		t.Fatalf("expect on unborn stream reports 0: %+v", o)
+		t.Fatalf("expect on an unborn slice reports 0: %+v", o)
 	}
 
 	// several expectations: only the mismatches are reported
-	o = h.expecting(admin, cmd("c6", "rename-patron", "id", "p1", "name", "x"), map[string]any{"patron:p1": 3, "book": 5})
-	if o.kind != "conflict" || len(o.current) != 1 || o.current["book"] != 2 {
+	o = h.expecting(admin, mut("c6", "rename-patron", "id", "p1", "name", "x"), map[string]any{"patron:p1": 2, "book": 5})
+	if o.kind != "conflict" || len(o.current) != 1 || o.current["book"] != 1 {
 		t.Fatalf("mixed expect: %+v", o)
 	}
 
-	// the snapshot's seq is the token to expect for a stream with nothing
+	// the snapshot's seq is the token to expect for a slice with nothing
 	// after the cut
-	seq := h.snapshot(admin, "book").streams["book"]
-	o = h.expecting(admin, cmd("c6b", "add-book", "id", "b1", "title", "Dune"), map[string]any{"book": seq})
-	if o.kind != "reject" || o.reason != "book exists" { // precommit's rejection: it got past expect
+	seq := h.snapshot(admin, "book").slices["book"]
+	o = h.expecting(admin, mut("c6b", "add-book", "id", "b1", "title", "Dune"), map[string]any{"book": seq})
+	if o.kind != "reject" || o.reason != "book exists" { // decider's rejection: it got past expect
 		t.Fatalf("snapshot seq as expectation: %+v", o)
 	}
 
 	// dedup wins over a stale expectation
-	o = h.expecting(admin, cmd("c2", "rename-patron", "id", "p1", "name", "Anne").in("s1", 1), map[string]any{"patron:p1": 0})
+	o = h.expecting(admin, mut("c2", "rename-patron", "id", "p1", "name", "Anne").in("s1", 1), map[string]any{"patron:p1": 0})
 	if o.kind != "ok" {
 		t.Fatalf("resubmit with stale expect: %+v", o)
 	}
 
-	// a hashed command keeps its expectation through intake
-	o = h.expecting(admin, cmd("c7", "create-account", "user", "p1", "password", "pw"), map[string]any{"account:p1": 1})
+	// a hashed mutation keeps its expectation through intake
+	o = h.expecting(admin, mut("c7", "create-account", "user", "p1", "password", "pw"), map[string]any{"account:p1": 1})
 	if o.kind != "conflict" || o.current["account:p1"] != 0 {
 		t.Fatalf("expect survives hash intake: %+v", o)
 	}
-	o = h.expecting(admin, cmd("c8", "create-account", "user", "p1", "password", "pw"), map[string]any{"account:p1": 0})
+	o = h.expecting(admin, mut("c8", "create-account", "user", "p1", "password", "pw"), map[string]any{"account:p1": 0})
 	if o.kind != "ok" {
-		t.Fatalf("hashed command with matching expect: %+v", o)
+		t.Fatalf("hashed mutation with matching expect: %+v", o)
 	}
 
-	// an expectation names only streams the sender may see, so it never learns another's seq,
+	// an expectation names only slices the sender may see, so it never learns another's seq,
 	// nor whether it exists: an anonymous sender sees the book alone
-	o = h.expecting("", cmd("c8b", "create-account", "user", "p5", "password", "pw"), map[string]any{"book": h.snapshot(admin, "book").streams["book"]})
+	o = h.expecting("", mut("c8b", "create-account", "user", "p5", "password", "pw"), map[string]any{"book": h.snapshot(admin, "book").slices["book"]})
 	if o.kind != "ok" {
-		t.Fatalf("anonymous expect of a stream it may see: %+v", o)
+		t.Fatalf("anonymous expect of a slice it may see: %+v", o)
 	}
-	for _, stream := range []string{"account:p1", "account:p6"} {
-		o = h.expecting("", cmd("c8c", "create-account", "user", "p6", "password", "pw"), map[string]any{stream: 0})
-		if o.kind != "reject" || o.reason != "expect: "+stream+" is not a stream the sender may see" {
-			t.Fatalf("anonymous expect of %s: %+v", stream, o)
+	for _, slice := range []string{"account:p1", "account:p6"} {
+		o = h.expecting("", mut("c8c", "create-account", "user", "p6", "password", "pw"), map[string]any{slice: 0})
+		if o.kind != "reject" || o.reason != "expect: "+slice+" is not a slice the sender may see" {
+			t.Fatalf("anonymous expect of %s: %+v", slice, o)
 		}
 	}
 
-	// expect names at most 1024 streams
+	// a slice name is checked by its syntax alone, so one in a family no slice type declares, or
+	// under too many parameters, names a slice never born, which the sender may see or not as any
+	// other
+	for i, slice := range []string{"nope:p1", "patron:p1,x"} {
+		o = h.expecting(admin, mut(fmt.Sprintf("c8d-%d", i), "rename-patron", "id", "p1", "name", "x"), map[string]any{slice: 0})
+		if o.kind != "ok" {
+			t.Fatalf("expect of %s: %+v", slice, o)
+		}
+		o = h.expecting("", mut(fmt.Sprintf("c8e-%d", i), "create-account", "user", "p6", "password", "pw"), map[string]any{slice: 0})
+		if o.kind != "reject" || o.reason != "expect: "+slice+" is not a slice the sender may see" {
+			t.Fatalf("anonymous expect of %s: %+v", slice, o)
+		}
+	}
+
+	// expect names at most 1024 slices
 	many := map[string]any{}
 	for i := range 1024 {
 		many[fmt.Sprintf("patron:q%d", i)] = 0
 	}
-	o = h.expecting(admin, cmd("c9", "add-patron", "id", "p3", "name", "Cy"), many)
+	o = h.expecting(admin, mut("c9", "add-patron", "id", "p3", "name", "Cy"), many)
 	if o.kind != "ok" {
 		t.Fatalf("1024 expectations: %+v", o)
 	}
 	many["patron:q1024"] = 0
-	o = h.expecting(admin, cmd("c10", "add-patron", "id", "p4", "name", "Di"), many)
-	if o.kind != "reject" || o.reason != "expect names 1025 streams, more than 1024" {
+	o = h.expecting(admin, mut("c10", "add-patron", "id", "p4", "name", "Di"), many)
+	if o.kind != "reject" || o.reason != "expect names 1025 slices, more than 1024" {
 		t.Fatalf("1025 expectations: %+v", o)
 	}
 
-	// each an exact stream name and a seq from 0 to 2^53 - 1
+	// each an exact slice name and a seq from 0 to 2^53 - 1
 	malformed := []struct {
 		expect map[string]any
 		reason string
 	}{
-		{map[string]any{"nope:p1": 0}, "expect: nope:p1 is not a stream name"},
-		{map[string]any{"patron:p1\x00x": 0}, "expect: patron:p1 is not a stream name"},
+		{map[string]any{"patron:": 0}, "expect: patron: is not a slice name"},
+		{map[string]any{"patron:p/1": 0}, "expect: patron:p/1 is not a slice name"},
+		{map[string]any{"patron:p1!": 0}, "expect: patron:p1! is not a slice name"},
+		{map[string]any{"patron:*": 0}, "expect: patron:* is not a slice name"},
+		{map[string]any{"patron:p1\x00x": 0}, "expect: patron:p1 is not a slice name"},
 		{map[string]any{"patron:p1": -1}, "expect: the seq of patron:p1 is not an integer from 0 to 2^53 - 1"},
 		{map[string]any{"patron:p1": int64(1) << 53}, "expect: the seq of patron:p1 is not an integer from 0 to 2^53 - 1"},
 		{map[string]any{"patron:p1": 3.0}, "expect: the seq of patron:p1 is not an integer from 0 to 2^53 - 1"},
 	}
 	for i, m := range malformed {
-		o = h.expecting(admin, cmd(fmt.Sprintf("c11-%d", i), "rename-patron", "id", "p1", "name", "x"), m.expect)
+		o = h.expecting(admin, mut(fmt.Sprintf("c11-%d", i), "rename-patron", "id", "p1", "name", "x"), m.expect)
 		if o.kind != "reject" || o.reason != m.reason {
 			t.Fatalf("expect %v: %+v", m.expect, o)
 		}
@@ -1846,7 +2144,7 @@ func TestExpectAndConflict(t *testing.T) {
 
 	// and each named once, in a map; Go's maps cannot say either otherwise, so these are built by
 	// hand
-	rename := cmd("c12", "rename-patron", "id", "p1", "name", "x")
+	rename := mut("c12", "rename-patron", "id", "p1", "name", "x")
 	twice := append([]byte{0x82}, mpEncode("patron:p1")...)
 	twice = append(twice, 3)
 	twice = append(twice, mpEncode("patron:p1")...)
@@ -1856,10 +2154,10 @@ func TestExpectAndConflict(t *testing.T) {
 		string(mpEncode([]any{"x"})): "expect must be a map",
 	} {
 		body := rename.encode(nil)
-		body[0] = 0x95 // the command's array gains expect
-		status, _, out := h.do("POST", "/commands", admin, append(body, expect...))
+		body[0] = 0x95 // the mutation's array gains expect
+		status, _, out := h.do("POST", "/mutations", admin, append(body, expect...))
 		if status != 200 {
-			t.Fatalf("commands: status %d", status)
+			t.Fatalf("mutations: status %d", status)
 		}
 		if o := decodeOutcomes(t, out)[0]; o.kind != "reject" || o.reason != reason {
 			t.Fatalf("expect %x: %+v", expect, o)
@@ -1867,63 +2165,62 @@ func TestExpectAndConflict(t *testing.T) {
 	}
 }
 
-// A request carries at most 128 commands, and one without a session at most 8; a request past
-// its limit is refused whole with 413 and the limit it was held to, before any command is
+// A request carries at most 128 mutations, and one without a session at most 8; a request past
+// its limit is refused whole with 413 and the limit it was held to, before any mutation is
 // checked.  Options change both.
-func TestCommandLimits(t *testing.T) {
-	books := func(prefix string, n int) []command {
-		var cmds []command
+func TestMutationLimits(t *testing.T) {
+	books := func(prefix string, n int) []mutation {
+		var muts []mutation
 		for i := range n {
 			id := fmt.Sprintf("%s%d", prefix, i)
-			cmds = append(cmds, cmd(id, "add-book", "id", id, "title", "Dune"))
+			muts = append(muts, mut(id, "add-book", "id", id, "title", "Dune"))
 		}
-		return cmds
+		return muts
 	}
-	post := func(h *harness, token string, cmds []command) (int, string) {
+	post := func(h *harness, token string, muts []mutation) (int, string) {
 		var body []byte
-		for _, c := range cmds {
+		for _, c := range muts {
 			body = append(body, c.encode(nil)...)
 		}
-		status, header, _ := h.do("POST", "/commands", token, body)
-		return status, header.Get("PhaseLock-Max-Commands")
+		status, header, _ := h.do("POST", "/mutations", token, body)
+		return status, header.Get("PhaseLock-Max-Mutations")
 	}
 
-	// the defaults: anonymous commands are answered, if only with rejects, up to 8
+	// the defaults: anonymous mutations are answered, if only with rejects, up to 8
 	h := start(t)
 	admin := h.admin()
 	if status, _ := post(h, admin, books("a", 128)); status != 200 {
-		t.Fatalf("128 commands: status %d", status)
+		t.Fatalf("128 mutations: status %d", status)
 	}
 	if status, limit := post(h, admin, books("b", 129)); status != 413 || limit != "128" {
-		t.Fatalf("129 commands: status %d, limit %q", status, limit)
+		t.Fatalf("129 mutations: status %d, limit %q", status, limit)
 	}
 	if status, _ := post(h, "", books("c", 8)); status != 200 {
-		t.Fatalf("8 anonymous commands: status %d", status)
+		t.Fatalf("8 anonymous mutations: status %d", status)
 	}
 	if status, limit := post(h, "", books("d", 9)); status != 413 || limit != "8" {
-		t.Fatalf("9 anonymous commands: status %d, limit %q", status, limit)
+		t.Fatalf("9 anonymous mutations: status %d, limit %q", status, limit)
 	}
 
 	// a refused request decided nothing
-	if o := h.commands(admin, books("b", 1)...)[0]; o.kind != "ok" {
-		t.Fatalf("a command of a refused request: %+v", o)
+	if o := h.mutations(admin, books("b", 1)...)[0]; o.kind != "ok" {
+		t.Fatalf("a mutation of a refused request: %+v", o)
 	}
 
 	// limits of the server's own
-	h = startWith(t, t.Context(), Options{MaxCommands: 4, MaxAnonymousCommands: 2})
+	h = startWith(t, t.Context(), Options{MaxMutations: 4, MaxAnonymousMutations: 2})
 	if status, limit := post(h, h.admin(), books("e", 5)); status != 413 || limit != "4" {
-		t.Fatalf("5 commands under 4: status %d, limit %q", status, limit)
+		t.Fatalf("5 mutations under 4: status %d, limit %q", status, limit)
 	}
 	if status, limit := post(h, "", books("f", 3)); status != 413 || limit != "2" {
-		t.Fatalf("3 anonymous commands under 2: status %d, limit %q", status, limit)
+		t.Fatalf("3 anonymous mutations under 2: status %d, limit %q", status, limit)
 	}
 }
 
-// eventsRange reads one page of /events and returns its events and the
-// scanned header.
-func (h *harness) eventsRange(token, stream string, after, before int64, reverse bool, max int) ([]event, int64, int) {
+// editsRange reads one page of /edits and returns its edits and the scanned header.
+func (h *harness) editsRange(token, selector string, after, before int64, reverse bool, max int) ([]edit, int64, int) {
 	h.t.Helper()
-	q := "/events/" + stream + "?"
+	q := "/edits/" + selector + "?"
 	if after >= 0 {
 		q += fmt.Sprintf("&after=%d", after)
 	}
@@ -1940,7 +2237,7 @@ func (h *harness) eventsRange(token, stream string, after, before int64, reverse
 	if status != 200 {
 		return nil, 0, status
 	}
-	var evs []event
+	var evs []edit
 	dec := newMpDecoder(bytes.NewReader(out))
 	for {
 		f, err := dec.Decode()
@@ -1948,9 +2245,9 @@ func (h *harness) eventsRange(token, stream string, after, before int64, reverse
 			break
 		}
 		if err != nil {
-			h.t.Fatalf("decode events: %v", err)
+			h.t.Fatalf("decode edits: %v", err)
 		}
-		evs = append(evs, events(f.([]any))...)
+		evs = append(evs, edits(f.([]any))...)
 	}
 	scanned, err := strconv.ParseInt(hdr.Get("PhaseLock-Scanned"), 10, 64)
 	if err != nil {
@@ -1959,142 +2256,176 @@ func (h *harness) eventsRange(token, stream string, after, before int64, reverse
 	return evs, scanned, status
 }
 
-func TestEventsRange(t *testing.T) {
+// positions are the positions of edits, in order
+func positions(evs []edit) []int64 {
+	var out []int64
+	for _, e := range evs {
+		out = append(out, e.position)
+	}
+	return out
+}
+
+func TestEditsRange(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann")) // 1, 2
-	h.accept(admin, cmd("c2", "add-patron", "id", "p2", "name", "Bob")) // 3, 4
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann")) // 1
+	h.accept(admin, mut("c2", "add-patron", "id", "p2", "name", "Bob")) // 2
 	for i := 0; i < 5; i++ {
-		h.accept(admin, cmd(fmt.Sprintf("r%d", i), "rename-patron", "id", "p1", "name", fmt.Sprint(i))) // 5..9
+		h.accept(admin, mut(fmt.Sprintf("r%d", i), "rename-patron", "id", "p1", "name", fmt.Sprint(i))) // 3..7
 	}
-	last := h.accept(admin, cmd("c3", "rename-patron", "id", "p2", "name", "Robert")) // 10
+	last := h.accept(admin, mut("c3", "rename-patron", "id", "p2", "name", "Robert")) // 8
 	head := last + 1                                                                  // a position the client does not have yet
+	at := func(evs []edit, want ...int64) bool { return slices.Equal(positions(evs), want) }
 
-	// forward: only p1's events, ascending, range exhausted in one page
-	evs, scanned, _ := h.eventsRange(admin, "patron:p1", 0, head, false, 0)
-	if len(evs) != 7 || evs[0].position != 1 || evs[6].position != 9 || scanned != head {
-		t.Fatalf("forward: %d events, scanned %d", len(evs), scanned)
+	// forward: only p1's edits, ascending, range exhausted in one page
+	evs, scanned, _ := h.editsRange(admin, "patron:p1", 0, head, false, 0)
+	if !at(evs, 1, 3, 4, 5, 6, 7) || scanned != head {
+		t.Fatalf("forward: %v, scanned %d", positions(evs), scanned)
 	}
 	for i := 1; i < len(evs); i++ {
-		if evs[i].stream != "patron:p1" || evs[i].seq != evs[i-1].seq+1 {
+		if evs[i].slice != "patron:p1" || evs[i].seq != evs[i-1].seq+1 {
 			t.Fatalf("forward order/seq: %+v", evs)
 		}
 	}
 
 	// both bounds are exclusive: positions the client holds
-	evs, _, _ = h.eventsRange(admin, "patron:p1", 2, 6, false, 0)
-	if len(evs) != 1 || evs[0].position != 5 {
+	evs, _, _ = h.editsRange(admin, "patron:p1", 3, 5, false, 0)
+	if !at(evs, 4) {
 		t.Fatalf("bounds: %+v", evs)
 	}
 
 	// reverse: descending, scanned is the next before
-	evs, scanned, _ = h.eventsRange(admin, "patron:p1", 0, head, true, 0)
-	if len(evs) != 7 || evs[0].position != 9 || evs[6].position != 1 || scanned != 0 {
-		t.Fatalf("reverse: %+v scanned %d", evs, scanned)
+	evs, scanned, _ = h.editsRange(admin, "patron:p1", 0, head, true, 0)
+	if !at(evs, 7, 6, 5, 4, 3, 1) || scanned != 0 {
+		t.Fatalf("reverse: %v scanned %d", positions(evs), scanned)
 	}
 
 	// paging with max: the scanned value plugs straight into the next
 	// request, in both directions, with no arithmetic
-	evs, scanned, _ = h.eventsRange(admin, "patron:p1", 0, head, false, 3)
-	if len(evs) != 3 || evs[2].position != 5 || scanned != 5 {
-		t.Fatalf("forward page: %+v scanned %d", evs, scanned)
+	evs, scanned, _ = h.editsRange(admin, "patron:p1", 0, head, false, 3)
+	if !at(evs, 1, 3, 4) || scanned != 4 {
+		t.Fatalf("forward page: %v scanned %d", positions(evs), scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron:p1", scanned, head, false, 3)
-	if len(evs) != 3 || evs[0].position != 6 || evs[2].position != 8 || scanned != 8 {
-		t.Fatalf("forward page 2: %+v scanned %d", evs, scanned)
+	evs, scanned, _ = h.editsRange(admin, "patron:p1", scanned, head, false, 3)
+	if !at(evs, 5, 6, 7) || scanned != 7 {
+		t.Fatalf("forward page 2: %v scanned %d", positions(evs), scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron:p1", scanned, head, false, 3)
-	if len(evs) != 1 || evs[0].position != 9 || scanned != head {
-		t.Fatalf("forward page 3: %+v scanned %d", evs, scanned)
+	evs, scanned, _ = h.editsRange(admin, "patron:p1", scanned, head, false, 3)
+	if len(evs) != 0 || scanned != head {
+		t.Fatalf("forward page 3: %v scanned %d", positions(evs), scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron:p1", 0, head, true, 3)
-	if len(evs) != 3 || evs[2].position != 7 || scanned != 7 {
-		t.Fatalf("reverse page: %+v scanned %d", evs, scanned)
+	evs, scanned, _ = h.editsRange(admin, "patron:p1", 0, head, true, 3)
+	if !at(evs, 7, 6, 5) || scanned != 5 {
+		t.Fatalf("reverse page: %v scanned %d", positions(evs), scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron:p1", 0, scanned, true, 3)
-	if len(evs) != 3 || evs[0].position != 6 || evs[2].position != 2 || scanned != 2 {
-		t.Fatalf("reverse page 2: %+v scanned %d", evs, scanned)
+	evs, scanned, _ = h.editsRange(admin, "patron:p1", 0, scanned, true, 3)
+	if !at(evs, 4, 3, 1) || scanned != 1 {
+		t.Fatalf("reverse page 2: %v scanned %d", positions(evs), scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron:p1", 0, scanned, true, 3)
-	if len(evs) != 1 || evs[0].position != 1 || scanned != 0 {
-		t.Fatalf("reverse page 3: %+v scanned %d", evs, scanned)
+	evs, scanned, _ = h.editsRange(admin, "patron:p1", 0, scanned, true, 3)
+	if len(evs) != 0 || scanned != 0 {
+		t.Fatalf("reverse page 3: %v scanned %d", positions(evs), scanned)
 	}
 
-	// the stream must be visible to the principal
-	if _, _, status := h.eventsRange(h.token("p1"), "patron:p2", 0, head, false, 0); status != 403 {
-		t.Fatalf("invisible stream: status %d", status)
+	// the slice must be visible to the principal
+	if _, _, status := h.editsRange(h.token("p1"), "patron:p2", 0, head, false, 0); status != 403 {
+		t.Fatalf("invisible slice: status %d", status)
 	}
-	if _, _, status := h.eventsRange(h.token("p1"), "patron:p1", 0, head, false, 0); status != 200 {
-		t.Fatalf("own stream: status %d", status)
+	if _, _, status := h.editsRange(h.token("p1"), "patron:p1", 0, head, false, 0); status != 200 {
+		t.Fatalf("own slice: status %d", status)
 	}
 
 	// both bounds are optional: the start of the log and the head.  At the
 	// head, scanned is the last position delivered, or after if nothing was
-	evs, scanned, _ = h.eventsRange(admin, "patron:p1", -1, -1, false, 0)
-	if len(evs) != 7 || evs[0].position != 1 || evs[6].position != 9 || scanned != 9 {
-		t.Fatalf("unbounded forward: %d events, scanned %d", len(evs), scanned)
+	evs, scanned, _ = h.editsRange(admin, "patron:p1", -1, -1, false, 0)
+	if !at(evs, 1, 3, 4, 5, 6, 7) || scanned != 7 {
+		t.Fatalf("unbounded forward: %v, scanned %d", positions(evs), scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron:p1", 9, -1, false, 0)
-	if len(evs) != 0 || scanned != 9 {
-		t.Fatalf("empty at head: %d events, scanned %d", len(evs), scanned)
+	evs, scanned, _ = h.editsRange(admin, "patron:p1", 7, -1, false, 0)
+	if len(evs) != 0 || scanned != 7 {
+		t.Fatalf("empty at head: %v, scanned %d", positions(evs), scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron:p1", -1, -1, true, 0)
-	if len(evs) != 7 || evs[0].position != 9 || scanned != 0 {
-		t.Fatalf("unbounded reverse: %d events, scanned %d", len(evs), scanned)
+	evs, scanned, _ = h.editsRange(admin, "patron:p1", -1, -1, true, 0)
+	if !at(evs, 7, 6, 5, 4, 3, 1) || scanned != 0 {
+		t.Fatalf("unbounded reverse: %v, scanned %d", positions(evs), scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron:p1", -1, 6, false, 0)
-	if len(evs) != 3 || evs[2].position != 5 || scanned != 6 {
-		t.Fatalf("no after: %+v scanned %d", evs, scanned)
+	evs, scanned, _ = h.editsRange(admin, "patron:p1", -1, 4, false, 0)
+	if !at(evs, 1, 3) || scanned != 4 {
+		t.Fatalf("no after: %v scanned %d", positions(evs), scanned)
 	}
 
-	// a family ref interleaves its streams in position order
-	evs, scanned, _ = h.eventsRange(admin, "patron:*", 0, head, true, 4)
-	if len(evs) != 4 || evs[0].position != 10 || evs[1].position != 9 || evs[3].position != 7 || scanned != 7 {
-		t.Fatalf("family reverse page: %+v scanned %d", evs, scanned)
+	// a family selector interleaves its slices in position order
+	evs, scanned, _ = h.editsRange(admin, "patron:*", 0, head, true, 4)
+	if !at(evs, 8, 7, 6, 5) || scanned != 5 {
+		t.Fatalf("family reverse page: %v scanned %d", positions(evs), scanned)
 	}
-	evs, scanned, _ = h.eventsRange(admin, "patron:*", 0, scanned, true, 0)
-	if len(evs) != 6 || evs[0].position != 6 || evs[5].position != 1 || scanned != 0 {
-		t.Fatalf("family reverse page 2: %+v scanned %d", evs, scanned)
+	evs, scanned, _ = h.editsRange(admin, "patron:*", 0, scanned, true, 0)
+	if !at(evs, 4, 3, 2, 1) || scanned != 0 {
+		t.Fatalf("family reverse page 2: %v scanned %d", positions(evs), scanned)
 	}
-	evs, _, _ = h.eventsRange(admin, "patron:*", 2, 5, false, 0)
-	if len(evs) != 2 || evs[0].position != 3 || evs[1].position != 4 || evs[0].stream != "patron:p2" {
+	evs, _, _ = h.editsRange(admin, "patron:*", 0, 3, false, 0)
+	if !at(evs, 1, 2) || evs[0].slice != "patron:p1" || evs[1].slice != "patron:p2" {
 		t.Fatalf("family bounds: %+v", evs)
 	}
 
-	// "*" is every stream; only a view granting "*" covers it, and a
-	// ref must be well formed
-	evs, _, _ = h.eventsRange(admin, "*", 0, head, false, 0)
-	if len(evs) != 10 || evs[0].position != 1 || evs[9].position != 10 {
-		t.Fatalf("everything: %d events", len(evs))
+	// "*" is every slice; only a view granting "*" covers it, and a
+	// selector must be well formed
+	evs, _, _ = h.editsRange(admin, "*", 0, head, false, 0)
+	if len(evs) != 8 || evs[0].position != 1 || evs[7].position != 8 {
+		t.Fatalf("everything: %v", positions(evs))
 	}
-	if _, _, status := h.eventsRange(h.token("p1"), "*", 0, head, false, 0); status != 403 {
+	if _, _, status := h.editsRange(h.token("p1"), "*", 0, head, false, 0); status != 403 {
 		t.Fatalf("everything for p1: status %d", status)
 	}
-	if _, _, status := h.eventsRange(h.token("p1"), "patron:*", 0, head, false, 0); status != 403 {
+	if _, _, status := h.editsRange(h.token("p1"), "patron:*", 0, head, false, 0); status != 403 {
 		t.Fatalf("family for p1: status %d", status)
 	}
 	for _, bad := range []string{"", "patron:", "patron:p1!", "patron*", "patron:p*", "pat*ron", "*:patron"} {
-		if _, _, status := h.eventsRange(admin, bad, 0, head, false, 0); status != 400 {
-			t.Fatalf("ref %q: status %d", bad, status)
+		if _, _, status := h.editsRange(admin, bad, 0, head, false, 0); status != 400 {
+			t.Fatalf("selector %q: status %d", bad, status)
 		}
 	}
 }
 
-// the command check //////////////////////////////////////////////////////////
+// a page of /edits holds max edits and the rest of the last one's position, so it never splits
+// a mutation's edits, in either direction
+func TestAnEditsPageNeverSplitsAMutation(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-book", "id", "b1", "title", "Dune"))                      // 1
+	h.accept(admin, mut("c2", "add-patron", "id", "p1", "name", "Ann"))                      // 2
+	hold := h.accept(admin, mut("c3", "try-hold", "id", "h1", "book", "b1", "patron", "p1")) // 3, two edits
 
-func TestCommandCheck(t *testing.T) {
+	evs, scanned, _ := h.editsRange(admin, "*", 0, hold+1, false, 3)
+	if !slices.Equal(positions(evs), []int64{1, 2, 3, 3}) || scanned != 3 {
+		t.Fatalf("a page ending inside a mutation: %v scanned %d", positions(evs), scanned)
+	}
+	evs, scanned, _ = h.editsRange(admin, "*", 2, hold+1, false, 1)
+	if !slices.Equal(positions(evs), []int64{3, 3}) || evs[0].slice != "book" || scanned != 3 {
+		t.Fatalf("a page of one mutation's edits: %+v scanned %d", evs, scanned)
+	}
+	evs, scanned, _ = h.editsRange(admin, "*", 0, hold+1, true, 1)
+	if !slices.Equal(positions(evs), []int64{3, 3}) || evs[0].slice != "book" || evs[1].slice != "patron:p1" ||
+		scanned != 3 {
+		t.Fatalf("a reverse page of one mutation's edits: %+v scanned %d", evs, scanned)
+	}
+}
+
+// the mutation check //////////////////////////////////////////////////////////
+
+func TestMutationCheck(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
 
-	// each malformed command is rejected where it stands, naming the problem,
+	// each malformed mutation is rejected where it stands, naming the problem,
 	// and the well-formed ones around it are accepted
-	outs := h.commands(admin,
-		cmd("c1", "add-book", "id", "b1", "title", "Dune").in("s1", 1),
-		cmd("c2", "add-book", "id", "b2").in("s1", 2),
-		cmd("c3", "add-book", "id", 7, "title", "Emma"),
-		cmd("c4", "add-book", "id", "b4", "title", "Emma", "extra", true),
-		cmd("c5", "no-such-command", "id", "x"),
-		cmd("c6", "add-book", "id", "b6", "title", "Persuasion"),
+	outs := h.mutations(admin,
+		mut("c1", "add-book", "id", "b1", "title", "Dune").in("s1", 1),
+		mut("c2", "add-book", "id", "b2").in("s1", 2),
+		mut("c3", "add-book", "id", 7, "title", "Emma"),
+		mut("c4", "add-book", "id", "b4", "title", "Emma", "extra", true),
+		mut("c5", "no-such-mutation", "id", "x"),
+		mut("c6", "add-book", "id", "b6", "title", "Persuasion"),
 	)
 	kinds := []string{"ok", "reject", "reject", "reject", "reject", "ok"}
 	for i, k := range kinds {
@@ -2106,7 +2437,7 @@ func TestCommandCheck(t *testing.T) {
 		1: "$.title: missing required field",
 		2: "$.id: expected a string",
 		3: "$.extra: unknown field",
-		4: "no-such-command",
+		4: "no-such-mutation",
 	} {
 		if !strings.Contains(outs[i].reason, needle) {
 			t.Fatalf("outcome %d: %q should mention %q", i, outs[i].reason, needle)
@@ -2116,32 +2447,26 @@ func TestCommandCheck(t *testing.T) {
 		t.Fatalf("oks around the rejects: %+v", outs)
 	}
 
-	// a malformed command never reached dedup, so it was not a decision: its number is free for
+	// a malformed mutation never reached dedup, so it was not a decision: its number is free for
 	// a good one, which runs and lands past everything before it
-	if o := h.commands(admin, cmd("c2", "add-book", "id", "b2", "title", "Mansfield Park").in("s1", 2))[0]; o.kind != "ok" || o.position <= outs[5].position {
-		t.Fatalf("number of a malformed command reused: %+v", o)
+	if o := h.mutations(admin, mut("c2", "add-book", "id", "b2", "title", "Mansfield Park").in("s1", 2))[0]; o.kind != "ok" || o.position <= outs[5].position {
+		t.Fatalf("number of a malformed mutation reused: %+v", o)
 	}
 
-	// the discriminator may sit anywhere in the map, and the log has it first
-	body := rawCommand("c7", "id", "b7", "title", "Emma", "type", "add-book")
-	if status, _, out := h.do("POST", "/commands", admin, body); status != 200 || decodeOutcomes(t, out)[0].kind != "ok" {
+	// the discriminator may sit anywhere in the map
+	body := rawMutation("c7", "id", "b7", "title", "Emma", "type", "add-book")
+	if status, _, out := h.do("POST", "/mutations", admin, body); status != 200 || decodeOutcomes(t, out)[0].kind != "ok" {
 		t.Fatalf("discriminator last: %d %s", status, out)
-	}
-	_, _, logged := h.do("GET", "/events/book", admin, nil)
-	written := append(mpMapHeader(nil, 3), mpEncode("type")...)
-	written = append(append(written, mpEncode("add-book")...), mpEncode("id")...)
-	if !bytes.Contains(logged, append(written, mpEncode("b7")...)) {
-		t.Fatalf("the logged event does not lead with its discriminator: %x", logged)
 	}
 
 	// an empty body is fine; a body that is not msgpack is a 400
-	if status, _, _ := h.do("POST", "/commands", admin, []byte{}); status != 200 {
+	if status, _, _ := h.do("POST", "/mutations", admin, []byte{}); status != 200 {
 		t.Fatalf("empty body: %d", status)
 	}
-	if status, _, _ := h.do("POST", "/commands", admin, []byte{0xc1}); status != 400 {
+	if status, _, _ := h.do("POST", "/mutations", admin, []byte{0xc1}); status != 400 {
 		t.Fatalf("not msgpack: %d", status)
 	}
-	// a command that is not [S, n, id, data, expect?] is a 400 too, since nothing can be
+	// a mutation that is not [S, n, id, data, expect?] is a 400 too, since nothing can be
 	// answered for it
 	data := map[string]any{"type": "add-book", "id": "b9", "title": "Emma"}
 	for name, c := range map[string][]any{
@@ -2160,13 +2485,13 @@ func TestCommandCheck(t *testing.T) {
 		if len(c) == 1 {
 			v = c[0]
 		}
-		if status, _, _ := h.do("POST", "/commands", admin, mpEncode(v)); status != 400 {
+		if status, _, _ := h.do("POST", "/mutations", admin, mpEncode(v)); status != 400 {
 			t.Fatalf("%s: %d", name, status)
 		}
 	}
 	// a series id of the longest length and the largest n are well-formed
 	big := []any{strings.Repeat("s", 64), int64(1)<<53 - 1, label("c9"), data}
-	if status, _, out := h.do("POST", "/commands", admin, mpEncode(big)); status != 200 || decodeOutcomes(t, out)[0].kind != "ok" {
+	if status, _, out := h.do("POST", "/mutations", admin, mpEncode(big)); status != 200 || decodeOutcomes(t, out)[0].kind != "ok" {
 		t.Fatalf("the largest series id and n: %d %s", status, out)
 	}
 }
@@ -2176,12 +2501,12 @@ func TestTypedValues(t *testing.T) {
 	admin := h.admin()
 	added := time.Date(2026, 1, 2, 3, 4, 5, 678e6, time.UTC)
 
-	// a date field travels as a timestamp: into the log, through the reducer, out of the store
-	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune", "added", added))
-	s := h.stream(admin, 0)
-	evs := events(s.nextTagged("events"))
-	if got, ok := evs[1].data["added"].(time.Time); !ok || !got.Equal(added) {
-		t.Fatalf("event date: %v", evs[1].data["added"])
+	// a date field travels as a timestamp: through the decider, into the edit, out of the store
+	h.accept(admin, mut("c1", "add-book", "id", "b1", "title", "Dune", "added", added))
+	s := h.connect(admin, 0)
+	evs := edits(s.nextTagged("edits"))
+	if got, ok := evs[0].field("book!book:b1", "added").(time.Time); !ok || !got.Equal(added) {
+		t.Fatalf("edit date: %v", evs[0].field("book!book:b1", "added"))
 	}
 	book := h.snapshot(admin, "book").records["book!book:b1"].(map[string]any)
 	if got, ok := book["added"].(time.Time); !ok || !got.Equal(added) {
@@ -2198,7 +2523,7 @@ func TestTypedValues(t *testing.T) {
 	}
 
 	// a date given as a string is rejected before anything runs
-	o := h.commands(admin, cmd("c2", "add-book", "id", "b2", "title", "Emma", "added", "2026-01-02T03:04:05Z"))[0]
+	o := h.mutations(admin, mut("c2", "add-book", "id", "b2", "title", "Emma", "added", "2026-01-02T03:04:05Z"))[0]
 	if o.kind != "reject" || !strings.Contains(o.reason, "$.added: expected a timestamp") {
 		t.Fatalf("string date: %+v", o)
 	}
@@ -2206,7 +2531,7 @@ func TestTypedValues(t *testing.T) {
 	// a date reaches as far as a JS Date does either side of the epoch, and no further
 	for i, ms := range []int64{8.64e15, -8.64e15} {
 		id := fmt.Sprintf("e%d", i)
-		h.accept(admin, cmd(id, "add-book", "id", id, "title", "Emma", "added", time.UnixMilli(ms)))
+		h.accept(admin, mut(id, "add-book", "id", id, "title", "Emma", "added", time.UnixMilli(ms)))
 		stored := h.snapshot(admin, "book").records["book!book:"+id].(map[string]any)["added"]
 		if got, ok := stored.(time.Time); !ok || got.UnixMilli() != ms {
 			t.Fatalf("date at %d ms: %v", ms, stored)
@@ -2214,14 +2539,14 @@ func TestTypedValues(t *testing.T) {
 	}
 	for i, ms := range []int64{8.64e15 + 1, -8.64e15 - 1, 1 << 62} {
 		id := fmt.Sprintf("f%d", i)
-		o := h.commands(admin, cmd(id, "add-book", "id", id, "title", "Emma", "added", time.UnixMilli(ms)))[0]
+		o := h.mutations(admin, mut(id, "add-book", "id", id, "title", "Emma", "added", time.UnixMilli(ms)))[0]
 		if o.kind != "reject" || o.reason != "$.added: a timestamp outside the range of a Date" {
 			t.Fatalf("date at %d ms: %+v", ms, o)
 		}
 	}
 
 	// an optional field left out stays out
-	h.accept(admin, cmd("c3", "add-book", "id", "b3", "title", "Emma"))
+	h.accept(admin, mut("c3", "add-book", "id", "b3", "title", "Emma"))
 	if _, ok := h.snapshot(admin, "book").records["book!book:b3"].(map[string]any)["added"]; ok {
 		t.Fatalf("absent optional field written")
 	}
@@ -2230,25 +2555,25 @@ func TestTypedValues(t *testing.T) {
 func TestPreparedFields(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-patron", "id", "ann", "name", "Ann"))
+	h.accept(admin, mut("c1", "add-patron", "id", "ann", "name", "Ann"))
 
-	// a NewPassword is replaced by its argon2id hash before precommit sees it
-	h.accept("", cmd("c2", "create-account", "user", "ann", "password", "hunter2"))
+	// a NewPassword is replaced by its argon2id hash before the decider sees it
+	h.accept("", mut("c2", "create-account", "user", "ann", "password", "hunter2"))
 	acct := h.snapshot(admin, "account:ann").records["account:ann!account"].(map[string]any)
 	hash := acct["hash"].(string)
 	if !strings.HasPrefix(hash, "$argon2id$") {
 		t.Fatalf("expected an argon2id hash, got %q", hash)
 	}
 	// and the check saw the wire type: a password that is not a string is rejected
-	o := h.commands("", cmd("c3", "create-account", "user", "bob", "password", 42))[0]
+	o := h.mutations("", mut("c3", "create-account", "user", "bob", "password", 42))[0]
 	if o.kind != "reject" || !strings.Contains(o.reason, "$.password: expected a string") {
 		t.Fatalf("non-string password: %+v", o)
 	}
 }
 
-// command-time authentication ///////////////////////////////////////////////
+// mutation-time authentication ///////////////////////////////////////////////
 
-// proof is a password CommandAuth
+// proof is a password MutationAuth
 func proof(password string) map[string]any {
 	return map[string]any{"kind": "password", "password": password}
 }
@@ -2256,7 +2581,7 @@ func proof(password string) map[string]any {
 // signUp creates an account with a password, and signs in to it
 func (h *harness) signUp(user, password string) string {
 	h.t.Helper()
-	h.accept("", cmd("signup-"+user, "create-account", "user", user, "password", password))
+	h.accept("", mut("signup-"+user, "create-account", "user", user, "password", password))
 	return h.signIn(user, password)
 }
 
@@ -2282,8 +2607,8 @@ func (h *harness) setPasswordWhenProved(user, password string) chan error {
 	var once sync.Once
 	h.srv.proved = func() {
 		once.Do(func() {
-			body := cmd("hook-"+password, "set-password", "user", user, "password", password).encode(nil)
-			req, _ := http.NewRequest("POST", h.web.URL+"/commands", bytes.NewReader(body))
+			body := mut("hook-"+password, "set-password", "user", user, "password", password).encode(nil)
+			req, _ := http.NewRequest("POST", h.web.URL+"/mutations", bytes.NewReader(body))
 			req.Header.Set("Authorization", "Bearer "+admin)
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
@@ -2318,26 +2643,26 @@ func changed(t *testing.T, done chan error) {
 func TestAPasswordProofIsCheckedAgainstTheSendersAccount(t *testing.T) {
 	h := start(t)
 	tok := h.signUp("ann", "hunter2")
-	proven := func(id, password string) command {
-		return cmd(id, "authenticated-command", "user", "ann", "check", proof(password))
+	proven := func(id, password string) mutation {
+		return mut(id, "authenticated-mutation", "user", "ann", "check", proof(password))
 	}
 
-	// the right password passes, and precommit sees only what it proved
-	if o := h.commands(tok, proven("c1", "hunter2"))[0]; o.kind != "ok" {
+	// the right password passes, and the decider sees only what it proved
+	if o := h.mutations(tok, proven("c1", "hunter2"))[0]; o.kind != "ok" {
 		t.Fatalf("the right password: %+v", o)
 	}
 	tok = h.signUp("bob", "pw")
 
 	// the proof is the sender's own: ann's password proves nothing for bob
-	o := h.commands(tok, cmd("c2", "authenticated-command", "user", "bob", "check", proof("hunter2")))[0]
+	o := h.mutations(tok, mut("c2", "authenticated-mutation", "user", "bob", "check", proof("hunter2")))[0]
 	if o.kind != "reject" || o.reason != "invalid credentials" {
 		t.Fatalf("another account's password: %+v", o)
 	}
 
 	// a failed proof is rejected before its expectations are compared, so it learns no seq
 	stale := map[string]any{"patron:bob": 99}
-	bobs := func(id, password string) command {
-		return cmd(id, "authenticated-command", "user", "bob", "check", proof(password))
+	bobs := func(id, password string) mutation {
+		return mut(id, "authenticated-mutation", "user", "bob", "check", proof(password))
 	}
 	if o := h.expecting(tok, bobs("c3", "wrong"), stale); o.kind != "reject" {
 		t.Fatalf("a wrong password with a stale expectation: %+v", o)
@@ -2348,19 +2673,19 @@ func TestAPasswordProofIsCheckedAgainstTheSendersAccount(t *testing.T) {
 
 	// an account without a password, and the anonymous principal, prove nothing
 	for _, sender := range []string{h.token("p1"), ""} {
-		o := h.commands(sender, cmd("c5", "authenticated-command", "user", "p1", "check", proof("x")))[0]
+		o := h.mutations(sender, mut("c5", "authenticated-mutation", "user", "p1", "check", proof("x")))[0]
 		if o.kind != "reject" || o.reason != "invalid credentials" {
 			t.Fatalf("a proof with no password to check it against: %+v", o)
 		}
 	}
 
 	// the other kinds are refused at intake, after the wire shape is checked
-	o = h.commands(tok, cmd("c6", "authenticated-command", "user", "bob", "check",
+	o = h.mutations(tok, mut("c6", "authenticated-mutation", "user", "bob", "check",
 		map[string]any{"kind": "totp", "code": "123456"}))[0]
 	if o.kind != "reject" || o.reason != "totp proofs are not supported by this database yet" {
 		t.Fatalf("a totp proof: %+v", o)
 	}
-	o = h.commands(tok, cmd("c7", "authenticated-command", "user", "bob", "check",
+	o = h.mutations(tok, mut("c7", "authenticated-mutation", "user", "bob", "check",
 		map[string]any{"kind": "carrier-pigeon"}))[0]
 	if o.kind != "reject" || !strings.Contains(o.reason, "$.check") {
 		t.Fatalf("a malformed proof: %+v", o)
@@ -2370,34 +2695,34 @@ func TestAPasswordProofIsCheckedAgainstTheSendersAccount(t *testing.T) {
 func TestAResentPasswordChangeThatLandedIsOk(t *testing.T) {
 	h := start(t)
 	tok := h.signUp("ann", "hunter2")
-	change := cmd("c1", "change-password", "user", "ann", "check", proof("hunter2"), "password", "fresh").in("s1", 1)
+	change := mut("c1", "change-password", "user", "ann", "check", proof("hunter2"), "password", "fresh").in("s1", 1)
 
 	// the change lands, and its resend proves a password that is no longer ann's, but the resend
-	// is the decided command, so dedup answers it
-	if o := h.commands(tok, change)[0]; o.kind != "ok" {
+	// is the decided mutation, so dedup answers it
+	if o := h.mutations(tok, change)[0]; o.kind != "ok" {
 		t.Fatalf("the change: %+v", o)
 	}
-	if o := h.commands(tok, change)[0]; o.kind != "ok" {
+	if o := h.mutations(tok, change)[0]; o.kind != "ok" {
 		t.Fatalf("the resend: %+v", o)
 	}
-	again := cmd("c2", "change-password", "user", "ann", "check", proof("hunter2"), "password", "x").in("s1", 2)
-	if o := h.commands(tok, again)[0]; o.kind != "reject" || o.reason != "invalid credentials" {
-		t.Fatalf("a new command proving the old password: %+v", o)
+	again := mut("c2", "change-password", "user", "ann", "check", proof("hunter2"), "password", "x").in("s1", 2)
+	if o := h.mutations(tok, again)[0]; o.kind != "reject" || o.reason != "invalid credentials" {
+		t.Fatalf("a new mutation proving the old password: %+v", o)
 	}
 	if status := login(h, "ann", "fresh"); status != 200 {
 		t.Fatalf("login with the changed password: %d", status)
 	}
 }
 
-func TestACallProvesThePasswordItsEarlierCommandSet(t *testing.T) {
+func TestACallProvesThePasswordItsEarlierMutationSet(t *testing.T) {
 	h := start(t)
 	tok := h.signUp("ann", "hunter2")
 
 	// both proofs are checked against hunter2 before either runs; the second bounces when its turn
 	// comes and passes against the password the first set
-	outs := h.commands(tok,
-		cmd("c1", "change-password", "user", "ann", "check", proof("hunter2"), "password", "fresh"),
-		cmd("c2", "authenticated-command", "user", "ann", "check", proof("fresh")))
+	outs := h.mutations(tok,
+		mut("c1", "change-password", "user", "ann", "check", proof("hunter2"), "password", "fresh"),
+		mut("c2", "authenticated-mutation", "user", "ann", "check", proof("fresh")))
 	if outs[0].kind != "ok" || outs[1].kind != "ok" {
 		t.Fatalf("outcomes: %+v", outs)
 	}
@@ -2406,26 +2731,26 @@ func TestACallProvesThePasswordItsEarlierCommandSet(t *testing.T) {
 func TestAProofIsCheckedAgainWhenTheCredentialsChangeBeforeItsTurn(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("p", "add-patron", "id", "ann", "name", "Ann"))
+	h.accept(admin, mut("p", "add-patron", "id", "ann", "name", "Ann"))
 	tok := h.signUp("ann", "hunter2")
 
 	// a proof that passed against the old password fails against the new one
 	done := h.setPasswordWhenProved("ann", "fresh")
-	o := h.commands(tok, cmd("c1", "authenticated-command", "user", "ann", "check", proof("hunter2")))[0]
+	o := h.mutations(tok, mut("c1", "authenticated-mutation", "user", "ann", "check", proof("hunter2")))[0]
 	changed(t, done)
 	if o.kind != "reject" || o.reason != "invalid credentials" {
 		t.Fatalf("the old password after a change: %+v", o)
 	}
 
 	// a proof that failed against the old password passes against the new one, and the call's
-	// commands are still decided once each, in order
+	// mutations are still decided once each, in order
 	done = h.setPasswordWhenProved("ann", "fresher")
-	call := []command{
-		cmd("c2", "rename-patron", "id", "ann", "name", "A1").in("s1", 1),
-		cmd("c3", "authenticated-command", "user", "ann", "check", proof("fresher")).in("s1", 2),
-		cmd("c4", "rename-patron", "id", "ann", "name", "A2").in("s1", 3),
+	call := []mutation{
+		mut("c2", "rename-patron", "id", "ann", "name", "A1").in("s1", 1),
+		mut("c3", "authenticated-mutation", "user", "ann", "check", proof("fresher")).in("s1", 2),
+		mut("c4", "rename-patron", "id", "ann", "name", "A2").in("s1", 3),
 	}
-	outs := h.commands(tok, call...)
+	outs := h.mutations(tok, call...)
 	changed(t, done)
 	for i, o := range outs {
 		if o.kind != "ok" {
@@ -2440,9 +2765,9 @@ func TestAProofIsCheckedAgainWhenTheCredentialsChangeBeforeItsTurn(t *testing.T)
 		t.Fatalf("patron after the call: %v", patron)
 	}
 
-	// the proven command revoked the token, so the resend signs in again, and is answered by dedup
+	// the proven mutation revoked the token, so the resend signs in again, and is answered by dedup
 	tok = h.signIn("ann", "fresher")
-	for i, o := range h.commands(tok, call...) {
+	for i, o := range h.mutations(tok, call...) {
 		if o.kind != "ok" {
 			t.Fatalf("resent outcome %d: %+v", i, o)
 		}
@@ -2472,7 +2797,7 @@ func TestALookupThatChangesOnEveryReadIsABug(t *testing.T) {
 	h := start(t)
 
 	// the writer bounces the call a few times, then rejects it as lookup's bug, in full in dev
-	o := h.commands(h.token("flaky"), cmd("c1", "authenticated-command", "user", "flaky", "check", proof("x")))[0]
+	o := h.mutations(h.token("flaky"), mut("c1", "authenticated-mutation", "user", "flaky", "check", proof("x")))[0]
 	if o.kind != "reject" || !strings.Contains(o.reason, "different passwordHash on each of 5 reads") {
 		t.Fatalf("a proof against a flaky lookup: %+v", o)
 	}
@@ -2480,6 +2805,26 @@ func TestALookupThatChangesOnEveryReadIsABug(t *testing.T) {
 	// a login gives up the same way
 	if status := login(h, "flaky", "x"); status != 500 {
 		t.Fatalf("a login against a flaky lookup: %d", status)
+	}
+}
+
+// guards the core's own read-only check, which stops a lookup's write that slips past the bundle
+func TestTheCoreRefusesAWriteFromLookup(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+
+	// the lookup fails, naming its slot, so the sign-in does
+	req := mpEncode(map[string]any{"kind": "dev", "identity": "raw-lookup"})
+	status, _, body := h.do("POST", "/auth/token", "", req)
+	if status != 500 || !strings.Contains(string(body), "lookup reads only, and made a write") {
+		t.Fatalf("a sign-in under a lookup that writes past the bundle: %d %s", status, body)
+	}
+
+	// the write it made reached neither the store nor the next mutation's edit
+	h.accept(admin, mut("c2", "notify", "patron", "p1", "reasons", []any{"only"}))
+	if got := h.messages("p1"); strings.Join(got, ",") != "only,own" {
+		t.Fatalf("the messages of the next mutation: %v", got)
 	}
 }
 
@@ -2502,12 +2847,12 @@ func TestUnknownIntakeKindRefusesToStart(t *testing.T) {
 	}
 }
 
-// raw is msgpack bytes spliced as they are into a command built by rawCommand.
+// raw is msgpack bytes spliced as they are into a mutation built by rawMutation.
 type raw []byte
 
-// rawCommand encodes one [id, data] command whose data map holds the fields in order, raw
+// rawMutation encodes one [id, data] mutation whose data map holds the fields in order, raw
 // values spliced in as they are.
-func rawCommand(id string, kv ...any) []byte {
+func rawMutation(id string, kv ...any) []byte {
 	b := mpArrayHeader(nil, 4)
 	b = mpAppend(mpAppend(b, nil), nil)
 	b = mpAppend(b, label(id))
@@ -2527,11 +2872,11 @@ func TestCheckEdges(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
 
-	// a date in each of the timestamp's three sizes survives the log, the reducer, and the store
+	// a date in each of the timestamp's three sizes survives the decider, the edit, and the store
 	whole := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	old := time.Date(1960, 6, 7, 8, 9, 10, 123e6, time.UTC)
-	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune", "added", whole))
-	h.accept(admin, cmd("c2", "add-book", "id", "b2", "title", "Emma", "added", old))
+	h.accept(admin, mut("c1", "add-book", "id", "b1", "title", "Dune", "added", whole))
+	h.accept(admin, mut("c2", "add-book", "id", "b2", "title", "Emma", "added", old))
 	records := h.snapshot(admin, "book").records
 	for key, want := range map[string]time.Time{"book!book:b1": whole, "book!book:b2": old} {
 		if got, ok := records[key].(map[string]any)["added"].(time.Time); !ok || !got.Equal(want) {
@@ -2539,8 +2884,8 @@ func TestCheckEdges(t *testing.T) {
 		}
 	}
 
-	// values no type accepts are rejected by name, each in its own command of one request, and
-	// the commands after each still check and ack
+	// values no type accepts are rejected by name, each in its own mutation of one request, and
+	// the mutations after each still check and ack
 	badStamp := raw{0xc7, 5, 0xff, 0, 0, 0, 0, 0} // a timestamp extension of no valid size
 	badNanos := raw{0xd7, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0}
 	otherExt := raw{0xd6, 5, 0, 0, 0, 0}
@@ -2548,16 +2893,16 @@ func TestCheckEdges(t *testing.T) {
 	bigUint := raw{0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 	intKey := raw{0x81, 0x01, 0xa1, 'x'}
 	var body []byte
-	body = append(body, rawCommand("d1", "type", "add-book", "id", "b3", "title", "T", "added", badStamp)...)
-	body = append(body, rawCommand("d2", "type", "add-book", "id", "b4", "title", "T", "added", badNanos)...)
-	body = append(body, rawCommand("d3", "type", "add-book", "id", "b5", "title", "T", "added", otherExt)...)
-	body = append(body, rawCommand("d4", "type", "add-book", "id", "b6", "title", bin)...)
-	body = append(body, rawCommand("d5", "type", "add-book", "id", bigUint, "title", "T")...)
-	body = append(body, rawCommand("d6", "type", "add-book", "id", "b8", "title", "T", "added", intKey)...)
-	body = append(body, rawCommand("d7", "type", "add-book", "id", "b9", "title", "T")...)
-	status, _, out := h.do("POST", "/commands", admin, body)
+	body = append(body, rawMutation("d1", "type", "add-book", "id", "b3", "title", "T", "added", badStamp)...)
+	body = append(body, rawMutation("d2", "type", "add-book", "id", "b4", "title", "T", "added", badNanos)...)
+	body = append(body, rawMutation("d3", "type", "add-book", "id", "b5", "title", "T", "added", otherExt)...)
+	body = append(body, rawMutation("d4", "type", "add-book", "id", "b6", "title", bin)...)
+	body = append(body, rawMutation("d5", "type", "add-book", "id", bigUint, "title", "T")...)
+	body = append(body, rawMutation("d6", "type", "add-book", "id", "b8", "title", "T", "added", intKey)...)
+	body = append(body, rawMutation("d7", "type", "add-book", "id", "b9", "title", "T")...)
+	status, _, out := h.do("POST", "/mutations", admin, body)
 	if status != 200 {
-		t.Fatalf("commands: %d %s", status, out)
+		t.Fatalf("mutations: %d %s", status, out)
 	}
 	outs := decodeOutcomes(t, out)
 	for i, want := range []string{
@@ -2573,7 +2918,7 @@ func TestCheckEdges(t *testing.T) {
 		}
 	}
 	if outs[6].kind != "ok" {
-		t.Fatalf("the command after the rejects: %+v", outs[6])
+		t.Fatalf("the mutation after the rejects: %+v", outs[6])
 	}
 
 	// a map key that is not a string, where the walk reads keys
@@ -2584,23 +2929,23 @@ func TestCheckEdges(t *testing.T) {
 	body = append(mpAppendStr(body, "id"), mpAppendStr(nil, "b10")...)
 	body = append(mpAppendStr(body, "title"), mpAppendStr(nil, "T")...)
 	body = append(body, 0x07, 0xc0)
-	if o := h.commandsRaw(admin, body)[0]; o.kind != "reject" || o.reason != "$: a map key is not a string" {
+	if o := h.mutationsRaw(admin, body)[0]; o.kind != "reject" || o.reason != "$: a map key is not a string" {
 		t.Fatalf("non-string key: %+v", o)
 	}
 
-	// elements a later protocol appends to a command are ignored
+	// elements a later protocol appends to a mutation are ignored
 	body = mpEncode([]any{nil, nil, label("e2"), map[string]any{"type": "add-book", "id": "b11", "title": "T"}, map[string]any{}, "newer"})
-	if o := h.commandsRaw(admin, body)[0]; o.kind != "ok" {
-		t.Fatalf("a command with an appended element: %+v", o)
+	if o := h.mutationsRaw(admin, body)[0]; o.kind != "ok" {
+		t.Fatalf("a mutation with an appended element: %+v", o)
 	}
 }
 
-// commandsRaw posts a request body as it is and returns the outcomes.
-func (h *harness) commandsRaw(token string, body []byte) []outcome {
+// mutationsRaw posts a request body as it is and returns the outcomes.
+func (h *harness) mutationsRaw(token string, body []byte) []outcome {
 	h.t.Helper()
-	status, _, out := h.do("POST", "/commands", token, body)
+	status, _, out := h.do("POST", "/mutations", token, body)
 	if status != 200 {
-		h.t.Fatalf("commands: status %d: %s", status, out)
+		h.t.Fatalf("mutations: status %d: %s", status, out)
 	}
 	return decodeOutcomes(h.t, out)
 }
@@ -2618,7 +2963,7 @@ func login(h *harness, identity, password string) int {
 func TestLoginAttemptsAreRateLimitedPerClient(t *testing.T) {
 	h := startWith(t, t.Context(), Options{AuthBurst: 3, AuthRate: 0.001})
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "create-account", "user", "ann", "password", "hunter2"))
+	h.accept(admin, mut("c1", "create-account", "user", "ann", "password", "hunter2"))
 
 	// the account's creation hashed once, so two attempts remain, right or wrong
 	if status := login(h, "ann", "wrong"); status != 401 {
@@ -2684,27 +3029,27 @@ func TestAListClientIPHeaderIsRefused(t *testing.T) {
 
 func TestIntakeHashingIsRateLimitedPerClient(t *testing.T) {
 	h := startWith(t, t.Context(), Options{AuthBurst: 1, AuthRate: 0.001})
-	h.accept("", cmd("c1", "create-account", "user", "ann", "password", "hunter2"))
+	h.accept("", mut("c1", "create-account", "user", "ann", "password", "hunter2"))
 
 	// a request whose hash finds the budget spent is refused whole, so it can be retried later
 	// under the same ids
-	status, _ := h.commandsStatus("", cmd("c2", "create-account", "user", "bob", "password", "pw"))
+	status, _ := h.mutationsStatus("", mut("c2", "create-account", "user", "bob", "password", "pw"))
 	if status != 429 {
 		t.Fatalf("a hash past the budget: %d, want 429", status)
 	}
 
-	// commands that hash nothing are not limited
-	if o := h.commands(h.admin(), cmd("c3", "add-book", "id", "b1", "title", "Dune"))[0]; o.kind != "ok" {
-		t.Fatalf("a command with no password: %+v", o)
+	// mutations that hash nothing are not limited
+	if o := h.mutations(h.admin(), mut("c3", "add-book", "id", "b1", "title", "Dune"))[0]; o.kind != "ok" {
+		t.Fatalf("a mutation with no password: %+v", o)
 	}
 }
 
 // shutdown ///////////////////////////////////////////////////////////////////
 
-func TestShutdownEndsOpenStreams(t *testing.T) {
+func TestShutdownEndsOpenConnections(t *testing.T) {
 	ctx, stop := context.WithCancel(t.Context())
 	h := startWith(t, ctx, Options{})
-	s := h.stream(h.admin(), -1)
+	s := h.connect(h.admin(), -1)
 	s.live()
 
 	// the server's context ends, and so does every request under it, at once
@@ -2712,7 +3057,7 @@ func TestShutdownEndsOpenStreams(t *testing.T) {
 	select {
 	case <-s.errs:
 	case <-time.After(2 * time.Second):
-		t.Fatalf("an open stream outlived the server's context")
+		t.Fatalf("an open connection outlived the server's context")
 	}
 
 	// the server then closes cleanly
@@ -2752,8 +3097,8 @@ func TestATokenForNoAccountIsRefusedEverywhere(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if status, _ := h.commandsStatus(ghost, cmd("c1", "add-book", "id", "b1", "title", "Dune")); status != 401 {
-		t.Fatalf("commands: %d", status)
+	if status, _ := h.mutationsStatus(ghost, mut("c1", "add-book", "id", "b1", "title", "Dune")); status != 401 {
+		t.Fatalf("mutations: %d", status)
 	}
 	req, _ := http.NewRequest("GET", h.web.URL+"/stream?since=-1", nil)
 	req.Header.Set("Authorization", "Bearer "+ghost)
@@ -2763,7 +3108,7 @@ func TestATokenForNoAccountIsRefusedEverywhere(t *testing.T) {
 	}
 	resp.Body.Close()
 	if resp.StatusCode != 401 {
-		t.Fatalf("stream: %d", resp.StatusCode)
+		t.Fatalf("connection: %d", resp.StatusCode)
 	}
 	if status, _, _ := h.do("POST", "/auth/token", ghost, mpEncode(map[string]any{"kind": "refresh"})); status != 401 {
 		t.Fatalf("refresh: %d", status)
@@ -2777,19 +3122,13 @@ func TestBootstrapSeedsAnEmptyLog(t *testing.T) {
 	env := []string{"BOOTSTRAP_ADMIN", "BOOTSTRAP_PASSWORD"}
 	h := startWith(t, t.Context(), Options{DataDir: dir, BootstrapEnv: env})
 
-	// one atom, under the id the core minted for it: the stream's birth and the account's
-	// creation
-	s := h.stream(h.admin(), 0)
-	evs := events(s.nextTagged("events"))
-	if len(evs) != 2 || evs[0].data["$sys"] != "birth" || evs[1].data["type"] != "account-created" {
-		t.Fatalf("bootstrap's atom: %+v", evs)
+	// one mutation, under the id the core minted for it: the account slice's birth
+	s := h.connect(h.admin(), 0)
+	evs := edits(s.nextTagged("edits"))
+	if len(evs) != 1 || evs[0].lifecycle != birth || evs[0].slice != "account:boss" || len(evs[0].id) != 16 {
+		t.Fatalf("bootstrap's edit: %+v", evs)
 	}
-	for _, e := range evs {
-		if e.stream != "account:boss" || len(e.id) != 16 || !bytes.Equal(e.id, evs[0].id) {
-			t.Fatalf("bootstrap's event: %+v", e)
-		}
-	}
-	if hash := evs[1].data["hash"].(string); !strings.HasPrefix(hash, "$argon2id$") {
+	if hash, _ := evs[0].field("account:boss!account", "hash").(string); !strings.HasPrefix(hash, "$argon2id$") {
 		t.Fatalf("bootstrap's hash: %q", hash)
 	}
 
@@ -2805,8 +3144,8 @@ func TestBootstrapSeedsAnEmptyLog(t *testing.T) {
 	// a log that is not empty is not seeded again, and the seeded account acts as an admin
 	h.stop()
 	h = startWith(t, t.Context(), Options{DataDir: dir, BootstrapEnv: env})
-	if next := h.accept(boss, cmd("c1", "add-book", "id", "b1", "title", "Dune")); next != 4 {
-		t.Fatalf("after a restart, the next atom lands at %d, want 4: bootstrap ran again", next)
+	if next := h.accept(boss, mut("c1", "add-book", "id", "b1", "title", "Dune")); next != 2 {
+		t.Fatalf("after a restart, the next mutation lands at %d, want 2: bootstrap ran again", next)
 	}
 }
 
@@ -2827,12 +3166,12 @@ func TestABootstrapThatFailsStopsTheOpen(t *testing.T) {
 		BootstrapEnv: []string{"BOOTSTRAP_ADMIN"},
 	})
 	if err == nil || !strings.Contains(err.Error(), "bootstrap") {
-		t.Fatalf("a bootstrap emitting to a malformed stream: %v", err)
+		t.Fatalf("a bootstrap writing to a malformed slice: %v", err)
 	}
 }
 
-func TestValidRef(t *testing.T) {
-	for ref, want := range map[string]bool{
+func TestValidSelector(t *testing.T) {
+	for selector, want := range map[string]bool{
 		"*":                 true,
 		"book":              true,
 		"login":             true,
@@ -2869,27 +3208,27 @@ func TestValidRef(t *testing.T) {
 		"patron:p 1":        false,
 		"patron:p%2F1":      false,
 	} {
-		if got := validRef(ref); got != want {
-			t.Errorf("validRef(%q) = %v, want %v", ref, got, want)
+		if got := validSelector(selector); got != want {
+			t.Errorf("validSelector(%q) = %v, want %v", selector, got, want)
 		}
 	}
 }
 
-func TestStreamNamesFillTheirTemplates(t *testing.T) {
+func TestSliceNamesFillTheirTemplates(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
 
 	// a family template's terminal parameter may hold . and ~
-	h.accept(admin, cmd("c1", "add-patron", "id", "p.1~x", "name", "Ann"))
+	h.accept(admin, mut("c1", "add-patron", "id", "p.1~x", "name", "Ann"))
 	if _, ok := h.snapshot(admin, "patron:p.1~x").records["patron:p.1~x!patron"]; !ok {
 		t.Fatalf("patron:p.1~x was not written")
 	}
 
-	// a precommit reading through a parameter that no stream name could hold is rejected before
-	// it labels anything
-	outs := h.commands(admin,
-		cmd("c2", "add-patron", "id", "p/1", "name", "Bob"),
-		cmd("c3", "add-patron", "id", "", "name", "Cy"),
+	// a decider reading through a parameter that no slice name could hold is rejected before it
+	// writes anything
+	outs := h.mutations(admin,
+		mut("c2", "add-patron", "id", "p/1", "name", "Bob"),
+		mut("c3", "add-patron", "id", "", "name", "Cy"),
 	)
 	for i, id := range []string{"p/1", ""} {
 		if outs[i].kind != "reject" || !strings.Contains(outs[i].reason, fmt.Sprintf("patron: patron %q", id)) {
@@ -2910,7 +3249,7 @@ func TestKeysHoldNoControlCharacterOrLoneSurrogate(t *testing.T) {
 	// a key's terminal parameter may hold any other text, the empty string included
 	ok := []string{"b\U0001F600", "b\uFF0Cc", "b\u200Dc", "b\u00A0c", ""}
 	for i, id := range ok {
-		h.accept(admin, cmd(fmt.Sprintf("ok%d", i), "add-book", "id", id, "title", "T"))
+		h.accept(admin, mut(fmt.Sprintf("ok%d", i), "add-book", "id", id, "title", "T"))
 	}
 	records := h.snapshot(admin, "book").records
 	for _, id := range ok {
@@ -2919,19 +3258,19 @@ func TestKeysHoldNoControlCharacterOrLoneSurrogate(t *testing.T) {
 		}
 	}
 
-	// a key holding a control character or a lone surrogate is refused, and its command with it
+	// a key holding a control character or a lone surrogate is refused, and its mutation with it
 	bad := []string{"a\nb", "a\tb", "a\x7fb", "a\u0085b", "a\xed\xa0\x80b", "a\xed\xb0\x80b"}
 	for i, id := range bad {
-		o := h.commands(admin, cmd(fmt.Sprintf("bad%d", i), "add-book", "id", id, "title", "T"))[0]
+		o := h.mutations(admin, mut(fmt.Sprintf("bad%d", i), "add-book", "id", id, "title", "T"))[0]
 		if o.kind != "reject" || !strings.Contains(o.reason, "holds a control character or a lone surrogate") {
 			t.Fatalf("add-book %q: %+v", id, o)
 		}
 	}
 
-	// a key holding U+0000 is neither read short nor written: precommit's read of b1\x00x finds
-	// nothing although b1 is held, and the reducer's write is refused
-	h.accept(admin, cmd("c1", "add-book", "id", "b1", "title", "Dune"))
-	o := h.commands(admin, cmd("c2", "add-book", "id", "b1\x00x", "title", "Emma"))[0]
+	// a key holding U+0000 is neither read short nor written: the decider's read of b1\x00x
+	// finds nothing although b1 is held, and its write is refused
+	h.accept(admin, mut("c1", "add-book", "id", "b1", "title", "Dune"))
+	o := h.mutations(admin, mut("c2", "add-book", "id", "b1\x00x", "title", "Emma"))[0]
 	if o.kind != "reject" || !strings.Contains(o.reason, "a key beginning book!book:b1 holds U+0000") {
 		t.Fatalf("add-book with U+0000: %+v", o)
 	}
@@ -2940,30 +3279,30 @@ func TestKeysHoldNoControlCharacterOrLoneSurrogate(t *testing.T) {
 func TestAProductionBundleAnswersBugsWithInternalError(t *testing.T) {
 	h := startWith(t, t.Context(), Options{Bundle: filepath.Join("testdata", "bundle.prod.js")})
 	admin := h.admin()
-	if outs := h.commands(admin, cmd("c1", "add-patron", "id", "p/1", "name", "Bob")); outs[0].reason != "internal error" {
+	if outs := h.mutations(admin, mut("c1", "add-patron", "id", "p/1", "name", "Bob")); outs[0].reason != "internal error" {
 		t.Fatalf("a bug in a production bundle: %+v", outs[0])
 	}
 
 	// a rejection's reason is still the app's own
-	h.accept(admin, cmd("c2", "add-patron", "id", "p1", "name", "Ann"))
-	if outs := h.commands(admin, cmd("c3", "add-patron", "id", "p1", "name", "Ann")); outs[0].reason != "patron exists" {
+	h.accept(admin, mut("c2", "add-patron", "id", "p1", "name", "Ann"))
+	if outs := h.mutations(admin, mut("c3", "add-patron", "id", "p1", "name", "Ann")); outs[0].reason != "patron exists" {
 		t.Fatalf("a rejection in a production bundle: %+v", outs[0])
 	}
 }
 
-func TestAFailingMaySeeGrantsNothing(t *testing.T) {
+func TestAFailingGrantGrantsNothing(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
-	h.accept(admin, cmd("c2", "create-account", "user", "p1", "password", "hunter2"))
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "create-account", "user", "p1", "password", "hunter2"))
 	ann := h.token("p1")
-	s := h.stream(ann, -1)
+	s := h.connect(ann, -1)
 	s.live()
 
-	// a granted wildcard that cuts into a stream's terminal parameter ends the connection
-	h.accept(admin, cmd("c3", "grant-view", "user", "p1", "prefix", "patron:p1,*"))
+	// a granted wildcard that cuts into a parameter ends the connection
+	h.accept(admin, mut("c3", "grant-view", "user", "p1", "prefix", "patron:p1*"))
 	f := s.nextTagged("end")
-	if f[1] != "error" || !strings.Contains(f[2].(string), "malformed ref: patron:p1,*") {
+	if f[1] != "error" || !strings.Contains(f[2].(string), "malformed selector: patron:p1*") {
 		t.Fatalf("end frame: %v", f)
 	}
 	select {
@@ -2976,35 +3315,79 @@ func TestAFailingMaySeeGrantsNothing(t *testing.T) {
 
 	// and a new connection is refused with the failure
 	status, _, body := h.do("GET", "/stream?since=-1", ann, nil)
-	if status != 500 || !strings.Contains(string(body), "malformed ref: patron:p1,*") {
-		t.Fatalf("a stream under a failing maySee: %d %s", status, body)
+	if status != 500 || !strings.Contains(string(body), "malformed selector: patron:p1*") {
+		t.Fatalf("a connection under a failing grant: %d %s", status, body)
 	}
 }
 
-func TestMaySeeRefsCarryATerminator(t *testing.T) {
+// guards the core's own read-only check, which stops a grant's write that slips past the bundle
+func TestTheCoreRefusesAWriteFromGrant(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("c1", "add-patron", "id", "p1", "name", "Ann"))
-	h.accept(admin, cmd("c2", "add-patron", "id", "p2", "name", "Bob"))
-	h.accept(admin, cmd("c3", "create-account", "user", "p1", "password", "hunter2"))
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+
+	// the grant fails closed, naming its slot, so the connection is refused
+	status, _, body := h.do("GET", "/stream?since=-1", h.token("raw-requester"), nil)
+	if status != 500 || !strings.Contains(string(body), "grant reads only, and made a write") {
+		t.Fatalf("a connection under a grant that writes past the bundle: %d %s", status, body)
+	}
+
+	// the write it made reached neither the store nor the next mutation's edit
+	h.accept(admin, mut("c2", "notify", "patron", "p1", "reasons", []any{"only"}))
+	if got := h.messages("p1"); strings.Join(got, ",") != "only,own" {
+		t.Fatalf("the messages of the next mutation: %v", got)
+	}
+}
+
+func TestGrantSelectorsCarryATerminator(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, mut("c3", "create-account", "user", "p1", "password", "hunter2"))
 	ann := h.token("p1")
 
-	// an exact stream is "name!", which grants the stream
-	h.accept(admin, cmd("c4", "grant-view", "user", "p1", "prefix", "patron:p2!"))
-	if _, _, status := h.eventsRange(ann, "patron:p2", 0, 100, false, 0); status != 200 {
-		t.Fatalf("a granted stream: status %d", status)
+	// an exact slice is "name!", which grants the slice
+	h.accept(admin, mut("c4", "grant-view", "user", "p1", "prefix", "patron:p2!"))
+	if _, _, status := h.editsRange(ann, "patron:p2", 0, 100, false, 0); status != 200 {
+		t.Fatalf("a granted slice: status %d", status)
 	}
-	h.accept(admin, cmd("c5", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
+	h.accept(admin, mut("c5", "revoke-view", "user", "p1", "prefix", "patron:p2!"))
 
-	// a bare name, a wildcard cutting into a parameter, and a wildcard after a singleton family
-	// are malformed, so the registration fails closed
-	for i, ref := range []string{"patron:p2", "patron:p*", "book:*", "patron:p2/"} {
-		h.accept(admin, cmd(fmt.Sprintf("g%d", i), "grant-view", "user", "p1", "prefix", ref))
-		status, _, body := h.do("GET", "/stream?since=-1", ann, nil)
-		if status != 500 || !strings.Contains(string(body), "malformed ref: "+ref) {
-			t.Fatalf("maySee returning %q: %d %s", ref, status, body)
+	// a selector is checked by its syntax alone, so one in a family no slice type declares, or
+	// under more parameters than its family has, is well-formed and grants what it names
+	for i, grant := range []struct{ selector, covered string }{
+		{"nope:x!", "nope:x"},
+		{"patron:p2,x!", "patron:p2,x"},
+		{"patron:p2,*", "patron:p2,x"},
+		{"book:*", "book"},
+	} {
+		h.accept(admin, mut(fmt.Sprintf("w%d", i), "grant-view", "user", "p1", "prefix", grant.selector))
+		if status, _, body := h.do("GET", "/snapshot/"+grant.covered, ann, nil); status != 200 {
+			t.Fatalf("grant returning %q: %d %s", grant.selector, status, body)
 		}
-		h.accept(admin, cmd(fmt.Sprintf("r%d", i), "revoke-view", "user", "p1", "prefix", ref))
+		h.accept(admin, mut(fmt.Sprintf("v%d", i), "revoke-view", "user", "p1", "prefix", grant.selector))
+	}
+
+	// a bare name, a malformed name, and a wildcard cutting into a parameter or after a value no
+	// leading parameter holds are malformed, so the registration fails closed
+	for i, selector := range []string{
+		"patron:p2",    // a bare name
+		"patron:p2/",   // a bare name with a character no parameter holds
+		"!",            // an empty name
+		"patron:!",     // an empty parameter
+		"patron:p/2!",  // a character no parameter holds
+		"patron:*!",    // a star in a name
+		"patron:p*",    // a wildcard cutting into a parameter
+		"patron:p.2,*", // a '.' in a leading parameter
+		":*",           // a wildcard after an empty family
+	} {
+		h.accept(admin, mut(fmt.Sprintf("g%d", i), "grant-view", "user", "p1", "prefix", selector))
+		status, _, body := h.do("GET", "/stream?since=-1", ann, nil)
+		if status != 500 || !strings.Contains(string(body), "malformed selector: "+selector) {
+			t.Fatalf("grant returning %q: %d %s", selector, status, body)
+		}
+		h.accept(admin, mut(fmt.Sprintf("r%d", i), "revoke-view", "user", "p1", "prefix", selector))
 	}
 }
 
@@ -3012,9 +3395,9 @@ func TestAFamilyWalksInParameterOrder(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
 
-	// a stream whose parameter is another's followed by '-' or '.' sorts after it
+	// a slice whose parameter is another's followed by '-' or '.' sorts after it
 	for i, id := range []string{"gen.x", "gen-2", "gen"} {
-		h.accept(admin, cmd(fmt.Sprintf("c%d", i), "add-patron", "id", id, "name", "N"))
+		h.accept(admin, mut(fmt.Sprintf("c%d", i), "add-patron", "id", id, "name", "N"))
 	}
 	fam := h.snapshot(admin, "patron:*")
 	want := []string{
@@ -3028,7 +3411,7 @@ func TestAFamilyWalksInParameterOrder(t *testing.T) {
 
 	// and so does a key whose parameter is another's followed by '-'
 	for i, id := range []string{"2026-10-06", "2026-10"} {
-		h.accept(admin, cmd(fmt.Sprintf("b%d", i), "add-book", "id", id, "title", "T"))
+		h.accept(admin, mut(fmt.Sprintf("b%d", i), "add-book", "id", id, "title", "T"))
 	}
 	if got := strings.Join(h.snapshot(admin, "book").keys, ","); got != "book!book:2026-10,book!book:2026-10-06" {
 		t.Fatalf("book keys: %s", got)

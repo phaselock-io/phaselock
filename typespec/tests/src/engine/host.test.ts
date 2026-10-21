@@ -1,4 +1,4 @@
-// What the Engine needs from its host: it names whatever is missing when built, mints command ids
+// What the Engine needs from its host: it names whatever is missing when built, mints mutation ids
 // with the host's own generateUuid when there is one, and runs on a host's own AbortController
 
 import { describe, expect, test } from 'vitest';
@@ -89,13 +89,13 @@ describe('the host', () => {
     });
   });
 
-  test("command ids come from the host's generateUuid when it has one", async () => {
+  test("mutation ids come from the host's generateUuid when it has one", async () => {
     let n = 0;
     const sent = await withGlobals({ generateUuid: () => `host-${++n}` }, async () => {
       const r = rig();
       await bootstrap(r, ['patron:*'], { 'patron:*': patrons });
-      r.engine.sendCommand({});
-      r.engine.sendCommand({});
+      r.engine.sendMutation({});
+      r.engine.sendMutation({});
       await settle();
       return r.server.sends.flat().map((c) => c.id);
     });
@@ -108,7 +108,7 @@ describe('the host', () => {
       const r = rig();
       await bootstrap(r, ['patron:*'], { 'patron:*': patrons });
       expect(r.server.conn.signal).toBeInstanceOf(HostSignal);
-      r.server.events(ev('patron:p1', 2, 11, { type: 'set', field: 'name', value: 'Ann' }));
+      r.server.edits(ev('patron:p1', 2, 11, { type: 'set', field: 'name', value: 'Ann' }));
       await settle();
       expect(state(r.data(), 'patron:p1')).toEqual({ count: 1, fields: { name: 'Ann' } });
 

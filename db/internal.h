@@ -43,8 +43,12 @@ void die(const char *fmt, ...);
 uint32_t pl_crc32c(const void *data, size_t len);
 uint64_t pl_fnv1a(const void *data, size_t len, uint64_t h);
 
-/* the length of a command's id, a label the client mints */
+/* the length of a mutation's id, a label the client mints */
 #define ID_LEN 16
+
+/* where an edit stands in its slice's life, as its envelope carries it: a normal edit applies its
+   writes, a birth clears the slice first, and a death clears it and writes nothing */
+enum { EDIT_NORMAL = 0, EDIT_BIRTH = 1, EDIT_DEATH = 2 };
 
 /* store.c: one SQLite connection */
 typedef struct store store;
@@ -69,18 +73,23 @@ int store_cursor_step(store *s);
 const char *store_cursor_key(store *s, size_t *n);
 const uint8_t *store_cursor_value(store *s, size_t *n);
 void store_cursor_end(store *s);
-/* A log row is one event: atom is the first position of the command's atom, and commandid the
-   command's label, ID_LEN bytes. */
-int store_append(store *s, uint64_t position, uint64_t atom, const char *stream, uint64_t seq,
-                 const uint8_t *commandid, int64_t servertime, const uint8_t *data, size_t len);
-typedef int (*store_log_fn)(void *arg, uint64_t position, uint64_t atom, const char *stream,
-                            uint64_t seq, const uint8_t *commandid, int64_t servertime,
-                            const uint8_t *data, size_t len);
+/* A log row is one edit: the position of its mutation, the slice it edits, its seq there, its
+   lifecycle, and its wire encoding whole.  A mutation's edits share its position, one per slice.
+   A read hands each row to fn, which answers 0 to go on, a positive number to stop, or a
+   negative one to fail the read. */
+int store_append(store *s, uint64_t position, const char *slice, uint64_t seq, int lifecycle,
+                 const uint8_t *edit, size_t len);
+typedef int (*store_log_fn)(void *arg, uint64_t position, const char *slice, const uint8_t *edit,
+                            size_t len);
+/* the edits with from <= position <= to, by position, then slice */
 int store_read_log(store *s, uint64_t from, uint64_t to, store_log_fn fn, void *arg);
-int store_read_stream(store *s, const char *stream, uint64_t from, uint64_t to, bool reverse,
-                      size_t limit, store_log_fn fn, void *arg);
+/* the edits of one slice, or of the slices whose names start with prefix, with
+   from < position < to, by position ascending or descending, then by slice in the same
+   direction */
+int store_read_slice(store *s, const char *slice, uint64_t from, uint64_t to, bool reverse,
+                     store_log_fn fn, void *arg);
 int store_read_prefix(store *s, const char *prefix, uint64_t from, uint64_t to, bool reverse,
-                      size_t limit, store_log_fn fn, void *arg);
+                      store_log_fn fn, void *arg);
 int store_max_position(store *s, uint64_t *out);
 /* The series table, keyed by the hex SHA-256 of a series.  store_series_hwm answers 1 and
    the series' mark if the series is known, 0 if not; store_series_mark raises the mark to n
@@ -95,17 +104,68 @@ typedef int (*store_key_fn)(void *arg, const char *kid, const uint8_t *pub, size
 int store_keys(store *s, store_key_fn fn, void *arg);
 int store_key_add(store *s, const char *kid, const uint8_t *pub, size_t len, int64_t minted);
 int store_key_del(store *s, const char *kid);
-int store_stream_live(store *s, const char *name);
-int store_stream_birth(store *s, const char *name, uint64_t pos);
-int store_stream_death(store *s, const char *name, uint64_t pos);
-int store_stream_erase(store *s, const char *name, uint64_t before);
-int store_stream_next_seq(store *s, const char *name, size_t bytes, uint64_t *seq);
-int store_stream_stats(store *s, const char *name, uint64_t *seq, uint64_t *event_bytes,
-                       uint64_t *state_bytes);
+/* The slices table: one row per slice ever born, kept across its deaths, with its seq, the
+   position of its last birth, the position of its death or NULL while it is live, and the bytes
+   of its edits in the log and of its keys in the store.  A birth creates or revives the row, and
+   must come before the slice's first next_seq. */
+int store_slice_birth(store *s, const char *name, uint64_t pos);
+int store_slice_death(store *s, const char *name, uint64_t pos);
+/* the slice's edits below the position go, and its edit bytes are those of the edits that
+   remain */
+int store_slice_erase(store *s, const char *name, uint64_t before);
+/* the slice's next seq, charging the edit's bytes to it */
+int store_slice_next_seq(store *s, const char *name, size_t bytes, uint64_t *seq);
+/* 1 with the slice's seq and whether it is live when it has a row, 0 when it was never born */
+int store_slice_state(store *s, const char *name, uint64_t *seq, bool *live);
+/* 1 with the slice's seq and byte counters when it has a row, 0 when it was never born */
+int store_slice_stats(store *s, const char *name, uint64_t *seq, uint64_t *edit_bytes,
+                      uint64_t *state_bytes);
 typedef int (*store_name_fn)(void *arg, const char *name, uint64_t seq);
-int store_live_streams(store *s, const char *prefix, store_name_fn fn, void *arg);
-/* 1 and the stream's seq if it is live, 0 if unborn or dead */
-int store_live_stream(store *s, const char *name, uint64_t *seq);
+/* every live slice whose name starts with prefix, by name, with its seq */
+int store_live_slices(store *s, const char *prefix, store_name_fn fn, void *arg);
+/* 1 and the slice's seq if it is live, 0 if unborn or deleted */
+int store_live_slice(store *s, const char *name, uint64_t *seq);
+
+/* buffer.c: a mutation's write buffer, the read-write layer a decider, bootstrap, or a plugin's
+   run writes through.  It holds each key written once, with its last value's msgpack bytes in
+   store format or a deletion, and the slices deleted, each with whether its history goes too.
+   Deleting a slice drops the entries under it, so an entry under a deleted slice is a write made
+   after the deletion.  Reads see the buffer over the store: an entry wins, and a store key under
+   a deleted slice is absent.  Entries keep write order until wbuf_sort orders them by key, which
+   a scan or a commit asks for. */
+typedef struct wentry {
+    char *key;
+    size_t n;
+    uint8_t *val; /* NULL for a deletion */
+    size_t len;
+} wentry;
+typedef struct wdel {
+    char *slice;
+    bool erase;
+} wdel;
+typedef struct wbuf {
+    wentry *v;
+    size_t n, cap;
+    size_t *slots; /* open addressing over v: an entry's index plus one, 0 for an empty slot */
+    size_t nslots;
+    bool sorted;
+    wdel *dels;
+    size_t ndels, capdels;
+} wbuf;
+/* write key's value, copying it, or delete key for a NULL val */
+void wbuf_put(wbuf *b, const char *key, size_t n, const uint8_t *val, size_t len);
+/* the entry for key, or NULL */
+const wentry *wbuf_find(const wbuf *b, const char *key, size_t n);
+void wbuf_delete_slice(wbuf *b, const char *slice, bool erase);
+/* the deletion of the slice a key belongs to, or NULL when the buffer did not delete it */
+const wdel *wbuf_deleted(const wbuf *b, const char *key, size_t n);
+/* order the entries by key, bytewise, and the deleted slices by name */
+void wbuf_sort(wbuf *b);
+/* the first entry in key order at or after key, strictly after when strict; b must be sorted */
+size_t wbuf_seek(const wbuf *b, const char *key, size_t n, bool strict);
+bool wbuf_empty(const wbuf *b);
+void wbuf_clear(wbuf *b);
+void wbuf_free(wbuf *b);
 
 /* scan.c: key patterns, the skeleton's KeyPattern compiled, and the walk of the keys one picks
    out.  Text carries its length, since a pattern given by the bundle may hold U+0000. */
@@ -115,6 +175,8 @@ pattern *pattern_from_js(JSContext *ctx, JSValueConst v);
 void pattern_free(pattern *p);
 /* whether the pattern names a local template, so that its keys share one type */
 bool pattern_named(const pattern *p);
+/* whether the pattern picks out a key */
+bool pattern_matches(const pattern *p, const char *key, size_t n);
 /* the keys a walk steps through before it seeks: a SQLite seek costs about as much as 16 steps
    (2.5 us against 0.16 us a row) */
 #define SCAN_STEP_BUDGET 16
@@ -154,13 +216,6 @@ JSValue mpjs_decode(JSContext *ctx, const uint8_t *data, size_t len);
 JSValue mpjs_decode_node(JSContext *ctx, mpack_node_t node);
 int mpjs_encode(JSContext *ctx, JSValueConst v, buf *out);
 
-/* one slice's templates, from its SliceReducer */
-typedef struct slice_names {
-    char *family;
-    char *stream; /* the family template */
-    strlist keys; /* the key templates */
-} slice_names;
-
 /* os.c: the system calls that differ by platform.  os_random fills buf with n random bytes, and
    os_mkdir makes a directory that may exist; each answers 0, or -1 with errno set where the
    platform sets one.  now_ms is the wall clock in Unix milliseconds. */
@@ -178,16 +233,13 @@ typedef struct jsrt {
     pldb_hash_fn hasher;  /* bootstrap's hashPassword */
     strlist env_names;    /* the variables bootstrap's env may read */
     jsenv env;
+    /* the write buffer of the call running, which reads see over the store, or NULL while a slot
+       that only reads runs, which a write fails, naming slot */
+    wbuf *wb;
+    const char *slot;
     strlist *track_rkeys;
     span_list *track_spans;
     size_t scan_budget; /* the keys a scan steps through before it seeks */
-    strlist *track_wkeys;
-    slice_names *slices; /* every reducer's templates */
-    size_t nslices;
-    /* while a reducer runs, its slice, whose key templates every key it writes must fill, and the
-       length of the "<stream>!" prefix of those keys */
-    const slice_names *reducing;
-    size_t reducing_skip;
     bool dev;           /* the bundle's DEV: its errors go to clients in full */
     char *bundle_file;  /* the name the bundle's stack frames carry */
     JSValue source_map; /* the bundle's inline source map, parsed, or undefined */
@@ -195,54 +247,36 @@ typedef struct jsrt {
     char err[4096];
 } jsrt;
 
-typedef struct pc_item {
-    char *stream;
-    bool death;
-    // with death, whether the stream's earlier events go too
-    bool erase;
-    JSValue event;
-    buf bytes;
-} pc_item;
-
-typedef struct pc_result {
-    char *reason;
-    pc_item *items;
-    size_t n;
-} pc_result;
-
 /* open the JS host: host is host.js's source, which the Go layer embeds */
 int js_open(jsrt *js, const char *host, size_t hostlen, const char *bundle_path, store *st,
             char *err, size_t errlen);
 void js_close(jsrt *js);
 JSValue js_principal(jsrt *js, const char *user);
-/* run the bundle's bootstrap, if it has one, collecting what it emits */
-int js_bootstrap(jsrt *js, pc_result *out);
-int js_precommit(jsrt *js, JSValueConst data, JSValueConst principal, pc_result *out);
+/* The calls that write run over wb, which holds what they wrote when they return.  decide answers
+   0 with *reason NULL when it carried the mutation out, and 0 with the reason, malloc'd, when it
+   rejected it; each call answers -1 with js->err when the bundle threw. */
+int js_decide(jsrt *js, wbuf *wb, JSValueConst data, JSValueConst principal, char **reason);
+/* run the bundle's bootstrap, if it has one */
+int js_bootstrap(jsrt *js, wbuf *wb);
 /* every cron entry of the bundle's cron installs, as install, entry, and spec, three strings each */
 int js_cron_entries(jsrt *js, strlist *out);
-/* one tick of a cron entry, slot and now in Unix milliseconds, collecting what it emits */
-int js_tick(jsrt *js, const char *install, const char *entry, int64_t slot, int64_t now,
-            pc_result *out);
-void pc_result_free(jsrt *js, pc_result *r);
-int js_reduce(jsrt *js, const char *family, const char *stream, JSValueConst events);
-int js_maysee(jsrt *js, JSValueConst principal, strlist *out);
+/* one tick of a cron entry, slot and now in Unix milliseconds, as its install's mutation */
+int js_tick(jsrt *js, wbuf *wb, const char *install, const char *entry, int64_t slot,
+            int64_t now);
+int js_grant(jsrt *js, JSValueConst principal, strlist *out);
 int js_lookup(jsrt *js, const uint8_t *ident, size_t len, buf *out);
 int64_t js_generation(jsrt *js, JSValueConst principal);
 /* the password hash lookup answers for the principal's token, malloc'd into out, or NULL for
    none; -1 when lookup threw */
 int js_password_hash(jsrt *js, JSValueConst principal, char **out);
 
-/* names.c: stream names and keys against their slice's templates */
-/* the slice whose family a stream name's first segment names, or NULL */
-const slice_names *slice_of(const jsrt *js, const char *stream);
-/* whether a stream name fills its family's template */
-bool stream_fills(const jsrt *js, const char *name);
-/* whether a wildcard ref's text before its star ("chat:", "chat:acme,") covers whole parameters
-   of its family's template: the family alone, or the family and parameters other than the
-   terminal one */
-bool ref_prefix_fills(const jsrt *js, const char *prefix);
-/* whether a local key fills the key template its name picks */
-bool key_fills(const slice_names *sl, const char *key);
+/* names.c: slice names, the selectors a grantor returns, and the characters of a key */
+/* whether a string is a slice name: a family, then optionally ':' and its parameters' values
+   separated by ',' */
+bool slice_name_ok(const char *name);
+/* whether a prefix selector's text before its star ("chat:", "chat:acme,") is a family and ':',
+   then whole leading values, each followed by ',' */
+bool selector_prefix_ok(const char *prefix);
 /* whether a key, as its C string, holds no control character and no lone surrogate */
 bool key_chars_ok(const char *key);
 

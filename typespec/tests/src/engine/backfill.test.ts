@@ -11,7 +11,10 @@ import {
   FakeServer,
   keys,
   log,
-  parkedEvent,
+  page,
+  parkedEdit,
+  parkedKeys,
+  parkedPage,
   type Rig,
   rig,
   seq,
@@ -26,8 +29,8 @@ type Record_ = {
   children: string[];
 };
 
-const record = (r: Rig, ref: string): Record_ | undefined =>
-  r.data()[`!backfill:${ref}`] as Record_ | undefined;
+const record = (r: Rig, selector: string): Record_ | undefined =>
+  r.data()[`!backfill:${selector}`] as Record_ | undefined;
 
 /** a held family with two members at position 10 */
 const patrons: Blob = {
@@ -45,13 +48,13 @@ async function held(): Promise<Rig> {
   return r;
 }
 
-/** settle one round at a time until the ref has been asked for n times */
-async function untilCalls(r: Rig, ref: string, n: number): Promise<void> {
+/** settle one round at a time until the selector has been asked for n times */
+async function untilCalls(r: Rig, selector: string, n: number): Promise<void> {
   for (let i = 0; i < 200; i++) {
-    if (r.server.backfills.filter((b) => b.ref === ref).length >= n) return;
+    if (r.server.backfills.filter((b) => b.selector === selector).length >= n) return;
     await settle(1);
   }
-  throw new Error(`no ${n}th backfill of ${ref}`);
+  throw new Error(`no ${n}th backfill of ${selector}`);
 }
 
 afterEach(() => {
@@ -64,14 +67,22 @@ describe('backfill lifecycle', () => {
     r.server.hold('book:*');
     r.server.view('t2', 11, ['patron:*', 'book:*']);
     await settle();
-    expect(r.data()['!view']).toEqual({ token: 't2', position: 11, refs: ['patron:*', 'book:*'] });
+    expect(r.data()['!view']).toEqual({
+      token: 't2',
+      position: 11,
+      selectors: ['patron:*', 'book:*'],
+    });
     expect(record(r, 'book:*')).toEqual({
       until: 11,
       resume: null,
       replacing: false,
       children: [],
     });
-    expect(r.server.backfills.at(-1)).toMatchObject({ ref: 'book:*', until: 11, resume: null });
+    expect(r.server.backfills.at(-1)).toMatchObject({
+      selector: 'book:*',
+      until: 11,
+      resume: null,
+    });
   });
 
   test("the first view's grants are replacing and freeze the base until they land as a group; later grants are additive", async () => {
@@ -85,11 +96,11 @@ describe('backfill lifecycle', () => {
     r.server.vouch(15);
     await settle();
     expect(record(r, 'patron:*')?.replacing).toBe(true);
-    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, reduced: -1 });
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, applied: -1 });
     expect(state(r.data(), 'patron:p1')).toBeUndefined();
     hold.go();
     await settle();
-    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, reduced: 15 });
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, applied: 15 });
     expect(state(r.data(), 'patron:p1')).toEqual({ count: 2, fields: {} });
     r.server.hold('book:*');
     r.server.view('t2', 16, ['patron:*', 'book:*']);
@@ -97,11 +108,11 @@ describe('backfill lifecycle', () => {
     expect(record(r, 'book:*')?.replacing).toBe(false);
   });
 
-  test('creating a replacing ref marks every held stream under it: a stream on a gap, a family at bootstrap over held data', async () => {
-    // a gap on a held stream
+  test('creating a replacing selector marks every held slice under it: a slice on a gap, a family at bootstrap over held data', async () => {
+    // a gap on a held slice
     const r = await held();
     r.server.hold('patron:p1');
-    r.server.events(ev('patron:p1', 5, 11));
+    r.server.edits(ev('patron:p1', 5, 11));
     await settle();
     expect(seq(r.data(), 'patron:p1')).toBe('backfill');
     expect(seq(r.data(), 'patron:p2')).toBe(1);
@@ -127,7 +138,7 @@ describe('backfill lifecycle', () => {
     expect(state(r2.data(), 'patron:p1')).toEqual({ count: 2, fields: {} });
   });
 
-  test('the header writes !backfill-seqs and resume.position; values write !park-kv:{ref}! and skipBytes; events write parked events and fromPosition', async () => {
+  test('the header writes !backfill-seqs and resume.position; pages park raw and advance skipBytes; edits park and advance fromPosition', async () => {
     // the family's land waits on a child, so its record and ranges stay observable after the
     // whole download
     const r = await held();
@@ -148,18 +159,21 @@ describe('backfill lifecycle', () => {
     expect(record(r, 'book:*')?.resume).toEqual({
       position: 10,
       skipBytes: 3,
+      checksum: 'check-3',
       fromPosition: 12,
       snapshotDone: true,
       tailDone: true,
     });
-    // a key no slice declares is dropped
-    expect(keys(r.data(), '!park-kv:book:*!')).toEqual([
-      '!park-kv:book:*!book:b1!state',
-      '!park-kv:book:*!book:b7!state',
+    // a page parks whole, a key no slice declares included, which lands as inert bytes
+    expect(keys(r.data(), '!park-snap:book:*!')).toEqual([parkedPage('book:*', 0)]);
+    expect(parkedKeys(r.data(), 'book:*')).toEqual([
+      'book:b1!other',
+      'book:b1!state',
+      'book:b7!state',
     ]);
-    expect(keys(r.data(), '!park-ev:book:')).toEqual([
-      parkedEvent('book:b1', 4),
-      parkedEvent('book:b7', 4),
+    expect(keys(r.data(), '!park-ed:book:')).toEqual([
+      parkedEdit('book:b1', 4),
+      parkedEdit('book:b7', 4),
     ]);
     expect(seq(r.data(), 'book:b1')).toBe('backfill');
     expect(record(r, 'book:*')?.children).toEqual(['book:b7']);
@@ -170,6 +184,7 @@ describe('backfill lifecycle', () => {
     const resume = {
       position: 10,
       skipBytes: 1,
+      checksum: 'check-1',
       fromPosition: 10,
       snapshotDone: true,
       tailDone: false,
@@ -186,11 +201,11 @@ describe('backfill lifecycle', () => {
     const r = rig({
       server,
       seed: {
-        '!view': { token: 't1', position: 11, refs: ['book:b1'] },
-        '!checkpoint': { epoch: 'e1', position: 11, reduced: 11 },
+        '!view': { token: 't1', position: 11, selectors: ['book:b1'] },
+        '!checkpoint': { epoch: 'e1', position: 11, applied: 11 },
         '!backfill:book:b1': { until: 11, resume: { ...resume }, replacing: false, children: [] },
         '!backfill-seqs:book:b1': { 'book:b1': 3 },
-        '!park-kv:book:b1!book:b1!state': { count: 3, fields: {} },
+        [parkedPage('book:b1', 0)]: page([['book:b1!state', { count: 3, fields: {} }]]),
         '!seq:book:b1': 'backfill',
       },
     });
@@ -198,21 +213,22 @@ describe('backfill lifecycle', () => {
     r.server.open();
     r.server.live(11);
     await settle();
-    expect(r.server.backfills).toEqual([{ ref: 'book:b1', until: 11, resume }]);
+    expect(r.server.backfills).toEqual([{ selector: 'book:b1', until: 11, resume }]);
     expect(record(r, 'book:b1')?.resume).toEqual(resume);
     await vi.advanceTimersByTimeAsync(60_000);
     await settle();
     expect(r.server.backfills.length).toBe(2);
-    expect(r.server.backfills[1]).toEqual({ ref: 'book:b1', until: 11, resume });
+    expect(r.server.backfills[1]).toEqual({ selector: 'book:b1', until: 11, resume });
     expect(state(r.data(), 'book:b1')).toEqual({ count: 4, fields: {} });
     expect(log(r.data(), 'book:b1')).toEqual(['bump']);
     expect(seq(r.data(), 'book:b1')).toBe(4);
   });
 
-  test("'stale' clears the ref's values, keeps its parked events, and retries from the start of the blob", async () => {
+  test("'stale' clears the selector's values, keeps its parked edits, and retries from the start of the blob", async () => {
     const resume = {
       position: 10,
       skipBytes: 1,
+      checksum: 'check-1',
       fromPosition: 10,
       snapshotDone: false,
       tailDone: false,
@@ -227,19 +243,14 @@ describe('backfill lifecycle', () => {
     const r = rig({
       server,
       seed: {
-        '!view': { token: 't1', position: 11, refs: ['book:b1'] },
-        '!checkpoint': { epoch: 'e1', position: 11, reduced: 11 },
+        '!view': { token: 't1', position: 11, selectors: ['book:b1'] },
+        '!checkpoint': { epoch: 'e1', position: 11, applied: 11 },
         '!backfill:book:b1': { until: 11, resume, replacing: false, children: [] },
         '!backfill-seqs:book:b1': { 'book:b1': 3 },
-        '!park-kv:book:b1!book:b1!state': { count: 99, fields: { stale: true } },
-        [parkedEvent('book:b1', 5)]: {
-          id: 'x',
-          data: { id: 'b1', type: 'bump' },
-          position: 11,
-          stream: 'book:b1',
-          seq: 5,
-          servertime: 0,
-        },
+        [parkedPage('book:b1', 0)]: page([
+          ['book:b1!state', { count: 99, fields: { stale: true } }],
+        ]),
+        [parkedEdit('book:b1', 5)]: ev('book:b1', 5, 11, { type: 'bump' }, 'x'),
         '!seq:book:b1': 'backfill',
       },
     });
@@ -249,16 +260,23 @@ describe('backfill lifecycle', () => {
     await settle();
     expect(r.server.backfills.map((b) => b.resume)).toEqual([
       resume,
-      { position: 10, skipBytes: 0, fromPosition: 10, snapshotDone: false, tailDone: false },
+      {
+        position: 10,
+        skipBytes: 0,
+        checksum: '',
+        fromPosition: 10,
+        snapshotDone: false,
+        tailDone: false,
+      },
     ]);
-    // the fresh blob landed and the kept parked event reduced over it
+    // the fresh blob landed and the kept parked edit applied over it
     expect(state(r.data(), 'book:b1')).toEqual({ count: 5, fields: {} });
     expect(log(r.data(), 'book:b1')).toEqual(['bump']);
     expect(seq(r.data(), 'book:b1')).toBe(5);
-    expect(keys(r.data(), '!park-kv:')).toEqual([]);
+    expect(keys(r.data(), '!park-snap:')).toEqual([]);
   });
 
-  test('a revoke of an in-flight ref aborts it and drops its values, record, and uncovered streams', async () => {
+  test('a revoke of an in-flight selector aborts it and drops its values, record, and uncovered slices', async () => {
     const r = await held();
     r.server.hold('book:*');
     r.server.blobs.set('book:*', {
@@ -268,10 +286,10 @@ describe('backfill lifecycle', () => {
     });
     r.server.view('t2', 11, ['patron:*', 'book:*']);
     await settle();
-    r.server.events(ev('book:b1', 4, 12));
+    r.server.edits(ev('book:b1', 4, 12));
     await settle();
     expect(seq(r.data(), 'book:b1')).toBe('backfill');
-    expect(keys(r.data(), '!park-ev:book:')).toEqual([parkedEvent('book:b1', 4)]);
+    expect(keys(r.data(), '!park-ed:book:')).toEqual([parkedEdit('book:b1', 4)]);
     const signal = r.server.conn.signal;
     expect(signal.aborted).toBe(false);
     r.server.view('t3', 13, ['patron:*']);
@@ -281,35 +299,35 @@ describe('backfill lifecycle', () => {
     expect(keys(r.data(), '/park.')).toEqual([]);
     expect(seq(r.data(), 'book:b1')).toBeUndefined();
     expect(keys(r.data(), 'book:')).toEqual([]);
-    // the connection itself is untouched, the held stream too
+    // the connection itself is untouched, the held slice too
     expect(signal.aborted).toBe(false);
     expect(state(r.data(), 'patron:p1')).toEqual({ count: 2, fields: {} });
     // the held download was aborted through its own signal: releasing it starts nothing
     r.server.holds.get('book:*');
     await settle();
-    expect(r.server.backfills.filter((b) => b.ref === 'book:*').length).toBe(1);
+    expect(r.server.backfills.filter((b) => b.selector === 'book:*').length).toBe(1);
   });
 
-  test('a ref covered by an in-flight ref is not backfilled separately', async () => {
+  test('a selector covered by an in-flight selector is not backfilled separately', async () => {
     const r = await held();
     r.server.hold('book:*');
     r.server.view('t2', 11, ['patron:*', 'book:*', 'book:b1', 'patron:p1']);
     await settle();
-    expect(r.server.backfills.map((b) => b.ref)).toEqual(['patron:*', 'book:*']);
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['patron:*', 'book:*']);
     expect(keys(r.data(), '!backfill:')).toEqual(['!backfill:book:*']);
   });
 
-  test('a stream born under an in-flight ref parks; born under no ref it is held at seq 1', async () => {
+  test('a slice born under an in-flight selector parks; born under no selector it is held at seq 1', async () => {
     const r = await held();
     r.server.hold('book:*');
     r.server.view('t2', 11, ['patron:*', 'book:*']);
     await settle();
-    r.server.events(birth('book:b2', 1, 12), birth('patron:p3', 1, 12));
+    r.server.edits(birth('book:b2', 1, 12), birth('patron:p3', 1, 12));
     await settle();
     expect(seq(r.data(), 'book:b2')).toBe('backfill');
-    expect(keys(r.data(), '!park-ev:book:b2!')).toEqual([parkedEvent('book:b2', 1)]);
+    expect(keys(r.data(), '!park-ed:book:b2!')).toEqual([parkedEdit('book:b2', 1)]);
     expect(seq(r.data(), 'patron:p3')).toBe(1);
-    expect(keys(r.data(), '!park-ev:patron:')).toEqual([]);
+    expect(keys(r.data(), '!park-ed:patron:')).toEqual([]);
     await untilCalls(r, 'book:*', 1);
   });
 });

@@ -1,8 +1,8 @@
 /**
  * The type registry the TypeScript emitter generates: one table of nodes shared by every engine
  * and database, a map from type identity to node, and per engine and database the identities
- * the Registry answers for (its commands, eventTypes, and storeTypes).  Hosts walk this data to
- * convert values, so these tests pin its shape down.
+ * the Registry answers for (its key templates' types and its mutations union).  Hosts walk this
+ * data to convert values, so these tests pin its shape down.
  */
 
 import { beforeAll, describe, expect, it } from 'vitest';
@@ -12,15 +12,16 @@ import { emit, outDir } from './emit-harness.ts';
 const SOURCE = `
   alias Id = string;
 
-  interface CatalogSlice extends Slice<"catalog", CatalogEvents, {
+  interface CatalogSlice extends Slice<"catalog", {
     "item:{item}": Item;
     "count": int32;
     "tags": string[];
+    "last": CatalogChange;
   }> {}
 
   model Item { id: Id; title: string; added: utcDateTime; meta?: Record<int32>; }
 
-  union CatalogEvents { ItemAdded, ItemRemoved, Noted }
+  union CatalogChange { ItemAdded, ItemRemoved, Noted }
 
   model ItemAdded { type: "item-added"; id: Id; title: string; added: utcDateTime; }
   model ItemRemoved { id: Id; target: Target; type: "item-removed"; }
@@ -33,39 +34,32 @@ const SOURCE = `
   union Color { "red", "green" }
   model Slot { pair: Pair; color: Color; note: string | null; blob: unknown; }
 
-  interface InboxSlice extends Slice<"inbox:{org},{user}", InboxEvents, {
+  interface InboxSlice extends Slice<"inbox:{org},{user}", {
     "profile": Profile;
     "slot:{slot}": Slot;
   }> {}
 
   model Profile { name: string; }
-  union InboxEvents { ProfileSet, Noted }
-  model ProfileSet { type: "profile-set"; name: string; }
 
-  @command(Noted)
   model Noted { type: "noted"; note: Id; text: string; }
 
-  interface SecretSlice extends Slice<"secret:{user}", SecretSet, { "secret": PasswordHash }> {}
+  interface SecretSlice extends Slice<"secret:{user}", { "secret": PasswordHash; "set": SecretSet }> {}
   model SecretSet { type: "secret-set"; password: PasswordHash; }
 
-  @command(ItemAdded)
   model AddItem { type: "add-item"; id: Id; title: string; added: utcDateTime; }
 
-  @command(ItemRemoved)
   model RemoveItem { type: "remove-item"; id: Id; target: Target; }
 
   @online
-  @command([SecretSet, ProfileSet])
   model SignUp { type: "sign-up"; org: Id; user: Id; name: string; password: NewPassword; }
 
   @online
-  @command([Death, ItemRemoved[]])
-  model Leave { type: "leave"; check: CommandAuth; }
+  model Leave { type: "leave"; check: MutationAuth; }
 
   interface ReaderEngine extends Engine<[CatalogSlice], AddItem> {}
 
-  union WriterCommands { AddItem, RemoveItem, Noted, Leave }
-  interface WriterEngine extends Engine<[CatalogSlice, InboxSlice], WriterCommands> {}
+  union WriterMutations { AddItem, RemoveItem, Noted, Leave }
+  interface WriterEngine extends Engine<[CatalogSlice, InboxSlice], WriterMutations> {}
 
   interface AppDB extends Database<[ReaderEngine, WriterEngine], [SecretSlice], SignUp> {}
 
@@ -198,7 +192,7 @@ describe('the node table', () => {
     expect(node(s, 'SignUp')[3]).toBe(0);
     // declared last, and still the one it writes first
     expect(node(s, 'ItemRemoved')[3]).toBe(2);
-    // CommandAuth's anonymous members, told apart by `kind`
+    // MutationAuth's anonymous members, told apart by `kind`
     const check = s.nodes[field(s, node(s, 'Leave'), 'check')[2]];
     const [, byKind] = check[2][1].find(([jt]: [string]) => jt === 'object');
     for (const [, m] of byKind[2][1]) expect(s.nodes[m[1]][3]).toBe(0);
@@ -224,10 +218,10 @@ describe('the node table', () => {
   it("carries the solver's decision tree for each kind of union", () => {
     const s = M.appDBSchema;
     // discriminated by a literal field
-    const events = node(s, 'CatalogEvents');
-    expect(events[0]).toBe('union');
-    expect(events[1]).toBe('CatalogEvents');
-    const [, byType] = events[2][1].find(([jt]: [string]) => jt === 'object');
+    const changes = node(s, 'CatalogChange');
+    expect(changes[0]).toBe('union');
+    expect(changes[1]).toBe('CatalogChange');
+    const [, byType] = changes[2][1].find(([jt]: [string]) => jt === 'object');
     expect(byType[0]).toBe('field');
     expect(byType[1]).toBe('type');
     expect(byType[2][0]).toBe('literal');
@@ -259,7 +253,7 @@ describe('the node table', () => {
     expect(password).toEqual(['intake', 'NewPassword', leaf(s, 'str')]);
     const check = field(s, node(s, 'Leave'), 'check');
     expect(check[0]).toBe('intake');
-    expect(check[1]).toBe('CommandAuth');
+    expect(check[1]).toBe('MutationAuth');
     expect(s.nodes[check[2]][0]).toBe('union');
     // results travel as their base, under their vocabulary name
     expect(node(s, 'PasswordHash')).toEqual(['str']);
@@ -267,23 +261,23 @@ describe('the node table', () => {
   });
 
   it("has no node for the reserved identities, which are the host's", () => {
-    expect(M.appDBSchema.ids).not.toHaveProperty('.json');
-    expect(M.appDBSchema.ids).not.toHaveProperty('.event');
-    expect(M.appDBSchema.ids).not.toHaveProperty('.command');
+    for (const id of ['.json', '.mutation', '.edits', '.page']) {
+      expect(M.appDBSchema.ids).not.toHaveProperty(id);
+    }
   });
 });
 
 describe('the identities each registry answers for', () => {
-  it("names an engine's commands union, or its one command", () => {
-    expect(M.writerEngineSchema.commands).toBe('WriterCommands');
-    expect(M.readerEngineSchema.commands).toBe('AddItem');
-    expect(node(M.writerEngineSchema, 'WriterCommands')[0]).toBe('union');
+  it("names an engine's mutations union, or its one mutation", () => {
+    expect(M.writerEngineSchema.mutations).toBe('WriterMutations');
+    expect(M.readerEngineSchema.mutations).toBe('AddItem');
+    expect(node(M.writerEngineSchema, 'WriterMutations')[0]).toBe('union');
     expect(node(M.readerEngineSchema, 'AddItem')[0]).toBe('struct');
   });
 
-  it("names a database's commands, as its union when they are not already one", () => {
-    expect(M.appDBSchema.commands).toBe('AppDBCommand');
-    const union = node(M.appDBSchema, 'AppDBCommand');
+  it("names a database's mutations, as its union when they are not already one", () => {
+    expect(M.appDBSchema.mutations).toBe('AppDBMutation');
+    const union = node(M.appDBSchema, 'AppDBMutation');
     expect(union[0]).toBe('union');
     const [, byType] = union[2][1].find(([jt]: [string]) => jt === 'object');
     expect(byType[2][1].map(([lit]: [string]) => lit).sort()).toEqual([
@@ -295,29 +289,16 @@ describe('the identities each registry answers for', () => {
     ]);
   });
 
-  it('maps each family to its events union, a one-event slice to that event', () => {
-    expect(M.readerEngineSchema.eventTypes).toEqual({ catalog: 'CatalogEvents' });
-    expect(M.writerEngineSchema.eventTypes).toEqual({
-      catalog: 'CatalogEvents',
-      inbox: 'InboxEvents',
-    });
-    expect(M.appDBSchema.eventTypes).toEqual({
-      catalog: 'CatalogEvents',
-      inbox: 'InboxEvents',
-      secret: 'SecretSet',
-    });
+  it("answers for each key template's value type, unnamed ones under family/name", () => {
+    const s = M.writerEngineSchema;
+    expect(node(s, 'catalog/count')).toEqual(['int']);
+    expect(node(s, 'catalog/tags')[0]).toBe('array');
+    expect(node(s, 'Slot')[0]).toBe('struct');
+    expect(node(M.appDBSchema, 'PasswordHash')).toEqual(['str']);
   });
 
-  it("maps each slice's key templates to their value types, unnamed ones under family/name", () => {
-    expect(M.writerEngineSchema.storeTypes).toEqual({
-      'catalog/item': 'Item',
-      'catalog/count': 'catalog/count',
-      'catalog/tags': 'catalog/tags',
-      'inbox/profile': 'Profile',
-      'inbox/slot': 'Slot',
-    });
-    expect(M.appDBSchema.storeTypes).toMatchObject({ 'secret/secret': 'PasswordHash' });
-    expect(M.readerEngineSchema.storeTypes).not.toHaveProperty('inbox/profile');
+  it('carries the node table, the identities, and the mutations union, and nothing else', () => {
+    expect(Object.keys(M.writerEngineSchema).sort()).toEqual(['ids', 'mutations', 'nodes']);
   });
 
   it('registers the query wire types and each result under the query id plus #result', () => {
@@ -338,23 +319,17 @@ describe('what the registry replaces', () => {
 
   it("puts the database's schema in its bundle", () => {
     const b = M.defineAppDB({
-      reducers: {
-        catalog: { itemAdded() {}, itemRemoved() {}, noted() {} },
-        inbox: { profileSet() {}, noted() {} },
-        secret: { secretSet() {} },
+      deciders: {
+        addItem: () => {},
+        removeItem: () => {},
+        noted: () => {},
+        signUp: () => {},
+        leave: () => {},
       },
-      precommit: {
-        addItem: () => [],
-        removeItem: () => [],
-        noted: () => [],
-        signUp: () => [],
-        leave: () => [],
-      },
-      maySee: () => [],
+      grant: () => [],
       lookup: () => null,
     });
     expect(b.schema).toBe(M.appDBSchema);
     expect(b).not.toHaveProperty('hashedFields');
-    expect(b).not.toHaveProperty('checkCommand');
   });
 });

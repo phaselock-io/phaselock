@@ -142,15 +142,15 @@ func checkConformance(t *testing.T, st *scanTest, cases []conformanceCase) {
 func TestScanRequestErrors(t *testing.T) {
 	st, _ := openConformanceStore(t, -1)
 	for _, c := range []struct{ req, want string }{
-		{`{"pattern": {"stream": "chat:acme,gen", "name": null, "local": []}, "type": "shelf/lend", "limit": 1}`,
+		{`{"pattern": {"slice": "chat:acme,gen", "name": null, "local": []}, "type": "shelf/lend", "limit": 1}`,
 			"a scan of every local key reads keys only"},
-		{`{"pattern": {"stream": null, "name": "post", "local": []}, "type": false, "limit": 1}`,
-			"a pattern over every stream picks out every local key"},
-		{`{"pattern": {"stream": "login", "name": null, "local": [null]}, "type": false, "limit": 1}`,
+		{`{"pattern": {"slice": null, "name": "post", "local": []}, "type": false, "limit": 1}`,
+			"a pattern over every slice picks out every local key"},
+		{`{"pattern": {"slice": "login", "name": null, "local": [null]}, "type": false, "limit": 1}`,
 			"a pattern over every local key matches no parameter"},
-		{`{"pattern": {"stream": "login", "name": "user", "local": [null]}, "type": "nope", "limit": 1}`,
+		{`{"pattern": {"slice": "login", "name": "user", "local": [null]}, "type": "nope", "limit": 1}`,
 			"no registry entry for type nope"},
-		{`{"pattern": {"stream": "login", "name": "user", "local": [null]}, "type": false, "limit": 0}`,
+		{`{"pattern": {"slice": "login", "name": "user", "local": [null]}, "type": false, "limit": 0}`,
 			"a scan's limit is at least 1"},
 	} {
 		if _, err := st.scan([]byte(c.req)); err == nil || !strings.Contains(err.Error(), c.want) {
@@ -159,29 +159,29 @@ func TestScanRequestErrors(t *testing.T) {
 	}
 }
 
-func TestAPrecommitScans(t *testing.T) {
+func TestADeciderScans(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("b1", "add-book", "id", "b1", "title", "Dune"))
-	h.accept(admin, cmd("b2", "add-book", "id", "b2", "title", "Emma"))
-	h.accept(admin, cmd("b3", "add-book", "id", "b3", "title", "Dune"))
+	h.accept(admin, mut("b1", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(admin, mut("b2", "add-book", "id", "b2", "title", "Emma"))
+	h.accept(admin, mut("b3", "add-book", "id", "b3", "title", "Dune"))
 
-	// shelve reads the shelf's copies, with their values, a batch of one at a time
-	h.accept(admin, cmd("s1", "shelve", "branch", "x", "book", "b1"))
-	h.accept(admin, cmd("s2", "shelve", "branch", "x", "book", "b2"))
-	if o := h.commands(admin, cmd("s3", "shelve", "branch", "x", "book", "b3"))[0]; o.kind != "reject" || o.reason != "title on shelf" {
+	// shelve reads the shelf's copies, with their values
+	h.accept(admin, mut("s1", "shelve", "branch", "x", "book", "b1"))
+	h.accept(admin, mut("s2", "shelve", "branch", "x", "book", "b2"))
+	if o := h.mutations(admin, mut("s3", "shelve", "branch", "x", "book", "b3"))[0]; o.kind != "reject" || o.reason != "title on shelf" {
 		t.Fatalf("a title already on the shelf: %+v", o)
 	}
 
 	// and only that shelf's
-	h.accept(admin, cmd("s4", "shelve", "branch", "y", "book", "b3"))
+	h.accept(admin, mut("s4", "shelve", "branch", "y", "book", "b3"))
 }
 
-func TestAReducerScanSeesItsOwnWritesAndStream(t *testing.T) {
+func TestADeciderScanSeesItsOwnWrites(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
 	for _, b := range [][2]string{{"b1", "Dune"}, {"b2", "Emma"}, {"b3", "Ivanhoe"}} {
-		h.accept(admin, cmd(b[0], "add-book", "id", b[0], "title", b[1]))
+		h.accept(admin, mut(b[0], "add-book", "id", b[0], "title", b[1]))
 	}
 	shelved := func(branch string) string {
 		t.Helper()
@@ -192,15 +192,15 @@ func TestAReducerScanSeesItsOwnWritesAndStream(t *testing.T) {
 		return strings.Join(strs(v), ",")
 	}
 
-	// the reducer's scan sees the copy it set just before it, in local keys
-	h.accept(admin, cmd("s1", "shelve", "branch", "x", "book", "b1"))
+	// the decider's scan sees the copy it set just before it
+	h.accept(admin, mut("s1", "shelve", "branch", "x", "book", "b1"))
 	if got := shelved("x"); got != "copy:b1" {
 		t.Fatalf("after the first copy: %s", got)
 	}
 
-	// and its own stream's copies only, not a neighbour's whose name extends its own
-	h.accept(admin, cmd("s2", "shelve", "branch", "x-2", "book", "b2"))
-	h.accept(admin, cmd("s3", "shelve", "branch", "x", "book", "b3"))
+	// and its own shelf's copies only, not a neighbour's whose name extends its own
+	h.accept(admin, mut("s2", "shelve", "branch", "x-2", "book", "b2"))
+	h.accept(admin, mut("s3", "shelve", "branch", "x", "book", "b3"))
 	if got := shelved("x"); got != "copy:b1,copy:b3" {
 		t.Fatalf("shelf:x: %s", got)
 	}
@@ -209,50 +209,50 @@ func TestAReducerScanSeesItsOwnWritesAndStream(t *testing.T) {
 	}
 }
 
-func TestAMaySeeScanRerunsForKeysItsWalkCovers(t *testing.T) {
+func TestAGrantScanRerunsForKeysItsWalkCovers(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
-	h.accept(admin, cmd("l1", "lend", "branch", "x", "patron", "r1"))
+	h.accept(admin, mut("l1", "lend", "branch", "x", "patron", "r1"))
 
-	// r1 is audited, so each run of its maySee changes its view; it sees the shelves that lend
+	// r1 is audited, so each run of its grantor changes its view; it sees the shelves that lend
 	// to it, from a walk of every shelf's lend key for r1
 	r1 := h.token("r1")
-	s := h.stream(r1, -1)
+	s := h.connect(r1, -1)
 	if s.first == nil || strings.Join(strs(s.first[3]), ",") != "book,patron:r1,shelf:run-1,shelf:x" {
 		t.Fatalf("first view frame: %v", s.first)
 	}
 	s.live()
 
-	// a key inside the walk re-runs maySee, and the grant arrives ahead of the events
-	h.accept(admin, cmd("l2", "lend", "branch", "y", "patron", "r1"))
+	// a key inside the walk re-runs the grantor, and the grant arrives ahead of the edits
+	h.accept(admin, mut("l2", "lend", "branch", "y", "patron", "r1"))
 	f := s.nextTagged("view")
 	if got := strings.Join(strs(f[3]), ","); got != "book,patron:r1,shelf:run-2,shelf:x,shelf:y" {
 		t.Fatalf("a lend to r1: %v", got)
 	}
-	if evs := events(s.nextTagged("events")); evs[0].stream != "shelf:y" {
-		t.Fatalf("the granted shelf's events: %+v", evs)
+	if evs := edits(s.nextTagged("edits")); evs[0].slice != "shelf:y" {
+		t.Fatalf("the granted shelf's edits: %+v", evs)
 	}
 
-	// keys outside it do not, in a shelf r1 sees, whose events come with no view frame ahead of
+	// keys outside it do not, in a shelf r1 sees, whose edits come with no view frame ahead of
 	// them, or in one it does not
-	h.accept(admin, cmd("l3", "lend", "branch", "x", "patron", "p9"))
-	if evs := events(s.nextTagged("events")); evs[0].stream != "shelf:x" {
+	h.accept(admin, mut("l3", "lend", "branch", "x", "patron", "p9"))
+	if evs := edits(s.nextTagged("edits")); evs[0].slice != "shelf:x" {
 		t.Fatalf("a lend to another patron: %+v", evs)
 	}
-	h.accept(admin, cmd("l4", "lend", "branch", "z", "patron", "p9"))
+	h.accept(admin, mut("l4", "lend", "branch", "z", "patron", "p9"))
 	s.quiet()
-	h.accept(admin, cmd("s1", "add-book", "id", "b1", "title", "Dune"))
-	h.accept(admin, cmd("s2", "shelve", "branch", "x", "book", "b1"))
-	events(s.nextTagged("events")) // the book
-	events(s.nextTagged("events")) // the copy
+	h.accept(admin, mut("s1", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(admin, mut("s2", "shelve", "branch", "x", "book", "b1"))
+	edits(s.nextTagged("edits")) // the book
+	edits(s.nextTagged("edits")) // the copy
 
-	// nor does a death outside the walk's streams
-	h.accept(admin, cmd("p1", "add-patron", "id", "p2", "name", "Bob"))
-	h.accept(admin, cmd("p2", "remove-patron", "id", "p2"))
+	// nor does a death outside the walk's slices
+	h.accept(admin, mut("p1", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, mut("p2", "remove-patron", "id", "p2"))
 	s.quiet()
 
-	// the death of a shelf r1 lends at deletes a key the walk read, so maySee runs again
-	h.accept(admin, cmd("c1", "close-shelf", "branch", "y"))
+	// the death of a shelf r1 lends at deletes a key the walk read, so the grantor runs again
+	h.accept(admin, mut("c1", "close-shelf", "branch", "y"))
 	f = s.nextTagged("view")
 	if got := strings.Join(strs(f[3]), ","); got != "book,patron:r1,shelf:run-3,shelf:x" {
 		t.Fatalf("a closed shelf: %v", got)

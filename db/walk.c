@@ -311,28 +311,18 @@ typedef struct ident {
     uint32_t idx;
 } ident;
 
-typedef struct mapping {
-    const char *key;
-    size_t keylen;
-    const char *value;
-    size_t valuelen;
-} mapping;
-
 struct schema {
     node *nodes;
     size_t nnodes;
     ident *ids;
     size_t nids;
-    long commands;
-    mapping *event_types;
-    size_t nevent_types;
-    mapping *store_types;
-    size_t nstore_types;
+    long mutations;
     pl_tokbuf tb; /* the table points into these tokens */
 };
 
 /* the intake kinds this database can run; a schema naming another cannot be loaded */
-static const char *const INTAKE_KINDS[] = {"NewPassword", "CommandAuth", "CaptchaToken", "IdentityProof"};
+static const char *const INTAKE_KINDS[] = {"NewPassword", "MutationAuth", "CaptchaToken",
+                                           "IdentityProof"};
 
 static void sol_free(sol *s) {
     if (!s) return;
@@ -352,8 +342,6 @@ void schema_free(schema *sc) {
     }
     free(sc->nodes);
     free(sc->ids);
-    free(sc->event_types);
-    free(sc->store_types);
     tb_free(&sc->tb);
     free(sc);
 }
@@ -658,29 +646,10 @@ static int parse_node(scur *c, node *n) {
     return 0;
 }
 
-/* a {string: string} object as a mapping list */
-static int parse_mappings(scur *c, mapping **out, size_t *n) {
-    const pl_tok *obj = scur_next(c);
-    if (!obj || obj->kind != PL_BEGIN_OBJ) return scur_fail(c, "schema: expected an object");
-    *out = calloc(obj->num + 1, sizeof **out);
-    if (!*out) die("out of memory");
-    *n = 0;
-    while (c->pos < c->sc->tb.ntoks && c->sc->tb.toks[c->pos].kind == PL_KEY) {
-        mapping *m = &(*out)[*n];
-        m->key = tok_span(&c->sc->tb, &c->sc->tb.toks[c->pos], &m->keylen);
-        c->pos++;
-        m->value = scur_str(c, &m->valuelen);
-        if (!m->value) return -1;
-        (*n)++;
-    }
-    c->pos++; /* the end token */
-    return 0;
-}
-
 schema *schema_compile(const pl_tokbuf *src, char *err, size_t errlen) {
     schema *sc = calloc(1, sizeof *sc);
     if (!sc) die("out of memory");
-    sc->commands = -1;
+    sc->mutations = -1;
 
     // the schema keeps its own copy of the tokens, since the table points into them
     sc->tb.toks = xmalloc(sizeof(pl_tok) * (src->ntoks ? src->ntoks : 1));
@@ -697,20 +666,18 @@ schema *schema_compile(const pl_tokbuf *src, char *err, size_t errlen) {
         goto fail;
     }
     // the slots, found by key
-    size_t nodes_at = 0, ids_at = 0, commands_at = 0, events_at = 0, stores_at = 0;
+    size_t nodes_at = 0, ids_at = 0, mutations_at = 0;
     size_t p = 1;
     while (p < sc->tb.ntoks && sc->tb.toks[p].kind == PL_KEY) {
         size_t klen;
         const char *k = tok_span(&sc->tb, &sc->tb.toks[p], &klen);
         if (span_eq(k, klen, "nodes")) nodes_at = p + 1;
         else if (span_eq(k, klen, "ids")) ids_at = p + 1;
-        else if (span_eq(k, klen, "commands")) commands_at = p + 1;
-        else if (span_eq(k, klen, "eventTypes")) events_at = p + 1;
-        else if (span_eq(k, klen, "storeTypes")) stores_at = p + 1;
+        else if (span_eq(k, klen, "mutations")) mutations_at = p + 1;
         p = tok_skip(&sc->tb, p + 1);
     }
-    if (!nodes_at || !ids_at || !commands_at || !events_at || !stores_at) {
-        scur_fail(&c, "schema: missing nodes, ids, commands, eventTypes, or storeTypes");
+    if (!nodes_at || !ids_at || !mutations_at) {
+        scur_fail(&c, "schema: missing nodes, ids, or mutations");
         goto fail;
     }
 
@@ -743,22 +710,18 @@ schema *schema_compile(const pl_tokbuf *src, char *err, size_t errlen) {
         sc->nids++;
     }
 
-    // the commands union, and the family and key maps
-    c.pos = commands_at;
-    const char *commands;
-    if (scur_name(&c, &commands)) goto fail;
-    if (commands) {
-        size_t len = sc->tb.toks[commands_at].num;
-        sc->commands = schema_lookup(sc, commands, len);
-        if (sc->commands < 0) {
-            scur_fail(&c, "schema: commands names an unknown type");
+    // the mutations union
+    c.pos = mutations_at;
+    const char *mutations;
+    if (scur_name(&c, &mutations)) goto fail;
+    if (mutations) {
+        size_t len = sc->tb.toks[mutations_at].num;
+        sc->mutations = schema_lookup(sc, mutations, len);
+        if (sc->mutations < 0) {
+            scur_fail(&c, "schema: mutations names an unknown type");
             goto fail;
         }
     }
-    c.pos = events_at;
-    if (parse_mappings(&c, &sc->event_types, &sc->nevent_types)) goto fail;
-    c.pos = stores_at;
-    if (parse_mappings(&c, &sc->store_types, &sc->nstore_types)) goto fail;
     if (c.failed) goto fail;
     return sc;
 
@@ -775,22 +738,7 @@ long schema_lookup(const schema *sc, const char *id, size_t len) {
     return -1;
 }
 
-long schema_commands(const schema *sc) { return sc->commands; }
-
-static long mapping_lookup(const schema *sc, const mapping *m, size_t n, const char *key, size_t keylen) {
-    for (size_t i = 0; i < n; i++) {
-        if (m[i].keylen == keylen && memcmp(m[i].key, key, keylen) == 0) {
-            return schema_lookup(sc, m[i].value, m[i].valuelen);
-        }
-    }
-    return -1;
-}
-
-long schema_event_type(const schema *sc, const char *stream) {
-    const char *colon = strchr(stream, ':');
-    size_t flen = colon ? (size_t)(colon - stream) : strlen(stream);
-    return mapping_lookup(sc, sc->event_types, sc->nevent_types, stream, flen);
-}
+long schema_mutations(const schema *sc) { return sc->mutations; }
 
 // sinks ////////////////////////////////////////////////////////////////////
 

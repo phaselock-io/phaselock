@@ -138,7 +138,7 @@ function solveUnionStructs(types: readonly PStruct[]): Solution {
   // There could be a lot of ways to distinguish different structs, but for now I think we will
   // only solve oneof unions, where there is only one key, and discriminated unions, where each
   // struct has e.g. a .type field.  Discriminated unions also need to support a subdiscriminator,
-  // since we expect most types to have a .v field that distinguishes different event schema
+  // since we expect most types to have a .v field that distinguishes different schema
   // versions.  As exceptions arise, we can write a more advanced solver.
 
   // first check for oneof unions, where each member has a single key and they're all different.
@@ -191,7 +191,7 @@ function solveUnionStructs(types: readonly PStruct[]): Solution {
     perfectKeys.sort((a, b) => Number(a === 'v') - Number(b === 'v'));
     // multiple discriminators may mean the solver has done something weird, except the special
     // case where one is .v, because that could just mean a new union was created using two
-    // event types where the second one is on v=2.
+    // types where the second one is on v=2.
     if (perfectKeys.length - Number(perfectKeys[perfectKeys.length - 1] === 'v') > 1) {
       throw new Error(`warning: multiple discriminators (${perfectKeys}): ${types.join(' | ')}`);
     }

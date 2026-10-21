@@ -8,11 +8,14 @@ import { describe, expect, test } from 'vitest';
 import {
   compareKeys,
   deepCopy,
+  type EditEnvelope,
   ExternalStore,
   type ExternalStoreTxn,
   InMemStore,
   JS,
   type KeyPattern,
+  type Lifecycle,
+  MSGPACK,
   Overlay,
   type ParamMatch,
   prefixEnd,
@@ -23,7 +26,7 @@ import {
   type WTxn,
 } from '../../../ts/assets/skeleton.ts';
 
-import { registry } from './harness.ts';
+import { bytes, ev, INVALID, page, parkedEdit, parkedPage, rawEdit, registry } from './harness.ts';
 
 const T = '.json';
 
@@ -37,7 +40,7 @@ function seeded(...keys: string[]): InMemStore {
 }
 
 // every key
-const EVERY: KeyPattern = { stream: null, name: null, local: [] };
+const EVERY: KeyPattern = { slice: null, name: null, local: [] };
 
 /** every key in a store and its value */
 function contents(store: Store): Record<string, unknown> {
@@ -47,8 +50,8 @@ function contents(store: Store): Record<string, unknown> {
   });
 }
 
-/** the keys of stream s at template k:{id}, by a match on the id */
-const ks = (m: ParamMatch = null, stream = 's'): KeyPattern => ({ stream, name: 'k', local: [m] });
+/** the keys of slice s at template k:{id}, by a match on the id */
+const ks = (m: ParamMatch = null, slice = 's'): KeyPattern => ({ slice, name: 'k', local: [m] });
 
 /** the keys a scan walks */
 function scanKeys(txn: RTxn, req: Omit<ScanRequest, 'limit' | 'values'> & { limit?: number }) {
@@ -145,7 +148,7 @@ describe('scan', () => {
 
   test('a walk of every local key reads keys only', () => {
     const store = seeded(...five);
-    const every: KeyPattern = { stream: 's', name: null, local: [] };
+    const every: KeyPattern = { slice: 's', name: null, local: [] };
     expect(() =>
       store.read((txn) => txn.scan({ pattern: every, limit: 10, values: { type: T, rep: JS } })),
     ).toThrow('a scan of every local key reads keys only');
@@ -249,11 +252,12 @@ describe('key order', () => {
 
     // pending writes on either side of the surrogates merge into the base's walk
     const overlay = new Overlay(registry);
-    const merged = store.read((b) =>
+    let merged: string[] = [];
+    store.read((b) =>
       overlay.apply(b, (txn) => {
         txn.set('s!k:\uE001', T, JS, 's!k:\uE001');
         txn.set('s!k:\u{10001}', T, JS, 's!k:\u{10001}');
-        return scanKeys(txn, { pattern: ks(), limit: 2 });
+        merged = scanKeys(txn, { pattern: ks(), limit: 2 });
       }),
     );
     expect(merged).toEqual([
@@ -276,37 +280,37 @@ describe('key order', () => {
   });
 
   test("a walk visits a family's keys in the order of their template parameters", () => {
-    // the keys of x:{day},{channel} streams at reply:{thread},{id}, in the order of their
+    // the keys of x:{day},{channel} slices at reply:{thread},{id}, in the order of their
     // parameters, where a value may be another followed by '-' or '.'
     const days = ['2026-10', '2026-10-06'];
     const channels = ['gen', 'gen-2', 'gen.x'];
     const threads = ['t1', 't1-2'];
     const ids = ['', 'm1', 'm1-2'];
-    const streams = days.flatMap((d) => channels.map((c) => `x:${d},${c}`));
-    const keys = streams.flatMap((st) =>
+    const slices = days.flatMap((d) => channels.map((c) => `x:${d},${c}`));
+    const keys = slices.flatMap((st) =>
       threads.flatMap((t) => ids.map((id) => `${st}!reply:${t},${id}`)),
     );
     const store = seeded(...[...keys].reverse());
 
-    // the family, one stream, and one stream's thread
+    // the family, one slice, and one slice's thread
     const family = { family: 'x', params: [null, null] };
     expect(
       storeKeys(store, {
-        pattern: { stream: family, name: 'reply', local: [null, null] },
+        pattern: { slice: family, name: 'reply', local: [null, null] },
         limit: 7,
       }),
     ).toEqual(keys);
     const one = 'x:2026-10,gen';
     expect(
-      storeKeys(store, { pattern: { stream: one, name: 'reply', local: [null, null] }, limit: 7 }),
+      storeKeys(store, { pattern: { slice: one, name: 'reply', local: [null, null] }, limit: 7 }),
     ).toEqual(keys.filter((k) => k.startsWith(`${one}!`)));
-    const thread: KeyPattern = { stream: one, name: 'reply', local: [{ eq: 't1' }, null] };
+    const thread: KeyPattern = { slice: one, name: 'reply', local: [{ eq: 't1' }, null] };
     expect(storeKeys(store, { pattern: thread, limit: 7 })).toEqual(
       ids.map((id) => `${one}!reply:t1,${id}`),
     );
 
-    // stream names alone sort the same way
-    expect([...streams].reverse().sort(compareKeys)).toEqual(streams);
+    // slice names alone sort the same way
+    expect([...slices].reverse().sort(compareKeys)).toEqual(slices);
   });
 
   test('a prefix match holds exactly the values that start with it', () => {
@@ -322,7 +326,7 @@ describe('key order', () => {
   });
 });
 
-describe('delPrefix and move', () => {
+describe('delPrefix', () => {
   test('delPrefix reports exactly the keys deleted and nothing outside the prefix moves', () => {
     const store = seeded('p/1', 'p/2', 'pq/1', 'q/1');
     const deleted = store.write((txn) => {
@@ -332,33 +336,7 @@ describe('delPrefix and move', () => {
     expect(contents(store)).toEqual({ 'pq/1': 'pq/1', 'q/1': 'q/1' });
   });
 
-  test('move rekeys every key under the prefix, reports the keys as they now exist, and leaves the source empty', () => {
-    const store = seeded('p/1', 'p/2', 'q/1');
-    const moved = store.write((txn) => {
-      return txn.move('p/', 'r/');
-    });
-    expect(moved).toEqual(['r/1', 'r/2']);
-    expect(contents(store)).toEqual({ 'q/1': 'q/1', 'r/1': 'p/1', 'r/2': 'p/2' });
-  });
-
-  test('move into an occupied destination overwrites key by key', () => {
-    const store = seeded('p/1', 'r/1', 'r/3');
-    store.write((txn) => {
-      txn.move('p/', 'r/');
-    });
-    expect(contents(store)).toEqual({ 'r/1': 'p/1', 'r/3': 'r/3' });
-  });
-
-  test('move to the empty prefix lands keys at their remainder', () => {
-    const store = seeded('!park-kv:x!a/1', '!park-kv:x!b/1');
-    const moved = store.write((txn) => {
-      return txn.move('!park-kv:x!', '');
-    });
-    expect(moved).toEqual(['a/1', 'b/1']);
-    expect(contents(store)).toEqual({ 'a/1': '!park-kv:x!a/1', 'b/1': '!park-kv:x!b/1' });
-  });
-
-  test('both see the keys a transaction wrote and not the ones it deleted', () => {
+  test('it sees the keys a transaction wrote and not the ones it deleted', () => {
     const store = seeded('p/1', 'p/2');
     const deleted = store.write((txn) => {
       txn.set('p/0', T, JS, 'p/0');
@@ -367,6 +345,168 @@ describe('delPrefix and move', () => {
     });
     expect(deleted).toEqual(['p/0', 'p/1']);
     expect(contents(store)).toEqual({});
+  });
+});
+
+describe('applying edits', () => {
+  // an edit of slice s at a seq, writing ops, normal unless told
+  const edit = (seq: number, ops: [string, unknown][], lifecycle: Lifecycle = 'normal') => {
+    const env: EditEnvelope = {
+      position: 10 + seq,
+      slice: 's',
+      seq,
+      id: `m${seq}`,
+      servertime: new Date(0),
+      lifecycle,
+    };
+    return { ...env, raw: rawEdit(env, ops) };
+  };
+
+  test('an edit sets and deletes keys in order, and answers the keys it changed', () => {
+    const store = seeded('s!a', 's!b');
+    const changed = store.write((txn) =>
+      txn.applyEdits([
+        edit(1, [
+          ['s!a', 'a2'],
+          ['s!b', undefined],
+          ['s!c', null],
+        ]),
+        edit(2, [['s!d', 'd']]),
+      ]),
+    );
+    expect(changed).toEqual(['s!a', 's!b', 's!c', 's!d']);
+    expect(contents(store)).toEqual({ 's!a': 'a2', 's!c': null, 's!d': 'd' });
+  });
+
+  test("a birth deletes the slice's keys before its writes, and no other slice's", () => {
+    const store = seeded('s!a', 's!b', 'sx!a', 't!a');
+    const changed = store.write((txn) => txn.applyEdits([edit(1, [['s!b', 'b2']], 'birth')]));
+    expect(changed.sort()).toEqual(['s!a', 's!b']);
+    expect(contents(store)).toEqual({ 's!b': 'b2', 'sx!a': 'sx!a', 't!a': 't!a' });
+  });
+
+  test("a death deletes the slice's keys, and one that writes throws", () => {
+    const store = seeded('s!a', 's!b', 't!a');
+    const changed = store.write((txn) => txn.applyEdits([edit(1, [], 'death')]));
+    expect(changed.sort()).toEqual(['s!a', 's!b']);
+    expect(contents(store)).toEqual({ 't!a': 't!a' });
+    expect(() => store.write((txn) => txn.applyEdits([edit(2, [['s!a', 1]], 'death')]))).toThrow(
+      'a death of s writes "s!a"',
+    );
+  });
+
+  test("an edit that writes outside its slice throws, and so does an opcode the store doesn't know", () => {
+    const store = seeded();
+    expect(() => store.write((txn) => txn.applyEdits([edit(1, [['t!a', 1]])]))).toThrow(
+      'an edit of s writes "t!a"',
+    );
+    const bad = { ...edit(1, []), raw: bytes([[11, 's', 1, 'm', 0, false], 7, 's!a']) };
+    expect(() => store.write((txn) => txn.applyEdits([bad]))).toThrow('unknown opcode 7');
+    expect(contents(store)).toEqual({});
+  });
+
+  test("applyParked applies a slice's parked edits from a seq on, in seq order, and leaves them parked", () => {
+    const store = seeded('s!a');
+    store.write((txn) => {
+      for (const e of [
+        edit(1, [['s!x', 1]]),
+        edit(2, [['s!b', 'b']], 'birth'),
+        edit(3, [['s!b', 'b3']]),
+        edit(4, [['s!c', 'c']]),
+      ]) {
+        txn.set(parkedEdit('s', e.seq), '.edits', MSGPACK, e.raw);
+      }
+      txn.set(parkedEdit('sx', 1), '.edits', MSGPACK, edit(1, [['s!z', 1]]).raw);
+    });
+    const changed = store.write((txn) => txn.applyParked('s', 2));
+    expect(changed.sort()).toEqual(['s!a', 's!b', 's!c']);
+    const data = contents(store);
+    expect(Object.keys(data).filter((k) => !k.startsWith('!'))).toEqual(['s!b', 's!c']);
+    expect(data['s!b']).toBe('b3');
+    expect(Object.keys(data).filter((k) => k.startsWith('!park-ed:s!'))).toHaveLength(4);
+  });
+
+  test('a parked edit reads as its envelope, as often as it is read, and as its bytes in msgpack', () => {
+    const store = seeded();
+    const e = edit(3, [['s!a', 1]], 'birth');
+    store.write((txn) => txn.set(parkedEdit('s', 3), '.edits', MSGPACK, e.raw));
+    const read = () => store.read((txn) => txn.get(parkedEdit('s', 3), '.edits', JS));
+    const { raw: _, ...env } = e;
+    expect(read()).toEqual(env);
+    expect(read()).toEqual(env);
+    const raw = store.read((txn) => txn.get(parkedEdit('s', 3), '.edits', MSGPACK));
+    expect(raw).toEqual(e.raw);
+  });
+
+  test("applySnapshot applies a selector's pages in order, skipping the slices it is told to", () => {
+    const store = seeded('s1!old', 's2!kept');
+    store.write((txn) => {
+      txn.set(
+        parkedPage('s*', 0),
+        '.page',
+        MSGPACK,
+        page([
+          ['s1!a', 1],
+          ['s2!a', 1],
+        ]),
+      );
+      txn.set(
+        parkedPage('s*', 2),
+        '.page',
+        MSGPACK,
+        page([
+          ['s1!a', 2],
+          ['s3!a', 3],
+        ]),
+      );
+      txn.set(parkedPage('t', 0), '.page', MSGPACK, page([['t!a', 1]]));
+    });
+    const changed = store.write((txn) => txn.applySnapshot('s*', ['s2']));
+    expect(changed.sort()).toEqual(['s1!a', 's3!a']);
+    const data = contents(store);
+    expect(data).toMatchObject({ 's1!a': 2, 's1!old': 's1!old', 's2!kept': 's2!kept', 's3!a': 3 });
+    expect(data['s2!a']).toBeUndefined();
+    expect(data['t!a']).toBeUndefined();
+  });
+
+  test('a snapshot page holding a key outside its selector throws', () => {
+    const store = seeded();
+    store.write((txn) => txn.set(parkedPage('s', 0), '.page', MSGPACK, page([['t!a', 1]])));
+    expect(() => store.write((txn) => txn.applySnapshot('s', []))).toThrow(
+      'the snapshot of s holds "t!a"',
+    );
+  });
+
+  test("applied bytes decode on read with the reader's type, and the decoded value takes their place", () => {
+    let decodes = 0;
+    const counting = {
+      ...registry,
+      convert: (...a: Parameters<typeof registry.convert>) => {
+        if (a[2] === MSGPACK && a[3] === JS) decodes++;
+        return registry.convert(...a);
+      },
+    };
+    const store = new InMemStore(counting);
+    store.write((txn) => txn.applyEdits([edit(1, [['s!a', { n: 1 }]])]));
+    expect(decodes).toBe(0);
+    const read = () => store.read((txn) => txn.get('s!a', T, JS) as { n: number });
+    const first = read();
+    first.n = 2;
+    expect(read()).toEqual({ n: 1 });
+    expect(decodes).toBe(1);
+    expect(store.read((txn) => txn.get('s!a', T, MSGPACK))).toEqual(bytes({ n: 1 }));
+  });
+
+  test('a value that fails to decode is an error naming its key, in dev mode', () => {
+    const store = seeded();
+    store.write((txn) => txn.applyEdits([edit(1, [['s!a', { type: INVALID }]])]));
+    expect(() => store.read((txn) => txn.get('s!a', T, JS))).toThrow('s!a: $.type: invalid');
+  });
+
+  test('a harness edit applies its log key', () => {
+    const store = seeded();
+    store.write((txn) => txn.applyEdits([ev('patron:p1', 4, 11)]));
+    expect(Object.keys(contents(store))).toEqual(['patron:p1!log:000004']);
   });
 });
 
@@ -493,35 +633,46 @@ describe('a store of many keys', () => {
     expect(keys.size).toBe(2150);
   });
 
-  test('delPrefix and move cover every key under the prefix across blocks', () => {
+  test('delPrefix covers every key under the prefix across blocks', () => {
     const names = Array.from({ length: 5000 }, (_, i) => String(i).padStart(5, '0'));
     const store = seeded(...names.map((n) => `a/${n}`), ...names.map((n) => `b/${n}`));
     const deleted = store.write((txn) => txn.delPrefix('a/'));
     expect(deleted).toEqual(names.map((n) => `a/${n}`));
-    const moved = store.write((txn) => txn.move('b/', 'c/'));
-    expect(moved).toEqual(names.map((n) => `c/${n}`));
     const after = contents(store);
-    expect(Object.keys(after)).toEqual(names.map((n) => `c/${n}`));
-    expect(after['c/04999']).toBe('b/04999');
+    expect(Object.keys(after)).toEqual(names.map((n) => `b/${n}`));
+    expect(after['b/04999']).toBe('b/04999');
   });
 });
 
 describe('overlay', () => {
-  test('refuses to move keys, which no forecast does', () => {
+  test('refuses to apply edits, which no prediction does', () => {
     const base = seeded('s!k:1');
     const overlay = new Overlay(registry);
-    expect(() => base.read((b) => overlay.apply(b, (txn) => txn.move('s!', 't!')))).toThrow(
-      'the overlay does not move keys',
+    expect(() => base.read((b) => overlay.apply(b, (txn) => txn.applyEdits([])))).toThrow(
+      'the overlay applies no edits',
     );
   });
 
-  test('deletes whole streams, from the base and its own layers', () => {
+  test('answers the keys a scratch layer wrote, deletions included', () => {
+    const base = seeded('s!k:1');
+    const overlay = new Overlay(registry);
+    const written = base.read((b) =>
+      overlay.apply(b, (txn) => {
+        txn.set('s!k:2', T, JS, 's!k:2');
+        txn.del('s!k:1');
+      }),
+    );
+    expect(written.sort()).toEqual(['s!k:1', 's!k:2']);
+  });
+
+  test('deletes whole slices, from the base and its own layers', () => {
     const base = seeded('s!k:1', 's!m', 'sx!k:1', 't!k:1');
     const overlay = new Overlay(registry);
-    const deleted = base.read((b) =>
+    let deleted: string[] = [];
+    base.read((b) =>
       overlay.apply(b, (txn: WTxn) => {
         txn.set('s!k:2', T, JS, 's!k:2');
-        return txn.delPrefix('s!');
+        deleted = txn.delPrefix('s!');
       }),
     );
     expect(deleted).toEqual(['s!k:1', 's!k:2', 's!m']);
@@ -530,18 +681,19 @@ describe('overlay', () => {
       't!k:1',
     ]);
     expect(() => base.read((b) => overlay.apply(b, (txn) => txn.delPrefix('s!k:')))).toThrow(
-      'the overlay deletes whole streams, not s!k:',
+      'the overlay deletes whole slices, not s!k:',
     );
   });
 
   test('scan answers with pending writes merged in and pending deletes removed', () => {
     const base = seeded('s!k:1', 's!k:2', 's!k:3');
     const overlay = new Overlay(registry);
-    const inside = base.read((b) =>
+    let inside: [string, unknown][] = [];
+    base.read((b) =>
       overlay.apply(b, (txn) => {
         txn.set('s!k:4', T, JS, 's!k:4');
         txn.del('s!k:2');
-        return scanAll(txn, { pattern: ks(), limit: 10, values: { type: T, rep: JS } });
+        inside = scanAll(txn, { pattern: ks(), limit: 10, values: { type: T, rep: JS } });
       }),
     );
     expect(inside).toEqual([
@@ -712,7 +864,9 @@ describe('external store', () => {
         set: (key) => void calls.push(`set ${key}`),
         del: (key) => void calls.push(`del ${key}`),
         delPrefix: () => [],
-        move: () => [],
+        applyEdits: () => [],
+        applyParked: () => [],
+        applySnapshot: () => [],
         commit: () => {
           calls.push('commit');
           if (fail.commit) throw new Error('commit failed');

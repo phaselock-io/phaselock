@@ -1,5 +1,5 @@
-/* The core: request and result queues, the txn loop, maySee registrations,
-   and the reader-side calls. */
+/* The core: request and result queues, the txn loop, grant registrations, and the reader-side
+   calls. */
 
 #include <ctype.h>
 #include <errno.h>
@@ -33,7 +33,7 @@ typedef struct req {
     size_t len;
     size_t entry; /* a tick's cron entry */
     int64_t slot; /* a tick's slot, or an arm's minute */
-    /* a submit's verdicts, one per command of its body or none, and how often it has bounced */
+    /* a submit's verdicts, one per mutation of its body or none, and how often it has bounced */
     pldb_verdict *verdicts;
     size_t nverdicts;
     int attempt;
@@ -44,18 +44,17 @@ typedef struct req {
     struct req *next;
 } req;
 
-/* one registered maySee query, shared by every connection with the same
-   principal */
+/* one registered grant, shared by every connection with the same principal */
 typedef struct reg {
     char *canon;
     char *user;
-    strlist prefixes;
-    char hash[17]; /* of prefixes, so a change to the set is one comparison */
-    strlist rkeys;   /* the keys maySee got */
-    span_list spans; /* what each of maySee's scan batches walked */
+    strlist selectors;
+    char hash[17]; /* of selectors, so a change to the set is one comparison */
+    strlist rkeys;   /* the keys the grantor got */
+    span_list spans; /* what each of the grantor's scan batches walked */
     uint64_t *conns;
     size_t nconns, capconns;
-    char *failure; /* what its connections are answered with when maySee failed, or NULL */
+    char *failure; /* what its connections are answered with when the grantor failed, or NULL */
     struct reg *next;
 } reg;
 
@@ -81,6 +80,7 @@ struct pldb {
     bool started;
     uint64_t position;
     reg *regs;
+    wbuf wb; /* the write buffer of the mutation running */
 
     pldb_cron_entry *cron;
     char **cron_keys; /* each entry's series key, $cron:<install>,<entry> */
@@ -106,7 +106,7 @@ static pldb_item *items_push(items *it) {
 
 void pldb_items_free(pldb_item *items, size_t n) {
     for (size_t i = 0; i < n; i++) {
-        free(items[i].stream);
+        free(items[i].slice);
         free(items[i].data);
     }
     free(items);
@@ -114,42 +114,17 @@ void pldb_items_free(pldb_item *items, size_t n) {
 
 void pldb_free(void *p) { free(p); }
 
-/* encode [ [position, stream, seq, commandid, servertime], data ] */
-static void encode_wire(buf *out, uint64_t position, const char *stream, uint64_t seq,
-                        const uint8_t *commandid, int64_t servertime, const uint8_t *data,
-                        size_t len) {
-    char *d = NULL;
-    size_t size = 0;
-    mpack_writer_t w;
-    mpack_writer_init_growable(&w, &d, &size);
-    mpack_start_array(&w, 2);
-    mpack_start_array(&w, 5);
-    mpack_write_u64(&w, position);
-    mpack_write_cstr(&w, stream);
-    mpack_write_u64(&w, seq);
-    mpack_write_bin(&w, (const char *)commandid, ID_LEN);
-    mpack_write_timestamp(&w, servertime / 1000, (uint32_t)(servertime % 1000) * 1000000u);
-    mpack_finish_array(&w);
-    mpack_write_object_bytes(&w, (const char *)data, len);
-    mpack_finish_array(&w);
-    if (mpack_writer_destroy(&w) != mpack_ok) die("encode_wire");
-    buf_append(out, d, size);
-    free(d);
-}
-
-static void item_set(pldb_item *it, uint64_t position, uint64_t atom, const char *stream,
-                     uint64_t seq, const uint8_t *commandid, int64_t servertime,
-                     const uint8_t *data, size_t len) {
-    it->stream = xstrdup(stream);
-    it->atom = atom;
+/* an item of a stored edit, copied */
+static void item_set(pldb_item *it, uint64_t position, const char *slice, const uint8_t *edit,
+                     size_t len) {
+    it->slice = xstrdup(slice);
     it->position = position;
-    buf b = {0};
-    encode_wire(&b, position, stream, seq, commandid, servertime, data, len);
-    it->data = b.p;
-    it->len = b.len;
+    it->data = xmalloc(len ? len : 1);
+    memcpy(it->data, edit, len);
+    it->len = len;
 }
 
-/* a command id written as a uuid, for the server's log */
+/* a mutation id written as a uuid, for the server's log */
 static void format_id(const uint8_t *id, char out[37]) {
     char *p = out;
     for (int i = 0; i < ID_LEN; i++) {
@@ -160,12 +135,12 @@ static void format_id(const uint8_t *id, char out[37]) {
 
 /* What a client is told of a failure that is a bug, as opposed to a rejection: the whole error
    when the bundle is a dev build, and "internal error" otherwise.  The whole error goes to the
-   log either way, under the command it failed when it failed one.  Takes msg. */
+   log either way, under the mutation it failed when it failed one.  Takes msg. */
 static char *bug_reason(const pldb *db, const uint8_t *id, char *msg) {
     if (id) {
         char uuid[37];
         format_id(id, uuid);
-        fprintf(stderr, "pldb: command %s: %s\n", uuid, msg);
+        fprintf(stderr, "pldb: mutation %s: %s\n", uuid, msg);
     } else {
         fprintf(stderr, "pldb: %s\n", msg);
     }
@@ -213,7 +188,7 @@ void pldb_result_free(pldb_result *r) {
     if (!r) return;
     pldb_items_free(r->items, r->nitems);
     free(r->buf);
-    free_strings(r->prefixes, r->nprefixes);
+    free_strings(r->selectors, r->nselectors);
     free(r->marks);
     free(r->errmsg);
     free(r->hash);
@@ -335,16 +310,17 @@ int pldb_cron_tick(pldb *db, uint64_t reqid, size_t i, int64_t slot) {
     return 0;
 }
 
-// maySee registrations /////////////////////////////////////////////////////
+// grant registrations //////////////////////////////////////////////////////
 
 static char *canon_principal(const char *user) {
     return user ? strf("u:%s", user) : xstrdup("anon");
 }
 
-static void view_hash(const strlist *prefixes, char out[17]) {
+static void view_hash(const strlist *selectors, char out[17]) {
     strlist sorted = {0};
-    for (size_t i = 0; i < prefixes->n; i++)
-        if (!strlist_has(&sorted, prefixes->v[i])) strlist_push(&sorted, prefixes->v[i]);
+    for (size_t i = 0; i < selectors->n; i++) {
+        if (!strlist_has(&sorted, selectors->v[i])) strlist_push(&sorted, selectors->v[i]);
+    }
     strlist_sort(&sorted);
     uint64_t h = 14695981039346656037ull;
     for (size_t i = 0; i < sorted.n; i++) {
@@ -354,37 +330,37 @@ static void view_hash(const strlist *prefixes, char out[17]) {
     snprintf(out, 17, "%016llx", (unsigned long long)h);
 }
 
-static bool normalize_bundle_ref(const jsrt *js, char *ref);
+static bool normalize_bundle_selector(char *selector);
 
-/* Run maySee for the registration, replacing its prefixes and read-set.  A maySee that throws or
-   returns a malformed ref is a bug, and the registration fails closed: it grants nothing, and
-   every connection of it is answered with the failure. */
+/* Run the grantor for the registration, replacing its selectors and read-set.  A grantor that
+   throws or returns a malformed selector is a bug, and the registration fails closed: it grants
+   nothing, and every connection of it is answered with the failure. */
 static int reg_evaluate(pldb *db, reg *g) {
     JSValue principal = js_principal(&db->js, g->user);
-    strlist_clear(&g->prefixes);
+    strlist_clear(&g->selectors);
     strlist_clear(&g->rkeys);
     span_list_clear(&g->spans);
     db->js.track_rkeys = &g->rkeys;
     db->js.track_spans = &g->spans;
-    int rc = js_maysee(&db->js, principal, &g->prefixes);
+    int rc = js_grant(&db->js, principal, &g->selectors);
     db->js.track_rkeys = NULL;
     db->js.track_spans = NULL;
     JS_FreeValue(db->js.ctx, principal);
 
-    // every ref in wire form, or the first failure
-    char *msg = rc ? strf("maySee failed: %s", db->js.err) : NULL;
-    for (size_t i = 0; !msg && i < g->prefixes.n; i++) {
-        if (!normalize_bundle_ref(&db->js, g->prefixes.v[i])) {
-            msg = strf("maySee returned a malformed ref: %s", g->prefixes.v[i]);
+    // every selector in wire form, or the first failure
+    char *msg = rc ? strf("grant failed: %s", db->js.err) : NULL;
+    for (size_t i = 0; !msg && i < g->selectors.n; i++) {
+        if (!normalize_bundle_selector(g->selectors.v[i])) {
+            msg = strf("grant returned a malformed selector: %s", g->selectors.v[i]);
         }
     }
     free(g->failure);
     g->failure = NULL;
     if (msg) {
         g->failure = bug_reason(db, NULL, msg);
-        strlist_clear(&g->prefixes);
+        strlist_clear(&g->selectors);
     }
-    view_hash(&g->prefixes, g->hash);
+    view_hash(&g->selectors, g->hash);
     return g->failure ? -1 : 0;
 }
 
@@ -397,7 +373,7 @@ static reg *reg_find(pldb *db, const char *canon) {
 static void reg_free(reg *g) {
     free(g->canon);
     free(g->user);
-    strlist_free(&g->prefixes);
+    strlist_free(&g->selectors);
     strlist_free(&g->rkeys);
     span_list_free(&g->spans);
     free(g->conns);
@@ -414,42 +390,43 @@ static void reg_attach(reg *g, uint64_t conn) {
     g->conns[g->nconns++] = conn;
 }
 
-/* A wire ref is a stream name, a wildcard "chat:*" or "chat:acme,*" for
-   every stream whose name begins with its text before the star, or "*"
-   for every stream.  Wildcards are the prefix they cover, "" for "*". */
-static bool is_wildcard(const char *ref) {
-    size_t n = strlen(ref);
-    if (n == 1) return ref[0] == '*';
-    return n > 2 && ref[n - 1] == '*' && (ref[n - 2] == ':' || ref[n - 2] == ',');
+/* A selector in wire form is an exact one, a slice name, or a prefix one: "chat:*" or
+   "chat:acme,*" for every slice whose name begins with its text before the star, or "*" for every
+   slice.  A prefix selector is the prefix it covers, "" for "*". */
+static bool is_prefix_selector(const char *selector) {
+    size_t n = strlen(selector);
+    if (n == 1) return selector[0] == '*';
+    return n > 2 && selector[n - 1] == '*' && (selector[n - 2] == ':' || selector[n - 2] == ',');
 }
 
-static void ref_prefix(const char *ref, char *out, size_t cap) {
-    size_t n = strlen(ref) - 1; /* drop the star */
+static void selector_prefix(const char *selector, char *out, size_t cap) {
+    size_t n = strlen(selector) - 1; /* drop the star */
     if (n + 1 > cap) n = cap - 1;
-    memcpy(out, ref, n);
+    memcpy(out, selector, n);
     out[n] = 0;
 }
 
-/* maySee returns refs with a terminator on every entry: a wildcard
-   ("chat:*", "chat:acme,*", "*") or "name!" for an exact stream, so a bare
-   name is never a grant.  Strips the '!' into wire form; false on a
-   malformed entry, one whose name does not fill its family's template, or
-   a wildcard that cuts into a parameter. */
-static bool normalize_bundle_ref(const jsrt *js, char *ref) {
-    size_t n = strlen(ref);
-    if (strcmp(ref, "*") == 0) return true;
-    if (n > 1 && ref[n - 1] == '!') {
-        ref[n - 1] = 0;
-        return stream_fills(js, ref);
+/* The grantor returns selectors with a terminator on every entry: a prefix selector ("chat:*",
+   "chat:acme,*", "*") or "name!" for an exact one, so a bare name is never a grant.  Strips the
+   '!' into wire form; false, leaving the entry as it was, on a malformed entry: a bare name, an
+   exact one whose name is not a slice name, or a prefix selector that cuts into a parameter. */
+static bool normalize_bundle_selector(char *selector) {
+    size_t n = strlen(selector);
+    if (strcmp(selector, "*") == 0) return true;
+    if (n > 1 && selector[n - 1] == '!') {
+        selector[n - 1] = 0;
+        if (slice_name_ok(selector)) return true;
+        selector[n - 1] = '!';
+        return false;
     }
-    if (!is_wildcard(ref)) return false;
-    ref[n - 1] = 0; /* the text before the star */
-    bool ok = ref_prefix_fills(js, ref);
-    ref[n - 1] = '*';
+    if (!is_prefix_selector(selector)) return false;
+    selector[n - 1] = 0; /* the text before the star */
+    bool ok = selector_prefix_ok(selector);
+    selector[n - 1] = '*';
     return ok;
 }
 
-/* what maySee allows, sorted and unique, or its failure */
+/* what the grantor allows, sorted and unique, or its failure */
 static pldb_result *view_result(const reg *g, uint64_t conn, uint64_t position) {
     pldb_result *r = result_new(PLDB_R_VIEW);
     r->conn = conn;
@@ -460,11 +437,12 @@ static pldb_result *view_result(const reg *g, uint64_t conn, uint64_t position) 
         return r;
     }
     strlist sorted = {0};
-    for (size_t i = 0; i < g->prefixes.n; i++)
-        if (!strlist_has(&sorted, g->prefixes.v[i])) strlist_push(&sorted, g->prefixes.v[i]);
+    for (size_t i = 0; i < g->selectors.n; i++) {
+        if (!strlist_has(&sorted, g->selectors.v[i])) strlist_push(&sorted, g->selectors.v[i]);
+    }
     strlist_sort(&sorted);
-    r->prefixes = strings_copy(&sorted);
-    r->nprefixes = sorted.n;
+    r->selectors = strings_copy(&sorted);
+    r->nselectors = sorted.n;
     strlist_free(&sorted);
     return r;
 }
@@ -538,7 +516,7 @@ static bool has_prefix(const char *s, const char *prefix) {
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
-/* Whether a batch's writes touched what a registration's maySee read: a written key it got or
+/* Whether a batch's writes touched what a registration's grantor read: a written key it got or
    one inside a stretch a scan batch walked, or a deleted prefix holding a key it got or one that
    could lie inside such a stretch.  A spurious re-run costs only time, so a deleted prefix
    dirties whenever it may. */
@@ -567,9 +545,8 @@ static bool reads_touched(const reg *g, const strlist *written, const strlist *d
     return false;
 }
 
-/* after a batch's writes: re-run every maySee whose read-set was touched,
-   and emit a view result to every connection of a registration whose
-   prefixes changed */
+/* after a batch's writes: re-run every grantor whose read-set was touched, and emit a view result
+   to every connection of a registration whose selectors changed */
 static void invalidate_views(pldb *db, const strlist *written, const strlist *deleted,
                              pldb_result **head, pldb_result **tail) {
     for (reg *g = db->regs; g; g = g->next) {
@@ -593,9 +570,6 @@ static void invalidate_views(pldb *db, const strlist *written, const strlist *de
 
 // the write path ///////////////////////////////////////////////////////////
 
-static const uint8_t BIRTH[] = {0x81, 0xa4, '$', 's', 'y', 's', 0xa5, 'b', 'i', 'r', 't', 'h'};
-static const uint8_t DEATH[] = {0x81, 0xa4, '$', 's', 'y', 's', 0xa5, 'd', 'e', 'a', 't', 'h'};
-
 typedef struct batch {
     int64_t servertime;
     items commit;
@@ -603,29 +577,9 @@ typedef struct batch {
     strlist deleted;
 } batch;
 
-/* the stream row must exist: births create it before their event */
-static void append_event(pldb *db, batch *b, uint64_t atom, const char *stream,
-                         const uint8_t *commandid, const uint8_t *data, size_t len) {
-    uint64_t pos = ++db->position;
-    uint64_t seq;
-    if (store_stream_next_seq(db->w, stream, len, &seq)) die("next_seq: %s", store_err(db->w));
-    if (store_append(db->w, pos, atom, stream, seq, commandid, b->servertime, data, len))
-        die("append: %s", store_err(db->w));
-    item_set(items_push(&b->commit), pos, atom, stream, seq, commandid, b->servertime, data, len);
-}
-
-static void family_of(const char *stream, char *out, size_t cap) {
-    const char *colon = strchr(stream, ':');
-    size_t n = colon ? (size_t)(colon - stream) : strlen(stream);
-    if (n >= cap) n = cap - 1;
-    memcpy(out, stream, n);
-    out[n] = 0;
-}
-
-/* the most streams one command's expectations may name */
+/* the most slices one mutation's expectations may name */
 #define EXPECT_MAX 1024
 
-/* one command: returns the outcome as an mpack write into w */
 /* write an outcome of a kind and a reason */
 static void write_reason(mpack_writer_t *w, const char *kind, const char *reason) {
     mpack_start_array(w, 2);
@@ -634,46 +588,46 @@ static void write_reason(mpack_writer_t *w, const char *kind, const char *reason
     mpack_finish_array(w);
 }
 
-/* whether a view, maySee's refs in wire form, covers a stream: a wildcard the names that begin
-   with its text before the star, and a name itself */
-static bool view_covers(const strlist *view, const char *stream) {
+/* whether a view, the grantor's selectors in wire form, covers a slice: a prefix selector the
+   names that begin with its text before the star, and an exact one its own name */
+static bool view_covers(const strlist *view, const char *slice) {
     for (size_t i = 0; i < view->n; i++) {
-        const char *ref = view->v[i];
-        bool wild = is_wildcard(ref);
-        if (wild && strncmp(stream, ref, strlen(ref) - 1) == 0) return true;
-        if (!wild && strcmp(stream, ref) == 0) return true;
+        const char *selector = view->v[i];
+        bool prefix = is_prefix_selector(selector);
+        if (prefix && strncmp(slice, selector, strlen(selector) - 1) == 0) return true;
+        if (!prefix && strcmp(slice, selector) == 0) return true;
     }
     return false;
 }
 
-/* The OCC check: every expected stream's seq must be exactly what the client names (0 for never
-   born).  expect is the command's map as the intake checked it, or NULL for a command without
-   one.  An expectation answers a stream's seq, so the sender may name only streams its maySee
-   covers when the command's turn comes; naming another rejects the command, whether or not the
-   stream exists.  Writes the reject, or a conflict outcome listing each mismatched stream's
-   actual seq, and returns true when either is written. */
+/* The OCC check: every expected slice's seq must be exactly what the client names (0 for never
+   born).  expect is the mutation's map as the intake checked it, or NULL for a mutation without
+   one.  An expectation answers a slice's seq, so the sender may name only slices its grant
+   covers when the mutation's turn comes; naming another rejects the mutation, whether or not the
+   slice exists.  Writes the reject, or a conflict outcome listing each mismatched slice's actual
+   seq, and returns true when either is written. */
 static bool check_expect(pldb *db, mpack_writer_t *w, const uint8_t *id,
                          const mpack_node_t *expect, JSValueConst principal) {
     if (!expect) return false;
     size_t n = mpack_node_map_count(*expect);
-    if (n > EXPECT_MAX) die("prepared expect: %zu streams", n);
+    if (n > EXPECT_MAX) die("prepared expect: %zu slices", n);
     if (n == 0) return false;
 
-    // what the sender may see; a maySee that fails grants nothing
+    // what the sender may see; a grantor that fails grants nothing
     strlist view = {0};
-    int rc = js_maysee(&db->js, principal, &view);
+    int rc = js_grant(&db->js, principal, &view);
     for (size_t i = 0; rc == 0 && i < view.n; i++) {
-        if (!normalize_bundle_ref(&db->js, view.v[i])) rc = -1;
+        if (!normalize_bundle_selector(view.v[i])) rc = -1;
     }
     if (rc) {
         strlist_free(&view);
-        char *reason = bug_reason(db, id, strf("maySee failed: %s", db->js.err));
+        char *reason = bug_reason(db, id, strf("grant failed: %s", db->js.err));
         write_reason(w, "reject", reason);
         free(reason);
         return true;
     }
 
-    // every expected stream inside it
+    // every expected slice inside it
     buf name = {0};
     bool hidden = false;
     for (size_t i = 0; i < n && !hidden; i++) {
@@ -682,7 +636,7 @@ static bool check_expect(pldb *db, mpack_writer_t *w, const uint8_t *id,
         buf_append(&name, mpack_node_str(k), mpack_node_strlen(k));
         buf_append(&name, "", 1);
         if (view_covers(&view, (const char *)name.p)) continue;
-        char *reason = strf("expect: %s is not a stream the sender may see", (char *)name.p);
+        char *reason = strf("expect: %s is not a slice the sender may see", (char *)name.p);
         write_reason(w, "reject", reason);
         free(reason);
         hidden = true;
@@ -693,7 +647,7 @@ static bool check_expect(pldb *db, mpack_writer_t *w, const uint8_t *id,
         return true;
     }
 
-    // the streams whose seq differs from what the client named, with their seq
+    // the slices whose seq differs from what the client named, with their seq
     struct conflict {
         mpack_node_t name;
         uint64_t seq;
@@ -704,9 +658,11 @@ static bool check_expect(pldb *db, mpack_writer_t *w, const uint8_t *id,
         name.len = 0;
         buf_append(&name, mpack_node_str(k), mpack_node_strlen(k));
         buf_append(&name, "", 1);
-        uint64_t seq = 0, eb, sb;
-        int rc = store_stream_stats(db->w, (const char *)name.p, &seq, &eb, &sb);
-        if (rc < 0) die("stream_stats: %s", store_err(db->w));
+        uint64_t seq;
+        bool live;
+        if (store_slice_state(db->w, (const char *)name.p, &seq, &live) < 0) {
+            die("slice_state: %s", store_err(db->w));
+        }
         uint64_t want = mpack_node_u64(mpack_node_map_value_at(*expect, i));
         if (seq != want) conflicts[nconflicts++] = (struct conflict){k, seq};
     }
@@ -725,92 +681,191 @@ static bool check_expect(pldb *db, mpack_writer_t *w, const uint8_t *id,
     return true;
 }
 
-/* Append a command's outputs as one atom and fold them, inside a savepoint named cmd that the
-   caller releases on success.  Births come before a born stream's first event, deaths clear the
-   stream's keys, an erasure its earlier events too, and each stream's events reach its family's
-   reducer as one run.  Frees pc.
-   Answers NULL, or why the atom was rolled back. */
-static char *apply_outputs(pldb *db, batch *b, const uint8_t *id, pc_result *pc) {
-    JSContext *ctx = db->js.ctx;
-    char *reason = NULL;
-    uint64_t start = db->position, atom = start + 1;
-    size_t commit_start = b->commit.n;
-    size_t written_start = b->written.n, deleted_start = b->deleted.n;
-    if (store_exec(db->w, "SAVEPOINT cmd")) die("savepoint: %s", store_err(db->w));
+/* one slice a mutation's write buffer touched: its name, the run of the sorted buffer's entries
+   under it, and its deletion, or NULL */
+typedef struct touched {
+    const char *name;
+    size_t n;
+    size_t from, to;
+    const wdel *del;
+} touched;
 
-    /* append events, grouping them per stream for the reducers */
-    typedef struct group {
-        char *stream;
-        JSValue events;
-        uint32_t n;
-    } group;
-    group *groups = xmalloc(sizeof(group) * (pc->n ? pc->n : 1));
-    size_t ngroups = 0;
-    for (size_t i = 0; i < pc->n; i++) {
-        pc_item *it = &pc->items[i];
-        int live = store_stream_live(db->w, it->stream);
-        if (live < 0) die("stream_live: %s", store_err(db->w));
-        if (it->death) {
-            if (!live) continue;
-            append_event(db, b, atom, it->stream, id, DEATH, sizeof DEATH);
-            if (store_stream_death(db->w, it->stream, db->position)) die("death: %s", store_err(db->w));
-            if (it->erase && store_stream_erase(db->w, it->stream, db->position)) {
-                die("erase: %s", store_err(db->w));
-            }
-            char prefix[1024];
-            snprintf(prefix, sizeof prefix, "%s!", it->stream);
-            if (store_del_prefix(db->w, prefix)) die("del_prefix: %s", store_err(db->w));
-            strlist_push(&b->deleted, prefix);
-            continue;
-        }
-        if (!live) {
-            if (store_stream_birth(db->w, it->stream, db->position + 1)) die("birth: %s", store_err(db->w));
-            append_event(db, b, atom, it->stream, id, BIRTH, sizeof BIRTH);
-        }
-        append_event(db, b, atom, it->stream, id, it->bytes.p, it->bytes.len);
-        group *g = NULL;
-        for (size_t j = 0; j < ngroups; j++)
-            if (strcmp(groups[j].stream, it->stream) == 0) g = &groups[j];
-        if (!g) {
-            g = &groups[ngroups++];
-            g->stream = it->stream;
-            g->events = JS_NewArray(ctx);
-            g->n = 0;
-        }
-        JS_DefinePropertyValueUint32(ctx, g->events, g->n++, JS_DupValue(ctx, it->event), JS_PROP_C_W_E);
+/* the next slice in name order that a sorted buffer touches, past entry *i and deletion *d,
+   which it moves past it */
+static touched next_touched(const wbuf *wb, size_t *i, size_t *d) {
+    touched t = {0};
+
+    // the slice of the next entry, against the next deleted slice
+    int order = *i == wb->n ? 1 : *d == wb->ndels ? -1 : 0;
+    const char *entry = NULL;
+    size_t en = 0;
+    if (*i < wb->n) {
+        entry = wb->v[*i].key;
+        en = (size_t)((const char *)memchr(entry, '!', wb->v[*i].n) - entry);
+    }
+    if (order == 0) {
+        const char *del = wb->dels[*d].slice;
+        size_t dn = strlen(del);
+        int c = memcmp(entry, del, en < dn ? en : dn);
+        order = c ? c : en < dn ? -1 : en > dn ? 1 : 0;
     }
 
-    /* fold */
-    db->js.track_wkeys = &b->written;
-    for (size_t j = 0; j < ngroups && !reason; j++) {
-        char family[256];
-        family_of(groups[j].stream, family, sizeof family);
-        if (js_reduce(&db->js, family, groups[j].stream, groups[j].events) < 0) {
-            reason = bug_reason(db, id, strf("reducer error: %s", db->js.err));
+    // the entries under the slice, when it is the entry's
+    if (order <= 0) {
+        t.name = entry;
+        t.n = en;
+        t.from = *i;
+        while (*i < wb->n && wb->v[*i].n > en && wb->v[*i].key[en] == '!' &&
+               memcmp(wb->v[*i].key, entry, en) == 0) {
+            (*i)++;
         }
+        t.to = *i;
+    } else {
+        t.name = wb->dels[*d].slice;
+        t.n = strlen(t.name);
+        t.from = t.to = *i;
     }
-    db->js.track_wkeys = NULL;
-    for (size_t j = 0; j < ngroups; j++) JS_FreeValue(ctx, groups[j].events);
-    free(groups);
-    pc_result_free(&db->js, pc);
 
-    if (reason) {
-        if (store_exec(db->w, "ROLLBACK TO cmd") || store_exec(db->w, "RELEASE cmd"))
-            die("rollback: %s", store_err(db->w));
-        db->position = start;
-        for (size_t i = commit_start; i < b->commit.n; i++) {
-            free(b->commit.v[i].stream);
-            free(b->commit.v[i].data);
-        }
-        b->commit.n = commit_start;
-        while (b->written.n > written_start) free(b->written.v[--b->written.n]);
-        while (b->deleted.n > deleted_start) free(b->deleted.v[--b->deleted.n]);
-        return reason;
-    }
-    return NULL;
+    // its deletion, when it is the deleted slice's
+    if (order >= 0) t.del = &wb->dels[(*d)++];
+    return t;
 }
 
-/* write an ok outcome: the command was decided at or before position */
+/* An edit's wire encoding: one msgpack array, the envelope, then the payload's items flat, each
+   operation a one-byte opcode and its items: 0, key, value sets a key, and 1, key deletes one.
+   A birth carries the slice's sets alone, since it clears the slice first, and a death carries
+   no operations. */
+static void encode_edit(buf *out, uint64_t position, const char *slice, uint64_t seq,
+                        const uint8_t *id, int64_t servertime, int lifecycle, const wbuf *wb,
+                        const touched *t) {
+    // the payload's items: three per set, and two per deletion of a normal edit
+    uint32_t nitems = 0;
+    for (size_t k = t->from; lifecycle != EDIT_DEATH && k < t->to; k++) {
+        if (wb->v[k].val) nitems += 3;
+        else if (lifecycle == EDIT_NORMAL) nitems += 2;
+    }
+
+    // the envelope
+    char *d = NULL;
+    size_t size = 0;
+    mpack_writer_t w;
+    mpack_writer_init_growable(&w, &d, &size);
+    mpack_start_array(&w, 1 + nitems);
+    mpack_start_array(&w, 6);
+    mpack_write_u64(&w, position);
+    mpack_write_cstr(&w, slice);
+    mpack_write_u64(&w, seq);
+    mpack_write_bin(&w, (const char *)id, ID_LEN);
+    mpack_write_timestamp(&w, servertime / 1000, (uint32_t)(servertime % 1000) * 1000000u);
+    mpack_write_uint(&w, (uint64_t)lifecycle);
+    mpack_finish_array(&w);
+
+    // the operations, each value inline as the buffer holds it
+    for (size_t k = t->from; lifecycle != EDIT_DEATH && k < t->to; k++) {
+        const wentry *e = &wb->v[k];
+        if (e->val) {
+            mpack_write_uint(&w, 0);
+            mpack_write_str(&w, e->key, (uint32_t)e->n);
+            mpack_write_object_bytes(&w, (const char *)e->val, e->len);
+        } else if (lifecycle == EDIT_NORMAL) {
+            mpack_write_uint(&w, 1);
+            mpack_write_str(&w, e->key, (uint32_t)e->n);
+        }
+    }
+    mpack_finish_array(&w);
+    if (mpack_writer_destroy(&w) != mpack_ok) die("encode_edit");
+    buf_append(out, d, size);
+    free(d);
+}
+
+/* Commit one slice's part of a mutation as its edit, at the mutation's position, which its first
+   edit takes.  The lifecycle follows from the buffer and the slice's row: a slice the buffer
+   deleted is born again when the buffer wrote to it after, and otherwise dies, if it was live; a
+   slice the buffer only wrote is edited when it is live, and born when it is unborn or deleted.
+   An unborn or deleted slice that gains no key is no edit. */
+static void commit_slice(pldb *db, batch *b, const uint8_t *id, const wbuf *wb, const touched *t,
+                         uint64_t *position) {
+    // the slice, where it stands, and whether the buffer sets any of its keys
+    char *name = xmalloc(t->n + 1);
+    memcpy(name, t->name, t->n);
+    name[t->n] = 0;
+    uint64_t seq;
+    bool live;
+    if (store_slice_state(db->w, name, &seq, &live) < 0) die("slice_state: %s", store_err(db->w));
+    bool sets = false;
+    for (size_t k = t->from; k < t->to && !sets; k++) sets = wb->v[k].val != NULL;
+
+    // its lifecycle, or no edit
+    int life;
+    if (t->del) life = sets ? EDIT_BIRTH : EDIT_DEATH;
+    else life = live ? EDIT_NORMAL : EDIT_BIRTH;
+    if (!live && (life == EDIT_DEATH || !sets)) {
+        free(name);
+        return;
+    }
+    if (*position == 0) *position = ++db->position;
+    uint64_t pos = *position;
+
+    // the slice's row: a birth revives it, a death ends it, and an erasure drops its edits before
+    // this one
+    if (life == EDIT_BIRTH && store_slice_birth(db->w, name, pos)) {
+        die("slice_birth: %s", store_err(db->w));
+    }
+    if (life == EDIT_DEATH && store_slice_death(db->w, name, pos)) {
+        die("slice_death: %s", store_err(db->w));
+    }
+    if (t->del && t->del->erase && store_slice_erase(db->w, name, pos)) {
+        die("slice_erase: %s", store_err(db->w));
+    }
+
+    // the store: a live slice's birth or death clears it first, then the edit's operations apply
+    if (live && life != EDIT_NORMAL) {
+        char *prefix = strf("%s!", name);
+        if (store_del_prefix(db->w, prefix)) die("del_prefix: %s", store_err(db->w));
+        strlist_push(&b->deleted, prefix);
+        free(prefix);
+    }
+    for (size_t k = t->from; life != EDIT_DEATH && k < t->to; k++) {
+        const wentry *e = &wb->v[k];
+        if (!e->val && life == EDIT_BIRTH) continue;
+        int rc = e->val ? store_set(db->w, e->key, e->val, e->len) : store_del(db->w, e->key);
+        if (rc) die("apply %s: %s", e->key, store_err(db->w));
+        strlist_push(&b->written, e->key);
+    }
+
+    // the edit, appended to the log at the slice's next seq and queued for the live connections
+    buf edit = {0};
+    encode_edit(&edit, pos, name, seq + 1, id, b->servertime, life, wb, t);
+    uint64_t next;
+    if (store_slice_next_seq(db->w, name, edit.len, &next)) die("next_seq: %s", store_err(db->w));
+    if (next != seq + 1) {
+        die("slice %s: seq %llu after %llu", name, (unsigned long long)next,
+            (unsigned long long)seq);
+    }
+    if (store_append(db->w, pos, name, next, life, edit.p, edit.len)) {
+        die("append: %s", store_err(db->w));
+    }
+    pldb_item *it = items_push(&b->commit);
+    it->slice = name;
+    it->position = pos;
+    it->data = edit.p;
+    it->len = edit.len;
+}
+
+/* Commit a mutation's write buffer as its edits, one per slice it touched, in name order, all at
+   one position, and empty the buffer.  A mutation that edits nothing takes no position. */
+static void commit_edits(pldb *db, batch *b, const uint8_t *id, wbuf *wb) {
+    wbuf_sort(wb);
+    uint64_t position = 0;
+    size_t i = 0, d = 0;
+    while (i < wb->n || d < wb->ndels) {
+        touched t = next_touched(wb, &i, &d);
+        commit_slice(db, b, id, wb, &t, &position);
+    }
+    wbuf_clear(wb);
+}
+
+/* write an ok outcome: the mutation was decided at or before position */
 static void write_ok(mpack_writer_t *w, uint64_t position) {
     mpack_start_array(w, 2);
     mpack_write_cstr(w, "ok");
@@ -818,50 +873,35 @@ static void write_ok(mpack_writer_t *w, uint64_t position) {
     mpack_finish_array(w);
 }
 
-/* Decide one command: expect, precommit, and the append and fold of what precommit emitted.  A
-   reject or a conflict leaves nothing in the log or the store. */
+/* Decide one mutation: expect, then the decider over the writer's buffer, whose writes become
+   the mutation's edits when it carries the mutation out.  A reject, a conflict, or a throw
+   discards the buffer, leaving nothing in the log or the store. */
 static void decide(pldb *db, batch *b, mpack_writer_t *w, const uint8_t *id, JSValueConst data,
                    const mpack_node_t *expect, JSValueConst principal) {
-    // the client's expectations of its streams
+    // the client's expectations of its slices
     if (check_expect(db, w, id, expect, principal)) return;
 
-    // precommit, and the streams it emitted to
+    // the decider, writing into the buffer
     char *reason = NULL;
-    pc_result pc = {0};
-    if (js_precommit(&db->js, data, principal, &pc)) {
-        reason = bug_reason(db, id, strf("precommit error: %s", db->js.err));
-    } else if (pc.reason) {
-        reason = pc.reason;
-        pc.reason = NULL;
-    }
-    if (!reason) {
-        for (size_t i = 0; i < pc.n && !reason; i++)
-            if (!stream_fills(&db->js, pc.items[i].stream)) {
-                reason = bug_reason(db, id, strf("invalid stream name: %s", pc.items[i].stream));
-            }
+    if (js_decide(&db->js, &db->wb, data, principal, &reason)) {
+        reason = bug_reason(db, id, strf("decide error: %s", db->js.err));
     }
     if (reason) {
-        pc_result_free(&db->js, &pc);
+        wbuf_clear(&db->wb);
         write_reason(w, "reject", reason);
         free(reason);
         return;
     }
 
-    // the atom, answered ok at the head after it
-    reason = apply_outputs(db, b, id, &pc);
-    if (reason) {
-        write_reason(w, "reject", reason);
-        free(reason);
-        return;
-    }
-    if (store_exec(db->w, "RELEASE cmd")) die("release: %s", store_err(db->w));
+    // the edits, answered ok at the head after them
+    commit_edits(db, b, id, &db->wb);
     write_ok(w, db->position);
 }
 
 enum { PROOF_HOLDS, PROOF_DECIDED, PROOF_BOUNCED };
 
-/* A proven command's proof, against what lookup answers for its sender now, which is what
-   precommit would read: PROOF_HOLDS when it passed against the same hash; PROOF_DECIDED with a
+/* A proven mutation's proof, against what lookup answers for its sender now, which is what
+   the decider would read: PROOF_HOLDS when it passed against the same hash; PROOF_DECIDED with a
    rejection written into w when it failed against the same hash, or lookup failed; and
    PROOF_BOUNCED with the hash lookup answers in *bounce when the hash changed after the proof
    was checked, so that the proof is checked again against it.  A call that has bounced
@@ -900,17 +940,17 @@ static int check_proof(pldb *db, mpack_writer_t *w, const uint8_t *id, const pld
     return PROOF_HOLDS;
 }
 
-/* One command, its outcome written into w.  A command in a series passes the dedup check first,
-   against the group's open transaction, so it sees every decision ahead of it in its group: a
-   number at or below the series' mark was decided already, and anything else runs, an unknown
-   series included, since series rows are kept forever.  A proven command's proof is checked
-   next, before its expectations, so a failed proof never learns a stream's seq.  Every decision
-   moves the mark, whatever it decided.  Answers whether the command bounced instead, which
-   decides nothing and writes no outcome, with what lookup answers in *bounce. */
-static bool run_command(pldb *db, batch *b, mpack_writer_t *w, const char *series, uint64_t n,
-                        const uint8_t *id, JSValueConst data, const mpack_node_t *expect,
-                        JSValueConst principal, const pldb_verdict *v, int attempt,
-                        char **bounce) {
+/* One mutation, its outcome written into w.  A mutation in a series passes the dedup check
+   first, against the group's open transaction, so it sees every decision ahead of it in its
+   group: a number at or below the series' mark was decided already, and anything else runs, an
+   unknown series included, since series rows are kept forever.  A proven mutation's proof is
+   checked next, before its expectations, so a failed proof never learns a slice's seq.  Every
+   decision moves the mark, whatever it decided.  Answers whether the mutation bounced instead,
+   which decides nothing and writes no outcome, with what lookup answers in *bounce. */
+static bool run_mutation(pldb *db, batch *b, mpack_writer_t *w, const char *series, uint64_t n,
+                         const uint8_t *id, JSValueConst data, const mpack_node_t *expect,
+                         JSValueConst principal, const pldb_verdict *v, int attempt,
+                         char **bounce) {
     // the dedup check
     if (series) {
         uint64_t hwm = 0;
@@ -922,14 +962,14 @@ static bool run_command(pldb *db, batch *b, mpack_writer_t *w, const char *serie
         }
     }
 
-    // the proof, then the command
+    // the proof, then the mutation
     int proof = v && v->state != PLDB_PROOF_NONE
                     ? check_proof(db, w, id, v, attempt, principal, bounce)
                     : PROOF_HOLDS;
     if (proof == PROOF_BOUNCED) return true;
     if (proof == PROOF_HOLDS) decide(db, b, w, id, data, expect, principal);
 
-    // the decision moves the mark; a rolled-back atom has already left its savepoint
+    // the decision moves the mark
     if (series && store_series_mark(db->w, series, n, b->servertime))
         die("series_mark: %s", store_err(db->w));
     return false;
@@ -957,7 +997,7 @@ static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) 
        series' key or nil in place of the series, until one bounces */
     mpack_tree_t tree;
     mpack_tree_init_data(&tree, (const char *)q->body, q->len);
-    long commands = schema_commands(db->js.sc);
+    long mutations = schema_mutations(db->js.sc);
     char why[512];
     size_t k = 0;
     for (size_t consumed = 0; consumed < q->len && !r->bounce; k++) {
@@ -966,7 +1006,7 @@ static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) 
         consumed += mpack_tree_size(&tree);
         mpack_node_t c = mpack_tree_root(&tree);
 
-        // the series' key and the command's number, or none for an unnumbered command
+        // the series' key and the mutation's number, or none for an unnumbered mutation
         mpack_node_t keyn = mpack_node_array_at(c, 0);
         char *key = NULL;
         uint64_t n = 0;
@@ -979,7 +1019,7 @@ static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) 
         const uint8_t *id = (const uint8_t *)mpack_node_bin_data(mpack_node_array_at(c, 2));
 
         // the data as a JS value, and the expectations
-        JSValue datav = walk_prepared_to_js(ctx, db->js.sc, mpack_node_array_at(c, 3), commands,
+        JSValue datav = walk_prepared_to_js(ctx, db->js.sc, mpack_node_array_at(c, 3), mutations,
                                             why, sizeof why);
         mpack_node_t expect;
         bool expects = mpack_node_array_length(c) > 4;
@@ -989,8 +1029,8 @@ static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) 
             write_reason(&w, "reject", why);
         } else {
             const pldb_verdict *v = k < q->nverdicts ? &q->verdicts[k] : NULL;
-            r->bounce = run_command(db, b, &w, key, n, id, datav, expects ? &expect : NULL,
-                                    principal, v, q->attempt, &r->hash);
+            r->bounce = run_mutation(db, b, &w, key, n, id, datav, expects ? &expect : NULL,
+                                     principal, v, q->attempt, &r->hash);
         }
         free(key);
         JS_FreeValue(ctx, datav);
@@ -1041,9 +1081,9 @@ static void handle_arm(pldb *db, batch *b, req *q, pldb_result **after_tail) {
 }
 
 /* One tick of a cron entry, past intake.  A slot at or below the entry's mark was decided
-   already; any other runs the entry's hook as its install's command, with the batch's server
-   time as the tick's now, and lands what it emitted as one atom under a label of its own.  The
-   decision moves the mark, a hook's failure included. */
+   already; any other runs the entry's hook as its install's mutation, with the batch's server
+   time as the tick's now, over the writer's buffer, and commits what it wrote as one mutation's
+   edits under a label of its own.  The decision moves the mark, a hook's failure included. */
 static void handle_tick(pldb *db, batch *b, req *q, pldb_result **after_tail) {
     pldb_result *r = result_new(PLDB_R_TICK);
     r->reqid = q->reqid;
@@ -1058,29 +1098,15 @@ static void handle_tick(pldb *db, batch *b, req *q, pldb_result **after_tail) {
     if (known < 0) die("series_hwm: %s", store_err(db->w));
     if (known && (uint64_t)q->slot <= mark) return;
 
-    // the hook, and the streams it emitted to
+    // the hook, writing into the buffer, and its edits, or the failure that discards them
     uint8_t id[ID_LEN];
     if (os_random(id, sizeof id)) die("random bytes: %s", strerror(errno));
-    char *reason = NULL;
-    pc_result pc;
-    if (js_tick(&db->js, e->install, e->entry, q->slot * 1000, b->servertime, &pc)) {
-        reason = bug_reason(db, id, strf("cron %s,%s: %s", e->install, e->entry, db->js.err));
-    }
-    for (size_t i = 0; i < pc.n && !reason; i++)
-        if (!stream_fills(&db->js, pc.items[i].stream)) {
-            reason = bug_reason(db, id, strf("invalid stream name: %s", pc.items[i].stream));
-        }
-
-    // the atom
-    if (reason) {
-        pc_result_free(&db->js, &pc);
-    } else {
-        reason = apply_outputs(db, b, id, &pc);
-        if (!reason && store_exec(db->w, "RELEASE cmd")) die("release: %s", store_err(db->w));
-    }
-    if (reason) {
+    if (js_tick(&db->js, &db->wb, e->install, e->entry, q->slot * 1000, b->servertime)) {
+        wbuf_clear(&db->wb);
         r->status = 500;
-        r->errmsg = reason;
+        r->errmsg = bug_reason(db, id, strf("cron %s,%s: %s", e->install, e->entry, db->js.err));
+    } else {
+        commit_edits(db, b, id, &db->wb);
     }
 
     // the decision moves the mark
@@ -1221,33 +1247,22 @@ static int load_epoch(const char *dir, char **out, char *err, size_t errlen) {
     return 0;
 }
 
-/* On an empty log, the bundle's bootstrap seeds it: what it emits lands as one atom through the
-   ordinary append and fold, before anything is served.  A bootstrap that throws, or emits to a
-   malformed stream, fails the open. */
+/* On an empty log, the bundle's bootstrap seeds it: what it writes commits as one mutation's
+   edits, before anything is served.  A bootstrap that throws, writing to a key under no slice
+   name among the reasons, fails the open. */
 static int run_bootstrap(pldb *db, char *err, size_t errlen) {
-    pc_result pc;
-    if (js_bootstrap(&db->js, &pc)) {
+    if (js_bootstrap(&db->js, &db->wb)) {
         snprintf(err, errlen, "bootstrap: %s", db->js.err);
-        pc_result_free(&db->js, &pc);
+        wbuf_clear(&db->wb);
         return -1;
     }
-    if (pc.n == 0) {
-        pc_result_free(&db->js, &pc);
-        return 0;
-    }
-    for (size_t i = 0; i < pc.n; i++) {
-        if (!stream_fills(&db->js, pc.items[i].stream)) {
-            snprintf(err, errlen, "bootstrap: invalid stream name: %s", pc.items[i].stream);
-            pc_result_free(&db->js, &pc);
-            return -1;
-        }
-    }
+    if (wbuf_empty(&db->wb)) return 0;
 
-    // the atom's id, a label like any client's
+    // the mutation's id, a label like any client's
     uint8_t id[ID_LEN];
     if (os_random(id, sizeof id)) {
         snprintf(err, errlen, "random bytes: %s", strerror(errno));
-        pc_result_free(&db->js, &pc);
+        wbuf_clear(&db->wb);
         return -1;
     }
 
@@ -1255,17 +1270,8 @@ static int run_bootstrap(pldb *db, char *err, size_t errlen) {
     batch b = {0};
     b.servertime = now_ms();
     if (store_exec(db->w, "BEGIN IMMEDIATE")) die("begin: %s", store_err(db->w));
-    char *reason = apply_outputs(db, &b, id, &pc);
-    if (reason) {
-        if (store_exec(db->w, "ROLLBACK")) die("rollback: %s", store_err(db->w));
-        snprintf(err, errlen, "bootstrap: %s", reason);
-        free(reason);
-        pldb_items_free(b.commit.v, b.commit.n);
-        strlist_free(&b.written);
-        strlist_free(&b.deleted);
-        return -1;
-    }
-    if (store_exec(db->w, "RELEASE cmd") || store_exec(db->w, "COMMIT")) die("commit: %s", store_err(db->w));
+    commit_edits(db, &b, id, &db->wb);
+    if (store_exec(db->w, "COMMIT")) die("commit: %s", store_err(db->w));
 
     // nothing is subscribed yet, so the commit's items go nowhere
     pldb_items_free(b.commit.v, b.commit.n);
@@ -1393,6 +1399,7 @@ void pldb_close(pldb *db) {
         db->regs = g->next;
         reg_free(g);
     }
+    wbuf_free(&db->wb);
     store_close(db->w);
     store_close(db->r);
     free(db->dir);
@@ -1403,14 +1410,20 @@ const char *pldb_epoch(pldb *db) { return db->epoch; }
 
 // reader side //////////////////////////////////////////////////////////////
 
+/* What a log read collects: its edits, and with a limit, the most it takes, past which it reads
+   on only to the end of the last edit's position, so a read never splits a mutation's edits. */
 typedef struct read_ctx {
     items it;
+    size_t limit;
 } read_ctx;
 
-static int read_cb(void *arg, uint64_t position, uint64_t atom, const char *stream, uint64_t seq,
-                   const uint8_t *commandid, int64_t servertime, const uint8_t *data, size_t len) {
+static int read_cb(void *arg, uint64_t position, const char *slice, const uint8_t *edit,
+                   size_t len) {
     read_ctx *rc = arg;
-    item_set(items_push(&rc->it), position, atom, stream, seq, commandid, servertime, data, len);
+    if (rc->limit && rc->it.n >= rc->limit && position != rc->it.v[rc->it.n - 1].position) {
+        return 1;
+    }
+    item_set(items_push(&rc->it), position, slice, edit, len);
     return 0;
 }
 
@@ -1471,95 +1484,126 @@ int pldb_read_log(pldb *db, uint64_t from, uint64_t to, pldb_item **items, size_
     return 0;
 }
 
-int pldb_read_events(pldb *db, const char *ref, uint64_t from, uint64_t to, int reverse,
-                     size_t limit, pldb_item **items, size_t *n) {
-    read_ctx rc = {0};
+int pldb_read_edits(pldb *db, const char *selector, uint64_t from, uint64_t to, int reverse,
+                    size_t limit, pldb_item **items, size_t *n) {
+    read_ctx rc = {.limit = limit ? limit : 1};
     char prefix[1024];
-    if (is_wildcard(ref)) ref_prefix(ref, prefix, sizeof prefix);
+    if (is_prefix_selector(selector)) selector_prefix(selector, prefix, sizeof prefix);
     pthread_mutex_lock(&db->rmu);
-    int r = is_wildcard(ref)
-                ? store_read_prefix(db->r, prefix, from, to, reverse != 0, limit, read_cb, &rc)
-                : store_read_stream(db->r, ref, from, to, reverse != 0, limit, read_cb, &rc);
+    int r = is_prefix_selector(selector)
+                ? store_read_prefix(db->r, prefix, from, to, reverse != 0, read_cb, &rc)
+                : store_read_slice(db->r, selector, from, to, reverse != 0, read_cb, &rc);
     pthread_mutex_unlock(&db->rmu);
     if (r) {
         pldb_items_free(rc.it.v, rc.it.n);
         return -1;
+    }
+
+    // a reverse read's edits of one position, which came in descending slice order, ascending
+    for (size_t i = 0; reverse && i < rc.it.n;) {
+        size_t j = i;
+        while (j < rc.it.n && rc.it.v[j].position == rc.it.v[i].position) j++;
+        for (size_t a = i, z = j - 1; a < z; a++, z--) {
+            pldb_item t = rc.it.v[a];
+            rc.it.v[a] = rc.it.v[z];
+            rc.it.v[z] = t;
+        }
+        i = j;
     }
     *items = rc.it.v;
     *n = rc.it.n;
     return 0;
 }
 
+/* A snapshot blob's body as it is cut: its set operations back to back, and their count. */
 typedef struct snap_ctx {
-    buf records;
+    buf body;
     uint32_t count;
 } snap_ctx;
 
+/* a key and its value as one set operation, 0, key, value, the value inline as stored */
 static int snap_cb(void *arg, const char *key, const uint8_t *val, size_t len) {
     snap_ctx *sc = arg;
     size_t klen = strlen(key);
-    size_t start = sc->records.len;
-    buf_u32(&sc->records, (uint32_t)klen);
-    buf_append(&sc->records, key, klen);
-    buf_u32(&sc->records, (uint32_t)len);
-    buf_append(&sc->records, val, len);
-    /* crc over key ‖ value, which are not contiguous in the buffer */
-    uint8_t *k = sc->records.p + start + 4;
-    uint8_t *tmp = xmalloc(klen + len);
-    memcpy(tmp, k, klen);
-    memcpy(tmp + klen, val, len);
-    buf_u32(&sc->records, pl_crc32c(tmp, klen + len));
-    free(tmp);
+    uint8_t op = 0;
+    buf_append(&sc->body, &op, 1);
+
+    // the key, a msgpack str
+    uint8_t hdr[5];
+    size_t h;
+    if (klen < 32) {
+        hdr[0] = (uint8_t)(0xa0 | klen);
+        h = 1;
+    } else if (klen < 256) {
+        hdr[0] = 0xd9;
+        hdr[1] = (uint8_t)klen;
+        h = 2;
+    } else if (klen < 65536) {
+        hdr[0] = 0xda;
+        hdr[1] = (uint8_t)(klen >> 8);
+        hdr[2] = (uint8_t)klen;
+        h = 3;
+    } else {
+        hdr[0] = 0xdb;
+        for (int i = 0; i < 4; i++) hdr[1 + i] = (uint8_t)(klen >> (24 - 8 * i));
+        h = 5;
+    }
+    buf_append(&sc->body, hdr, h);
+    buf_append(&sc->body, key, klen);
+
+    // the value
+    buf_append(&sc->body, val, len);
     sc->count++;
     return 0;
 }
 
-/* the header's streams map, written as it is read from the streams table */
-static int snap_stream_cb(void *arg, const char *name, uint64_t seq) {
+/* the header's slices map, written as it is read from the slices table */
+static int snap_slice_cb(void *arg, const char *name, uint64_t seq) {
     mpack_writer_t *w = arg;
     mpack_write_cstr(w, name);
     mpack_write_u64(w, seq);
     return 0;
 }
 
-int pldb_snapshot(pldb *db, const char *ref, uint8_t **out, size_t *len, uint64_t *position) {
+int pldb_snapshot(pldb *db, const char *selector, uint8_t **out, size_t *len, uint64_t *position) {
     char prefix[1024];
-    if (is_wildcard(ref)) ref_prefix(ref, prefix, sizeof prefix);
-    else snprintf(prefix, sizeof prefix, "%s!", ref);
+    if (is_prefix_selector(selector)) selector_prefix(selector, prefix, sizeof prefix);
+    else snprintf(prefix, sizeof prefix, "%s!", selector);
 
     snap_ctx sc = {0};
-    uint64_t seq = 0, event_bytes = 0, state_bytes = 0;
+    uint64_t seq = 0, edit_bytes = 0, state_bytes = 0;
     int have_stats = 0, live = 0;
     char *hdr = NULL;
     size_t hsize = 0;
     mpack_writer_t w;
     mpack_writer_init_growable(&w, &hdr, &hsize);
 
+    // the keys and the header, in one read transaction, so every slice is at the position
     pthread_mutex_lock(&db->rmu);
     int rc = store_exec(db->r, "BEGIN");
     if (!rc) rc = store_max_position(db->r, position);
     if (!rc) rc = store_scan(db->r, prefix, snap_cb, &sc);
-    if (!rc && !is_wildcard(ref)) {
-        have_stats = store_stream_stats(db->r, ref, &seq, &event_bytes, &state_bytes);
+    if (!rc && !is_prefix_selector(selector)) {
+        have_stats = store_slice_stats(db->r, selector, &seq, &edit_bytes, &state_bytes);
         if (have_stats < 0) rc = -1;
-        if (!rc && (live = store_live_stream(db->r, ref, &seq)) < 0) rc = -1;
+        if (!rc && (live = store_live_slice(db->r, selector, &seq)) < 0) rc = -1;
     }
     if (!rc) {
         mpack_start_map(&w, have_stats > 0 ? 6 : 4);
-        mpack_write_cstr(&w, "ref");
-        mpack_write_cstr(&w, ref);
+        mpack_write_cstr(&w, "selector");
+        mpack_write_cstr(&w, selector);
         mpack_write_cstr(&w, "position");
         mpack_write_u64(&w, *position);
-        mpack_write_cstr(&w, "fold");
+        mpack_write_cstr(&w, "epoch");
         mpack_write_cstr(&w, db->epoch);
-        mpack_write_cstr(&w, "streams");
-        if (is_wildcard(ref)) {
+        mpack_write_cstr(&w, "slices");
+        if (is_prefix_selector(selector)) {
             mpack_build_map(&w);
-            rc = store_live_streams(db->r, prefix, snap_stream_cb, &w);
+            rc = store_live_slices(db->r, prefix, snap_slice_cb, &w);
             mpack_complete_map(&w);
         } else {
             mpack_start_map(&w, live ? 1 : 0);
-            if (live) snap_stream_cb(&w, ref, seq);
+            if (live) snap_slice_cb(&w, selector, seq);
             mpack_finish_map(&w);
         }
     }
@@ -1568,19 +1612,19 @@ int pldb_snapshot(pldb *db, const char *ref, uint8_t **out, size_t *len, uint64_
     if (rc) {
         mpack_writer_destroy(&w);
         free(hdr);
-        buf_free(&sc.records);
+        buf_free(&sc.body);
         return -1;
     }
-
     if (have_stats > 0) {
-        mpack_write_cstr(&w, "event_bytes");
-        mpack_write_u64(&w, event_bytes);
+        mpack_write_cstr(&w, "edit_bytes");
+        mpack_write_u64(&w, edit_bytes);
         mpack_write_cstr(&w, "state_bytes");
         mpack_write_u64(&w, state_bytes);
     }
     mpack_finish_map(&w);
     if (mpack_writer_destroy(&w) != mpack_ok) die("snapshot header");
 
+    // magic, version, the header and its crc, the operations, the end marker, and the footer
     buf b = {0};
     buf_append(&b, "PLSN", 4);
     uint8_t version = 1;
@@ -1589,24 +1633,24 @@ int pldb_snapshot(pldb *db, const char *ref, uint8_t **out, size_t *len, uint64_
     buf_append(&b, hdr, hsize);
     buf_u32(&b, pl_crc32c((const uint8_t *)hdr, hsize));
     free(hdr);
-    buf_append(&b, sc.records.p, sc.records.len);
+    buf_append(&b, sc.body.p, sc.body.len);
     buf_u32(&b, 0xFFFFFFFFu);
     uint8_t footer[12];
-    footer[0] = sc.count >> 24;
-    footer[1] = sc.count >> 16;
-    footer[2] = sc.count >> 8;
-    footer[3] = sc.count;
-    uint64_t h = pl_fnv1a(sc.records.p, sc.records.len, 14695981039346656037ull);
+    footer[0] = (uint8_t)(sc.count >> 24);
+    footer[1] = (uint8_t)(sc.count >> 16);
+    footer[2] = (uint8_t)(sc.count >> 8);
+    footer[3] = (uint8_t)sc.count;
+    uint64_t h = pl_fnv1a(sc.body.p, sc.body.len, 14695981039346656037ull);
     for (int i = 0; i < 8; i++) footer[4 + i] = (uint8_t)(h >> (56 - 8 * i));
     buf_append(&b, footer, 12);
     buf_u32(&b, pl_crc32c(footer, 12));
-    buf_free(&sc.records);
+    buf_free(&sc.body);
     *out = b.p;
     *len = b.len;
     return 0;
 }
 
-// the command check //////////////////////////////////////////////////////
+// the mutation check /////////////////////////////////////////////////////
 
 static char *reasonf(const char *fmt, ...) {
     char msg[1024];
@@ -1617,10 +1661,10 @@ static char *reasonf(const char *fmt, ...) {
     return xstrdup(msg);
 }
 
-/* the longest series id a command may carry, in bytes */
+/* the longest series id a mutation may carry, in bytes */
 #define SERIES_MAX 64
 
-/* whether a msgpack integer is a command number: from 1 to 2^53 - 1, so that every client's
+/* whether a msgpack integer is a mutation number: from 1 to 2^53 - 1, so that every client's
    numbers are exact */
 static bool is_number(mpack_node_t n) {
     if (mpack_node_type(n) == mpack_type_uint) {
@@ -1632,9 +1676,9 @@ static bool is_number(mpack_node_t n) {
 }
 
 /* Whether a parsed request element is [S, n, id, data, expect?]: S a string of 1 to SERIES_MAX
-   bytes and n a command number, or both nil, and id ID_LEN bytes of bin.  Elements a later
+   bytes and n a mutation number, or both nil, and id ID_LEN bytes of bin.  Elements a later
    protocol appends are ignored. */
-static bool is_command(mpack_node_t c) {
+static bool is_mutation(mpack_node_t c) {
     if (mpack_node_type(c) != mpack_type_array || mpack_node_array_length(c) < 4) return false;
 
     // the series and the number
@@ -1667,21 +1711,21 @@ static int str_cmp(const void *a, const void *b) {
     return d ? d : (xn > yn) - (xn < yn);
 }
 
-/* Why a command's expectations are malformed, or NULL when they are a map from at most
-   EXPECT_MAX distinct exact stream names to seqs. */
+/* Why a mutation's expectations are malformed, or NULL when they are a map from at most
+   EXPECT_MAX distinct exact slice names to seqs. */
 static char *expect_reason(pldb *db, mpack_node_t e) {
     if (mpack_node_type(e) != mpack_type_map) return xstrdup("expect must be a map");
     size_t n = mpack_node_map_count(e);
-    if (n > EXPECT_MAX) return reasonf("expect names %zu streams, more than %d", n, EXPECT_MAX);
+    if (n > EXPECT_MAX) return reasonf("expect names %zu slices, more than %d", n, EXPECT_MAX);
 
-    // each entry an exact stream name and a seq
+    // each entry an exact slice name and a seq
     mpack_node_t names[EXPECT_MAX];
     buf name = {0};
     char *reason = NULL;
     for (size_t i = 0; i < n && !reason; i++) {
         names[i] = mpack_node_map_key_at(e, i);
         if (mpack_node_type(names[i]) != mpack_type_str) {
-            reason = xstrdup("expect: a stream name is not a string");
+            reason = xstrdup("expect: a slice name is not a string");
             break;
         }
         const char *s = mpack_node_str(names[i]);
@@ -1690,8 +1734,8 @@ static char *expect_reason(pldb *db, mpack_node_t e) {
         name.len = 0;
         if (len) buf_append(&name, s, len);
         buf_append(&name, "", 1);
-        if (memchr(s, 0, len) || !stream_fills(&db->js, (const char *)name.p)) {
-            reason = reasonf("expect: %.*s is not a stream name", shown, s);
+        if (memchr(s, 0, len) || !slice_name_ok((const char *)name.p)) {
+            reason = reasonf("expect: %.*s is not a slice name", shown, s);
         } else if (!is_seq(mpack_node_map_value_at(e, i))) {
             reason = reasonf("expect: the seq of %.*s is not an integer from 0 to 2^53 - 1", shown,
                              s);
@@ -1700,7 +1744,7 @@ static char *expect_reason(pldb *db, mpack_node_t e) {
     buf_free(&name);
     if (reason) return reason;
 
-    // no stream named twice
+    // no slice named twice
     qsort(names, n, sizeof *names, str_cmp);
     for (size_t i = 1; i < n; i++) {
         if (str_cmp(&names[i - 1], &names[i]) != 0) continue;
@@ -1711,7 +1755,7 @@ static char *expect_reason(pldb *db, mpack_node_t e) {
     return NULL;
 }
 
-/* write a command's expectations as expect_reason passed them, each seq a u64 */
+/* write a mutation's expectations as expect_reason passed them, each seq a u64 */
 static void write_expect(mpack_writer_t *w, mpack_node_t e) {
     size_t n = mpack_node_map_count(e);
     mpack_start_map(w, (uint32_t)n);
@@ -1723,7 +1767,7 @@ static void write_expect(mpack_writer_t *w, mpack_node_t e) {
     mpack_finish_map(w);
 }
 
-/* write a command's series as its key in the series table: the hex SHA-256 of its bytes, so
+/* write a mutation's series as its key in the series table: the hex SHA-256 of its bytes, so
    that nothing the database stores lets its reader send under a live series */
 static void write_series_key(mpack_writer_t *w, mpack_node_t series) {
     SHA256_CTX sha;
@@ -1736,20 +1780,20 @@ static void write_series_key(mpack_writer_t *w, mpack_node_t series) {
     mpack_write_str(w, hex, 2 * SHA256_BLOCK_SIZE);
 }
 
-/* the CommandAuth proofs of a request's passing commands */
+/* the MutationAuth proofs of a request's passing mutations */
 typedef struct proof_list {
     pldb_proof *v;
     size_t n, cap;
 } proof_list;
 
-static void proof_push(proof_list *l, size_t command, mpack_node_t password) {
+static void proof_push(proof_list *l, size_t mutation, mpack_node_t password) {
     if (l->n == l->cap) {
         l->cap = l->cap ? l->cap * 2 : 4;
         l->v = realloc(l->v, l->cap * sizeof *l->v);
         if (!l->v) die("out of memory");
     }
     pldb_proof *p = &l->v[l->n++];
-    p->command = command;
+    p->mutation = mutation;
     p->password = xmalloc(mpack_node_strlen(password) + 1);
     memcpy(p->password, mpack_node_str(password), mpack_node_strlen(password));
     p->password[mpack_node_strlen(password)] = 0;
@@ -1760,21 +1804,21 @@ static void proofs_free(pldb_proof *v, size_t n) {
     free(v);
 }
 
-/* Check one command's data and prepare its fields: a NewPassword is hashed, and a password
-   CommandAuth is replaced by its result and its password appended to proofs, under index, the
-   command's in the request; any other kind cannot be verified yet.  Writes the prepared
+/* Check one mutation's data and prepare its fields: a NewPassword is hashed, and a password
+   MutationAuth is replaced by its result and its password appended to proofs, under index, the
+   mutation's in the request; any other kind cannot be verified yet.  Writes the prepared
    [key, n, id, data, expect?] to out, its series replaced by its key, or answers why the
-   command is rejected; a hash function's refusal sets *refused instead, and answers NULL. */
-static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t c, size_t index, buf *out,
-                             proof_list *proofs, int *refused) {
-    long commands = schema_commands(db->js.sc);
-    if (commands < 0) return xstrdup("this database takes no commands");
+   mutation is rejected; a hash function's refusal sets *refused instead, and answers NULL. */
+static char *prepare_mutation(pldb *db, uintptr_t arg, mpack_node_t c, size_t index, buf *out,
+                              proof_list *proofs, int *refused) {
+    long mutations = schema_mutations(db->js.sc);
+    if (mutations < 0) return xstrdup("this database takes no mutations");
     mpack_node_t data = mpack_node_array_at(c, 3);
     char why[512];
     intake_list il = {0};
     size_t proofs_start = proofs->n;
     char *reason = NULL;
-    if (walk_check(db->js.sc, data, commands, true, &il, why, sizeof why)) {
+    if (walk_check(db->js.sc, data, mutations, true, &il, why, sizeof why)) {
         reason = xstrdup(why);
         goto done;
     }
@@ -1783,10 +1827,10 @@ static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t c, size_t ind
         if (reason) goto done;
     }
 
-    // each proof, whose password the caller checks, before any hash is spent on the command
+    // each proof, whose password the caller checks, before any hash is spent on the mutation
     for (size_t k = 0; k < il.n; k++) {
         intake *in = &il.v[k];
-        if (strcmp(in->kind, "CommandAuth") != 0) continue;
+        if (strcmp(in->kind, "MutationAuth") != 0) continue;
         mpack_node_t kind = mpack_node_map_cstr(in->node, "kind");
         if (mpack_node_strlen(kind) != 8 || memcmp(mpack_node_str(kind), "password", 8) != 0) {
             reason = reasonf("%.*s proofs are not supported by this database yet",
@@ -1800,7 +1844,7 @@ static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t c, size_t ind
     // each other prepared field's result
     for (size_t k = 0; k < il.n; k++) {
         intake *in = &il.v[k];
-        if (strcmp(in->kind, "CommandAuth") == 0) continue;
+        if (strcmp(in->kind, "MutationAuth") == 0) continue;
         if (strcmp(in->kind, "NewPassword") != 0) {
             reason = reasonf("%s fields are not supported by this database yet", in->kind);
             goto done;
@@ -1820,7 +1864,7 @@ static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t c, size_t ind
         in->result = xstrdup(hash);
     }
 
-    // the command as checked, its prepared fields replaced
+    // the mutation as checked, its prepared fields replaced
     char *bytes = NULL;
     size_t size = 0;
     mpack_writer_t w;
@@ -1836,7 +1880,7 @@ static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t c, size_t ind
         mpack_write_u64(&w, (uint64_t)mpack_node_i64(mpack_node_array_at(c, 1)));
     }
     mpack_write_bin(&w, mpack_node_bin_data(id), ID_LEN);
-    int rc = walk_write(db->js.sc, data, commands, true, &il, &w, why, sizeof why);
+    int rc = walk_write(db->js.sc, data, mutations, true, &il, &w, why, sizeof why);
     if (rc == 0 && len > 4) write_expect(&w, mpack_node_array_at(c, 4));
     mpack_finish_array(&w);
     if (mpack_writer_destroy(&w) != mpack_ok && rc == 0) {
@@ -1850,7 +1894,7 @@ static char *prepare_command(pldb *db, uintptr_t arg, mpack_node_t c, size_t ind
 done:
     intake_list_free(&il);
 
-    // a command that does not pass carries no proofs
+    // a mutation that does not pass carries no proofs
     if (reason || *refused) {
         while (proofs->n > proofs_start) free(proofs->v[--proofs->n].password);
     }
@@ -1874,13 +1918,13 @@ int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, size_
             return -1;
         }
         consumed += mpack_tree_size(&tree);
-        if (!is_command(mpack_tree_root(&tree))) {
-            snprintf(err, errlen, "command must be [S, n, id, data, expect?]");
+        if (!is_mutation(mpack_tree_root(&tree))) {
+            snprintf(err, errlen, "mutation must be [S, n, id, data, expect?]");
             mpack_tree_destroy(&tree);
             return -1;
         }
         if (ncmds == max) {
-            snprintf(err, errlen, "a request carries at most %zu commands", max);
+            snprintf(err, errlen, "a request carries at most %zu mutations", max);
             mpack_tree_destroy(&tree);
             return PLDB_TOO_MANY;
         }
@@ -1891,7 +1935,7 @@ int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, size_
     out->offsets = xmalloc(sizeof(size_t) * (ncmds ? ncmds : 1));
     out->n = ncmds;
 
-    // check and prepare each command; a refused hash refuses the request
+    // check and prepare each mutation; a refused hash refuses the request
     buf prepared = {0};
     proof_list proofs = {0};
     int refused = 0;
@@ -1899,8 +1943,8 @@ int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, size_
     for (size_t i = 0; i < ncmds && !refused; i++) {
         mpack_tree_parse(&tree);
         out->offsets[i] = prepared.len;
-        out->reasons[i] = prepare_command(db, arg, mpack_tree_root(&tree), i, &prepared, &proofs,
-                                          &refused);
+        out->reasons[i] = prepare_mutation(db, arg, mpack_tree_root(&tree), i, &prepared,
+                                           &proofs, &refused);
     }
     mpack_tree_destroy(&tree);
     out->body = prepared.p;

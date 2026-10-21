@@ -50,7 +50,7 @@ alias Isbn = string;
 // checkout, with no patron named anywhere, since every user syncs this slice.  Collections are
 // key ranges that readers scan, such as `edition_book:{isbn},` for the books of one edition.
 
-interface BookSlice extends Slice<"book:{room}", BookEvents, BookStore> {}
+interface BookSlice extends Slice<"book:{room}", BookStore> {}
 
 alias BookStore = {
   "edition:{isbn}": Edition;
@@ -85,7 +85,7 @@ model Hold {
   timestamp: utcDateTime;
   // absent for an open-ended hold
   expires?: utcDateTime;
-  // true while the hold is only a forecast, which the database has not decided yet
+  // true while the hold is only a prediction, which the database has not decided yet
   pending?: boolean;
 }
 
@@ -94,26 +94,12 @@ model Checkout {
   book: Uuid;
   expires: utcDateTime;
   overdue: boolean;
-  // true while the checkout is only a forecast, which the database has not decided yet
+  // true while the checkout is only a prediction, which the database has not decided yet
   pending?: boolean;
 }
 
-union BookEvents {
-  AddEdition,
-  UpdateEditionTitle,
-  AddBook,
-  UpdateBookRestricted,
-  RemoveBook,
-  HoldOpened,
-  HoldClosed,
-  CheckoutOpened,
-  CheckoutEnded,
-  CheckoutOverdue,
-}
+// Edition mutations //
 
-// Edition commands + events //
-
-@command(AddEdition)
 model AddEdition {
   type: "add-edition";
   ...InRoom;
@@ -122,7 +108,6 @@ model AddEdition {
   timestamp: utcDateTime;
 }
 
-@command(UpdateEditionTitle)
 model UpdateEditionTitle {
   type: "update-edition-title";
   ...InRoom;
@@ -131,9 +116,8 @@ model UpdateEditionTitle {
   timestamp: utcDateTime;
 }
 
-// Book commands + events //
+// Book mutations //
 
-@command(AddBook)
 model AddBook {
   type: "add-book";
   ...InRoom;
@@ -145,7 +129,6 @@ model AddBook {
 
 // Restricting a book closes a book-level hold on it by a patron who is not a researcher, and when
 // edition-level holds need the copy, the newest of them until the rest fit.
-@command((UpdateBookRestricted | HoldClosed | PatronHoldClosed)[])
 model UpdateBookRestricted {
   type: "update-book-restricted";
   ...InRoom;
@@ -156,7 +139,6 @@ model UpdateBookRestricted {
 
 // Rejected while the book is checked out.  A book-level hold on it closes, and when edition-level
 // holds need the copy, the newest of them until the rest fit.
-@command((RemoveBook | HoldClosed | PatronHoldClosed)[])
 model RemoveBook {
   type: "remove-book";
   ...InRoom;
@@ -164,11 +146,10 @@ model RemoveBook {
   timestamp: utcDateTime;
 }
 
-// Hold commands + events //
+// Hold mutations //
 
 // the catalog learns of the hold, the patron learns it is theirs, and the librarians learn whose
 // it is, or the patron alone learns why it failed
-@command([HoldOpened, PatronHoldOpened, HoldOwner] | HoldFailed)
 model TryHold {
   type: "try-hold";
   ...InRoom;
@@ -180,16 +161,8 @@ model TryHold {
   timestamp: utcDateTime;
 }
 
-model HoldOpened {
-  type: "hold-opened";
-  id: Uuid;
-  target: { book: Uuid } | { edition: Isbn };
-  timestamp: utcDateTime;
-  expires?: utcDateTime;
-}
-
-// the hold closes in the catalog, in the librarians' record of whose it was, and for its patron
-@command([HoldClosed, HoldClosed, PatronHoldClosed])
+// a patron cancels their own hold: it closes in the catalog, in the librarians' record of whose
+// it was, and for its patron
 model CancelHold {
   type: "cancel-hold";
   ...InRoom;
@@ -197,26 +170,19 @@ model CancelHold {
   patron: Uuid;
 }
 
-// closes a hold, whether cancelled, fulfilled by a checkout, closed with its patron's account, or
-// expired by the daily sheet
-model HoldClosed {
-  type: "hold-closed";
+// a librarian cancels a patron's hold: it closes as a patron's cancel does, and the patron gets a
+// notice saying the library canceled it
+model LibraryCancelHold {
+  type: "library-cancel-hold";
+  ...InRoom;
   id: Uuid;
-  reason: string;
+  patron: Uuid;
 }
 
-// Checkout commands + events //
+// Checkout mutations //
 
 // a checkout that fulfills the patron's own hold also closes it; a failure is a notice to the
 // librarians, since a checkout queued offline at the desk can fail after they have moved on
-@command((
-  | CheckoutOpened
-  | PatronCheckoutOpened
-  | CheckoutOwner
-  | HoldClosed
-  | PatronHoldClosed
-  | CheckoutFailed
-)[])
 model TryCheckout {
   type: "try-checkout";
   ...InRoom;
@@ -226,16 +192,7 @@ model TryCheckout {
   timestamp: utcDateTime;
 }
 
-model CheckoutOpened {
-  type: "checkout-opened";
-  id: Uuid;
-  book: Uuid;
-  expires: utcDateTime;
-  timestamp: utcDateTime;
-}
-
 // the checkout ends in the catalog, in the librarians' record of whose it was, and for its patron
-@command([CheckoutEnded, CheckoutEnded, PatronCheckoutEnded])
 model EndCheckout {
   type: "end-checkout";
   ...InRoom;
@@ -244,27 +201,15 @@ model EndCheckout {
   timestamp: utcDateTime;
 }
 
-model CheckoutEnded {
-  type: "checkout-ended";
-  id: Uuid;
-  timestamp: utcDateTime;
-}
-
-// the daily sheet marks a checkout overdue once its expiry has passed
-model CheckoutOverdue {
-  type: "checkout-overdue";
-  id: Uuid;
-}
-
 //////////////////
 // Patron Slice //
 //////////////////
 
 // One patron's own record: their profile, and the holds, checkouts, and notices that are theirs.
-// Every hold and checkout change that touches a patron reaches them as an event of their own,
-// since a reducer here cannot read the book slice.
+// The catalog names no patron, so each hold and checkout that is a patron's is kept here too,
+// where the patron and the librarians see it.
 
-interface PatronSlice extends Slice<"patron:{room},{patron}", PatronEvents, PatronStore> {}
+interface PatronSlice extends Slice<"patron:{room},{patron}", PatronStore> {}
 
 alias PatronStore = {
   "patron": Patron;
@@ -287,7 +232,7 @@ model PatronHold {
   id: Uuid;
   target: { book: Uuid } | { edition: Isbn };
   expires?: utcDateTime;
-  // true while the hold is only a forecast, which the database has not decided yet
+  // true while the hold is only a prediction, which the database has not decided yet
   pending?: boolean;
 }
 
@@ -297,28 +242,6 @@ model Notice {
   reason: string;
 }
 
-union PatronEvents {
-  PatronCreated,
-  RenamePatron,
-  AssignPatron,
-  PatronHoldOpened,
-  PatronHoldClosed,
-  HoldFailed,
-  PatronCheckoutOpened,
-  PatronCheckoutEnded,
-  PatronCheckoutOverdue,
-  PatronPasswordChanged,
-  PatronDismissNotice,
-}
-
-model PatronCreated {
-  type: "patron-created";
-  id: Uuid;
-  name: string;
-  color: string;
-}
-
-@command(RenamePatron)
 model RenamePatron {
   type: "rename-patron";
   ...InRoom;
@@ -328,7 +251,6 @@ model RenamePatron {
 }
 
 // grants or revokes researcher status; revoking it closes the patron's holds on restricted books
-@command((AssignPatron | HoldClosed | PatronHoldClosed)[])
 model AssignPatron {
   type: "assign-patron";
   ...InRoom;
@@ -337,54 +259,7 @@ model AssignPatron {
   timestamp: utcDateTime;
 }
 
-model PatronHoldOpened {
-  type: "patron-hold-opened";
-  id: Uuid;
-  target: { book: Uuid } | { edition: Isbn };
-  expires?: utcDateTime;
-}
-
-// with notify, folded into a notice the patron dismisses, for a hold that closed without the
-// patron closing it themselves
-model PatronHoldClosed {
-  type: "patron-hold-closed";
-  id: Uuid;
-  reason: string;
-  notify: boolean;
-}
-
-// folded into a notice the patron dismisses
-model HoldFailed {
-  type: "hold-failed";
-  id: Uuid;
-  reason: string;
-}
-
-model PatronCheckoutOpened {
-  type: "patron-checkout-opened";
-  id: Uuid;
-  book: Uuid;
-  expires: utcDateTime;
-}
-
-model PatronCheckoutEnded {
-  type: "patron-checkout-ended";
-  id: Uuid;
-}
-
-model PatronCheckoutOverdue {
-  type: "patron-checkout-overdue";
-  id: Uuid;
-}
-
-// the patron's own record of a password change, which precommit stamps
-model PatronPasswordChanged {
-  type: "patron-password-changed";
-  timestamp: utcDateTime;
-}
-
 // a patron dismisses one of their own notices, or a librarian dismisses it for them
-@command(PatronDismissNotice)
 model PatronDismissNotice {
   type: "patron-dismiss-notice";
   ...InRoom;
@@ -398,10 +273,9 @@ model PatronDismissNotice {
 
 // The librarians' shared inbox, notices about work that failed after it was queued, and the owner
 // of every open hold and checkout, which the catalog leaves out.  A hold or checkout that opens
-// names its owner here, and its HoldClosed or CheckoutEnded comes here too, as it does to the
-// catalog.
+// records its owner here, and closing it deletes the record, as it deletes the catalog's key.
 
-interface AdminSlice extends Slice<"admin:{room}", AdminEvents, AdminStore> {}
+interface AdminSlice extends Slice<"admin:{room}", AdminStore> {}
 
 alias AdminStore = {
   // one key per undismissed notice
@@ -412,37 +286,7 @@ alias AdminStore = {
   "checkout_owner:{checkout}": Uuid;
 };
 
-union AdminEvents {
-  CheckoutFailed,
-  DismissNotice,
-  HoldOwner,
-  HoldClosed,
-  CheckoutOwner,
-  CheckoutEnded,
-}
-
-model HoldOwner {
-  type: "hold-owner";
-  hold: Uuid;
-  patron: Uuid;
-}
-
-model CheckoutOwner {
-  type: "checkout-owner";
-  checkout: Uuid;
-  patron: Uuid;
-}
-
-model CheckoutFailed {
-  type: "checkout-failed";
-  id: Uuid;
-  patron: Uuid;
-  book: Uuid;
-  reason: string;
-}
-
 // a librarian dismisses one of the shared notices
-@command(DismissNotice)
 model DismissNotice {
   type: "dismiss-notice";
   ...InRoom;
@@ -455,13 +299,13 @@ model DismissNotice {
 
 // Credentials, which the database keeps for itself and never syncs: a hash in a browser cache
 // can be cracked offline.  `lookup` reads a login by name to sign someone in, and by user to
-// check a token and a command's proof.  A login's user is the patron it belongs to, except for
+// check a token and a mutation's proof.  A login's user is the patron it belongs to, except for
 // the one `admin` login every librarian shares, which is flagged as a librarian's.  A login
-// name fills a key parameter, so precommit rejects one holding a separator of the key templates.
-// The slice's history keeps every login name and superseded hash, which only a retention
-// policy trims.
+// name fills a key parameter, so the decider rejects one holding a separator of the key
+// templates.  The slice's history keeps every login name and superseded hash, which only a
+// retention policy trims.
 
-interface LoginSlice extends Slice<"login:{room}", LoginEvents, LoginStore> {}
+interface LoginSlice extends Slice<"login:{room}", LoginStore> {}
 
 alias LoginStore = {
   // login names are unique and never change
@@ -476,67 +320,38 @@ model Login {
   librarian: boolean;
 }
 
-union LoginEvents {
-  LoginCreated,
-  PasswordChanged,
-  LoginDeleted,
-}
-
 // Sent anonymously before signing in, outside any Engine, since no token exists until the
-// account does.  Precommit mints the new patron's id, so no id is ever reused; signing in
+// account does.  The decider mints the new patron's id, so no id is ever reused; signing in
 // answers it.
 @online
-@command([LoginCreated, PatronCreated])
 model CreateAccount {
   type: "create-account";
   ...InRoom;
   login: string;
   name: string;
-  // as #rrggbb; without one, precommit picks the next of the demo's colors
+  // as #rrggbb; without one, the decider picks the next of the demo's colors
   color?: string;
   password: NewPassword;
 }
 
-model LoginCreated {
-  type: "login-created";
-  login: string;
-  user: Uuid;
-  password: PasswordHash;
-  librarian: boolean;
-}
-
 // changes the sender's own password
 @online
-@command([PasswordChanged, PatronPasswordChanged])
 model ChangePassword {
   type: "change-password";
   ...InRoom;
   // proves a credential the account has registered, which the database verifies before
-  // precommit sees the command
-  check: CommandAuth;
+  // the decider sees the mutation
+  check: MutationAuth;
   new: NewPassword;
 }
 
-model PasswordChanged {
-  type: "password-changed";
-  login: string;
-  password: PasswordHash;
-}
-
 // deletes the sender's own account; rejected while they have open checkouts, their open holds
-// close with the account, and their patron stream ends with its history erased
+// close with the account, and their patron slice is deleted with its history erased
 @online
-@command([LoginDeleted, Erasure, HoldClosed[]])
 model DeleteAccount {
   type: "delete-account";
   ...InRoom;
-  check: CommandAuth;
-}
-
-model LoginDeleted {
-  type: "login-deleted";
-  login: string;
-  user: Uuid;
+  check: MutationAuth;
 }
 
 ///////////
@@ -546,14 +361,14 @@ model LoginDeleted {
 /* Room stuff, for hosting the demo with many rooms in one database.  Every
    visitor gets a room of their own, a private copy of the library seeded with
    the demo's data, and shares it by sharing its link.  Every family takes the
-   room as its first parameter, every command names its room, and a user id
+   room as its first parameter, every mutation names its room, and a user id
    is `<room>.<id>`, so a signed-in user's room is in their token.  A room
-   lives for an hour from its creation, when a cron hook erases its streams;
+   lives for an hour from its creation, when a cron hook erases its slices;
    the next CreateRoom for its id seeds it afresh. */
 
 alias RoomId = Uuid;
 
-// the room a command acts in, which must be the sender's own
+// the room a mutation acts in, which must be the sender's own
 model InRoom {
   room: RoomId;
 }
@@ -561,7 +376,7 @@ model InRoom {
 // The room's own record, which every Engine in the room syncs, so the UI can say when the room
 // resets.
 
-interface RoomSlice extends Slice<"room:{room}", RoomCreated, RoomStore> {}
+interface RoomSlice extends Slice<"room:{room}", RoomStore> {}
 
 alias RoomStore = {
   "room_created": utcDateTime;
@@ -570,43 +385,17 @@ alias RoomStore = {
 // Every room, by when it was created, which the database keeps for itself to know which rooms
 // to reap.
 
-interface RoomRegistrySlice extends Slice<"rooms", RoomRegistryEvents, RoomRegistryStore> {}
+interface RoomRegistrySlice extends Slice<"rooms", RoomRegistryStore> {}
 
 alias RoomRegistryStore = {
   "room:{room}": utcDateTime;
 };
 
-union RoomRegistryEvents {
-  RoomCreated,
-  RoomDeleted,
-}
-
 // Sent anonymously by the UI for the room in its URL.  For a room that exists it writes
 // nothing; otherwise it seeds the room with the demo's catalog, patrons, and logins.
 @online
-@command((
-  | RoomCreated
-  | AddEdition
-  | AddBook
-  | PatronCreated
-  | AssignPatron
-  | LoginCreated
-)[])
 model CreateRoom {
   type: "create-room";
-  room: RoomId;
-}
-
-// recorded in the registry and in the room's own record
-model RoomCreated {
-  type: "room-created";
-  room: RoomId;
-  created: utcDateTime;
-}
-
-// recorded in the registry when the room is reaped
-model RoomDeleted {
-  type: "room-deleted";
   room: RoomId;
 }
 
@@ -614,9 +403,9 @@ model RoomDeleted {
 // Engine definitions //
 ////////////////////////
 
-// A patron has very limited write capabilities.  Each of these commands may be sent only for
+// A patron has very limited write capabilities.  Each of these mutations may be sent only for
 // their own patron.
-union UserCommands {
+union UserMutations {
   RenamePatron,
   TryHold,
   CancelHold,
@@ -625,13 +414,15 @@ union UserCommands {
   DeleteAccount,
 }
 
-interface UserEngine extends Engine<[BookSlice, PatronSlice, RoomSlice], UserCommands> {}
+interface UserEngine extends Engine<[BookSlice, PatronSlice, RoomSlice], UserMutations> {}
 
-// An admin (the librarian at the front desk) has every command but the database's own,
-// CreateAccount and CreateRoom.
-union AdminCommands {
-  // admin can send UserCommands for whatever patron they want
-  UserCommands,
+// An admin (the librarian at the front desk) has the patron's mutations a librarian sends on any
+// patron's behalf, and the librarians' own.
+union AdminMutations {
+  RenamePatron,
+  TryHold,
+  PatronDismissNotice,
+  LibraryCancelHold,
   AddEdition,
   UpdateEditionTitle,
   AddBook,
@@ -644,19 +435,19 @@ union AdminCommands {
 }
 
 interface AdminEngine
-  extends Engine<[BookSlice, PatronSlice, AdminSlice, RoomSlice], AdminCommands> {}
+  extends Engine<[BookSlice, PatronSlice, AdminSlice, RoomSlice], AdminMutations> {}
 
 //////////////////
 // The Database //
 //////////////////
 
-/* The DB holds all slices and its precommit function handles all commands,
-   and it may declare additional slices and commands that no Engine handles.
-   Additional slices are maintained for internal use (precommit, maySee, and
-   lookup), but are not synced to any client.  Its commands of its own are
+/* The DB holds all slices and its deciders decide all mutations, and it may
+   declare additional slices and mutations that no Engine handles.  Additional
+   slices are maintained for internal use (the deciders, the grantor, and
+   lookup), but are not synced to any client.  Its mutations of its own are
    sent before signing in, when there is no Engine to send them.  The daily
    sheet and the reaping of rooms are cron hooks of the bundle, which write
-   their events as a command's handler does. */
+   through the database's transaction as a decider does. */
 interface LibraryDB
   extends Database<
       [UserEngine, AdminEngine],
@@ -672,7 +463,7 @@ model AdminBookInfo {
   id: string;
   restricted: boolean;
   state: "open" | "restricted" | "held" | "out";
-  // true while the book's hold or checkout is only a forecast
+  // true while the book's hold or checkout is only a prediction
   pending?: boolean;
   patronId?: string;
   holdId?: string;

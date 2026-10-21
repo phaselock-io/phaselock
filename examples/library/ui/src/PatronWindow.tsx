@@ -23,8 +23,8 @@ function noticesQuery(qx: UserEngineQueryTxn): Notice[] {
   return [...qx.scan.patron_notice()].map(([, notice]) => notice);
 }
 
-// the commands the Engine queues and sends, which are all those the window sends
-type Command = Parameters<UserEngine['sendCommand']>[0];
+// the mutations the Engine queues and sends, which are all those the window sends
+type Mutation = Parameters<UserEngine['sendMutation']>[0];
 
 // the state of the Engine's connection, which a query reads like any other state
 function connectionQuery(qx: UserEngineQueryTxn) {
@@ -130,9 +130,9 @@ export default function PatronWindow({
   const notices = useLocalQuery(eng, noticesQuery) ?? [];
   const connState = useLocalQuery(eng, connectionQuery) ?? 'connecting';
 
-  // every command names the window's room
-  function send(command: Unroomed<Command>) {
-    eng.sendCommand({ ...command, room: client.room });
+  // every mutation names the window's room
+  function send(mutation: Unroomed<Mutation>) {
+    eng.sendMutation({ ...mutation, room: client.room });
   }
 
   // the switch takes the window's way to the database offline, and back online at once

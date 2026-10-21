@@ -7,14 +7,14 @@
 
 import { NoTarget, type Program, type Type } from '@typespec/compiler';
 
+import { onlineModels } from './decorators.ts';
 import { reportDiagnostic } from './lib.ts';
 import { type LoweredProgram, lowerProgram } from './lower.ts';
 import {
   PArray,
-  type PCommand,
   PIntake,
+  type PMutation,
   PObject,
-  type POutput,
   PResult,
   type PSlice,
   PStruct,
@@ -31,8 +31,8 @@ export function $onValidate(program: Program): void {
 
   const lowered = lowerProgram(program);
   checkCompositions(program, lowered);
-  checkDatabaseOutputs(program, lowered);
   checkIntake(program, lowered);
+  checkOnline(program, lowered);
   checkReachability(program, lowered);
 
   // Try solving every union so decoder/checker generation can't fail later.  Checkers must
@@ -54,8 +54,9 @@ export function $onValidate(program: Program): void {
 }
 
 /**
- * Slices composed into one engine or one database share its reducer table and its global
- * context, so their families must differ and so must their local key names.
+ * Slices composed into one engine or one database share its contexts, whose deleteSlice accessors
+ * are named by family and whose other accessors by local key name, so their families must differ
+ * and so must their local key names.
  */
 function checkCompositions(program: Program, lowered: LoweredProgram): void {
   const contexts = [...lowered.engines, ...lowered.databases];
@@ -64,7 +65,7 @@ function checkCompositions(program: Program, lowered: LoweredProgram): void {
     const families = new Map<string, PSlice>();
     const keys = new Map<string, PSlice>();
     for (const slice of ctx.slices) {
-      // one reducer per family
+      // one deleteSlice accessor per family
       const other = families.get(slice.family);
       if (other !== undefined && other !== slice) {
         reportDiagnostic(program, {
@@ -86,38 +87,6 @@ function checkCompositions(program: Program, lowered: LoweredProgram): void {
           });
         }
         keys.set(item.name, slice);
-      }
-    }
-  }
-}
-
-/** the events an output names, each with the slices that fold it */
-function outputEvents(o: POutput): { type: PType; slices: readonly PSlice[] }[] {
-  switch (o.kind) {
-    case 'event':
-      return [o];
-    case 'death':
-      return [];
-    case 'oneOf':
-      return o.options.flatMap(outputEvents);
-    case 'all':
-      return o.items.flatMap(outputEvents);
-    case 'many':
-      return outputEvents(o.item);
-  }
-}
-
-/** every event a database's command emits must land in a slice of that database */
-function checkDatabaseOutputs(program: Program, lowered: LoweredProgram): void {
-  for (const db of lowered.databases) {
-    for (const cmd of db.commands) {
-      for (const ev of outputEvents(cmd.output)) {
-        if (ev.slices.length === 0 || ev.slices.some((s) => db.slices.includes(s))) continue;
-        reportDiagnostic(program, {
-          code: 'command-output-outside-db',
-          format: { name: cmd.name, db: db.name, event: ev.type.name ?? String(ev.type) },
-          target: lowered.sources.get(db) ?? NoTarget,
-        });
       }
     }
   }
@@ -149,39 +118,52 @@ function findResult(t: PType, seen = new Set<PType>()): PResult | undefined {
   return undefined;
 }
 
+/** the kind of the first intake type a type holds, anywhere inside it, or undefined */
+function findIntake(t: PType, seen = new Set<PType>()): string | undefined {
+  if (seen.has(t)) return undefined;
+  seen.add(t);
+  if (t instanceof PIntake) return t.kind;
+  if (t instanceof PArray) return findIntake(t.itemType, seen);
+  if (t instanceof PObject) return findIntake(t.valueType, seen);
+  if (t instanceof PTuple) return t.itemTypes.map((x) => findIntake(x, seen)).find((k) => k);
+  if (t instanceof PUnion) return t.types.map((x) => findIntake(x, seen)).find((k) => k);
+  if (t instanceof PStruct) {
+    return [...t.fields.values()].map((x) => findIntake(x, seen)).find((k) => k);
+  }
+  return undefined;
+}
+
 /**
- * Intake types are transformed by the database before precommit runs, so they may only be
- * top-level fields of commands, which then must be @online; their results come only from
- * intake, so no command may carry one, where a client could forge it.
+ * Intake types are transformed by the database before the decider runs, so they may only be
+ * top-level fields of mutations, which then must be @online; their results come only from
+ * intake, so no mutation may carry one, where a client could forge it.
  */
 function checkIntake(program: Program, lowered: LoweredProgram): void {
-  const commandOf = new Map<PType, PCommand>();
-  for (const cmd of lowered.commands) commandOf.set(cmd.type, cmd);
-  const events = new Set(lowered.slices.flatMap((s) => s.eventTypes));
+  const mutationOf = new Map<PType, PMutation>();
+  for (const m of lowered.mutations) mutationOf.set(m.type, m);
   const placement = (kind: string, where: string, target: Type | typeof NoTarget) =>
     reportDiagnostic(program, { code: 'placement-violation', format: { kind, where }, target });
 
-  // every struct: an intake type is fine only as a command's own top-level field
+  // every struct: an intake type is fine only as a mutation's own top-level field
   for (const t of lowered.registry.all) {
     if (!(t instanceof PStruct)) continue;
-    const cmd = commandOf.get(t);
     const target = lowered.targets.get(t) ?? NoTarget;
     const where = t.name ?? String(t);
     for (const [, ft] of t.fields) {
       const kind = intakeKind(ft);
       if (ft instanceof PIntake) {
-        if (cmd === undefined) placement(ft.kind, where, target);
-        else if (events.has(t)) placement(ft.kind, `event ${where}`, target);
+        if (!mutationOf.has(t)) placement(ft.kind, where, target);
       } else if (kind !== undefined) {
         placement(kind, where, target);
       }
     }
   }
 
-  // store values and queries hold no intake type at all
+  // store values and queries hold no intake type at all, a mutation's own fields included, since
+  // only the database prepares a mutation, and only for its decider
   for (const slice of lowered.slices) {
     for (const item of slice.store.items) {
-      const kind = intakeKind(item.type);
+      const kind = findIntake(item.type);
       if (kind === undefined) continue;
       placement(
         kind,
@@ -193,40 +175,53 @@ function checkIntake(program: Program, lowered: LoweredProgram): void {
   for (const kq of lowered.queries) {
     for (const q of kq.queries) {
       const types = [q.result, ...q.args.map(([, t]) => t)];
-      const kind = types.map(intakeKind).find((k) => k !== undefined);
+      const kind = types.map((t) => findIntake(t)).find((k) => k !== undefined);
       if (kind === undefined) continue;
       placement(kind, `query ${kq.name}.${q.name}`, NoTarget);
     }
   }
 
-  // commands: intake types require @online, and results are never accepted from a client
-  for (const cmd of lowered.commands) {
-    const target = lowered.sources.get(cmd) ?? NoTarget;
-    const struct = cmd.type instanceof PStruct ? cmd.type : undefined;
+  // mutations: intake types require @online, and results are never accepted from a client
+  for (const m of lowered.mutations) {
+    const target = lowered.sources.get(m) ?? NoTarget;
+    const struct = m.type instanceof PStruct ? m.type : undefined;
     const intake = struct && [...struct.fields.values()].find((ft) => ft instanceof PIntake);
-    if (intake !== undefined && !cmd.online) {
+    if (intake !== undefined && !m.online) {
       reportDiagnostic(program, {
         code: 'online-required',
-        format: { name: cmd.name, kind: (intake as PIntake).kind },
+        format: { name: m.name, kind: (intake as PIntake).kind },
         target,
       });
     }
-    const result = findResult(cmd.type);
+    const result = findResult(m.type);
     if (result !== undefined) {
       reportDiagnostic(program, {
-        code: 'result-in-command',
-        format: { name: cmd.name, result: result.kind },
+        code: 'result-in-mutation',
+        format: { name: m.name, result: result.kind },
         target,
       });
     }
   }
 }
 
-/** with a database present, warn about slices and commands no database holds */
+/** warn about an @online model that no union lists as a mutation, whose mark means nothing */
+function checkOnline(program: Program, lowered: LoweredProgram): void {
+  const listed = new Set(lowered.mutations.map((m) => lowered.sources.get(m)));
+  for (const model of onlineModels(program)) {
+    if (listed.has(model)) continue;
+    reportDiagnostic(program, {
+      code: 'online-not-mutation',
+      format: { name: model.name },
+      target: model,
+    });
+  }
+}
+
+/** with a database present, warn about slices and mutations no database holds */
 function checkReachability(program: Program, lowered: LoweredProgram): void {
   if (lowered.databases.length === 0) return;
   const slices = new Set(lowered.databases.flatMap((db) => db.slices));
-  const commands = new Set(lowered.databases.flatMap((db) => db.commands));
+  const mutations = new Set(lowered.databases.flatMap((db) => db.mutations));
   for (const slice of lowered.slices) {
     if (slices.has(slice)) continue;
     reportDiagnostic(program, {
@@ -235,12 +230,12 @@ function checkReachability(program: Program, lowered: LoweredProgram): void {
       target: lowered.sources.get(slice) ?? NoTarget,
     });
   }
-  for (const cmd of lowered.commands) {
-    if (commands.has(cmd)) continue;
+  for (const m of lowered.mutations) {
+    if (mutations.has(m)) continue;
     reportDiagnostic(program, {
-      code: 'unreachable-command',
-      format: { name: cmd.name },
-      target: lowered.sources.get(cmd) ?? NoTarget,
+      code: 'unreachable-mutation',
+      format: { name: m.name },
+      target: lowered.sources.get(m) ?? NoTarget,
     });
   }
 }

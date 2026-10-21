@@ -4,15 +4,7 @@ import { describe, expect, test } from 'vitest';
 
 import { DEV } from '../../../ts/assets/skeleton.ts';
 
-import {
-  type Blob,
-  bootstrap,
-  type Forecaster,
-  rig,
-  settle,
-  type State,
-  watch,
-} from './harness.ts';
+import { type Blob, bootstrap, rig, settle, type State } from './harness.ts';
 
 const patrons: Blob = {
   position: 10,
@@ -28,7 +20,10 @@ describe('dev mode', () => {
   test('a query result is read-only, and the throw names the key and the property', async () => {
     const r = rig();
     await bootstrap(r, ['patron:*'], { 'patron:*': patrons });
-    const { values } = watch(r, 'patron:p1');
+    const values: State[] = [];
+    r.engine
+      .newQuery((qx) => qx.get('patron:p1!state', 'state') as State)
+      .subscribe((v) => values.push(v));
     await settle();
     const v = values[0]!;
     const fields = v.fields as { tags: string[] };
@@ -46,19 +41,5 @@ describe('dev mode', () => {
     // reading is unaffected
     expect(fields.tags.map((t) => t.toUpperCase())).toEqual(['A']);
     expect(fields.tags.length).toBe(1);
-  });
-
-  test('a forecast that mutates what it read throws, so it forecasts nothing', async () => {
-    const forecaster: Forecaster = (qx) => {
-      (qx.get('patron:p1!state', 'state') as State).count++;
-      return [{ stream: 'patron:p1', event: { id: 'p1', type: 'bump' } }];
-    };
-    const r = rig({ forecaster });
-    await bootstrap(r, ['patron:*'], { 'patron:*': patrons });
-    const { values } = watch(r, 'patron:p1');
-    await settle();
-    r.engine.sendCommand({});
-    await settle();
-    expect(values).toEqual([{ count: 2, fields: { tags: ['a'] } }]);
   });
 });

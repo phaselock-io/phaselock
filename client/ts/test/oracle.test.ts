@@ -247,19 +247,19 @@ describe('values with no schema', () => {
 });
 
 describe("the registry's own identities", () => {
-  const reg = buildRegistry({ nodes: [], ids: {}, commands: null, eventTypes: {}, storeTypes: {} });
+  const reg = buildRegistry({ nodes: [], ids: {}, mutations: null });
 
-  test('an outbox row is [id, series, n, command], the command nested as its own bytes', () => {
+  test('an outbox row is [id, series, n, mutation], the mutation nested as its own bytes', () => {
     const row = { id: 'c1', series: 's1', n: 2, data: encode({ type: 'noted' }) };
-    const bytes = reg.convert('.command', row, JS, MSGPACK) as Uint8Array;
+    const bytes = reg.convert('.mutation', row, JS, MSGPACK) as Uint8Array;
     expect(bytes).toEqual(encode(['c1', 's1', 2, { type: 'noted' }]));
-    expect(reg.convert('.command', bytes, MSGPACK, JS)).toEqual(row);
+    expect(reg.convert('.mutation', bytes, MSGPACK, JS)).toEqual(row);
 
     // an unnumbered row has nil for both
     const unnumbered = { ...row, series: null, n: null };
-    const nils = reg.convert('.command', unnumbered, JS, MSGPACK) as Uint8Array;
+    const nils = reg.convert('.mutation', unnumbered, JS, MSGPACK) as Uint8Array;
     expect(nils).toEqual(encode(['c1', null, null, { type: 'noted' }]));
-    expect(reg.convert('.command', nils, MSGPACK, JS)).toEqual(unnumbered);
+    expect(reg.convert('.mutation', nils, MSGPACK, JS)).toEqual(unnumbered);
   });
 
   test('an Engine record is any value, undefined properties left out', () => {

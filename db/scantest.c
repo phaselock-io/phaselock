@@ -1,7 +1,7 @@
 /* Test only: the bundle's JS host over a store of its own, with no txn thread, for the scan
-   conformance test (server/scan_test.go).  The test fills the store with keys no reducer could
-   write and calls the host's __pl_scan, the native behind every transaction's scan, so it
-   drives the pattern walk the bundle's scans take.  Nothing on the server's paths calls it. */
+   conformance test (scan_test.go).  The test fills the store with keys no decider could write
+   and calls the host's __pl_scan, the native behind every transaction's scan, so it drives the
+   pattern walk the bundle's scans take.  Nothing on the server's paths calls it. */
 
 #include "internal.h"
 
@@ -41,7 +41,7 @@ int pldb_scantest_put(pldb_scantest *t, const char *key, const char *type, const
                       char *err, size_t errlen) {
     enter(t);
 
-    // the value, converted under its type as a reducer's write would be
+    // the value, converted under its type as a decider's write would be
     long node = schema_lookup(t->js.sc, type, strlen(type));
     if (node < 0) {
         snprintf(err, errlen, "no registry entry for type %s", type);
@@ -52,7 +52,7 @@ int pldb_scantest_put(pldb_scantest *t, const char *key, const char *type, const
     int rc = walk_to_mpack(&t->js.env, t->js.sc, v, node, false, &b, err, errlen);
     JS_FreeValue(t->js.ctx, v);
 
-    // stored under the key as it is, which no template check sees
+    // stored under the key as it is, which the write gate never sees
     if (!rc && store_set(t->st, key, b.p, b.len)) {
         snprintf(err, errlen, "%s", store_err(t->st));
         rc = -1;

@@ -1,14 +1,14 @@
 /**
  * TypeScript code generator: emits type aliases for the model's types; the type registry as
- * data, one node table with a schema per engine and per database; each slice's reducer context
- * and handler table; each engine's read context, forecaster table, and Engine class; each
- * database's read context, precommit table, and bundle definition; and the typed query layers,
- * all from the lowered IR.
+ * data, one node table with a schema per engine and per database; each slice's accessor
+ * fragments, which its contexts are assembled from; each engine's contexts, predictor table, and
+ * Engine class; each database's contexts, grantor and decider types, and bundle definition; and
+ * the typed query layers, all from the lowered IR.
  *
- * Names derive from the declarations the user wrote: `PatronSlice` gives `PatronSliceTxn` and
- * `PatronSliceReducers`, `UserEngine` gives `UserEngineTxn`, `userEngineSchema`, and the
- * `UserEngine` class, and a handler table's keys are its event or command model names,
- * camelCased.
+ * Names derive from the declarations the user wrote: `PatronSlice` gives `patronSliceGet`,
+ * `UserEngine` gives `UserEngineTxn`, `UserEnginePredictors`, `userEngineSchema`, and the
+ * `UserEngine` class, `LibraryDB` gives `LibraryDBTxn`, `LibraryDBDeciders`, and
+ * `defineLibraryDB`, and a handler table's keys are its mutation model names, camelCased.
  */
 
 import {
@@ -23,7 +23,6 @@ import {
   Match,
   PArray,
   PBool,
-  type PCommand,
   type PDatabase,
   PDate,
   type PEngine,
@@ -31,9 +30,9 @@ import {
   PIntake,
   PJson,
   PLiteral,
+  type PMutation,
   PNull,
   PObject,
-  type POutput,
   PQueries,
   PQuery,
   PResult,
@@ -239,8 +238,8 @@ function walkSolution(d: Denter, solution: Solution, onMatch: (t: PType) => stri
 
 /* The registry is data: a table of nodes, each type once, referring to each other by index,
    with the union solver's decision tree inside each union node; and for each engine and
-   database a Schema naming that table, the identities a Registry answers for, and its commands,
-   eventTypes, and storeTypes.  Hosts walk it to convert values. */
+   database a Schema naming that table, the identities a Registry answers for, and its mutations
+   union.  Hosts walk it to convert values. */
 
 /** the type identities a Schema answers for, each to its type */
 type Identities = Map<string, PType>;
@@ -373,34 +372,20 @@ function identityOf(t: PType): string {
   return t.name;
 }
 
-/** the identities of an engine's or a database's slices and commands: the events union of
-    each family, the type of each key template, and the commands union */
+/** the identities of an engine's or a database's slices and mutations, the type of each key
+    template and the mutations union, answering the mutations union's */
 function audienceIdentities(
   ids: Identities,
   slices: readonly PSlice[],
-  commandType: PType | undefined,
-): {
-  commands: string | null;
-  eventTypes: Record<string, string>;
-  storeTypes: Record<string, string>;
-} {
-  const eventTypes: Record<string, string> = {};
-  const storeTypes: Record<string, string> = {};
+  mutationType: PType | undefined,
+): string | null {
   for (const slice of slices) {
-    eventTypes[slice.family] = identityOf(slice.events);
-    ids.set(eventTypes[slice.family], slice.events);
-    for (const item of slice.store.items) {
-      const id = storeTypeName(slice, item);
-      storeTypes[`${slice.family}/${item.name}`] = id;
-      ids.set(id, item.type);
-    }
+    for (const item of slice.store.items) ids.set(storeTypeName(slice, item), item.type);
   }
-  let commands: string | null = null;
-  if (commandType !== undefined) {
-    commands = identityOf(commandType);
-    ids.set(commands, commandType);
-  }
-  return { commands, eventTypes, storeTypes };
+  if (mutationType === undefined) return null;
+  const mutations = identityOf(mutationType);
+  ids.set(mutations, mutationType);
+  return mutations;
 }
 
 /** the node table, the identity map, and a Schema per engine and per database */
@@ -410,19 +395,19 @@ function generateSchema(
   roots: readonly PType[],
   engines: readonly PEngine[],
   databases: readonly PDatabase[],
-  commandUnions: Map<PDatabase, PType>,
+  mutationUnions: Map<PDatabase, PType>,
   queries: readonly PQueries[],
 ): void {
   const ids: Identities = new Map();
   for (const t of roots) ids.set(identityOf(t), t);
 
   // each audience's own identities
-  const audiences: [string, ReturnType<typeof audienceIdentities>][] = [];
+  const audiences: [string, string | null][] = [];
   for (const e of engines) {
-    audiences.push([e.name, audienceIdentities(ids, e.slices, e.commandType)]);
+    audiences.push([e.name, audienceIdentities(ids, e.slices, e.mutationType)]);
   }
   for (const db of databases) {
-    audiences.push([db.name, audienceIdentities(ids, db.slices, commandUnions.get(db))]);
+    audiences.push([db.name, audienceIdentities(ids, db.slices, mutationUnions.get(db))]);
   }
 
   // every query's wire type, and each result under the query's id plus #result
@@ -449,15 +434,13 @@ function generateSchema(
   for (const [id, t] of ids) d.print(`${JSON.stringify(id)}: ${table.visit(t)},\n`);
   d.dedent();
   d.print('};\n');
-  for (const [name, a] of audiences) {
+  for (const [name, mutations] of audiences) {
     d.print(`\n/** the registry data of ${name} */\n`);
     d.print(`export const ${lowerFirst(name)}Schema: Schema = {\n`);
     d.indent('  ');
     d.print('nodes: schemaNodes,\n');
     d.print('ids: schemaIds,\n');
-    d.print(`commands: ${JSON.stringify(a.commands)},\n`);
-    d.print(`eventTypes: ${JSON.stringify(a.eventTypes)},\n`);
-    d.print(`storeTypes: ${JSON.stringify(a.storeTypes)},\n`);
+    d.print(`mutations: ${JSON.stringify(mutations)},\n`);
     d.dedent();
     d.print('};\n');
   }
@@ -466,7 +449,7 @@ function generateSchema(
 /**
  * isUpdatable returns if a type is suitable for a txn.update member.
  *
- * The txn.update pattern is to accept a mutator function which updates-in-place its parameter.
+ * The txn.update pattern is to accept a function which updates its parameter in place.
  * This is for two reasons:
  * - ergonomically, it means many updates are one-liners
  * - it makes it possible to write a type-safe updater that works against many variants of a store
@@ -481,67 +464,30 @@ function isUpdatable(t: PType): boolean {
   return false;
 }
 
-// commands //////////////////////////////////////////////////////////////////
+// mutations /////////////////////////////////////////////////////////////////
 
-/** a command's fields that intake transforms */
-function intakeFields(cmd: PCommand): [string, PIntake][] {
-  if (!(cmd.type instanceof PStruct)) return [];
-  return [...cmd.type.fields].filter((f): f is [string, PIntake] => f[1] instanceof PIntake);
+/** a mutation's fields that intake transforms */
+function intakeFields(m: PMutation): [string, PIntake][] {
+  if (!(m.type instanceof PStruct)) return [];
+  return [...m.type.fields].filter((f): f is [string, PIntake] => f[1] instanceof PIntake);
 }
 
-/** the type precommit sees a command as: its intake view when intake transforms it */
-function precommitView(annos: Annos, cmd: PCommand): string {
-  return intakeFields(cmd).length > 0 ? `${cmd.name}ForPrecommit` : annos.get(cmd.type)!;
+/** the type a decider sees a mutation as: its intake view when intake transforms it */
+function deciderView(annos: Annos, m: PMutation): string {
+  return intakeFields(m).length > 0 ? `${m.name}ForDecider` : annos.get(m.type)!;
 }
 
-/** the stream label of an event folded by these slices: the union of their stream patterns */
-function streamLabel(slices: readonly PSlice[]): string {
-  const labels = new Set(slices.map(streamPattern));
-  if (labels.size === 0) return 'string';
-  return [...labels].join(' | ');
-}
-
-/** A slice's stream names as a type: a singleton's literal name, or its family template as a
-    template literal type with a string for each parameter, as in `patron:${string}`.  The type
-    checks the family and the separators; the parameters' characters are the database's to check. */
-function streamPattern(slice: PSlice): string {
-  if (slice.params.length === 0) return JSON.stringify(slice.family);
-  return '`' + slice.family + ':' + slice.params.map(() => '${string}').join(',') + '`';
-}
-
-/** the annotation of what a handler returns for a command, from its @command output */
-function outputAnno(annos: Annos, o: POutput): string {
-  switch (o.kind) {
-    case 'event':
-      return `{ stream: ${streamLabel(o.slices)}; event: ${annos.get(o.type)!} }`;
-    case 'death':
-      return o.erase
-        ? '{ stream: string; death: true; erase: true }'
-        : '{ stream: string; death: true }';
-    case 'oneOf':
-      return o.options.map((x) => outputAnno(annos, x)).join(' | ');
-    case 'all':
-      return '[' + o.items.map((x) => outputAnno(annos, x)).join(', ') + ']';
-    case 'many': {
-      const item = outputAnno(annos, o.item);
-      return o.item.kind === 'oneOf' ? `(${item})[]` : `${item}[]`;
-    }
-  }
-}
-
-/** a command's output type, and the command as precommit sees it when intake transforms it */
-function generateCommandTypes(d: Denter, annos: Annos, cmd: PCommand): void {
-  d.print(`\nexport type ${cmd.name}Output = ${outputAnno(annos, cmd.output)};\n`);
-
+/** a mutation as the database prepares it for its decider, when intake transforms it */
+function generateMutationTypes(d: Denter, annos: Annos, m: PMutation): void {
   // the intake view: each intake field becomes its result
-  if (intakeFields(cmd).length === 0) return;
-  const struct = cmd.type as PStruct;
+  if (intakeFields(m).length === 0) return;
+  const struct = m.type as PStruct;
   const fields = [...struct.fields].map(([k, ft]) => {
     const anno = ft instanceof PIntake ? annos.get(ft.result)! : annos.get(ft)!;
     return k + (struct.maybes.has(k) ? '?' : '') + ': ' + anno;
   });
-  d.print(`\n/** ${cmd.name} as the database prepares it for precommit */\n`);
-  d.print(`export type ${cmd.name}ForPrecommit = {${fields.join(', ')}};\n`);
+  d.print(`\n/** ${m.name} as the database prepares it for its decider */\n`);
+  d.print(`export type ${m.name}ForDecider = {${fields.join(', ')}};\n`);
 }
 
 /** Print a function that dispatches `val`, a member of a union, to the arm onMatch prints for
@@ -566,11 +512,12 @@ function generateDispatch(
 
 // contexts //////////////////////////////////////////////////////////////////
 
-/* A context has accessors over keys.  A slice's reducer context names its own stream's keys, so
-   its accessors take only the local template's parameters; a global context, an engine's or a
-   database's, names keys across slices, so its accessors take the family's parameters and then
-   the local template's.  Every accessor is named for its key template's name, which validation
-   keeps unique across the slices of a context. */
+/* A context has accessors over keys across slices: each takes its slice's family parameters and
+   then its local template's, and is named for its key template's name, which validation keeps
+   unique across the slices of a context.  Its deleteSlice accessors take a family's parameters,
+   and are named for the family, which validation keeps unique too.  Every context of an engine or
+   a database is assembled from the same per-slice fragments, so a database's context is
+   assignable to each of its engines', writes included. */
 
 /** the type a store value travels under: its own name, or failing that the key it is kept at */
 function storeTypeName(slice: PSlice, item: PStoreItem): string {
@@ -591,7 +538,7 @@ type Accessor = {
 };
 
 /** a template as the text of a template literal, each parameter interpolated through its check: a
-    terminal parameter of a family template as the rest of a stream name, a terminal parameter of a
+    terminal parameter of a family template as the rest of a slice name, a terminal parameter of a
     key template as is, and every other parameter as a segment */
 function checkedText(accessor: string, tpl: string, family: boolean): string {
   const [chunks, params] = PStoreItem.parseTpl(tpl);
@@ -599,65 +546,64 @@ function checkedText(accessor: string, tpl: string, family: boolean): string {
   for (let i = 0; i < params.length; i++) {
     const p = params[i];
     const args = `${p}, ${JSON.stringify(accessor)}, ${JSON.stringify(p)}`;
-    let value = `asSegment(${args})`;
-    if (i === params.length - 1) value = family ? `asStreamRest(${args})` : p;
+    let value = `$asSegment(${args})`;
+    if (i === params.length - 1) value = family ? `$asSliceRest(${args})` : p;
     out += '${' + value + '}' + chunks[i + 1];
   }
   return out;
 }
 
-/** the accessors over a slice's keys, local for its reducer, or global for any other context */
-function accessors(annos: Annos, slice: PSlice, global: boolean): Accessor[] {
+/** the accessors over a slice's keys */
+function accessors(annos: Annos, slice: PSlice): Accessor[] {
   return slice.store.items.map((item) => ({
     name: item.name,
-    params: global ? [...slice.params, ...item.params] : item.params,
-    key:
-      (global ? `${checkedText(item.name, slice.template, true)}!` : '') +
-      checkedText(item.name, item.tpl, false),
+    params: [...slice.params, ...item.params],
+    key: `${checkedText(item.name, slice.template, true)}!${checkedText(item.name, item.tpl, false)}`,
     anno: annos.get(item.type)!,
     type: storeTypeName(slice, item),
     updatable: isUpdatable(item.type),
   }));
 }
 
+/** a slice's deleteSlice accessor, named for its family, naming the slice itself */
+function sliceAccessor(slice: PSlice): { name: string; params: readonly string[]; key: string } {
+  return {
+    name: slice.family,
+    params: slice.params,
+    key: checkedText(slice.family, slice.template, true),
+  };
+}
+
 /** the name an accessor's own argument takes, apart from its params */
-function own(a: Accessor, name: string): string {
+function own(a: { params: readonly string[] }, name: string): string {
   return a.params.includes(name) ? `$${name}` : name;
 }
 
-/** an accessor's parameter list, then any arguments of its own as [name, annotation] */
-function args(a: Accessor, ...extra: [string, string][]): string {
+/** an accessor's parameter list, then any arguments of its own as [name, annotation], a name
+    ending in `?` being optional */
+function args(a: { params: readonly string[] }, ...extra: [string, string][]): string {
   const params = a.params.map((p) => `${p}: string`);
-  return [...params, ...extra.map(([n, t]) => `${own(a, n)}: ${t}`)].join(', ');
+  const owns = extra.map(([n, t]) => {
+    const optional = n.endsWith('?');
+    return `${own(a, optional ? n.slice(0, -1) : n)}${optional ? '?' : ''}: ${t}`;
+  });
+  return [...params, ...owns].join(', ');
 }
 
-/** the members of a context's get accessors, as a type */
-function printGetTypes(d: Denter, list: Accessor[]): void {
-  for (const a of list) d.print(`${prop(a.name)}: (${args(a)}) => ${a.anno} | undefined;\n`);
-}
-
-/** the members of a context's get accessors, reading through the transaction $cell holds */
-function printGets(d: Denter, list: Accessor[]): void {
-  for (const a of list) {
-    const read = `$cell.txn.get(\`${a.key}\`, ${JSON.stringify(a.type)})`;
-    d.print(`${prop(a.name)}: (${args(a)}) => ${read} as ${a.anno} | undefined,\n`);
-  }
-}
-
-/** a scan accessor: its name, the parameters that vary in its context, its value's annotation, and
-    its template as the skeleton's ScanTemplate, in source */
+/** a scan accessor: its name, the parameters that vary, its value's annotation, and its template
+    as the skeleton's ScanTemplate, in source */
 type Scanner = { name: string; params: readonly string[]; anno: string; template: string };
 
-/** the scan accessors over a slice's keys, local for its reducer, or global for any other context:
-    one per key template with a parameter that varies there, since any other names one key */
-function scanners(annos: Annos, slice: PSlice, global: boolean): Scanner[] {
+/** the scan accessors over a slice's keys: one per key template with a parameter, since any other
+    names one key */
+function scanners(annos: Annos, slice: PSlice): Scanner[] {
   return slice.store.items.flatMap((item) => {
-    const params = global ? [...slice.params, ...item.params] : item.params;
+    const params = [...slice.params, ...item.params];
     if (params.length === 0) return [];
     const template = {
       accessor: item.name,
       family: slice.family,
-      stream: global ? slice.params : [],
+      slice: slice.params,
       name: item.name,
       local: item.params,
       type: storeTypeName(slice, item),
@@ -673,348 +619,297 @@ function scanTypeArgs(s: Scanner): string {
   return `${s.params.map((p) => JSON.stringify(p)).join(' | ')}, ${s.anno}`;
 }
 
-/** the members of a context's scan accessors, as a type */
-function printScanTypes(d: Denter, list: Scanner[]): void {
-  for (const s of list) d.print(`${prop(s.name)}: ScanAccessor<${scanTypeArgs(s)}>;\n`);
+/** print one group of a context type: its opening line, its members, and its closing line */
+function printGroup(d: Denter, open: string, close: string, members: () => void): void {
+  d.print(open);
+  d.indent('  ');
+  members();
+  d.dedent();
+  d.print(close);
 }
 
-/** the members of a context's scan accessors, walking through the transaction $cell holds with
-    the skeleton's global or local scan */
-function printScans(d: Denter, list: Scanner[], global: boolean): void {
-  const make = global ? 'globalScan' : 'localScan';
-  for (const s of list) {
-    d.print(`${prop(s.name)}: ${make}<${scanTypeArgs(s)}>($cell, ${s.template}),\n`);
-  }
+/** Print a fragment: a function of a box that answers one group's accessors, which read or write
+    through the transaction the box holds when each is called.  The box is `$ref`, a name no
+    template parameter can take, since a parameter holds no `$`. */
+function printFragment(d: Denter, name: string, txn: string, members: string[]): void {
+  // a fragment with no members never reads its box, so its parameter is marked unused
+  const ref = members.length === 0 ? '_$ref' : '$ref';
+  d.print(`\nfunction ${name}(${ref}: { txn: ${txn} }) {\n`);
+  d.print('  return {\n');
+  for (const m of members) d.print(`    ${m},\n`);
+  d.print('  };\n');
+  d.print('}\n');
 }
 
-/** a slice's reducer context type and factory, its handler table type, and its SliceReducer */
-function generateSlice(d: Denter, annos: Annos, registry: PTypeRegistry, slice: PSlice): void {
-  const base = slice.name;
-  const txnType = `${base}Txn`;
-  const local = accessors(annos, slice, false);
-  const localScans = scanners(annos, slice, false);
-  const updatable = local.filter((a) => a.updatable);
-  const params = slice.params.map((p) => `${p}: string`).join('; ');
+/** The fragments every context over a slice is assembled from: its get and scan accessors over a
+    read transaction, and its set, del, update, and deleteSlice accessors over a write
+    transaction. */
+function generateSlice(d: Denter, annos: Annos, slice: PSlice): void {
+  const base = lowerFirst(slice.name);
+  const list = accessors(annos, slice);
+  const ds = sliceAccessor(slice);
 
-  // the reducer context's type
-  d.print(`\n/** ${base}'s reducer context: its stream's parameters, and accessors over the`);
-  d.print(` stream's own keys */\n`);
-  d.print(`export type ${txnType} = {\n`);
-  d.indent('  ');
-  d.print(`params: {${params === '' ? '' : ` ${params} `}};\n`);
-  d.print('get: {\n');
-  d.indent('  ');
-  printGetTypes(d, local);
-  d.dedent();
-  d.print('};\nscan: {\n');
-  d.indent('  ');
-  printScanTypes(d, localScans);
-  d.dedent();
-  d.print('};\nset: {\n');
-  d.indent('  ');
-  for (const a of local) d.print(`${prop(a.name)}: (${args(a, ['value', a.anno])}) => void;\n`);
-  d.dedent();
-  d.print('};\ndel: {\n');
-  d.indent('  ');
-  for (const a of local) d.print(`${prop(a.name)}: (${args(a)}) => void;\n`);
-  d.dedent();
-  d.print('};\n');
+  // gets
+  printFragment(
+    d,
+    `${base}Get`,
+    'ReadTxn',
+    list.map((a) => {
+      const read = `$ref.txn.get(\`${a.key}\`, ${JSON.stringify(a.type)})`;
+      return `${prop(a.name)}: (${args(a)}) => ${read} as ${a.anno} | undefined`;
+    }),
+  );
+
+  // scans
+  printFragment(
+    d,
+    `${base}Scan`,
+    'ReadTxn',
+    scanners(annos, slice).map(
+      (s) => `${prop(s.name)}: $globalScan<${scanTypeArgs(s)}>($ref, ${s.template})`,
+    ),
+  );
+
+  // sets
+  printFragment(
+    d,
+    `${base}Set`,
+    'WriteTxn',
+    list.map((a) => {
+      const write = `$ref.txn.set(\`${a.key}\`, ${JSON.stringify(a.type)}, ${own(a, 'value')})`;
+      return `${prop(a.name)}: (${args(a, ['value', a.anno])}) => ${write}`;
+    }),
+  );
+
+  // dels
+  printFragment(
+    d,
+    `${base}Del`,
+    'WriteTxn',
+    list.map((a) => `${prop(a.name)}: (${args(a)}) => $ref.txn.del(\`${a.key}\`)`),
+  );
+
+  // updates, of the keys whose values change in place
+  printFragment(
+    d,
+    `${base}Update`,
+    'WriteTxn',
+    list
+      .filter((a) => a.updatable)
+      .map((a) => {
+        const call = `$updateKey($ref.txn, \`${a.key}\`, ${JSON.stringify(a.type)}, ${own(a, 'fn')})`;
+        return `${prop(a.name)}: <R>(${args(a, ['fn', `(value: ${a.anno}) => R`])}) => ${call}`;
+      }),
+  );
+
+  // the slice's own deletion
+  const del = `$ref.txn.deleteSlice(\`${ds.key}\`, ${own(ds, 'options')}?.erase === true)`;
+  printFragment(d, `${base}DeleteSlice`, 'WriteTxn', [
+    `${prop(ds.name)}: (${args(ds, ['options?', 'DeleteSliceOptions'])}) => ${del}`,
+  ]);
+}
+
+/** the members of a read context's type over slices: its get and scan groups */
+function printReadTypes(d: Denter, annos: Annos, slices: readonly PSlice[]): void {
+  printGroup(d, 'get: {\n', '};\n', () => {
+    for (const slice of slices) {
+      for (const a of accessors(annos, slice)) {
+        d.print(`${prop(a.name)}: (${args(a)}) => ${a.anno} | undefined;\n`);
+      }
+    }
+  });
+  printGroup(d, 'scan: {\n', '};\n', () => {
+    for (const slice of slices) {
+      for (const s of scanners(annos, slice)) {
+        d.print(`${prop(s.name)}: ScanAccessor<${scanTypeArgs(s)}>;\n`);
+      }
+    }
+  });
+}
+
+/** the members of a write context's type over slices: its set, del, update, and deleteSlice
+    groups */
+function printWriteTypes(d: Denter, annos: Annos, slices: readonly PSlice[]): void {
+  const list = slices.flatMap((slice) => accessors(annos, slice));
+  printGroup(d, 'set: {\n', '};\n', () => {
+    for (const a of list) d.print(`${prop(a.name)}: (${args(a, ['value', a.anno])}) => void;\n`);
+  });
+  printGroup(d, 'del: {\n', '};\n', () => {
+    for (const a of list) d.print(`${prop(a.name)}: (${args(a)}) => void;\n`);
+  });
+  const updatable = list.filter((a) => a.updatable);
   if (updatable.length === 0) {
     d.print('update: {};\n');
   } else {
     d.print(
       '/** apply fn to the value at a key in place and set it, answering what fn returns; an\n',
     );
-    d.print(
-      '    absent key throws, as a reducer does whenever the state is not what its event implies */\n',
-    );
-    d.print('update: {\n');
-    d.indent('  ');
-    for (const a of updatable) {
-      d.print(`${prop(a.name)}: <R>(${args(a, ['fn', `(value: ${a.anno}) => R`])}) => R;\n`);
+    d.print('    absent key throws */\n');
+    printGroup(d, 'update: {\n', '};\n', () => {
+      for (const a of updatable) {
+        d.print(`${prop(a.name)}: <R>(${args(a, ['fn', `(value: ${a.anno}) => R`])}) => R;\n`);
+      }
+    });
+  }
+  d.print('/** delete a slice, and with `{ erase: true }` drop its history from the edit log */\n');
+  printGroup(d, 'deleteSlice: {\n', '};\n', () => {
+    for (const slice of slices) {
+      const ds = sliceAccessor(slice);
+      d.print(`${prop(ds.name)}: (${args(ds, ['options?', 'DeleteSliceOptions'])}) => void;\n`);
     }
-    d.dedent();
-    d.print('};\n');
-  }
-  d.dedent();
-  d.print('};\n');
-
-  // the reducer context, one object bound to each stream's transaction and parameters in turn
-  d.print(`\nfunction create${txnType}(): {\n`);
-  d.print(`  readonly ctx: ${txnType};\n`);
-  d.print(`  bind(txn: ReducerTxn, params: ${txnType}['params']): ${txnType};\n`);
-  d.print('} {\n');
-  d.indent('  ');
-  d.print('const $cell = unboundCell<ReducerTxn>();\n');
-  d.print(`const ctx: ${txnType} = {\n`);
-  d.indent('  ');
-  d.print(`params: {} as ${txnType}['params'],\nget: {\n`);
-  d.indent('  ');
-  printGets(d, local);
-  d.dedent();
-  d.print('},\nscan: {\n');
-  d.indent('  ');
-  printScans(d, localScans, false);
-  d.dedent();
-  d.print('},\nset: {\n');
-  d.indent('  ');
-  for (const a of local) {
-    const v = own(a, 'value');
-    const write = `$cell.txn.set(\`${a.key}\`, ${JSON.stringify(a.type)}, ${v})`;
-    d.print(`${prop(a.name)}: (${args(a, ['value', a.anno])}) => ${write},\n`);
-  }
-  d.dedent();
-  d.print('},\ndel: {\n');
-  d.indent('  ');
-  for (const a of local) {
-    d.print(`${prop(a.name)}: (${args(a)}) => $cell.txn.del(\`${a.key}\`),\n`);
-  }
-  d.dedent();
-  d.print('},\n');
-  if (updatable.length === 0) {
-    d.print('update: {},\n');
-  } else {
-    d.print('update: {\n');
-    d.indent('  ');
-    for (const a of updatable) {
-      const fn = own(a, 'fn');
-      const call = `updateKey($cell.txn, \`${a.key}\`, ${JSON.stringify(a.type)}, ${fn})`;
-      d.print(`${prop(a.name)}: <R>(${args(a, ['fn', `(value: ${a.anno}) => R`])}) => ${call},\n`);
-    }
-    d.dedent();
-    d.print('},\n');
-  }
-  d.dedent();
-  d.print('};\n');
-  d.print('return {\n');
-  d.print('  ctx,\n');
-  d.print('  bind(txn, params) {\n');
-  d.print('    $cell.txn = txn;\n');
-  d.print('    ctx.params = params;\n');
-  d.print('    return ctx;\n');
-  d.print('  },\n');
-  d.print('};\n');
-  d.dedent();
-  d.print('}\n');
-
-  // the handler table: one handler per event type
-  const tableType = `${base}Reducers`;
-  d.print(`\n/** ${base}'s reducer handlers, one per event type */\n`);
-  d.print(`export type ${tableType} = {\n`);
-  d.indent('  ');
-  for (const ev of slice.eventTypes) {
-    const anno = annos.get(ev)!;
-    d.print(`${prop(lowerFirst(ev.name!))}: (txn: ${txnType}, event: ${anno}, pending: boolean)`);
-    d.print(' => void;\n');
-  }
-  d.dedent();
-  d.print('};\n');
-
-  // each event to its handler
-  const reduce = `reduce${base}`;
-  generateDispatch(
-    d,
-    registry,
-    `${reduce}(handlers: ${tableType}, txn: ${txnType}, pending: boolean, val: any): void`,
-    slice.events,
-    (t) => `return handlers.${prop(lowerFirst(t.name!))}(txn, val as ${annos.get(t)!}, pending);\n`,
-  );
-
-  // the stream's parameters, parsed from its name: after the family and its ':', separated by
-  // ',', which no parameter holds
-  const skip = slice.family.length + 1;
-  const n = slice.params.length;
-  let parsed: string;
-  if (n === 0) {
-    parsed = '{}';
-  } else if (n === 1) {
-    parsed = `{ ${slice.params[0]}: stream.slice(${skip}) }`;
-  } else {
-    parsed = `{ ${slice.params.map((p, i) => `${p}: parts[${i}]`).join(', ')} }`;
-  }
-
-  // the SliceReducer the Engine and the database call
-  d.print(`\n/** the SliceReducer that folds ${base}'s events through its handlers */\n`);
-  d.print(`export function ${lowerFirst(base)}Reducer(handlers: ${tableType}): SliceReducer {\n`);
-  d.indent('  ');
-  d.print(`const context = create${txnType}();\n`);
-  d.print('return {\n');
-  d.indent('  ');
-  // a single stream's name has no parameters to parse, so its reducer leaves it unread
-  const stream = n === 0 ? '_stream' : 'stream';
-  d.print(
-    `reducer($txn: ReducerTxn, events: unknown[], ${stream}: string, pending: boolean): void {\n`,
-  );
-  d.indent('  ');
-  if (n > 1) d.print(`const parts = stream.slice(${skip}).split(",");\n`);
-  d.print(`const txn = context.bind($txn, ${parsed});\n`);
-  d.print(`for (const event of events) ${reduce}(handlers, txn, pending, event);\n`);
-  d.dedent();
-  d.print('},\n');
-  d.print(`template: ${JSON.stringify(slice.template)},\n`);
-  d.print(`keys: ${JSON.stringify(slice.store.items.map((item) => item.tpl))},\n`);
-  d.dedent();
-  d.print('};\n');
-  d.dedent();
-  d.print('}\n');
-
-  // the slice's global accessors, for every context that reads it
-  d.print(`\nfunction ${lowerFirst(base)}Get($cell: TxnCell<ReadTxn>) {\n`);
-  d.indent('  ');
-  d.print('return {\n');
-  d.indent('  ');
-  printGets(d, accessors(annos, slice, true));
-  d.dedent();
-  d.print('};\n');
-  d.dedent();
-  d.print('}\n');
-  d.print(`\nfunction ${lowerFirst(base)}Scan($cell: TxnCell<ReadTxn>) {\n`);
-  d.indent('  ');
-  d.print('return {\n');
-  d.indent('  ');
-  printScans(d, scanners(annos, slice, true), true);
-  d.dedent();
-  d.print('};\n');
-  d.dedent();
-  d.print('}\n');
+  });
 }
 
-/** A global context's type and the factory of its bindings, with the Engine's status when the
-    context is a query's.  A database's context takes the database's plugin set, whose request APIs
-    are its fields by plugin name. */
-function generateGlobalContext(
+/** a context's groups, as the factory assembles them from the slices' fragments */
+function fragments(slices: readonly PSlice[], kind: string): string {
+  return `{ ${slices.map((s) => `...${lowerFirst(s.name)}${kind}($ref)`).join(', ')} }`;
+}
+
+/** a read context's type over slices */
+function generateReadContext(
   d: Denter,
   annos: Annos,
   type: string,
   doc: string,
   slices: readonly PSlice[],
-  extra: 'status' | 'plugins' | null = null,
 ): void {
   d.print(`\n/** ${doc} */\n`);
-  d.print(`export type ${type}${extra === 'plugins' ? '<P = {}>' : ''} = {\n`);
-  d.indent('  ');
-  d.print('get: {\n');
-  d.indent('  ');
-  for (const slice of slices) printGetTypes(d, accessors(annos, slice, true));
-  d.dedent();
-  d.print('};\nscan: {\n');
-  d.indent('  ');
-  for (const slice of slices) printScanTypes(d, scanners(annos, slice, true));
-  d.dedent();
-  d.print('};\n');
-  if (extra === 'status') d.print('status: EngineStatus;\n');
-  d.dedent();
-  d.print(extra === 'plugins' ? '} & PluginApis<P>;\n' : '};\n');
+  printGroup(d, `export type ${type} = {\n`, '};\n', () => printReadTypes(d, annos, slices));
+}
 
-  const gets = slices.map((s) => `...${lowerFirst(s.name)}Get($cell)`).join(', ');
-  const scans = slices.map((s) => `...${lowerFirst(s.name)}Scan($cell)`).join(', ');
-  const members = [`get: { ${gets} }`, `scan: { ${scans} }`];
-  if (extra === 'status') members.push('status: engineStatus($cell)');
-  d.print(`\nexport function create${type}(): ContextBinding<${type}> {\n`);
-  d.print('  const $cell = unboundCell<ReadTxn>();\n');
-  d.print(`  const ctx: ${type} = { ${members.join(', ')} };\n`);
-  d.print('  return {\n');
-  d.print('    ctx,\n');
-  d.print('    bind(txn) {\n');
-  d.print('      $cell.txn = txn;\n');
-  d.print('      return ctx;\n');
-  d.print('    },\n');
+/** A write context's type, its read context and its writes, and its create function, which
+    answers the context and the box it reads its write transaction through.  A database's context
+    takes the database's plugin set, whose request APIs are its fields by plugin name. */
+function generateWriteContext(
+  d: Denter,
+  annos: Annos,
+  type: string,
+  readType: string,
+  doc: string,
+  slices: readonly PSlice[],
+  plugins: boolean,
+): void {
+  d.print(`\n/** ${doc} */\n`);
+  const params = plugins ? '<P = {}>' : '';
+  printGroup(d, `export type ${type}${params} = ${readType} & {\n`, '', () =>
+    printWriteTypes(d, annos, slices),
+  );
+  d.print(plugins ? '} & PluginApis<P>;\n' : '};\n');
+
+  const members = ['get', 'scan', 'set', 'del', 'update', 'deleteSlice'].map(
+    (g) => `${g}: ${fragments(slices, g[0].toUpperCase() + g.slice(1))}`,
+  );
+  d.print(`\nexport function create${type}(): { ctx: ${type}; $ref: { txn: WriteTxn } } {\n`);
+  d.print('  const $ref = unboundRef<WriteTxn>();\n');
+  d.print(`  const ctx: ${type} = {\n`);
+  for (const m of members) d.print(`    ${m},\n`);
   d.print('  };\n');
+  d.print('  return { ctx, $ref };\n');
   d.print('}\n');
 }
 
-/** the reducer handler tables of slices, by family, as a type */
-function reducersAnno(slices: readonly PSlice[]): string {
-  return '{ ' + slices.map((s) => `${prop(s.family)}: ${s.name}Reducers`).join('; ') + ' }';
-}
-
-/** the SliceReducers of slices, by family, over the handler tables in `tables` */
-function reducersValue(slices: readonly PSlice[], tables: string): string {
-  const entries = slices.map(
-    (s) => `${prop(s.family)}: ${lowerFirst(s.name)}Reducer(${tables}.${prop(s.family)})`,
-  );
-  return '{ ' + entries.join(', ') + ' }';
+/** the selectors of slice types, one each, as a literal: `family:*`, or the family alone for a
+    slice type without parameters, whose one slice is named for it */
+function wantsValue(slices: readonly PSlice[]): string {
+  const wants = slices.map((s) => (s.params.length === 0 ? s.family : `${s.family}:*`));
+  return '[' + wants.map((w) => JSON.stringify(w)).join(', ') + ']';
 }
 
 // engines ///////////////////////////////////////////////////////////////////
 
-/** an engine's read context, its forecaster table and its wrapper, and its Engine subclass */
+/** an engine's contexts, its predictor table and the Predictor over it, and its Engine subclass */
 function generateEngine(d: Denter, annos: Annos, registry: PTypeRegistry, e: PEngine): void {
+  const readType = `${e.name}ReadTxn`;
   const txnType = `${e.name}Txn`;
   const queryTxnType = `${e.name}QueryTxn`;
-  const tableType = `${e.name}Forecasters`;
-  const offline = e.commands.filter((c) => !c.online);
-  const online = e.commands.filter((c) => c.online);
-  const anno = (c: PCommand) => annos.get(c.type)!;
+  const tableType = `${e.name}Predictors`;
+  const offline = e.mutations.filter((m) => !m.online);
+  const online = e.mutations.filter((m) => m.online);
+  const anno = (m: PMutation) => annos.get(m.type)!;
 
-  // the read context of its forecasts, and of its queries, which also read the Engine's status
-  const doc = `${e.name}'s read context: what its forecasts read, over its slices`;
-  generateGlobalContext(d, annos, txnType, doc, e.slices);
-  const queryDoc =
-    `${e.name}'s query context: what its queries read, over its slices, ` +
-    "and the Engine's status";
-  generateGlobalContext(d, annos, queryTxnType, queryDoc, e.slices, 'status');
+  // what any of its contexts reads
+  generateReadContext(
+    d,
+    annos,
+    readType,
+    `${e.name}'s read context: what its queries and predictors read, over its slices`,
+    e.slices,
+  );
 
-  // the forecaster table: one optional forecaster per command that is not @online
+  // what its predictors read and write
+  const doc = `${e.name}'s predict context: what its predictors read and write, over its slices`;
+  generateWriteContext(d, annos, txnType, readType, doc, e.slices, false);
+
+  // what its queries read, which includes the Engine's status
+  d.print(`\n/** ${e.name}'s query context: what its queries read, over its slices, and the`);
+  d.print(" Engine's status */\n");
+  d.print(`export type ${queryTxnType} = ${readType} & { status: EngineStatus };\n`);
   d.print(
-    `\n/** ${e.name}'s forecasters, one per command; a command left out forecasts nothing */\n`,
+    `\nexport function create${queryTxnType}(): { ctx: ${queryTxnType}; $ref: { txn: ReadTxn } } {\n`,
+  );
+  d.print('  const $ref = unboundRef<ReadTxn>();\n');
+  d.print(`  const ctx: ${queryTxnType} = {\n`);
+  d.print(`    get: ${fragments(e.slices, 'Get')},\n`);
+  d.print(`    scan: ${fragments(e.slices, 'Scan')},\n`);
+  d.print('    status: $engineStatus($ref),\n');
+  d.print('  };\n');
+  d.print('  return { ctx, $ref };\n');
+  d.print('}\n');
+
+  // the predictor table: one optional predictor per mutation that is not @online
+  d.print(
+    `\n/** ${e.name}'s predictors, one per mutation; a mutation left out predicts nothing */\n`,
   );
   d.print(`export type ${tableType} = {\n`);
   d.indent('  ');
-  for (const c of offline) {
-    d.print(
-      `${prop(lowerFirst(c.name))}?: (txn: ${txnType}, cmd: ${anno(c)}) => ${c.name}Output;\n`,
-    );
+  for (const m of offline) {
+    d.print(`${prop(lowerFirst(m.name))}?: Predictor<${txnType}, ${anno(m)}>;\n`);
   }
   d.dedent();
   d.print('};\n');
 
-  // each command to its forecaster; an @online command is never forecast
-  const commandOf = new Map(e.commands.map((c) => [c.type, c]));
-  const forecast = `forecast${e.name}`;
+  // each mutation to its predictor; an @online mutation is never predicted
+  const mutationOf = new Map(e.mutations.map((m) => [m.type, m]));
+  const predict = `predict${e.name}`;
   generateDispatch(
     d,
     registry,
-    `${forecast}(table: ${tableType}, txn: ${txnType}, val: any): ForecastOutput[]`,
-    e.commandType,
+    `${predict}(table: ${tableType}, txn: ${txnType}, val: any, pending?: true): void`,
+    e.mutationType,
     (t) => {
-      const c = commandOf.get(t)!;
-      if (c.online) return 'return [];\n';
-      const k = `table.${prop(lowerFirst(c.name))}`;
-      return `return ${k} === undefined ? [] : outputList(${k}(txn, val as ${anno(c)}));\n`;
+      const m = mutationOf.get(t)!;
+      if (m.online) return 'return;\n';
+      return `return table.${prop(lowerFirst(m.name))}?.(txn, val as ${anno(m)}, pending);\n`;
     },
   );
 
-  // the commands sendCommand takes, and those sendOnlineCommand takes
-  const C =
+  // the mutations sendMutation takes, and those sendOnlineMutation takes
+  const M =
     offline.length === 0
       ? 'never'
       : online.length === 0
-        ? annos.get(e.commandType)!
+        ? annos.get(e.mutationType)!
         : offline.map(anno).join(' | ');
   const N = online.length === 0 ? 'never' : online.map(anno).join(' | ');
 
-  d.print(`\n/** the Forecaster that runs ${e.name}'s forecasters */\n`);
-  d.print(`export function ${lowerFirst(e.name)}Forecaster(table: ${tableType}): `);
-  d.print(`Forecaster<${txnType}, ${C}> {\n`);
-  d.print(`  return (txn, cmd) => ${forecast}(table, txn, cmd);\n`);
+  d.print(`\n/** the Predictor that runs ${e.name}'s predictors */\n`);
+  d.print(`export function ${lowerFirst(e.name)}Predictor(table: ${tableType}): `);
+  d.print(`Predictor<${txnType}, ${M}> {\n`);
+  d.print(`  return (txn, mutation, pending) => ${predict}(table, txn, mutation, pending);\n`);
   d.print('}\n');
 
   // the engine itself
-  const wants = e.slices.map((s) => (s.params.length === 0 ? s.family : `${s.family}:*`));
   const names = e.slices.map((s) => s.name).join(', ');
   d.print(`
 /** the Engine of ${e.name}, syncing ${names} */
-export class ${e.name} extends Engine<${queryTxnType}, ${txnType}, ${C}, ${N}> {
+export class ${e.name} extends Engine<${queryTxnType}, ${txnType}, ${M}, ${N}> {
   constructor(
     transport: Transport,
     options: {
       // who the Engine syncs as, or null for anonymous
       session: Session | null;
-      // each slice's reducer handlers, by family
-      reducers: ${reducersAnno(e.slices)};
-      // optional: forecast what the database will do with a command
-      forecasters?: ${tableType};
+      // optional: predict what the database will do with a mutation
+      predictors?: ${tableType};
       // optional: makes the Engine's store from its Registry; without it, an InMemStore
       store?: StoreFactory;
       // optional: ends the Engine, its connection, and every backfill
@@ -1023,16 +918,13 @@ export class ${e.name} extends Engine<${queryTxnType}, ${txnType}, ${C}, ${N}> {
       onError?: (e: unknown) => void;
     },
   ) {
-    const forecasters = options.forecasters;
-    const queries = create${queryTxnType}();
-    const forecasts = create${txnType}();
+    const predictors = options.predictors;
     const schema = ${lowerFirst(e.name)}Schema;
-    super((txn) => queries.bind(txn), (txn) => forecasts.bind(txn), schema, transport, {
+    super(create${queryTxnType}(), create${txnType}(), schema, transport, {
       session: options.session,
-      reducers: ${reducersValue(e.slices, 'options.reducers')},
-      wants: ${JSON.stringify(wants)},
+      wants: ${wantsValue(e.slices)},
       store: options.store,
-      forecaster: forecasters === undefined ? undefined : ${lowerFirst(e.name)}Forecaster(forecasters),
+      predictor: predictors === undefined ? undefined : ${lowerFirst(e.name)}Predictor(predictors),
       signal: options.signal,
       onError: options.onError,
     });
@@ -1043,95 +935,78 @@ export class ${e.name} extends Engine<${queryTxnType}, ${txnType}, ${C}, ${N}> {
 
 // databases /////////////////////////////////////////////////////////////////
 
-/** a database's read context, precommit table, slots, and the definition of its bundle */
+/** a database's contexts, its grantor and decider types, its slots, the definition of its bundle,
+    and the post of its mutations */
 function generateDatabase(
   d: Denter,
   annos: Annos,
   registry: PTypeRegistry,
   db: PDatabase,
-  commandUnion: PType | undefined,
+  mutationUnion: PType | undefined,
 ): void {
+  const readType = `${db.name}ReadTxn`;
   const txnType = `${db.name}Txn`;
-  const tableType = `${db.name}Precommit`;
-  const ctxType = `${db.name}BootstrapContext`;
-  const slotsType = `${db.name}Slots`;
-  const outputType = `${db.name}Output`;
   const typesType = `${db.name}Types`;
+  const grantorType = `${db.name}Grantor`;
+  const tableType = `${db.name}Deciders`;
+  const slotsType = `${db.name}Slots`;
 
-  // the read context of precommit, maySee, lookup, and plugin hooks, with the plugins of P
+  // what grant and lookup read
+  const readDoc = `${db.name}'s read context: what its grantor and lookup read, over every slice`;
+  generateReadContext(d, annos, readType, readDoc, db.slices);
+
+  // what deciders, bootstrap, and plugin hooks read and write, with the plugins of P
   const doc =
-    `${db.name}'s read context: what precommit, maySee, lookup, and plugin hooks read, over ` +
-    'every slice, and the request APIs of the plugin set P';
-  generateGlobalContext(d, annos, txnType, doc, db.slices, 'plugins');
+    `${db.name}'s context: what its deciders, bootstrap, and plugin hooks read and write, ` +
+    'over every slice, and the request APIs of the plugin set P';
+  generateWriteContext(d, annos, txnType, readType, doc, db.slices, true);
 
-  // what a plugin hook may return: any event of a slice labelled with one of its streams, or a
-  // death, erasing the stream's history or not
-  const outputs = db.slices.map(
-    (s) => `{ stream: ${streamLabel([s])}; event: ${annos.get(s.events)!} }`,
-  );
-  d.print(
-    `\n/** any output of ${db.name}: an event of a slice on one of its streams, or a death, ` +
-      "erasing the stream's history or not */\n",
-  );
-  d.print(`export type ${outputType} =\n`);
-  const death = '{ stream: string; death: true; erase?: true }';
-  for (const o of [...outputs, death]) d.print(`  | ${o}\n`);
-  d.print(';\n');
+  // the types a plugin's hooks are typed by
+  d.print(`\n/** ${db.name}'s types, as an installed plugin's hooks take them */\n`);
+  d.print(`export type ${typesType}<P = {}> = { txn: ${txnType}<P> };\n`);
 
-  // the types a plugin's handlers are typed by
-  d.print(`\n/** ${db.name}'s types, as an installed plugin's handlers take them */\n`);
-  d.print(`export type ${typesType}<P = {}> = { txn: ${txnType}<P>; output: ${outputType} };\n`);
+  // the grantor
+  d.print(`\n/** ${db.name}'s grantor: the selectors of the slices a principal may see */\n`);
+  d.print(`export type ${grantorType} = Grantor<${readType}>;\n`);
 
-  // the precommit table: one handler per command, each seeing the command after intake
-  d.print(`\n/** ${db.name}'s precommit handlers, one per command, with the plugin set P */\n`);
+  // the decider table: one decider per mutation, each seeing the mutation after intake
+  d.print(`\n/** ${db.name}'s deciders, one per mutation, with the plugin set P */\n`);
   d.print(`export type ${tableType}<P = {}> = {\n`);
   d.indent('  ');
-  for (const c of db.commands) {
-    d.print(`${prop(lowerFirst(c.name))}: (auth: Auth, txn: ${txnType}<P>, `);
-    d.print(`cmd: ${precommitView(annos, c)}) => ${c.name}Output;\n`);
+  for (const m of db.mutations) {
+    d.print(`${prop(lowerFirst(m.name))}: Decider<${txnType}<P>, ${deciderView(annos, m)}>;\n`);
   }
   d.dedent();
   d.print('};\n');
 
-  // each command to its handler, run with a fresh Auth
-  const precommit = `precommit${db.name}`;
+  // each mutation to its decider, run with a fresh Auth
+  const decide = `decide${db.name}`;
   const signature =
-    `${precommit}(table: ${tableType}<any>, principal: Principal, txn: ${txnType}<any>, ` +
-    'val: any): string | ForecastOutput[]';
-  if (commandUnion !== undefined) {
-    const commandOf = new Map(db.commands.map((c) => [c.type, c]));
-    generateDispatch(d, registry, signature, commandUnion, (t) => {
-      const c = commandOf.get(t)!;
-      const k = lowerFirst(c.name);
-      const call = `table.${prop(k)}(auth, txn, val as ${precommitView(annos, c)})`;
-      return `return runPrecommit(${JSON.stringify(k)}, principal, (auth) => ${call});\n`;
+    `${decide}(table: ${tableType}<any>, principal: Principal, txn: ${txnType}<any>, ` +
+    'val: any): string | null';
+  if (mutationUnion !== undefined) {
+    const mutationOf = new Map(db.mutations.map((m) => [m.type, m]));
+    generateDispatch(d, registry, signature, mutationUnion, (t) => {
+      const m = mutationOf.get(t)!;
+      const k = lowerFirst(m.name);
+      const call = `table.${prop(k)}(auth, txn, val as ${deciderView(annos, m)})`;
+      return `return runDecider(${JSON.stringify(k)}, principal, (auth) => ${call});\n`;
     });
   } else {
     d.print(`\nfunction ${signature} {\n`);
-    d.print('  throw new Error(`no commands: ${val}`);\n');
+    d.print('  throw new Error(`no mutations: ${val}`);\n');
     d.print('}\n');
   }
 
-  // what bootstrap emits: any event of a slice, labelled with one of its streams
-  const seeds = db.slices.map((s) => `[${streamLabel([s])}, ${annos.get(s.events)!}]`);
-  d.print(`\n/** what ${db.name}'s bootstrap seeds the empty log with */\n`);
-  d.print(`export type ${ctxType} = {\n`);
-  d.print(`  emit: (...out: ${seeds.join(' | ')}) => void;\n`);
-  d.print('  hashPassword: (plain: string) => PasswordHash;\n');
-  d.print('  env: (name: string) => string;\n');
-  d.print('};\n');
-
   // the bundle's slots, as the app writes them
   d.print(`
-/** what ${db.name}'s bundle is made of: every slice's reducer handlers, precommit, maySee, lookup,
-    an optional bootstrap, and the installed plugins of the set P, every one of them under its
-    name */
+/** what ${db.name}'s bundle is made of: its deciders, its grantor, lookup, an optional bootstrap,
+    and the installed plugins of the set P, every one of them under its name */
 export type ${slotsType}<P = {}> = {
-  reducers: ${reducersAnno(db.slices)};
-  precommit: ${tableType}<P>;
-  maySee: (txn: ${txnType}, principal: Principal) => string[];
-  lookup: (txn: ${txnType}, ident: LookupIdent) => LookupResult | null;
-  bootstrap?: (ctx: ${ctxType}) => void;
+  deciders: ${tableType}<P>;
+  grant: ${grantorType};
+  lookup: (txn: ${readType}, ident: LookupIdent) => LookupResult | null;
+  bootstrap?: (txn: ${txnType}<P>, ctx: BootstrapContext) => void;
 } & ({} extends P
   ? { plugins?: PluginSlots<P, ${typesType}<P>> }
   : { plugins: PluginSlots<P, ${typesType}<P>> });
@@ -1140,19 +1015,29 @@ export type ${slotsType}<P = {}> = {
   // the bundle, over the generated wrappers
   d.print(`
 /** Install ${db.name}'s bundle as globalThis.__bundle, the app's slots behind the generated
-    wrappers, and answer it.  P is the plugin set, which the slots' precommit and plugins share. */
+    wrappers, and answer it.  P is the plugin set, which the slots' deciders and plugins share.
+    It builds two contexts once: the write context of the deciders, bootstrap, and the plugins,
+    and the read context grant and lookup share, whose writes throw. */
 export function define${db.name}<P = {}>(slots: ${slotsType}<P>): Bundle {
   const bootstrap = slots.bootstrap;
   const installs = (slots.plugins ?? {}) as Record<string, PluginInstall>;
-  const { plugins, bind } = installPlugins(create${txnType}(), installs);
+  const write = create${txnType}();
+  const read = create${txnType}();
+  const { plugins, bind } = installPlugins(write.ctx, installs);
+  const txn = write.ctx as ${txnType}<P>;
   const bundle: Bundle = {
     schema: ${lowerFirst(db.name)}Schema,
-    precommit: (txn, data, principal) =>
-      ${precommit}(slots.precommit, principal, bind(txn), data),
-    reducers: ${reducersValue(db.slices, 'slots.reducers')},
-    maySee: (txn, principal) => slots.maySee(bind(txn), principal),
-    lookup: (txn, ident) => slots.lookup(bind(txn), ident),
-    bootstrap: bootstrap === undefined ? undefined : (ctx) => bootstrap(ctx as ${ctxType}),
+    bindWrite: (raw) => {
+      write.$ref.txn = raw;
+      bind(raw);
+    },
+    bindRead: (raw) => {
+      read.$ref.txn = readOnlyTxn(raw);
+    },
+    decide: (data, principal) => ${decide}(slots.deciders, principal, txn, data),
+    grant: (principal) => slots.grant(read.ctx, principal),
+    lookup: (ident) => slots.lookup(read.ctx, ident),
+    bootstrap: bootstrap === undefined ? undefined : (ctx) => bootstrap(txn, ctx),
     plugins,
     dev: DEV,
     mapStack,
@@ -1162,19 +1047,19 @@ export function define${db.name}<P = {}>(slots: ${slotsType}<P>): Bundle {
 }
 `);
 
-  // a post of any of the database's commands outside any Engine, named for the database without
+  // a post of any of the database's mutations outside any Engine, named for the database without
   // a trailing DB or Database
-  if (commandUnion === undefined) return;
-  const post = `post${db.name.replace(/(db|database)$/i, '')}Command`;
+  if (mutationUnion === undefined) return;
+  const post = `post${db.name.replace(/(db|database)$/i, '')}Mutation`;
   d.print(`
-/** Posts one of ${db.name}'s commands outside any Engine, such as one sent before anyone has
+/** Posts one of ${db.name}'s mutations outside any Engine, such as one sent before anyone has
     signed in, as the session or as anonymous, and answers with the database's outcome */
 export function ${post}(
   transport: Transport,
-  command: ${annos.get(commandUnion)!},
+  mutation: ${annos.get(mutationUnion)!},
   options: { session?: Session | null } = {},
-): Promise<CommandResult> {
-  return postWithSchema(${lowerFirst(db.name)}Schema, transport, command, options);
+): Promise<MutationResult> {
+  return postWithSchema(${lowerFirst(db.name)}Schema, transport, mutation, options);
 }
 `);
 }
@@ -1322,7 +1207,7 @@ function generateQueries(d: Denter, annos: Annos, kq: PQueries): void {
 
 /** entrypoint: assemble the complete generated module */
 export function generateTs(lowered: LoweredProgram, skeleton: string): string {
-  const { registry, roots, slices, commands, engines, databases, queries } = lowered;
+  const { registry, roots, slices, mutations, engines, databases, queries } = lowered;
   if (!roots.length) throw new Error('no named types found to generate code for');
 
   const d = new Denter();
@@ -1332,15 +1217,15 @@ export function generateTs(lowered: LoweredProgram, skeleton: string): string {
 
   const typesToVisit = [...roots, ...slices.flatMap((s) => s.store.items.map((si) => si.type))];
 
-  // A database needs the PasswordHash its bootstrap makes, and the union of its commands, which
+  // A database needs the PasswordHash its bootstrap makes, and the union of its mutations, which
   // its bundle checks and dispatches on.
-  const commandUnions = new Map<PDatabase, PType>();
+  const mutationUnions = new Map<PDatabase, PType>();
   for (const db of databases) {
     typesToVisit.push(registry.result('PasswordHash', registry.string()));
-    if (db.commands.length === 0) continue;
-    const union = registry.union(db.commands.map((c) => c.type));
-    if (union.name === null) union.name = `${db.name}Command`;
-    commandUnions.set(db, union);
+    if (db.mutations.length === 0) continue;
+    const union = registry.union(db.mutations.map((m) => m.type));
+    if (union.name === null) union.name = `${db.name}Mutation`;
+    mutationUnions.set(db, union);
     typesToVisit.push(union);
   }
 
@@ -1357,15 +1242,15 @@ export function generateTs(lowered: LoweredProgram, skeleton: string): string {
   for (const t of typesToVisit) generateAnnotations(d, annos, t);
 
   // The type registry, which every host converts by.
-  generateSchema(d, registry, roots, engines, databases, commandUnions, queries);
+  generateSchema(d, registry, roots, engines, databases, mutationUnions, queries);
 
-  // Generate each command's output type and intake view
-  for (const c of commands) generateCommandTypes(d, annos, c);
+  // Generate each mutation's intake view
+  for (const m of mutations) generateMutationTypes(d, annos, m);
 
   // Generate slices, engines, and databases
-  for (const s of slices) generateSlice(d, annos, registry, s);
+  for (const s of slices) generateSlice(d, annos, s);
   for (const e of engines) generateEngine(d, annos, registry, e);
-  for (const db of databases) generateDatabase(d, annos, registry, db, commandUnions.get(db));
+  for (const db of databases) generateDatabase(d, annos, registry, db, mutationUnions.get(db));
 
   // Generate query layers
   for (const kq of queries) generateQueries(d, annos, kq);

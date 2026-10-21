@@ -85,11 +85,30 @@ export class ByteReader {
     }
   }
 
+  /** peek returns the next byte, which must already be available, without consuming it */
+  peek(): number {
+    if (this.#pos >= this.#len) throw new Error('ByteReader.peek past the buffer');
+    return this.#buf[this.#pos];
+  }
+
   /** tryValue returns a copy of the next whole msgpack value if it is buffered, else null */
   tryValue(): Uint8Array | null {
     const end = measure(this.#buf, this.#pos, this.#len);
     if (end < 0) return null;
     const out = this.#buf.slice(this.#pos, end);
+    this.#pos = end;
+    return out;
+  }
+
+  /** tryValues returns a view of the next n whole msgpack values if they are all buffered, else
+      null, consuming nothing then; the view is valid until the next refill */
+  tryValues(n: number): Uint8Array | null {
+    let end = this.#pos;
+    for (let i = 0; i < n; i++) {
+      end = measure(this.#buf, end, this.#len);
+      if (end < 0) return null;
+    }
+    const out = this.#buf.subarray(this.#pos, end);
     this.#pos = end;
     return out;
   }

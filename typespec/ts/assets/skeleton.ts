@@ -47,7 +47,7 @@ export type SignalController = { readonly signal: Signal; abort(reason?: unknown
     provide all of it.  A host embedding a JS engine (QuickJS, goja, JavaScriptCore) installs it:
     timers that run their callback on the JS thread; an AbortController whose signals, and those
     AbortSignal.any combines, are of the host's own kind, for its transports to use as they are,
-    each firing its abort listeners on the JS thread; and randomness for command ids and series,
+    each firing its abort listeners on the JS thread; and randomness for mutation ids and series,
     as crypto.getRandomValues or a generateUuid of its own.  An Engine checks for them when
     built. */
 export type HostGlobals = {
@@ -79,7 +79,7 @@ function checkHost(): void {
   }
 }
 
-// a fresh command id: the host's own uuid when it mints them, else a version 4 uuid from its
+// a fresh mutation id: the host's own uuid when it mints them, else a version 4 uuid from its
 // randomness; lower-case, as the id a connection decodes from an envelope is
 function generateUuid(): string {
   if (host.generateUuid !== undefined) return host.generateUuid().toLowerCase();
@@ -471,28 +471,32 @@ export const HOST = 2;
 export const MSGPACK = 3;
 export type Rep = typeof JS | typeof HOST | typeof MSGPACK;
 
-/** Registry converts between representations of typed values and names the types the store
-    holds.  Types are model names from the TypeSpec, plus three reserved names: `.json` for the
-    Engine's own shapes; `.command` for the outbox envelope, `{id, series, n, data}` with `data`
-    already the command's wire bytes, so it needs no vocabulary to read; and `.event` for a parked
-    event, the wire pair `[env, data]` in `msgpack` and a DbEvent in `js`, its `data` converted
-    through the union of the stream's slice. */
+/** Registry converts between representations of typed values.  Types are model names from the
+    TypeSpec, plus four reserved names.  `.json` is the Engine's own shapes.  `.mutation` is an
+    outbox row, a Mutation<Uint8Array> whose `data` is already the mutation's wire bytes, so it
+    needs no vocabulary to read.  `.edits` is a parked edit, the raw edit in `msgpack` and its
+    EditEnvelope alone in `js`; it converts from `msgpack` only.  `.page` is a parked snapshot
+    page, bytes that only a store's applySnapshot reads, which no Registry converts. */
 export interface Registry {
   /** a value of type `type`, given in one representation, in another */
   convert(type: string, value: unknown, from: Rep, to: Rep): unknown;
-  /** the commands union this engine may submit */
-  commands: string;
-  /** a family, a stream name before its first ':', to the slice's events union */
-  eventTypes: Record<string, string>;
-  /** family/name, a key's family and its local key's name, to the store value's type */
-  storeTypes: Record<string, string>;
+  /** The operations of a raw edit, its envelope skipped, or of a snapshot page, in order, for a
+      JS-native store to apply: each a key and its value's bytes, sliced out undecoded, or
+      undefined for a deletion.  An opcode it does not know throws. */
+  ops(bytes: Uint8Array, edit: boolean): EditOp[];
+  /** the mutations union this engine may send */
+  mutations: string;
 }
+
+/** one operation of an edit or a snapshot page: a set, with its value's msgpack bytes, a nil
+    setting null, or a deletion, with undefined */
+export type EditOp = [key: string, value: Uint8Array | undefined];
 
 /** One type of the model, as the generated registry describes it; children are indices into
     the same node table.  A struct lists its fields in declaration order, and names the one it
     writes first, the field a union tells it apart from its other members by, or -1; a union
     carries the solver's decision tree; an intake node names a field the database prepares for
-    precommit, over the wire type a client sends.  The identities of a struct, record, array,
+    the decider, over the wire type a client sends.  The identities of a struct, record, array,
     tuple, or union are its name, or null when the type has none. */
 export type SchemaNode =
   | ['null']
@@ -529,31 +533,14 @@ export type SchemaSolution =
 
 /** The type registry as data, generated per engine and per database: the model's types as a
     node table, the type identities the Registry answers for and their nodes, and what the
-    Registry's `commands`, `eventTypes`, and `storeTypes` are.  Every engine and database of one
-    model shares one node table.  A host walks it to convert values; the reserved identities are
-    the host's own. */
+    Registry's `mutations` is.  Every engine and database of one model shares one node table.  A
+    host walks it to convert values; the reserved identities are the host's own. */
 export type Schema = {
   nodes: SchemaNode[];
   ids: Record<string, number>;
-  /** the commands union, or null for a database with no commands */
-  commands: string | null;
-  eventTypes: Record<string, string>;
-  storeTypes: Record<string, string>;
+  /** the mutations union, or null for a database with no mutations */
+  mutations: string | null;
 };
-
-/** the type of a store key's value, from the Registry's storeTypes; undefined for a key no slice
-    declares */
-export function storeTypeOf(reg: Registry, key: string): string | undefined {
-  const bang = key.indexOf('!');
-  if (bang < 0) throw new Error(`invalid key has no '!': ${key}`);
-  const stream = key.slice(0, bang);
-  const local = key.slice(bang + 1);
-  const name = (x: string) => {
-    const i = x.indexOf(':');
-    return i < 0 ? x : x.slice(0, i);
-  };
-  return reg.storeTypes[`${name(stream)}/${name(local)}`]!;
-}
 
 /** Keys sort in code-point order, which is the order of their UTF-8 bytes, so a store comparing
     UTF-8 keys bytewise (SQLite, LMDB) walks in the same order as the in-memory layers.  JS's own
@@ -614,15 +601,27 @@ export interface RTxn {
   scan(req: ScanRequest): StoreScan;
 }
 
+/** A WTxn writes keys one by one, and applies edits and snapshot pages whole.  Applying an edit
+    deletes every key under its slice first when its envelope marks a birth or a death, then
+    carries out its payload's operations in order; a death carries none.  Each apply answers the
+    keys it changed, which mark queries dirty.  Applied values are the bytes the edit or page
+    carries, which the store keeps as they are or in its own form, and a read decodes with the
+    reader's type; JS never sees a payload. */
 export interface WTxn extends RTxn {
   /** persist the value, given in a representation, in the one the store keeps */
   set(key: string, type: string, rep: Rep, value: unknown): void;
   del(key: string): void;
   /** delete every key under prefix; returns the keys deleted */
   delPrefix(prefix: string): string[];
-  /** rekey every key under src to dst, never decoding a value; returns the keys as they now
-      exist.  Callers never rekey into the source range. */
-  move(src: string, dst: string): string[];
+  /** apply live edits, in order */
+  applyEdits(edits: WireEdit[]): string[];
+  /** apply a slice's parked edits, `!park-ed:{slice}!{seq}` from fromSeq on, in seq order.  The
+      edits applied always form a contiguous range of seqs, through the slice's last parked one,
+      and stay parked. */
+  applyParked(slice: string, fromSeq: number): string[];
+  /** apply a backfill's parked snapshot pages, `!park-snap:{selector}!{offset}`, in order, skipping
+      every key of a slice in skip; the pages stay parked */
+  applySnapshot(selector: string, skip: string[]): string[];
 }
 
 /** Store is the interface for running read and write transactions.  It is synchronous: a
@@ -630,7 +629,8 @@ export interface WTxn extends RTxn {
     throws, and a transaction method answers when it returns and fails by throwing.  A store
     holds a Registry and does its own conversions, in the host language.  Values cross the
     boundary by copy: what a get or scan hands out is the caller's, and what set is given is the
-    store's from that call on, converted or copied then. */
+    store's from that call on, converted or copied then.  A value that fails to decode is an
+    error in a dev bundle, and in production a read answers it as absent. */
 export interface Store {
   write<T>(fn: (txn: WTxn) => T): T;
   read<T>(fn: (txn: RTxn) => T): T;
@@ -650,14 +650,14 @@ export type ParamMatch =
   | { gte?: string; gt?: string; lte?: string; lt?: string };
 
 /** A KeyPattern picks out keys of one key template by a match on each of its parameters.
-    `stream` is one stream by name, the empty name being the Engine's own stream; or a family and a
-    match per family parameter; or null for every stream.  `name` is the local template's name, with
-    a match per local parameter in `local`, or null for every local key of the streams matched,
+    `slice` is one slice by name, the empty name being the Engine's own slice; or a family and a
+    match per family parameter; or null for every slice.  `name` is the local template's name, with
+    a match per local parameter in `local`, or null for every local key of the slices matched,
     which a scan reads keys only, since the values of different templates differ in type.  Each
     separator in a key sorts below every character the parameter before it may hold, so the keys a
-    pattern picks out come in the order of their parameters, stream ones first. */
+    pattern picks out come in the order of their parameters, slice ones first. */
 export type KeyPattern = {
-  stream: string | { family: string; params: ParamMatch[] } | null;
+  slice: string | { family: string; params: ParamMatch[] } | null;
   name: string | null;
   local: ParamMatch[];
 };
@@ -694,7 +694,7 @@ export function scanAll(txn: RTxn, req: ScanRequest): [string, unknown][] {
 
 /* A pattern compiles to the text every key it picks out starts with, then its fields in key order:
    a value field per parameter, with its bounds and the separator that follows it ('' after the
-   last one of a key), and between the stream's fields and the local ones a literal, the local
+   last one of a key), and between the slice's fields and the local ones a literal, the local
    template's name with the ':' that follows it when it has parameters.  The literal matches as
    text, not as an ordered value, since a name may hold characters that sort below ':'. */
 type ValueField = {
@@ -753,17 +753,17 @@ function valueField(m: ParamMatch, sep: string): ValueField {
 
 function compilePattern(p: KeyPattern): CompiledPattern {
   const fields: CompiledPattern['fields'] = [];
-  const s = p.stream;
+  const s = p.slice;
 
   // every key
   if (s === null) {
     if (p.name !== null || p.local.length > 0) {
-      throw new Error('a pattern over every stream picks out every local key');
+      throw new Error('a pattern over every slice picks out every local key');
     }
     return { head: '', fields };
   }
 
-  // the streams: one by name, or a family's with a field per parameter
+  // the slices: one by name, or a family's with a field per parameter
   let head: string;
   if (typeof s === 'string') {
     head = `${s}!`;
@@ -775,7 +775,7 @@ function compilePattern(p: KeyPattern): CompiledPattern {
     s.params.forEach((m, i) => fields.push(valueField(m, i < n - 1 ? ',' : '!')));
   }
 
-  // every local key of the streams, or one template's, its name a literal
+  // every local key of the slices, or one template's, its name a literal
   if (p.name === null) {
     if (p.local.length > 0) throw new Error('a pattern over every local key matches no parameter');
     return { head, fields };
@@ -984,10 +984,11 @@ function readHalf(txn: RTxn): WTxn {
 // in-memory layers /////////////////////////////////////////////////////////
 
 /* The in-memory store and the overlay keep rich js values, converting through the Registry on the
-   way in and out.  Each keeps a base map, and each transaction keeps a map of pending updates over
-   it, in which undefined marks a deletion.  The store also keeps its keys in a KeyList, so a scan
-   seeks to its first key and walks from there; the overlay holds only the few keys forecasts
-   write, and sorts them for each scan. */
+   way in and out; the store also keeps bytes it was given, until a read decodes them.  Each keeps
+   a base map, and each transaction keeps a map of pending updates over it, in which undefined
+   marks a deletion.  The store also keeps its keys in a KeyList, so a scan seeks to its first key
+   and walks from there; the overlay holds only the few keys predictions write, and sorts them for
+   each scan. */
 
 type Layer = Map<string, unknown>;
 
@@ -1231,8 +1232,37 @@ class KeyList {
   }
 }
 
-/** InMemStore keeps values in their JS form in memory, with its keys in a sorted list, so a scan
-    seeks to its first key rather than sorting.  Values cross the transaction boundary by copy. */
+/** a value the in-memory store holds as the msgpack bytes it was given, until a read decodes it */
+class Packed {
+  readonly bytes: Uint8Array;
+
+  constructor(bytes: Uint8Array) {
+    this.bytes = bytes;
+  }
+}
+
+// the reserved types whose bytes are the value itself, which a read never decodes in their place:
+// a parked edit reads as its envelope, and a parked page is never read
+const RAW_TYPES = new Set(['.edits', '.page']);
+
+/* A stored value decoded with the reader's type.  One that fails to decode is a loud error in dev
+   mode, and absent in production. */
+function decodeStored(reg: Registry, key: string, type: string, bytes: Uint8Array): unknown {
+  try {
+    return reg.convert(type, bytes, MSGPACK, JS);
+  } catch (e: unknown) {
+    if (!DEV) return undefined;
+    throw new Error(`${key}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+// an edit as an error names it, by its lifecycle
+const edit = (life: Lifecycle) => (life === 'normal' ? 'an edit' : `a ${life}`);
+
+/** InMemStore keeps values in memory, with its keys in a sorted list, so a scan seeks to its
+    first key rather than sorting.  A value given as bytes, as every value an edit or a snapshot
+    applies is, stays bytes until its first read decodes it with the reader's type, and the
+    decoded value takes their place.  Values cross the transaction boundary by copy. */
 export class InMemStore implements Store {
   #reg: Registry;
   #values: Layer = new Map();
@@ -1298,12 +1328,15 @@ class InMemTxn implements WTxn {
   }
 
   get(key: string, type: string, rep: Rep): unknown {
-    const js = layerGet(this.#values, this.#updates, key);
-    return js === undefined ? undefined : layerOut(this.#reg, type, js, rep);
+    return this.#out(key, type, rep);
   }
 
   set(key: string, type: string, rep: Rep, value: unknown): void {
-    this.#updates.set(key, layerIn(this.#reg, type, rep, value));
+    if (rep === MSGPACK) {
+      this.#updates.set(key, new Packed((value as Uint8Array).slice()));
+    } else {
+      this.#updates.set(key, layerIn(this.#reg, type, rep, value));
+    }
   }
 
   del(key: string): void {
@@ -1316,16 +1349,81 @@ class InMemTxn implements WTxn {
     return keys;
   }
 
-  move(src: string, dst: string): string[] {
-    const keys = this.#keysUnder(src);
-    const moved: string[] = [];
-    for (const k of keys) {
-      const to = dst + k.slice(src.length);
-      this.#updates.set(to, layerGet(this.#values, this.#updates, k));
-      this.#updates.set(k, undefined);
-      moved.push(to);
+  applyEdits(edits: WireEdit[]): string[] {
+    const changed = new Set<string>();
+    for (const e of edits) this.#applyEdit(e.slice, e.lifecycle, e.raw as Uint8Array, changed);
+    return [...changed];
+  }
+
+  applyParked(slice: string, fromSeq: number): string[] {
+    const changed = new Set<string>();
+    const from = parkedEditKey(slice, fromSeq);
+
+    // the slice's parked edits from the seq on, each as its envelope says
+    for (const key of this.#keysUnder(`!park-ed:${slice}!`)) {
+      if (compareKeys(key, from) < 0) continue;
+      const bytes = this.#bytes(key);
+      const env = this.#reg.convert('.edits', bytes, MSGPACK, JS) as EditEnvelope;
+      this.#applyEdit(slice, env.lifecycle, bytes, changed);
     }
-    return moved;
+    return [...changed];
+  }
+
+  applySnapshot(selector: string, skip: string[]): string[] {
+    const changed = new Set<string>();
+    const skipped = new Set(skip);
+    const prefix = selectorPrefix(selector);
+
+    // every page in order, each key under the selector, and none of a skipped slice
+    for (const page of this.#keysUnder(`!park-snap:${selector}!`)) {
+      for (const [key, value] of this.#reg.ops(this.#bytes(page), false)) {
+        if (!key.startsWith(prefix)) {
+          throw new Error(`the snapshot of ${selector} holds ${JSON.stringify(key)}`);
+        }
+        if (skipped.has(sliceOf(key))) continue;
+        this.#write(key, value, changed);
+      }
+    }
+    return [...changed];
+  }
+
+  // one edit: a birth or a death clears the slice's keys first, then the operations apply in
+  // order, of which a death has none
+  #applyEdit(slice: string, life: Lifecycle, bytes: Uint8Array, changed: Set<string>): void {
+    if (life !== 'normal') for (const k of this.delPrefix(`${slice}!`)) changed.add(k);
+    for (const [key, value] of this.#reg.ops(bytes, true)) {
+      if (life === 'death' || sliceOf(key) !== slice) {
+        throw new Error(`${edit(life)} of ${slice} writes ${JSON.stringify(key)}`);
+      }
+      this.#write(key, value, changed);
+    }
+  }
+
+  // one operation: a set keeps a copy of its bytes, and a deletion marks the key
+  #write(key: string, value: Uint8Array | undefined, changed: Set<string>): void {
+    this.#updates.set(key, value === undefined ? undefined : new Packed(value.slice()));
+    changed.add(key);
+  }
+
+  // the bytes a parked key holds
+  #bytes(key: string): Uint8Array {
+    const v = layerGet(this.#values, this.#updates, key);
+    if (!(v instanceof Packed)) throw new Error(`${key} holds no bytes`);
+    return v.bytes;
+  }
+
+  // the value at key in a representation, undefined when absent; bytes decode with the reader's
+  // type, and the decoded value takes their place unless the bytes are the value itself
+  #out(key: string, type: string, rep: Rep): unknown {
+    const v = layerGet(this.#values, this.#updates, key);
+    if (v === undefined) return undefined;
+    if (!(v instanceof Packed)) return layerOut(this.#reg, type, v, rep);
+    if (rep === MSGPACK) return v.bytes.slice();
+    if (RAW_TYPES.has(type)) return this.#reg.convert(type, v.bytes, MSGPACK, rep);
+    const js = decodeStored(this.#reg, key, type, v.bytes);
+    if (js === undefined) return undefined;
+    (this.#updates.has(key) ? this.#updates : this.#values).set(key, js);
+    return layerOut(this.#reg, type, js, rep);
   }
 
   scan(req: ScanRequest): StoreScan {
@@ -1341,12 +1439,13 @@ class InMemTxn implements WTxn {
     const cursor = this.#cursor(c.head, req.reverse === true);
     walkPattern(c, cursor, req, STEP_BUDGET, (k) => keys.push(k) <= req.limit);
 
-    // the batch, its values copied or converted out
+    // the batch, its values copied or converted out; a value that fails to decode is left out
     const page = keys.slice(0, req.limit);
-    const entries: [string, unknown][] = page.map((k) => {
-      if (!v) return [k, undefined];
-      return [k, layerOut(this.#reg, v.type, layerGet(this.#values, this.#updates, k), v.rep)];
-    });
+    const entries: [string, unknown][] = [];
+    for (const k of page) {
+      const value = v ? this.#out(k, v.type, v.rep) : undefined;
+      if (!v || value !== undefined) entries.push([k, value]);
+    }
     return { entries, next: keys.length > req.limit ? page[page.length - 1] : null };
   }
 
@@ -1375,9 +1474,9 @@ class InMemTxn implements WTxn {
   }
 }
 
-/** Overlay is the Engine's in-memory layer of forecasts over the base.  It is not a Store: each
+/** Overlay is the Engine's in-memory layer of predictions over the base.  It is not a Store: each
     call takes a base read transaction the caller already holds, so one rebuild of the overlay, its
-    forecasts and the graph run after them, reads one snapshot of the base. */
+    predictions and the graph run after them, reads one snapshot of the base. */
 export class Overlay {
   #reg: Registry;
   #data: Layer = new Map();
@@ -1391,17 +1490,17 @@ export class Overlay {
   }
 
   /** run fn over a scratch layer on top of the overlay and base, keeping its writes when fn
-      returns; a throw drops them */
-  apply<T>(base: RTxn, fn: (txn: WTxn) => T): T {
+      returns, and answer the keys it wrote; a throw drops them */
+  apply(base: RTxn, fn: (txn: WTxn) => void): string[] {
     const updates: Layer = new Map();
-    const result = fn(new OverlayTxn(this.#reg, base, this.#data, updates));
+    fn(new OverlayTxn(this.#reg, base, this.#data, updates));
 
     // keep the scratch layer's writes in the overlay's own layer
     for (const [key, val] of updates) {
       // note: we must keep undefined values rather than propagate deletions to base
       this.#data.set(key, val);
     }
-    return result;
+    return [...updates.keys()];
   }
 
   /** the overlay over base, read-only */
@@ -1444,14 +1543,14 @@ class OverlayTxn implements WTxn {
     this.#updates.set(key, undefined);
   }
 
-  // every key of the stream a prefix `{stream}!` names, from the base and the layers, in order;
-  // forecasts end whole streams, so the overlay deletes nothing narrower
+  // every key of the slice a prefix `{slice}!` names, from the base and the layers, in order;
+  // predictions delete whole slices, so the overlay deletes nothing narrower
   #keysUnder(prefix: string): string[] {
     if (prefix.indexOf('!') !== prefix.length - 1) {
-      throw new Error(`the overlay deletes whole streams, not ${prefix}`);
+      throw new Error(`the overlay deletes whole slices, not ${prefix}`);
     }
     const all = new Set<string>();
-    const pattern: KeyPattern = { stream: prefix.slice(0, -1), name: null, local: [] };
+    const pattern: KeyPattern = { slice: prefix.slice(0, -1), name: null, local: [] };
     for (const [k] of scanAll(this.#base, { pattern, limit: 1000, values: false })) {
       if (!this.#has(k)) all.add(k);
     }
@@ -1466,9 +1565,17 @@ class OverlayTxn implements WTxn {
     return keys;
   }
 
-  /** forecasts never move keys, so the overlay does not */
-  move(): string[] {
-    throw new Error('the overlay does not move keys');
+  /** predictions write keys one by one, so the overlay applies no edits or snapshots */
+  applyEdits(): string[] {
+    throw new Error('the overlay applies no edits');
+  }
+
+  applyParked(): string[] {
+    throw new Error('the overlay applies no edits');
+  }
+
+  applySnapshot(): string[] {
+    throw new Error('the overlay applies no snapshots');
   }
 
   scan(req: ScanRequest): StoreScan {
@@ -1510,8 +1617,9 @@ class OverlayTxn implements WTxn {
 
 /** ExternalStoreTxn is one transaction of an ExternalStore, a WTxn that also commits and aborts.
     The store converts: it persists the representation it keeps and answers in the one asked for,
-    undefined for an absent key.  It walks keys in code-point order, as a store comparing UTF-8
-    keys bytewise does. */
+    undefined for an absent key.  It applies edits and snapshot pages itself, in the host
+    language, reading the bytes it parked.  It walks keys in code-point order, as a store comparing
+    UTF-8 keys bytewise does. */
 export interface ExternalStoreTxn extends WTxn {
   commit(): void;
   /** abort the transaction.  ExternalStore calls it after any failure in the transaction,
@@ -1550,16 +1658,13 @@ export class ExternalStore implements Store {
   }
 }
 
-// reducers /////////////////////////////////////////////////////////////////
+// transactions //////////////////////////////////////////////////////////////
 
-/** ReadTxn is what a query, a forecast, or precommit reads through: rich JS values by key and type,
-    undefined for an absent key, and scans by pattern.  The database's own adds `emit`, which
-    plugin code calls to add outputs to the atom being built, after the outputs emitted before them
-    and ahead of what the running handler returns. */
+/** ReadTxn is what a query, a grantor, or lookup reads through: rich JS values by key and type,
+    undefined for an absent key, and scans by pattern. */
 export interface ReadTxn {
   get(key: string, type: string): unknown;
   scan(req: ReadScan): StoreScan;
-  emit?(outputs: ForecastOutput[]): void;
 }
 
 /** a scan through a ReadTxn: its values are rich JS values of `type`, or keys only for false */
@@ -1571,31 +1676,51 @@ export type ReadScan = {
   limit: number;
 };
 
-/** ReducerTxn is what a slice reducer reads and writes through, inside the Engine's transaction.
-    Its keys are local to one stream: the Engine prefixes `{stream}!`, so a reducer cannot name a
-    key outside its own stream.  A reducer owns what it gets, and what it sets is the store's from
-    that call on. */
-export interface ReducerTxn {
-  get(key: string, type: string): unknown;
+/** WriteTxn is what a predictor and a decider read and write through.  The database's and the
+    Engine's are one shape, so a decider can hand its own to a predictor.  On the database its
+    writes become the mutation's edits, one per slice written; on an Engine they are the
+    mutation's prediction, in the overlay.  A key's slice is everything before its first `!`, and
+    every key written is under a well-formed slice name.  Reads see the transaction's own writes,
+    and what a get hands out is the caller's, to change and set back. */
+export interface WriteTxn extends ReadTxn {
   set(key: string, type: string, value: unknown): void;
   del(key: string): void;
-  /** One batch of the stream's keys of a local template, by a match per parameter, keyed
-      locally, `after` included.  A scan sees the reducer's own writes, but it is a walk taken a
-      batch at a time: a key written or deleted ahead of an unfinished scan, among the keys it
-      picks out, is seen or not depending on whether its batch was already fetched, so the Engine
-      and the database could fold such a reducer differently.  Write only behind a scan, or after
-      it ends. */
-  scan(req: LocalScan): StoreScan;
+  /** Delete a slice: every key under it goes, and on the database its edit is a death, or a
+      birth when the writes that follow write to it again.  `erase` also drops the slice's
+      history from the edit log, which means nothing on an Engine. */
+  deleteSlice(slice: string, erase: boolean): void;
+  /** One batch of the keys a pattern picks out.  A scan sees the transaction's own writes, but it
+      is a walk taken a batch at a time: a key written or deleted ahead of an unfinished scan,
+      among the keys it picks out, is seen or not depending on whether its batch was already
+      fetched, so a predictor and the decider calling it could see different states.  Write only
+      behind a scan, or after it ends. */
+  scan(req: ReadScan): StoreScan;
 }
 
-/** a scan through a ReducerTxn: a local template, or null for every local key, keys only */
-export type LocalScan = Omit<ReadScan, 'pattern'> & { name: string | null; local: ParamMatch[] };
+/** how a generated deleteSlice accessor takes its options: `erase` also drops the slice's history
+    from the database's edit log */
+export type DeleteSliceOptions = { erase?: true };
 
-// the transactions a query or forecast read through that have returned, so a scan carried out of
+/** a read transaction in the shape of a WriteTxn whose writes throw, so a database context serves
+    the slots that only read */
+export function readOnlyTxn(txn: ReadTxn): WriteTxn {
+  const refuse = (): never => {
+    throw new Error('this call reads only, and made a write');
+  };
+  return {
+    get: (key, type) => txn.get(key, type),
+    scan: (req) => txn.scan(req),
+    set: refuse,
+    del: refuse,
+    deleteSlice: refuse,
+  };
+}
+
+// the transactions a query or a prediction ran over that have returned, so a scan carried out of
 // one throws rather than reading on
 const closedTxns = new WeakSet<object>();
 
-/** every entry a scan picks out, as the key's template parameters in order, stream ones first,
+/** every entry a scan picks out, as the key's template parameters in order, slice ones first,
     and its value; batches are fetched as the walk goes, from 16 entries growing to 256 */
 export function scanEach(
   txn: ReadTxn,
@@ -1603,23 +1728,14 @@ export function scanEach(
 ): IterableIterator<[string[], unknown]> {
   const p = req.pattern;
   const parse = (key: string) => {
-    if (p.stream === null) return [key];
+    if (p.slice === null) return [key];
     const bang = key.indexOf('!');
-    const stream =
-      typeof p.stream === 'string' || p.stream.params.length === 0
+    const slice =
+      typeof p.slice === 'string' || p.slice.params.length === 0
         ? []
-        : key.slice(p.stream.family.length + 1, bang).split(',');
-    return [...stream, ...localParams(key.slice(bang + 1), p.name, p.local.length)];
+        : key.slice(p.slice.family.length + 1, bang).split(',');
+    return [...slice, ...localParams(key.slice(bang + 1), p.name, p.local.length)];
   };
-  return batches(txn, (after, limit) => txn.scan({ ...req, after, limit }), parse);
-}
-
-/** every entry a reducer's scan picks out, as scanEach yields them, of its own stream */
-export function scanEachLocal(
-  txn: ReducerTxn,
-  req: Omit<LocalScan, 'after' | 'limit'>,
-): IterableIterator<[string[], unknown]> {
-  const parse = (key: string) => localParams(key, req.name, req.local.length);
   return batches(txn, (after, limit) => txn.scan({ ...req, after, limit }), parse);
 }
 
@@ -1646,7 +1762,7 @@ function* batches(
   let limit = 16;
   for (;;) {
     if (closedTxns.has(txn)) {
-      throw new Error('a scan was used after its query or forecast returned');
+      throw new Error('a scan was used after its query or prediction returned');
     }
 
     // a batch, whose span the fetch just recorded or extended
@@ -1658,7 +1774,7 @@ function* batches(
       if (span !== undefined) span.to = key;
       yield [parse(key), value];
       if (closedTxns.has(txn)) {
-        throw new Error('a scan was used after its query or forecast returned');
+        throw new Error('a scan was used after its query or prediction returned');
       }
     }
 
@@ -1674,16 +1790,13 @@ function* batches(
 
 // contexts //////////////////////////////////////////////////////////////////
 
-/** the transaction a generated context reads through, as its holder last bound it */
-export type TxnCell<T> = { txn: T };
+/* A generated context is built once, by its create function, which answers `{ ctx, $ref }`: the
+   context, and the one box every accessor of it reads the transaction through when called.  Its
+   holder binds it by assigning the transaction, `$ref.txn = txn`, whenever the transaction it
+   runs over changes, so no context is built per call. */
 
-/** A generated context that stays one object for its holder's lifetime.  `bind` points it at the
-    transaction it reads through until the next bind, and answers it; a holder binds whenever the
-    transaction it runs over changes, so no context is built per call. */
-export type ContextBinding<X, T = ReadTxn> = { readonly ctx: X; bind(txn: T): X };
-
-/** a cell that holds no transaction yet, throwing on any use of it */
-export function unboundCell<T extends object>(): TxnCell<T> {
+/** a box that holds no transaction yet, throwing on any use of it */
+export function unboundRef<T extends object>(): { txn: T } {
   const unbound = new Proxy(
     {},
     {
@@ -1718,12 +1831,12 @@ export type ScanAccessor<P extends string, V> = {
 };
 
 /** what a generated scan accessor knows of its template: its own name for errors, its family and
-    the family's parameters (none for a reducer's, whose stream is its own), the local template's
-    name and parameters, and the type its values travel under */
+    the family's parameters, the local template's name and parameters, and the type its values
+    travel under */
 export type ScanTemplate = {
   accessor: string;
   family: string;
-  stream: string[];
+  slice: string[];
   name: string;
   local: string[];
   type: string;
@@ -1732,40 +1845,25 @@ export type ScanTemplate = {
 type ScanOptions = { reverse?: boolean; keys?: boolean };
 type NamedMatch = Partial<Record<string, ScanMatch>>;
 
-/** a scan accessor over a global context's read transaction, whichever the cell holds when it is
-    called */
-export function globalScan<P extends string, V>(
-  cell: TxnCell<ReadTxn>,
+/** A scan accessor over a global context's read transaction, whichever the box holds when it is
+    called.  For generated code: no template parameter holds a `$`, so none can shadow it. */
+export function $globalScan<P extends string, V>(
+  ref: { txn: ReadTxn },
   t: ScanTemplate,
 ): ScanAccessor<P, V> {
   const scan = (match: NamedMatch = {}, options: ScanOptions = {}) => {
-    const n = t.stream.length;
-    const params = t.stream.map((p, i) => {
-      return paramMatch(t.accessor, p, match[p], i < n - 1 ? asSegment : asStreamRest);
+    const n = t.slice.length;
+    const params = t.slice.map((p, i) => {
+      return paramMatch(t.accessor, p, match[p], i < n - 1 ? $asSegment : $asSliceRest);
     });
     const pattern: KeyPattern = {
-      stream: { family: t.family, params },
+      slice: { family: t.family, params },
       name: t.name,
       local: localMatches(t, match),
     };
     const type = options.keys === true ? false : t.type;
-    const walk = scanEach(cell.txn, { pattern, type, reverse: options.reverse });
-    return named(walk, [...t.stream, ...t.local], options.keys === true);
-  };
-  return scan as ScanAccessor<P, V>;
-}
-
-/** a scan accessor over a reducer's transaction, of its own stream, whichever the cell holds when
-    it is called */
-export function localScan<P extends string, V>(
-  cell: TxnCell<ReducerTxn>,
-  t: ScanTemplate,
-): ScanAccessor<P, V> {
-  const scan = (match: NamedMatch = {}, options: ScanOptions = {}) => {
-    const local = localMatches(t, match);
-    const type = options.keys === true ? false : t.type;
-    const walk = scanEachLocal(cell.txn, { name: t.name, local, type, reverse: options.reverse });
-    return named(walk, t.local, options.keys === true);
+    const walk = scanEach(ref.txn, { pattern, type, reverse: options.reverse });
+    return named(walk, [...t.slice, ...t.local], options.keys === true);
   };
   return scan as ScanAccessor<P, V>;
 }
@@ -1773,7 +1871,7 @@ export function localScan<P extends string, V>(
 // a template's local parameters' matches; the last one may hold anything a key may
 function localMatches(t: ScanTemplate, match: NamedMatch): ParamMatch[] {
   const n = t.local.length;
-  return t.local.map((p, i) => paramMatch(t.accessor, p, match[p], i < n - 1 ? asSegment : null));
+  return t.local.map((p, i) => paramMatch(t.accessor, p, match[p], i < n - 1 ? $asSegment : null));
 }
 
 // a parameter's match as a pattern takes it: an exact value checked as its place in its template
@@ -1814,34 +1912,33 @@ function* named(
   }
 }
 
-// stream names and keys ////////////////////////////////////////////////////
+// slice names and keys /////////////////////////////////////////////////////
 
-/* A slice's family template and each of its key templates is a name, then, if it has parameters,
-   `:{param}` and `,{param}` for each further one: `chat:{org},{channel}`, `post:{id}`, `meta`.  A
-   parameter the template ends with is terminal and holds the rest of the string.  Every other
-   parameter is a segment, a non-empty run of `A-Z a-z 0-9 _ -`, so `chat:acme,general` parses
-   back as `chat:{org},{channel}` unambiguously and `chat:acme,*` covers one org's channels.  A
-   stream name's terminal parameter is non-empty and may also hold `.` and `~`, the rest of the
-   RFC 3986 unreserved set, since stream names appear in URLs.  A local key's terminal parameter
-   may hold anything a key may, the empty string included.  No key holds a control character
-   (U+0000-001F, U+007F-009F) or a lone surrogate; the database refuses a reducer's write of one.
+/* A slice type's family template and each of its key templates is a name, then, if it has
+   parameters, `:{param}` and `,{param}` for each further one: `chat:{org},{channel}`, `post:{id}`,
+   `meta`.  A parameter the template ends with is terminal and holds the rest of the string.  Every
+   other parameter is a segment, a non-empty run of `A-Z a-z 0-9 _ -`, so `chat:acme,general`
+   parses back as `chat:{org},{channel}` unambiguously and `chat:acme,*` covers one org's
+   channels.  A slice name's terminal parameter is non-empty and may also hold `.` and `~`, the
+   rest of the RFC 3986 unreserved set, since slice names appear in URLs.  A local key's terminal
+   parameter may hold anything a key may, the empty string included.  No key holds a control
+   character (U+0000-001F, U+007F-009F) or a lone surrogate; the database refuses a write of one.
 
-   A store key is `{stream}!{local key}`, as in `chat:acme,general!reply:t1,m5`, and its stream is
+   A store key is `{slice}!{local key}`, as in `chat:acme,general!reply:t1,m5`, and its slice is
    everything before its first `!`.  Keys sort in code-point order, and each separator after a
    parameter sorts below every character that parameter may hold: `,` below a segment's, and `!`
-   below a stream name's.  So a walk of a family visits its streams in the order of their
+   below a slice name's.  So a walk of a family visits its slices in the order of their
    parameters, `gen` before `gen-2`, and a walk of a key template its keys likewise. */
 
 const SEGMENT = '[A-Za-z0-9_-]+';
-const STREAM_REST = '[A-Za-z0-9_.~-]+';
+const SLICE_REST = '[A-Za-z0-9_.~-]+';
 const SEGMENT_RE = new RegExp(`^${SEGMENT}$`);
-const STREAM_REST_RE = new RegExp(`^${STREAM_REST}$`);
-// the shape of a stream name of any family, for a family whose template is not at hand
-const ANY_STREAM_RE = new RegExp(`^${SEGMENT}(:(${SEGMENT},)*${STREAM_REST})?$`);
+const SLICE_REST_RE = new RegExp(`^${SLICE_REST}$`);
 
-/** a template parameter's value, other than a terminal one, checked; a generated accessor passes
-    each of its parameters through this or asStreamRest before building a key */
-export function asSegment(value: string, accessor: string, param: string): string {
+/** A template parameter's value, other than a terminal one, checked.  A generated accessor passes
+    each of its parameters through this or $asSliceRest before building a key; no template
+    parameter holds a `$`, so none can shadow it. */
+export function $asSegment(value: string, accessor: string, param: string): string {
   if (!SEGMENT_RE.test(value)) {
     const v = JSON.stringify(value);
     throw new Error(`${accessor}: ${param} ${v} is not a non-empty run of A-Z a-z 0-9 _ -`);
@@ -1849,60 +1946,26 @@ export function asSegment(value: string, accessor: string, param: string): strin
   return value;
 }
 
-/** the value of a family template's terminal parameter, checked */
-export function asStreamRest(value: string, accessor: string, param: string): string {
-  if (!STREAM_REST_RE.test(value)) {
+/** The value of a family template's terminal parameter, checked.  For generated code: no template
+    parameter holds a `$`, so none can shadow it. */
+export function $asSliceRest(value: string, accessor: string, param: string): string {
+  if (!SLICE_REST_RE.test(value)) {
     const v = JSON.stringify(value);
     throw new Error(`${accessor}: ${param} ${v} is not a non-empty run of A-Z a-z 0-9 _ - . ~`);
   }
   return value;
 }
 
-// a family template as the pattern of the stream names that fill it
-function streamPattern(tpl: string): RegExp {
-  const [family, params] = tpl.split(':');
-  if (params === undefined) return new RegExp(`^${family}$`);
-  const n = params.split(',').length;
-  const src = [...Array<string>(n - 1).fill(SEGMENT), STREAM_REST];
-  return new RegExp(`^${family}:${src.join(',')}$`);
+/** the slice a key belongs to: everything before its first `!` */
+export function sliceOf(key: string): string {
+  const bang = key.indexOf('!');
+  if (bang < 0) throw new Error(`key ${JSON.stringify(key)} has no '!'`);
+  return key.slice(0, bang);
 }
 
-// a ReducerTxn over a store transaction for one stream's keys, marking every key it writes in
-// updates
-function reducerTxn(txn: WTxn, stream: string, updates: Record<string, true>): ReducerTxn {
-  const prefix = `${stream}!`;
-  return {
-    get: (key, type) => txn.get(prefix + key, type, JS),
-    set(key, type, value) {
-      txn.set(prefix + key, type, JS, value);
-      updates[prefix + key] = true;
-    },
-    del(key) {
-      txn.del(prefix + key);
-      updates[prefix + key] = true;
-    },
-    scan(req) {
-      const pattern: KeyPattern = { stream, name: req.name, local: req.local };
-      const values: ScanRequest['values'] =
-        req.type === false ? false : { type: req.type, rep: JS };
-      const after = req.after === undefined ? undefined : prefix + req.after;
-      const { entries, next } = txn.scan({ ...req, pattern, values, after });
-      return {
-        entries: entries.map(([k, v]) => [k.slice(prefix.length), v]),
-        next: next === null ? null : next.slice(prefix.length),
-      };
-    },
-  };
-}
-
-/** apply fn to the value at a key in place and set it, answering what fn returns; an absent key
-    throws, as a reducer does whenever the state is not what its event implies */
-export function updateKey<T, R>(
-  txn: ReducerTxn,
-  key: string,
-  type: string,
-  fn: (value: T) => R,
-): R {
+/** Apply fn to the value at a key in place and set it, answering what fn returns; an absent key
+    throws.  For generated code: no template parameter holds a `$`, so none can shadow it. */
+export function $updateKey<T, R>(txn: WriteTxn, key: string, type: string, fn: (value: T) => R): R {
   const value = txn.get(key, type) as T | undefined;
   if (value === undefined) throw new Error(`update of absent key ${key}`);
   const out = fn(value);
@@ -1917,8 +1980,8 @@ function markDirty(dirty: Record<string, true>, keys: string[]): void {
 
 // authorization //////////////////////////////////////////////////////////////
 
-/** A precommit handler rejects a command by throwing a Reject, whose reason goes back to the
-    client.  Any other throw is a bug, answered with a generic rejection. */
+/** A decider rejects a mutation by throwing a Reject, whose reason goes back to the client.  Any
+    other throw is a bug, answered with a generic rejection. */
 export class Reject extends Error {
   constructor(reason: string) {
     super(reason);
@@ -1926,13 +1989,12 @@ export class Reject extends Error {
   }
 }
 
-/** who sent a command, as their token proves it; user is null for the anonymous principal */
+/** who sent a mutation, as their token proves it; user is null for the anonymous principal */
 export type Principal = { user: string | null };
 
-/** Auth is what a precommit handler authorizes through.  Each call gets a fresh one, and the
-    caller rejects a handler that returns without an authorization decision, so authorization
-    fails closed.  It carries the principal, so precommit can hand it on wherever a Principal is
-    wanted. */
+/** Auth is what a decider authorizes through.  Each call gets a fresh one, and the caller rejects
+    a decider that returns without an authorization decision, so authorization fails closed.  It
+    carries the principal, so a decider can hand it on wherever a Principal is wanted. */
 export class Auth implements Principal {
   readonly user: string | null;
   #authorized: boolean = false;
@@ -1953,46 +2015,61 @@ export class Auth implements Principal {
   }
 
   /** authorize the call for anyone, anonymous included: the one unconditional decision, so an
-      open command is visible in code */
+      open mutation is visible in code */
   authorizeAnyone(): void {
     this.#authorized = true;
   }
 }
 
-/** Run one precommit handler with a fresh Auth, answering its outputs as a list, or the reason
-    for a rejection.  A Reject is a rejection, and so is a handler that returns without an
-    authorization decision, which in dev mode is an error naming the handler.  Any other throw
-    is a bug, and goes to the host. */
-export function runPrecommit(
+/** Run one decider with a fresh Auth, answering null when it carried the mutation out, or the
+    reason for a rejection.  A Reject is a rejection, and so is a decider that returns without an
+    authorization decision, which in dev mode is an error naming the decider.  Any other throw is
+    a bug, and goes to the host.  On a rejection or a throw the database discards the decider's
+    writes. */
+export function runDecider(
   name: string,
   principal: Principal,
-  handler: (auth: Auth) => unknown,
-): string | ForecastOutput[] {
+  decider: (auth: Auth) => void,
+): string | null {
   const auth = new Auth(principal);
-  let out: unknown;
   try {
-    out = handler(auth);
+    decider(auth);
+
+    // authorization fails closed: a decider that made no decision is rejected, loudly in dev
+    if (!auth.authorized) {
+      if (DEV) throw new Error(`decider ${name} returned without an authorization decision`);
+      throw new Reject('unauthorized');
+    }
   } catch (e: unknown) {
+    // every rejection reaches the host as its reason; anything else is a bug
     if (e instanceof Reject) return e.message;
     throw e;
   }
-
-  // authorization fails closed
-  if (!auth.authorized) {
-    if (DEV) {
-      throw new Error(`precommit handler ${name} returned without an authorization decision`);
-    }
-    return 'unauthorized';
-  }
-  return outputList(out);
+  return null;
 }
+
+/** The app's prediction of what the database will do with a mutation, made by writing through the
+    transaction.  The Engine passes `pending` as true, and a decider calling the predictor leaves
+    it out, so a predictor may mark what it writes as pending; branching on it for anything else
+    makes the prediction and the decision diverge. */
+export type Predictor<X, M> = (txn: X, mutation: M, pending?: true) => void;
+
+/** The app's decision on a mutation, inside the database's serialized transaction: it rejects by
+    throwing a Reject, or carries the mutation out by writing through the transaction, and must
+    make an authorization decision either way. */
+export type Decider<X, M> = (auth: Auth, txn: X, mutation: M) => void;
+
+/** The selectors of the slices a principal may see: an exact selector, one slice by its name
+    terminated, `name!`; or a prefix selector, a family's slices, `chat:*`, those under whole
+    leading parameters, `chat:acme,*`, or every slice, `*`. */
+export type Grantor<X> = (txn: X, principal: Principal) => string[];
 
 // the database bundle ////////////////////////////////////////////////////////
 
 /** What the database asks lookup about: a sign-in by identity, a token's principal at refresh,
-    and a token's principal on every check of its account's generation and of a CommandAuth
-    proof its commands carry.  A proof is checked against the answer before its command reaches
-    the writer, and the writer asks again in the command's turn: a proof whose answer changed
+    and a token's principal on every check of its account's generation and of an auth proof its
+    mutations carry.  A proof is checked against the answer before its mutation reaches the
+    writer, and the writer asks again in the mutation's turn: a proof whose answer changed
     meanwhile is checked again, so the answer for a token should change only when the account's
     credentials do. */
 export type LookupIdent =
@@ -2008,27 +2085,31 @@ export type LookupResult = {
   passwordHash?: string;
 };
 
-/** what the database hands bootstrap: emit appends an event to the seed atom, hashPassword makes
-    a hash as intake would, and env reads a variable the operator named */
+/** what the database hands bootstrap beside its transaction: hashPassword makes a hash as the
+    database would prepare a new password, and env reads a variable the operator named */
 export type BootstrapContext = {
-  emit: (stream: string, event: unknown) => void;
   hashPassword: (plain: string) => string;
   env: (name: string) => string;
 };
 
-/** Bundle is what a database runs: the app's handlers behind the generated wrappers, installed
-    as `globalThis.__bundle`, and the registry the database converts and checks every value by.
-    precommit, maySee, and lookup read global keys; each reducer reads and writes its own stream's
-    keys.  precommit gets a command's data alone.  Values are rich JS values.  `plugins` are the
-    database's installed plugins by name, as the host calls them.  `dev` is the bundle's DEV, so a
-    host answers the errors of a dev bundle in full, and `mapStack` maps an error's stack through
-    the bundle's source map. */
+/** Bundle is what a database runs: the app's slots behind the generated wrappers, installed as
+    `globalThis.__bundle`, and the registry the database converts and checks every value by.  Its
+    contexts are built once, and the host binds them through two hooks.  bindWrite binds the
+    read-write context of decide, bootstrap, and every plugin's run, and the plugins themselves,
+    to a transaction whose writes, when decide answers null, are the mutation's edits.  bindRead
+    binds the one context grant and lookup share, whose writes throw.  The entry points then run
+    over whatever was bound last: decide gets the mutation's data alone, and bootstrap seeds an
+    empty database by writing.  Values are rich JS values.  `plugins` are the database's
+    installed plugins by name, as the host calls them.  `dev` is the bundle's DEV, so a host
+    answers the errors of a dev bundle in full, and `mapStack` maps an error's stack through the
+    bundle's source map. */
 export type Bundle = {
   schema: Schema;
-  precommit: (txn: ReadTxn, data: unknown, principal: Principal) => string | ForecastOutput[];
-  reducers: Record<string, SliceReducer>;
-  maySee: (txn: ReadTxn, principal: Principal) => string[];
-  lookup: (txn: ReadTxn, ident: LookupIdent) => LookupResult | null;
+  bindWrite: (txn: WriteTxn) => void;
+  bindRead: (txn: ReadTxn) => void;
+  decide: (data: unknown, principal: Principal) => string | null;
+  grant: (principal: Principal) => string[];
+  lookup: (ident: LookupIdent) => LookupResult | null;
   bootstrap?: (ctx: BootstrapContext) => void;
   plugins: Record<string, BundlePlugin>;
   dev: boolean;
@@ -2039,40 +2120,40 @@ export type Bundle = {
 
 /** A plugin as one database holds it: the name it is installed under, its request API, which app
     code calls as `txn.{name}`, bind, which points the plugin's own contexts at the transaction
-    the database runs over, and, for a plugin with commands of its own, run, which handles one of
-    them, a cron tick or a worker's result, and answers its outputs.  A built-in's config is what
+    the database binds its write context to, and, for a plugin with mutations of its own, run,
+    which carries one of them out, a cron tick or a worker's result, by writing through that
+    transaction.  A request is a write to the plugin's own slice, committed with the rest of the
+    transaction's writes, which the host acts on after the commit.  A built-in's config is what
     the host reads of it, by its install's kind. */
 export interface Plugin<Api extends object = object> {
   readonly name: string;
   readonly api: Api;
   readonly config?: unknown;
-  bind(txn: ReadTxn): void;
-  run?(cmd: unknown): ForecastOutput[];
+  bind(txn: WriteTxn): void;
+  run?(mutation: unknown): void;
 }
 
 /** What a plugin's install answers and a plugin set lists: the plugin's kind, which prefixes its
     type identities, and create, which makes the plugin under the name a database installs it by.
     ctx is the database's context, the txn of the app's hooks: the plugin's own context offers
-    each hook as a field whose wrapper calls the hook over ctx and emits what it returns, and only
-    those wrappers hold ctx. */
+    each hook as a field whose wrapper calls the hook over ctx, and only those wrappers hold
+    ctx. */
 export interface PluginInstall<Api extends object = object> {
   readonly kind: string;
   create(name: string, ctx: unknown): Plugin<Api>;
 }
 
 /** An installed plugin as a host sees it: its kind, by which the host recognizes a built-in, a
-    built-in's config, and, for a plugin with commands of its own, run, which binds the database's
-    context and every plugin to the transaction, as every entry into the bundle does, and hands
-    the plugin one command. */
+    built-in's config, and, for a plugin with mutations of its own, run, which hands the plugin
+    one mutation over the transaction the bundle's bindWrite bound. */
 export type BundlePlugin = {
   readonly kind: string;
   readonly config?: unknown;
-  readonly run?: (txn: ReadTxn, cmd: unknown) => ForecastOutput[];
+  readonly run?: (mutation: unknown) => void;
 };
 
-/** the types a database hands a plugin's handlers: the txn they read through and the outputs they
-    return */
-export type DbTypes = { txn: unknown; output: unknown };
+/** the types a database hands a plugin's hooks: the txn they read and write through */
+export type DbTypes = { txn: unknown };
 
 /** What ties an installed plugin to one database's types.  DB appears bare, so a plugin's install
     infers it from the slot it lands in, and an install for one database fits no other's. */
@@ -2082,14 +2163,23 @@ export type DbMarker<DB extends DbTypes> = { readonly db: (db: DB) => DB };
 export type PluginApis<P> = { [K in keyof P]: P[K] extends PluginInstall<infer A> ? A : never };
 
 /** the fields of a database context, which no plugin may be named after */
-export type ContextField = 'get' | 'scan' | 'status';
+export type ContextField = 'get' | 'scan' | 'set' | 'del' | 'update' | 'deleteSlice' | 'status';
 
 /** the names no plugin may take: a context's fields, and __proto__, which an assignment would take
     as the object's prototype rather than a field */
 export type ReservedPluginName = ContextField | '__proto__';
-const RESERVED_PLUGIN_NAMES: readonly string[] = ['get', 'scan', 'status', '__proto__'];
+const RESERVED_PLUGIN_NAMES: readonly string[] = [
+  'get',
+  'scan',
+  'set',
+  'del',
+  'update',
+  'deleteSlice',
+  'status',
+  '__proto__',
+];
 
-// a plugin's name: a JS identifier without $, so it is also a stream name's text
+// a plugin's name: a JS identifier without $, so it is also a slice name's text
 const PLUGIN_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** a database's plugins slot: each plugin of the set P under its name, tied to the database's
@@ -2098,34 +2188,30 @@ export type PluginSlots<P, DB extends DbTypes> = {
   [K in keyof P]: K extends ReservedPluginName ? never : P[K] & DbMarker<DB>;
 };
 
-/** Install a database's plugins: create each under its name, which is checked, over the database
-    context, and attach its request API to that context under its name.  Answers the plugins by
-    name as a host calls them, and the bind a database runs on every entry, which points the
-    context and every plugin at the transaction. */
-export function installPlugins<X extends object>(
-  b: ContextBinding<X>,
+/** Install a database's plugins: create each under its name, which is checked, over the
+    database's write context, and attach its request API to that context under its name.  Answers
+    the plugins by name as a host calls them, and one bind that points every plugin at the
+    transaction the context is bound to. */
+export function installPlugins(
+  ctx: object,
   installs: Record<string, PluginInstall>,
-): { plugins: Record<string, BundlePlugin>; bind: (txn: ReadTxn) => X } {
+): { plugins: Record<string, BundlePlugin>; bind: (txn: WriteTxn) => void } {
   const all: Plugin[] = [];
-  const bind = (txn: ReadTxn): X => {
+  const bind = (txn: WriteTxn): void => {
     for (const plugin of all) plugin.bind(txn);
-    return b.bind(txn);
   };
 
-  // create each plugin, attach its API, and give a plugin with commands its entry
+  // create each plugin, attach its API, and give a plugin with mutations its entry
   const plugins: Record<string, BundlePlugin> = {};
   for (const [name, install] of Object.entries(installs)) {
     if (RESERVED_PLUGIN_NAMES.includes(name)) throw new Error(`a plugin may not be named ${name}`);
     if (!PLUGIN_NAME_RE.test(name)) {
       throw new Error(`plugin name ${JSON.stringify(name)} is not a JS identifier without $`);
     }
-    const plugin = install.create(name, b.ctx);
+    const plugin = install.create(name, ctx);
     all.push(plugin);
-    (b.ctx as Record<string, unknown>)[name] = plugin.api;
-    const run = (txn: ReadTxn, cmd: unknown): ForecastOutput[] => {
-      bind(txn);
-      return plugin.run!(cmd);
-    };
+    (ctx as Record<string, unknown>)[name] = plugin.api;
+    const run = (mutation: unknown): void => plugin.run!(mutation);
     plugins[name] = {
       kind: install.kind,
       ...(plugin.config === undefined ? {} : { config: plugin.config }),
@@ -2423,8 +2509,9 @@ class QueryImpl<QX, T> {
 
 /** QueryGraph tracks the app's queries and runs them again when keys they read change.  Each query
     runs over a read transaction that records its keys, through the query context the Engine's
-    context factory builds over it.  The Engine tells it which keys changed: keys written by real
-    events, keys of an overlay being discarded, and keys a new forecast wrote. */
+    context factory builds over it.  The Engine tells it which keys changed: keys that applied
+    edits and snapshots changed, keys of an overlay being discarded, and keys a new prediction
+    wrote. */
 export class QueryGraph<QX> {
   #context: (txn: ReadTxn) => QX;
   // the keys changed since the last run: {key: true}
@@ -2547,23 +2634,83 @@ export class RemoteQueries {
   }
 }
 
+// edits /////////////////////////////////////////////////////////////////////
+
+/** Mutation wraps mutation data T with the client-minted id it will carry through the log, and
+    the series and number the database dedups it by: an Engine numbers its mutations in a series
+    it mints, and the database runs each number once.  An unnumbered mutation has neither. */
+export type Mutation<T> = {
+  id: string;
+  series: string | null;
+  n: number | null;
+  data: T;
+};
+
+/** Bytes the Engine carries without reading them: a Uint8Array in a JS-native host, and in a
+    quickjs-class host whatever handle its transport and its store agree on, so the bytes never
+    enter the JS heap. */
+export type RawBytes = unknown;
+
+/** Where an edit stands in its slice's life.  A normal edit applies its writes.  A birth clears
+    the slice, then applies its writes: it is the first edit to a slice that is unborn or deleted,
+    and the edit of a mutation that deletes its slice and writes to it.  A death clears the slice
+    and writes nothing: the slice is deleted, or erased, which the database alone tells apart.  A
+    birth or a death is a reset, which a client chains on at any seq above its last. */
+export type Lifecycle = 'normal' | 'birth' | 'death';
+
+/** What the database stamped on an edit when it committed it: the log position of its mutation,
+    the slice it edits and its seq there, the mutation's id, the server time, and where the edit
+    stands in the slice's life.  A mutation that edits three slices makes three edits at one
+    position. */
+export type EditEnvelope = {
+  position: number;
+  slice: string;
+  seq: number;
+  id: string;
+  servertime: Date;
+  lifecycle: Lifecycle;
+};
+
+/* An edit on the wire is one msgpack array: its envelope, then its payload's items, flat.
+
+     [[position, slice, seq, id, servertime, lifecycle, ...], 0, key, value, 1, key, ...]
+
+   The envelope's id is the mutation's uuid as 16 bytes of bin, its servertime a msgpack
+   timestamp, and lifecycle an integer, 0 for normal, 1 for birth, and 2 for death, any other
+   value an error; elements a later protocol appends to the envelope are skipped.  The payload
+   is a stream of operations, each a one-byte opcode and the items it fixes: `0, key, value` sets
+   a key, a nil value setting null, and `1, key` deletes one.  A key written twice in one mutation
+   appears once, with its last write.  A value is inline msgpack in the store format, which a host
+   slices out as a byte span without decoding it.  An opcode a client does not know is an error,
+   and the client crashes.  A snapshot page is a run of operations encoded as a payload is, all
+   of them sets. */
+
+/** WireEdit is an edit as a connection delivers it: the envelope decoded for routing, and the
+    whole edit as it came, which the Engine parks or hands to its store to apply, never reading
+    its payload. */
+export type WireEdit = EditEnvelope & { raw: RawBytes };
+
 // transports ////////////////////////////////////////////////////////////////////
 
 export type Backfill = {
-  // what ref are we backfilling (stream name or prefix)
-  ref: string;
+  // what selector are we backfilling (slice name or prefix)
+  selector: string;
   // the tail's exclusive upper bound: the cursor when this backfill started.  Anything at or
-  // above it arrives on the live stream and is parked.  Retries keep the original value.
+  // above it arrives on the live connection and is parked.  Retries keep the original value.
   until: number;
   // what a previous attempt got through, or null for a fresh backfill.  A finished half is
   // skipped outright.  Otherwise skipBytes > 0 resumes the blob download, and the header's
   // position must then equal position or the outcome is 'stale'; skipBytes === 0 fetches from
-  // the start and accepts any position.  The tail starts at max(fromPosition, header position),
-  // so a newer blob overrides the floor.  It reads forward, which may result in gaps if retention
-  // pruning happens concurrently, so it must be checked for gaps just before landing.
+  // the start and accepts any position.  Either way a blob from another log, its epoch not the
+  // connection's, is 'stale'.  The tail starts at max(fromPosition, header position), so a newer
+  // blob overrides the floor.  It reads forward, which may result in gaps if retention
+  // pruning happens concurrently, so it must be checked for gaps just before landing.  The
+  // checksum is the last parked page's, handed back so a resumed download continues its check;
+  // it is '' when skipBytes is 0.
   resume: null | {
     position: number;
     skipBytes: number;
+    checksum: string;
     fromPosition: number;
     snapshotDone: boolean;
     tailDone: boolean;
@@ -2575,31 +2722,33 @@ export type Backfill = {
 };
 
 /** One delivery of a backfill: the blob's whole length in bytes, when its response states one;
-    the blob's header (its cut position and the seq of every stream in it); a batch of values with
-    the byte offset after them; a page of tail events with the position its scan reached; or the
-    end of either half.  The length and the scan feed the Engine's progress status alone.  A
-    download without a resume pushes its header before anything else but its length, since the
-    header is what the rest is parked against. */
+    the blob's header, its cut position and the seq of every slice in it, which names every slice
+    the blob holds; a page of the blob's set operations, whole ones, with the byte offset after
+    it, to resume past, and the transport's running check over every page delivered so far; a run
+    of tail edits with the position its scan reached; or the end of either half.  The length and
+    the scan feed the Engine's progress status alone, and the checksum is opaque to it, kept only
+    to hand back on a resume.  A download without a resume pushes its header before anything else
+    but its length, since the header is what the rest is parked against. */
 export type BackfillItem =
   | { length: number }
   | { header: { position: number; seqs: Record<string, number> } }
-  | { values: [string, Uint8Array][]; skip: number }
-  | { valuesDone: true }
-  | { events: WireEvent[]; scanned: number }
-  | { eventsDone: true };
+  | { page: RawBytes; skip: number; checksum: string }
+  | { pagesDone: true }
+  | { edits: WireEdit[]; scanned: number }
+  | { editsDone: true };
 
-/** What the database answers for a command.  `ok` means it was decided at or before position, so
-    a client that has reduced that far can read the outcome from its state.  A reject's reason
-    and a conflict's current seqs come only in the first answer to a decision, and a resend of
-    either is answered `ok`. */
-export type CommandResult =
+/** What the database answers for a mutation.  `ok` means it was decided at or before position,
+    so a client that has applied that far can read the outcome from its state.  A reject's reason
+    and a conflict's current seqs, by slice, come only in the first answer to a decision, and a
+    resend of either is answered `ok`. */
+export type MutationResult =
   | { kind: 'ok'; position: number }
   | { kind: 'reject'; reason: string }
   | { kind: 'conflict'; current: Record<string, number> };
 
-// 'stale' when the snapshot vanished, or a resumed fetch's PhaseLock-Position differs from
-// resume.position; the Engine discards what it parked and starts over.  Any other failure rejects,
-// and the Engine may retry with resume as persisted.
+// 'stale' when the snapshot vanished, when its epoch is not the connection's, or when a resumed
+// fetch's PhaseLock-Position differs from resume.position; the Engine discards what it parked and
+// starts over.  Any other failure rejects, and the Engine may retry with resume as persisted.
 export type BackfillOutcome = 'done' | 'stale';
 
 export interface Connection {
@@ -2607,7 +2756,7 @@ export interface Connection {
   // Calls are applied in call order, and within a call, array order.  A call that fails also
   // fails every call behind it, unsent, and ends the connection, so the next connection's resend
   // keeps the Engine's order.  Retrying before giving up is the connection's choice.
-  sendCommands(commands: Command<Uint8Array>[]): Promise<CommandResult[]>;
+  sendMutations(mutations: Mutation<Uint8Array>[]): Promise<MutationResult[]>;
 }
 
 export interface ConnectionHooks {
@@ -2615,11 +2764,13 @@ export interface ConnectionHooks {
   // every position on this connection belongs to, and the head, the log's position as the
   // connection opened
   onOpen(epoch: string, head: number): void;
-  // the whole view: token is its hash, position the commit it is the view at, refs the set.
-  // Sent first when the presented token was not current, and on every change, in stream order
-  // ahead of the events it applies to.  The Engine diffs refs against what it holds.
-  onView(token: string, position: number, refs: string[]): void;
-  onEvents(events: WireEvent[]): void;
+  // the whole view: token is its hash, position the commit it is the view at, selectors the set.
+  // Sent first when the presented token was not current, and on every change, in log order
+  // ahead of the edits it applies to.  The Engine diffs selectors against what it holds.
+  onView(token: string, position: number, selectors: string[]): void;
+  // the edits of one frame, in log order; a mutation's edits to the slices this connection holds
+  // arrive in one frame
+  onEdits(edits: WireEdit[]): void;
   // history done; live from here (sent once per connection)
   onLive(position: number): void;
   onVouch(position: number): void;
@@ -2636,14 +2787,15 @@ export interface ConnectionHooks {
 export type Session = object;
 
 /** A Transport is how a host reaches one database: the host's Registry, built from generated
-    registry data; one connection per connect attempt; and commands posted outside any
+    registry data; one connection per connect attempt; and mutations posted outside any
     connection.  It keeps no identity: each call names the session it speaks for, or null for
     anonymous. */
 export interface Transport {
   buildRegistry(schema: Schema): Registry;
   // One Connection per attempt: since is the Engine's checkpoint (-1 to bootstrap), and the
-  // connection reports exactly one onEnd.  The signal is its lifetime; aborting it ends the
-  // connection and rejects any backfill or send in flight.
+  // connection reports exactly one onEnd.  wants are the selectors of the Engine's slice types, one
+  // each, which the database cuts the view down to.  The signal is its lifetime; aborting it ends
+  // the connection and rejects any backfill or send in flight.
   connect(
     since: number,
     view: string | null, // the Engine's stored view token; null to bootstrap
@@ -2652,11 +2804,11 @@ export interface Transport {
     hooks: ConnectionHooks,
     session: Session | null,
   ): Connection;
-  // Commands outside any connection, answered with their outcomes in order, in as many requests
-  // as the database's limit on commands per request calls for, one after another.  A transport
-  // may retry a failed request when every command in it is numbered, since the database answers
+  // Mutations outside any connection, answered with their outcomes in order, in as many requests
+  // as the database's limit on mutations per request calls for, one after another.  A transport
+  // may retry a failed request when every mutation in it is numbered, since the database answers
   // a resend of one that landed as decided, and never retries one that is not.
-  post(commands: Command<Uint8Array>[], session?: Session | null): Promise<CommandResult[]>;
+  post(mutations: Mutation<Uint8Array>[], session?: Session | null): Promise<MutationResult[]>;
 }
 
 // each transport's Registry for each schema, built once and shared by every Engine and post
@@ -2679,50 +2831,11 @@ function registryFor(transport: Transport, schema: Schema): Registry {
 
 // engines ////////////////////////////////////////////////////////////////////
 
-/** Command wraps command data T with the client-minted id it will carry through the log, and
-    the series and number the database dedups it by: an Engine numbers its commands in a series
-    it mints, and the database runs each number once.  An unnumbered command has neither. */
-export type Command<T> = {
-  id: string;
-  series: string | null;
-  n: number | null;
-  data: T;
-};
-
-/** DbEvent is event data T with the envelope the DB stamped on it when it was committed:
-    [position, stream, seq, id, servertime] on the wire, the server time a msgpack timestamp.  The
-    id is the command's. */
-export type DbEvent<T> = {
-  id: string;
-  data: T;
-  position: number;
-  stream: string;
-  seq: number;
-  servertime: Date;
-};
-
-/** WireEvent is an event as a connection delivers it: the envelope decoded for routing, data as
-    the bytes the server sent, and the whole wire pair `[env, data]` so if needs to be parked, the
-    full msgpack format is readily available. */
-export type WireEvent = DbEvent<Uint8Array> & { raw: Uint8Array };
-/** one slice's reducer, keyed by stream prefix in the Engine's table.  The Engine calls it with a
-    run of one stream's events, in order, inside the transaction that brings them in, through a
-    ReducerTxn over that stream's own keys.  `pending` is true when the events are a forecast
-    folded onto the overlay, and false for real events folded onto the base, so a reducer may mark
-    what it writes as pending; the base, the only state ever stored or synced, is always folded
-    with false.  `template` is the slice's family template and `keys` its key templates, as
-    declared, which every stream name and every key the reducer writes must fill. */
-export type SliceReducer = {
-  reducer: (txn: ReducerTxn, events: unknown[], stream: string, pending: boolean) => void;
-  template: string;
-  keys: string[];
-};
-
 /** the view, as persisted at !view when a reconciliation commits */
-export type ViewRecord = { token: string; position: number; refs: string[] };
+export type ViewRecord = { token: string; position: number; selectors: string[] };
 /** the cursor, as persisted at !checkpoint with every batch, vouch, and live mark */
-export type CheckpointRecord = { epoch: string; position: number; reduced: number };
-/** a backfill in flight, as persisted at !backfill:{ref} */
+export type CheckpointRecord = { epoch: string; position: number; applied: number };
+/** a backfill in flight, as persisted at !backfill:{selector} */
 export type BackfillRecord = {
   until: number;
   resume: Backfill['resume'];
@@ -2760,7 +2873,7 @@ function newBackfillEntry(record: BackfillRecord, parent: string | null): Backfi
 }
 
 // a backfill's status, from its record and what its connection has reported
-function backfillStatus(ref: string, entry: BackfillEntry): BackfillStatus {
+function backfillStatus(selector: string, entry: BackfillEntry): BackfillStatus {
   const r = entry.record.resume;
   const snapshot = {
     bytes: r?.skipBytes ?? 0,
@@ -2777,7 +2890,7 @@ function backfillStatus(ref: string, entry: BackfillEntry): BackfillStatus {
           done: r.tailDone,
         };
   const retryAt = entry.retryAt === null ? null : new Date(entry.retryAt);
-  return { ref, replacing: entry.record.replacing, snapshot, tail, retryAt };
+  return { selector, replacing: entry.record.replacing, snapshot, tail, retryAt };
 }
 
 // a tail's share scanned: none before the blob's header gives its cut, and all once done
@@ -2788,41 +2901,42 @@ function tailShare(b: BackfillStatus): number {
   return Math.min(1, Math.max(0, (t.scanned - t.cut) / (t.until - t.cut)));
 }
 
-/** whether a wire ref covers a stream name or a narrower ref: a wildcard (`*`, `chat:*`,
-    `chat:acme,*`) covers the names under the prefix before its star, and a name covers itself */
-export function refCovers(ref: string, name: string): boolean {
-  if (ref.endsWith('*')) return name.startsWith(ref.slice(0, -1));
-  return name === ref;
+/** whether a selector covers a slice name or a narrower selector: a prefix selector (`*`,
+    `chat:*`, `chat:acme,*`) covers the names under the prefix before its star, and an exact
+    selector, a slice's name, covers itself */
+export function selectorCovers(selector: string, name: string): boolean {
+  if (selector.endsWith('*')) return name.startsWith(selector.slice(0, -1));
+  return name === selector;
 }
 
 /** one push from a backfill, queued for the advancer with the promise's resolvers */
 type BackfillWork = {
-  ref: string;
+  selector: string;
   item: BackfillItem;
   resolve: () => void;
   reject: (e: unknown) => void;
 };
 
-/** one command the app submitted: one for the outbox, or an @online one with its promise's
+/** one mutation the app sent: one for the outbox, or an @online one with its promise's
     resolvers */
-type Submission<C, N> =
-  | { outbox: C }
-  | { online: N; resolve: (result: CommandResult) => void; reject: (e: unknown) => void };
+type Submission<M, N> =
+  | { outbox: M }
+  | { online: N; resolve: (result: MutationResult) => void; reject: (e: unknown) => void };
 
-/** an @online command handed to a connection and not yet settled: its promise's resolvers, the
-    database's ok once it arrives, and whether an event carrying its id has been reduced */
-type OnlineCommand = {
-  resolve: (result: CommandResult) => void;
+/** an @online mutation handed to a connection and not yet settled: its promise's resolvers, the
+    database's ok once it arrives, and whether an edit carrying its id has been applied */
+type OnlineMutation = {
+  resolve: (result: MutationResult) => void;
   reject: (e: unknown) => void;
   ack: { kind: 'ok'; position: number } | null;
   seen: boolean;
 };
 
-/** the store key prefix a ref covers: a wildcard's text before its star (`chat:`, `chat:acme,`,
-    and the empty prefix for `*`), and `{stream}!` for a stream */
-export function refPrefix(ref: string): string {
-  if (ref.endsWith('*')) return ref.slice(0, -1);
-  return `${ref}!`;
+/** the store key prefix a selector covers: a prefix selector's text before its star (`chat:`,
+    `chat:acme,`, and the empty prefix for `*`), and `{slice}!` for an exact one */
+export function selectorPrefix(selector: string): string {
+  if (selector.endsWith('*')) return selector.slice(0, -1);
+  return `${selector}!`;
 }
 
 /** the delay before the n-th retry in a row: exponential from half a second, capped at half a
@@ -2832,53 +2946,35 @@ export function backoffDelay(attempt: number): number {
   return base / 2 + Math.random() * (base / 2);
 }
 
-/** the `$sys` of a birth or death event's data, null for an ordinary event */
-export function sysOf(data: unknown): 'birth' | 'death' | null {
-  if (data !== null && typeof data === 'object' && '$sys' in data) {
-    const sys = (data as { $sys: unknown }).$sys;
-    if (sys === 'birth' || sys === 'death') return sys;
-  }
-  return null;
+/** the key of a parked edit: its slice, then its seq zero-padded so a scan of the slice's prefix
+    walks its chain in order; a re-parked edit overwrites itself */
+export function parkedEditKey(slice: string, seq: number): string {
+  return `!park-ed:${slice}!${String(seq).padStart(20, '0')}`;
 }
 
-/** the key of a parked event: its stream, then its seq zero-padded so a scan of the stream's
-    prefix walks its chain in order; a re-parked event overwrites itself */
-export function parkedEventKey(stream: string, seq: number): string {
-  return `!park-ev:${stream}!${String(seq).padStart(20, '0')}`;
+/** the key of a parked snapshot page: its backfill's selector, then the blob offset it starts at,
+    zero-padded so a scan of the selector's prefix walks the pages in order */
+export function parkedPageKey(selector: string, offset: number): string {
+  return `!park-snap:${selector}!${String(offset).padStart(20, '0')}`;
 }
 
-/** the key of an outbox command: its ordinal zero-padded so a scan walks the outbox in send
+/** the key of an outbox mutation: its ordinal zero-padded so a scan walks the outbox in send
     order */
-export function commandKey(ordinal: number): string {
-  return `!command:${String(ordinal).padStart(20, '0')}`;
+export function mutationKey(ordinal: number): string {
+  return `!mutation:${String(ordinal).padStart(20, '0')}`;
 }
 
 /** the pattern of the Engine's own keys of one template, by a match on its one parameter */
 function engineKeys(name: string, match: ParamMatch = null): KeyPattern {
-  return { stream: '', name, local: [match] };
+  return { slice: '', name, local: [match] };
 }
 
-/** the stream and seq a parked event key names */
-export function parsePark(key: string): { stream: string; seq: number } {
-  const at = '!park-ev:'.length;
+/** the slice and seq a parked edit's key names */
+export function parsePark(key: string): { slice: string; seq: number } {
+  const at = '!park-ed:'.length;
   const bang = key.indexOf('!', at);
-  return { stream: key.slice(at, bang), seq: Number(key.slice(bang + 1)) };
+  return { slice: key.slice(at, bang), seq: Number(key.slice(bang + 1)) };
 }
-
-/** Like precommit, forecast emits either an event labelled with a stream, or the death of a stream.
-    Unlike precommit, if a death is labeled with .erase=true, nothing happens, since .erase is about
-    the history of events, which the Engine does not track anyway. */
-export type ForecastOutput =
-  { stream: string; event: unknown } | { stream: string; death: true; erase?: true };
-
-/** a handler's typed output, which nests tuples and arrays of outputs, as the flat list of them */
-export function outputList(out: unknown): ForecastOutput[] {
-  return [out].flat(Infinity) as ForecastOutput[];
-}
-
-/** the app's forecast of what the database will do with a command, read through the forecast
-    context over the overlay; a throw, a Reject included, forecasts nothing */
-export type Forecaster<FX, C> = (fx: FX, command: C) => ForecastOutput[];
 
 // status ////////////////////////////////////////////////////////////////////
 
@@ -2886,7 +2982,7 @@ export type Forecaster<FX, C> = (fx: FX, command: C) => ForecastOutput[];
    has come, and the outbox.  Sync work comes in three kinds, which the Engine tells apart and the
    UI may treat differently.
 
-   First boot.  The Engine has no base: nothing has been reduced yet, on a fresh store or on one
+   First boot.  The Engine has no base: nothing has been applied yet, on a fresh store or on one
    whose first sync never landed.  The first view's grants download as replacing backfills and
    land together, so the first state queries see is complete.  Until then the Engine refuses every
    query that reads past the status: such a query waits with no result and answers once the base
@@ -2897,12 +2993,12 @@ export type Forecaster<FX, C> = (fx: FX, command: C) => ForecastOutput[];
    and queries see each batch as it lands, so the app zooms forward at catch-up speed.  Every
    state shown is a prefix of the log, consistent if stale.  The UI may let the zoom show, or
    cover it with a loading screen while `state` is `syncing`.  A gap partway through replaces its
-   stream with a backfill and freezes the base until it lands; queries keep answering from the
+   slice with a backfill and freezes the base until it lands; queries keep answering from the
    frozen base.
 
    Backfill.  Downloads on a live base: a new grant, or a gap's repair, and queries keep
    answering through both.  A new grant is additive: the base keeps moving while it downloads,
-   and its streams appear when it lands.  A gap's repair is replacing: the base freezes until it
+   and its slices appear when it lands.  A gap's repair is replacing: the base freezes until it
    lands, and queries answer from the frozen base meanwhile.  The UI may show progress or
    nothing.
 
@@ -2910,14 +3006,14 @@ export type Forecaster<FX, C> = (fx: FX, command: C) => ForecastOutput[];
    weighs the stages of each kind:
      - first boot and backfill: 5% knowing every backfill and its size, 85% the downloads, and
        10% the land
-     - resync: 5% the ref list confirmed, by any frame after the open, 20% backfills, and 75% the
-       replay, the checkpoint's way from where the episode started to the head the server stated
-       when the connection opened
+     - resync: 5% the selector list confirmed, by any frame after the open, 20% backfills, and
+       75% the replay, the checkpoint's way from where the episode started to the head the server
+       stated when the connection opened
    A download is half snapshot and half tail.  The snapshots are exact, bytes over lengths, while
    every backfill in flight has a length its response stated, and otherwise fall back to
    downloadCurve over the bytes downloaded.  A tail is the share of its span, from the blob's cut
    to until, that its scan has reached.  A resync never knows which backfills it will need, so its
-   backfill share is half the held streams resolved, each when an event chains onto it, when its
+   backfill share is half the held slices resolved, each when an edit chains onto it, when its
    backfill lands, or when the replay reaches head, and half the download, which is whole until a
    backfill starts and then follows downloadCurve whatever lengths are known.
 
@@ -2944,7 +3040,7 @@ export type ConnectionStatus = {
     when its response states one.  The tail is in log positions, from the blob's cut to until,
     scanned up to `scanned`; it is null until the blob's header gives the cut. */
 export type BackfillStatus = {
-  ref: string;
+  selector: string;
   replacing: boolean;
   snapshot: { bytes: number; length: number | null; done: boolean };
   tail: { cut: number; scanned: number; until: number; done: boolean } | null;
@@ -2954,14 +3050,14 @@ export type BackfillStatus = {
 /** How far syncing has come.  `estimate` runs from 0 to 1 over the work in progress and never
     goes back, and is null when nothing is in progress.  The log is in positions: where this
     connection started, the server's head as last known, the checkpoint, and how far the base
-    has been reduced. */
+    has been applied. */
 export type ProgressStatus = {
   estimate: number | null;
-  log: { since: number; head: number | null; committed: number; reduced: number };
+  log: { since: number; head: number | null; committed: number; applied: number };
   backfills: BackfillStatus[];
 };
 
-/** the outbox: commands the database has not acknowledged */
+/** the outbox: mutations the database has not acknowledged */
 export type OutboxStatus = { unacknowledged: number };
 
 /** The Engine's status, which a query reads like any state and runs again when it changes.
@@ -2979,13 +3075,14 @@ const STATUS_KEYS = {
   outbox: '!status:outbox',
 } as const;
 
-/** the status accessor of a query context, over the query's read transaction so its reads are
-    recorded like any other */
-export function engineStatus(cell: TxnCell<ReadTxn>): EngineStatus {
+/** The status accessor of a query context, over the query's read transaction so its reads are
+    recorded like any other.  For generated code: no template parameter holds a `$`, so none can
+    shadow it. */
+export function $engineStatus(ref: { txn: ReadTxn }): EngineStatus {
   return {
-    connection: () => cell.txn.get(STATUS_KEYS.connection, '.json') as ConnectionStatus,
-    progress: () => cell.txn.get(STATUS_KEYS.progress, '.json') as ProgressStatus,
-    outbox: () => cell.txn.get(STATUS_KEYS.outbox, '.json') as OutboxStatus,
+    connection: () => ref.txn.get(STATUS_KEYS.connection, '.json') as ConnectionStatus,
+    progress: () => ref.txn.get(STATUS_KEYS.progress, '.json') as ProgressStatus,
+    outbox: () => ref.txn.get(STATUS_KEYS.outbox, '.json') as OutboxStatus,
   };
 }
 
@@ -3019,12 +3116,12 @@ type Episode = {
   shown: number;
   // every backfill of the episode as last seen; one no longer in flight is complete
   backfills: Map<string, BackfillStatus>;
-  // a resync's start: the checkpoint, and the streams held then, which each resolve when an event
+  // a resync's start: the checkpoint, and the slices held then, which each resolve when an edit
   // chains onto one, when its backfill lands, or when the replay reaches head
   since: number;
   held: Set<string>;
   resolved: Set<string>;
-  // a resync's connection has delivered a frame after it opened, which confirms the ref list
+  // a resync's connection has delivered a frame after it opened, which confirms the selector list
   confirmed: boolean;
 };
 
@@ -3032,47 +3129,46 @@ type Episode = {
 type Inbound =
   | { open: { epoch: string; head: number } }
   | { view: ViewRecord }
-  | { events: WireEvent[] }
+  | { edits: WireEdit[] }
   | { vouch: number }
   | { live: number }
   | { end: { code: number; reason: string; fatal: unknown } };
 
-/** Engine builds a sync engine out of a Transport, a Store, a user's reducers, and optionally a
-    user's forecasters, syncing as one session or as anonymous for its whole life.  The Engine is
-    responsible for managing connection status, the synchronization protocol, and the flow of
-    events and commands, ultimately keeping the Store as up-to-date with the PhaseLockDB server as
-    possible.
+/** Engine builds a sync engine out of a Transport, a Store, and optionally a user's predictors,
+    syncing as one session or as anonymous for its whole life.  The Engine is responsible for
+    managing connection status, the synchronization protocol, and the flow mutations, ultimately
+    keeping the Store as up-to-date with the PhaseLockDB server as possible.
 
     An application interacts with the Engine primarily through newQuery(), which returns a
-    subscribable stream of results, and sendCommand(), which sends commands back to PhaseLockDB.
-    If forecasters were provided, the Engine also provides optimistic updates.
+    subscribable stream of results, and sendMutation(), which sends mutations back to PhaseLockDB.
+    If predictors were provided, the Engine also provides optimistic updates.
 
-    With forecasters and a persistent Store implementation, the Engine is the basis for a fully
+    With predictors and a persistent Store implementation, the Engine is the basis for a fully
     offline-capable application.
 
     Engine internals diagram:
 
         (* = owned by user)
          ______________________________________________________
-        |  PWA                                                 |
+        |  App                                                 |
         |    _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _   |
         |   | Engine                                        |  |
-        |       ___________           __________________       |
-        |   |  |           |       C |                  |   |  |
-        |      | *reducers |<------->|  store + overlay |      |
-        |   |  |___________|         |__________________|   |  |
+        |       ________________________________________       |
+        |   |  |                                        |   |  |
+        |      |              store + overlay           |      |
+        |   |  |________________________________________|   |  |
         |         ^ B    ^              ^         |            |
-        |   |     |      |              | H       | D       |  |
-        |         |    __|___________   |   ______v______      |
-        |   |     |   |              |  |  |             |  |  |
-        |         |   | *forecasters |  |  | query graph |     |
-        |   |     |   |______________|  |  |_____________|  |  |
+        |   |     |      |              | G       | C       |  |
+        |         |    __|__________    |   ______v______      |
+        |   |     |   |             |   |  |             |  |  |
+        |         |   | *predictors |   |  | query graph |     |
+        |   |     |   |_____________|   |  |_____________|  |  |
         |         |               ^     |    _ _ _|_ _ _ _ _   |
-        |   |     |               | G   |   |     | E          |
+        |   |     |               | F   |   |     | D          |
         |       __|__________     |     |       __v___         |
-        |   |  |             | I  |     |   |  |      |        |
+        |   |  |             | H  |     |   |  |      |        |
         |      |  transport  |<---+-----+------| *UI  |        |
-        |   |  |_____________|            F |  |______|        |
+        |   |  |_____________|            E |  |______|        |
         |           ^                                          |
         |   |_ _ _ _|_ _ _ _ _ _ _ _ _ _ _ _|                  |
         |___________|__________________________________________|
@@ -3083,64 +3179,63 @@ type Inbound =
               | PhaseLockDB |
               |_____________|
 
-        A: transport talks to PhaseLockDB, reading events and writing commands
+        A: Transport talks to PhaseLockDB, reading edits and writing mutations.
 
-        B: events received by transport are passed to reducers
+        B: Edits received by transport are applied to the store.
 
-        C: reducers process incoming batches, updating store
+        C: Query graph wakes on store update and reruns queries whose dependencies have changed.
 
-        D: query graph wakes after store update and reruns queries whose dependencies have changed
+        D: Fresh query results are delivered to the UI.
 
-        E: fresh query results are delivered to the UI
+        E: UI submits new mutations with Engine.sendMutation(), triggering F, G, and H:
 
-        F: UI submits new commands with Engine.sendCommand()
+        F: New mutations trigger predictor; predicted edits land in the storage overlay.
 
-        G: new commands trigger forecaster; forecasted events are reduced onto storage overlay
+        G: New mutations are also stored in an outbox in the store.
 
-        H: new commands are also stored in an outbox in the store
+        H: New mutations are also sent through the transport.
 
-        I: new commands are also sent through the transport
+    Engine-owned store keys.  Slice state lives at `{slice}!{local key}`; everything the Engine
+    keeps for itself lives in the nameless slice, which no slice name can reach, so its keys start
+    with `!`.  Its local keys follow the template grammar, and the parked keys' terminal parameter
+    is itself a slice or a selector, `!`, then the rest.  Each is stored as `.json` unless noted:
 
-    Engine-owned store keys.  Slice state lives at `{stream}!{local key}`; everything the Engine
-    keeps for itself lives in the nameless stream, which no stream name can reach, so its keys
-    start with `!`.  Its local keys follow the template grammar, and the parked keys' terminal
-    parameter is itself a stream or ref, `!`, then the rest.  Each is stored as `.json` unless
-    noted:
-
-        !view                      ViewRecord: the view token, its position, and the refs granted
-        !checkpoint                CheckpointRecord: the epoch of the log the cursor is in, the
-                                   cursor, advanced with every batch, vouch, and live mark, and
-                                   how far the base is reduced
-        !seq:{stream}              the stream's last held seq, or 'backfill' while a backfill
-                                   covering it is in flight
-        !command:{ordinal}         Command<Uint8Array> (`.command`): the outbox, in send order,
-                                   each command's data as its wire bytes, under the series and
-                                   number it was minted with; ordinal zero-padded to 20 digits so
-                                   a scan walks the outbox in order
-        !backfill:{ref}            BackfillRecord: an in-flight backfill's until, resume, replacing,
-                                   and children
-        !backfill-seqs:{ref}       the backfill blob's header seqs, stream name to seq
-        !park-ev:{stream}!{seq}    a parked event (`.event`), raw as delivered; seq zero-padded to
-                                   20 digits so a stream's range walks its chain; a ref's key
-                                   prefix after `!park-ev:` covers its streams' events
-        !park-kv:{ref}!{key}       a slice value from the ref's backfill blob, typed as its key
-                                   is, moved to {key} when the backfill lands
-        !status:{part}             the Engine's status that queries read, its connection,
-                                   progress, or outbox; no store holds it, since the Engine
-                                   answers it from memory
+        !view                       ViewRecord: the view token, its position, and the selectors
+                                    granted
+        !checkpoint                 CheckpointRecord: the epoch of the log the cursor is in, the
+                                    cursor, advanced with every batch, vouch, and live mark, and
+                                    how far the base is applied
+        !seq:{slice}                the slice's last held seq, or 'backfill' while a backfill
+                                    covering it is in flight; deleted when the slice dies
+        !mutation:{ordinal}         Mutation<Uint8Array> (`.mutation`): the outbox, in send order,
+                                    each mutation's data as its wire bytes, under the series and
+                                    number it was minted with; ordinal zero-padded to 20 digits
+                                    so a scan walks the outbox in order
+        !backfill:{selector}        BackfillRecord: an in-flight backfill's until, resume,
+                                    replacing, and children
+        !backfill-seqs:{selector}   the backfill blob's header seqs, slice name to seq
+        !park-ed:{slice}!{seq}      a parked edit (`.edits`), raw as delivered; seq zero-padded
+                                    to 20 digits so a slice's range walks its chain; a selector's
+                                    key prefix after `!park-ed:` covers its slices' edits
+        !park-snap:{selector}!{offset}
+                                    a page of the selector's backfill blob (`.page`), raw: a run
+                                    of its whole set operations, offset the byte it starts at in
+                                    the blob, zero-padded to 20 digits so the pages walk in blob
+                                    order; applied in place when the backfill lands, and deleted
+                                    with the backfill
+        !status:{part}              the Engine's status that queries read, its connection,
+                                    progress, or outbox; no store holds it, since the Engine
+                                    answers it from memory
 */
-export class Engine<QX, FX, C, N = never> {
+export class Engine<QX, PX, M, N = never> {
   #store: Store;
   #reg: Registry;
   #transport: Transport;
   // who the Engine syncs as, handed to every connection; null for anonymous
   #session: Session | null;
-  #reducers: Record<string, SliceReducer>;
-  // the pattern of each reducer's stream names, by stream prefix
-  #streamPatterns: Record<string, RegExp>;
-  // runs against the overlay for every outbox command in order on every rebuild; a string is a
-  // rejection and forecasts nothing
-  #forecaster: null | Forecaster<FX, C>;
+  // runs against the overlay for every outbox mutation in order on every rebuild
+  #predictor: null | Predictor<PX, M>;
+  // the selectors of the Engine's slice types, one each
   #wants: string[];
   #signal: Signal;
 
@@ -3165,7 +3260,7 @@ export class Engine<QX, FX, C, N = never> {
   #asked: boolean = false;
 
   // the connection's checkpoint as it started, the server's head as last known, and whether a
-  // frame after the open has confirmed the ref list
+  // frame after the open has confirmed the selector list
   #since: number = -1;
   #head: number | null = null;
   #confirmed: boolean = false;
@@ -3179,30 +3274,30 @@ export class Engine<QX, FX, C, N = never> {
   // the persisted state, held in memory and written through
   #view: ViewRecord | null = null;
   #checkpoint: CheckpointRecord | null = null;
-  // seq per held stream, or the marker for a stream under an in-flight ref; the marker is
-  // persisted at !seq:{stream} on first sight during the backfill, in the transaction that parks
-  #streams: Map<string, number | 'backfill'> = new Map();
+  // seq per held slice, or the marker for a slice under an in-flight selector; the marker is
+  // persisted at !seq:{slice} on first sight during the backfill, in the transaction that parks
+  #slices: Map<string, number | 'backfill'> = new Map();
   #backfills: Map<string, BackfillEntry> = new Map();
-  // the outbox in send order: command id to its ordinal in !command:{ordinal}
+  // the outbox in send order: mutation id to its ordinal in !mutation:{ordinal}
   #outbox: Map<string, number> = new Map();
   #nextOrdinal: number = 0;
-  // the series new commands are numbered in, and the number the next one takes.  Neither touches
-  // the disk: a stored outbox resends under the series it was numbered in, and new commands go in
+  // the series new mutations are numbered in, and the number the next one takes.  Neither touches
+  // the disk: a stored outbox resends under the series it was numbered in, and new mutations go in
   // a series of this Engine's own, so two Engines over one copied store never share one.
   readonly #series: string;
   #nextN: number = 1;
-  // outbox commands handed to the current connection with no outcome yet, and those acked, with
+  // outbox mutations handed to the current connection with no outcome yet, and those acked, with
   // the position they landed at, waiting for the checkpoint to reach it
   #sent: Set<string> = new Set();
   #acked: Map<string, number> = new Map();
-  // @online commands handed to a connection and not yet settled, by id
-  #online: Map<string, OnlineCommand> = new Map();
+  // @online mutations handed to a connection and not yet settled, by id
+  #online: Map<string, OnlineMutation> = new Map();
   // set by a release inside a transaction, read by the refresh after its commit
   #outboxChanged: boolean = false;
-  // how far the base has been reduced, -1 for never: the checkpoint, except while frozen, when it
-  // stays at the last event that reduced.  Persisted in the checkpoint record.  An acked command
-  // at or below it is in the base, events or none
-  #reduced: number = -1;
+  // how far the base has been applied, -1 for never: the checkpoint, except while frozen, when it
+  // stays at the last edit that applied.  Persisted in the checkpoint record.  An acked mutation
+  // at or below it is in the base, edits or none
+  #applied: number = -1;
 
   // the connection has delivered `live`
   #live: boolean = false;
@@ -3216,25 +3311,27 @@ export class Engine<QX, FX, C, N = never> {
   #backfillWork: BackfillWork[] = [];
   // how each backfill() call ended, and on which connection
   #backfillOutcomes: {
-    ref: string;
+    selector: string;
     outcome: BackfillOutcome | { failed: unknown };
     conn: SignalController;
   }[] = [];
-  // how each sendCommands() call ended, with the ids it carried in order
-  #commandOutcomes: { ids: string[]; results: CommandResult[] | { failed: unknown } }[] = [];
+  // how each sendMutations() call ended, with the ids it carried in order
+  #mutationOutcomes: { ids: string[]; results: MutationResult[] | { failed: unknown } }[] = [];
   // work received from the app
-  #submitted: Submission<C, N>[] = [];
+  #submitted: Submission<M, N>[] = [];
   #newQueries: boolean = false;
   // every new connection resends the outbox
   #resend: boolean = false;
-  // builds the forecast context, handed to every forecast, over a read transaction
-  #forecastContext: (txn: ReadTxn) => FX;
+  // the predict context, handed to every predictor, and the box it reads its write transaction
+  // through
+  #predictions: { ctx: PX; $ref: { txn: WriteTxn } };
 
   constructor(
     // the context a query reads, the engine's slices and the Engine's status, and the context a
-    // forecast reads, the slices alone; each over a read transaction
-    queryContext: (txn: ReadTxn) => QX,
-    forecastContext: (txn: ReadTxn) => FX,
+    // predictor reads and writes, the slices alone, each with the box its accessors read the
+    // transaction through, which the Engine points at each store transaction it runs them over
+    queries: { ctx: QX; $ref: { txn: ReadTxn } },
+    predictions: { ctx: PX; $ref: { txn: WriteTxn } },
     // injected by generated subclass: the engine's registry data, which the transport builds the
     // Registry from
     schema: Schema,
@@ -3242,15 +3339,13 @@ export class Engine<QX, FX, C, N = never> {
     options: {
       // who the Engine syncs as, or null for anonymous
       session: Session | null;
-      // injected by generated subclass: each slice's reducer and scoped context, by stream prefix
-      reducers: Record<string, SliceReducer>;
-      // injected by generated subclass: the refs of the shards the engine declares
+      // injected by generated subclass: the selectors of the engine's slice types, one each
       wants: string[];
       // optional: makes the Engine's store from its Registry; without it, an InMemStore
       store?: StoreFactory;
-      // optional: forecast what the database will do with a command, reading the state the
-      // earlier outbox commands leave
-      forecaster?: Forecaster<FX, C>;
+      // optional: predict what the database will do with a mutation, over the state the earlier
+      // outbox mutations leave
+      predictor?: Predictor<PX, M>;
       // optional: ends the Engine, its connection, and every backfill
       signal?: Signal;
       // optional: receives the error that ended the Engine; without it the error is thrown out
@@ -3260,19 +3355,14 @@ export class Engine<QX, FX, C, N = never> {
   ) {
     checkHost();
     this.#series = generateSeries();
-    this.#forecastContext = forecastContext;
+    this.#predictions = predictions;
     const reg = registryFor(transport, schema);
     this.#store = options.store === undefined ? new InMemStore(reg) : options.store(reg);
     this.#reg = reg;
     this.#transport = transport;
     this.#session = options.session;
-    this.#reducers = options.reducers;
-    this.#streamPatterns = {};
-    for (const [family, slice] of Object.entries(options.reducers)) {
-      this.#streamPatterns[family] = streamPattern(slice.template);
-    }
     this.#wants = options.wants;
-    this.#forecaster = options.forecaster ?? null;
+    this.#predictor = options.predictor ?? null;
     this.#signal = options.signal ?? new host.AbortController().signal;
     this.#connectionAbort = new host.AbortController();
     this.#onError =
@@ -3283,7 +3373,10 @@ export class Engine<QX, FX, C, N = never> {
     this.#signal.addEventListener('abort', () => this.#schedule(), { once: true });
 
     this.#overlay = new Overlay(reg);
-    this.#graph = new QueryGraph(queryContext);
+    this.#graph = new QueryGraph((txn) => {
+      queries.$ref.txn = txn;
+      return queries.ctx;
+    });
 
     // let the advancer begin initializing
     this.#run();
@@ -3291,28 +3384,28 @@ export class Engine<QX, FX, C, N = never> {
 
   //// public api ////
 
-  /** After forecasting and saving to the outbox, the command is sent through the connection, in
-      order with every command submitted before it.  It is given in rich format (Date, Maps, and
-      Sets intact). */
-  sendCommand(command: C): void {
-    this.#submitted.push({ outbox: command });
+  /** After predicting and saving to the outbox, the mutation is sent through the connection, in
+      order with every mutation sent before it.  It is given in rich format (Date, Maps, and Sets
+      intact). */
+  sendMutation(mutation: M): void {
+    this.#submitted.push({ outbox: mutation });
     this.#schedule();
   }
 
-  /** Sends an @online command behind every command submitted before it, in the Engine's
-      series, and settles with the database's answer.  A reject or a conflict settles at once.
-      An ok settles on the round trip, once the queries have run over the base the position it
-      names reached; it means the command was decided, so a resend of a rejected one settles ok
-      too, and the app reads the outcome from state.  It rejects when there is no connection to
-      send it on, when its call fails, and when the Engine ends.  It is never persisted or
-      forecast, and the connection's retry of its call is the only resend. */
-  sendOnlineCommand(command: N): Promise<CommandResult> {
+  /** Sends an @online mutation behind every mutation sent before it, in the Engine's series, and
+      settles with the database's answer.  A reject or a conflict settles at once.  An ok settles
+      on the round trip, once the queries have run over the base the position it names reached;
+      it means the mutation was decided, so a resend of a rejected one settles ok too, and the app
+      reads the outcome from state.  It rejects when there is no connection to send it on, when
+      its call fails, and when the Engine ends.  It is never persisted or predicted, and the
+      connection's retry of its call is the only resend. */
+  sendOnlineMutation(mutation: N): Promise<MutationResult> {
     return new Promise((resolve, reject) => {
       if (this.#ended || this.#signal.aborted) {
         reject(new Error('engine ended'));
         return;
       }
-      this.#submitted.push({ online: command, resolve, reject });
+      this.#submitted.push({ online: mutation, resolve, reject });
       this.#schedule();
     });
   }
@@ -3361,22 +3454,22 @@ export class Engine<QX, FX, C, N = never> {
       this.#checkpoint = checkpoint ?? null;
       this.#view = (txn.get('!view', '.json', JS) as ViewRecord | undefined) ?? null;
 
-      // the streams table: seq per held stream, or the marker for a stream under a backfill
+      // the slices table: seq per held slice, or the marker for a slice under a backfill
       const json = { type: '.json', rep: JS } as const;
       const seqRows = scanAll(txn, { pattern: engineKeys('seq'), limit: 1000, values: json });
       for (const [key, value] of seqRows) {
-        this.#streams.set(key.slice('!seq:'.length), value as number | 'backfill');
+        this.#slices.set(key.slice('!seq:'.length), value as number | 'backfill');
       }
 
       // the outbox in ordinal order; the next ordinal continues from the last key
-      const commandRows = scanAll(txn, {
-        pattern: engineKeys('command'),
+      const mutationRows = scanAll(txn, {
+        pattern: engineKeys('mutation'),
         limit: 1000,
-        values: { type: '.command', rep: JS },
+        values: { type: '.mutation', rep: JS },
       });
-      for (const [key, value] of commandRows) {
-        const ordinal = Number(key.slice('!command:'.length));
-        this.#outbox.set((value as Command<Uint8Array>).id, ordinal);
+      for (const [key, value] of mutationRows) {
+        const ordinal = Number(key.slice('!mutation:'.length));
+        this.#outbox.set((value as Mutation<Uint8Array>).id, ordinal);
         this.#nextOrdinal = ordinal + 1;
       }
 
@@ -3394,34 +3487,34 @@ export class Engine<QX, FX, C, N = never> {
     });
 
     // a backfill whose download finished before the crash is ready to land
-    for (const [ref, entry] of this.#backfills) {
-      entry.parent = this.#parentOf(ref);
+    for (const [selector, entry] of this.#backfills) {
+      entry.parent = this.#parentOf(selector);
       const r = entry.record;
       if (r.resume?.snapshotDone && r.resume.tailDone) entry.status = 'ready';
     }
-    this.#reduced = this.#checkpoint?.reduced ?? -1;
+    this.#applied = this.#checkpoint?.applied ?? -1;
 
-    // purge what this build does not want.  The wants are the refs this build can fold, and the
-    // server cuts the view down to them, so a stream, a backfill, or a view ref outside the wants
-    // is an earlier build's.  Every one goes now, so the view frame that answers our token finds
-    // the base as this build would have made it.
-    const wanted = (x: string) => this.#wants.some((w) => refCovers(w, x));
+    // purge what this build does not want.  The wants are the selectors of this build's slice
+    // types, and the server cuts the view down to them, so a slice, a backfill, or a view selector
+    // outside the wants is an earlier build's.  Every one goes now, so the view frame that answers
+    // our token finds the base as this build would have made it.
+    const wanted = (x: string) => this.#wants.some((w) => selectorCovers(w, x));
     const wasFrozen = this.#replacing > 0;
     const dirty: Record<string, true> = {};
     this.#store.write((txn) => {
       // every backfill outside the wants
-      for (const ref of [...this.#backfills.keys()]) {
-        if (!wanted(ref)) this.#dropBackfillIn(txn, ref);
+      for (const selector of [...this.#backfills.keys()]) {
+        if (!wanted(selector)) this.#dropBackfillIn(txn, selector);
       }
 
-      // every stream outside the wants
-      for (const stream of [...this.#streams.keys()]) {
-        if (!wanted(stream)) this.#dropStreamIn(txn, stream, dirty);
+      // every slice outside the wants
+      for (const slice of [...this.#slices.keys()]) {
+        if (!wanted(slice)) this.#dropSliceIn(txn, slice, dirty);
       }
 
-      // every view ref outside the wants, so the next frame grants what it covered afresh
-      if (this.#view !== null && !this.#view.refs.every(wanted)) {
-        this.#view = { ...this.#view, refs: this.#view.refs.filter(wanted) };
+      // every view selector outside the wants, so the next frame grants what it covered afresh
+      if (this.#view !== null && !this.#view.selectors.every(wanted)) {
+        this.#view = { ...this.#view, selectors: this.#view.selectors.filter(wanted) };
         txn.set('!view', '.json', JS, this.#view);
       }
 
@@ -3437,15 +3530,16 @@ export class Engine<QX, FX, C, N = never> {
     // the first connection attempt
     this.#connectNow = true;
 
-    // publish the status, and forecast every outbox command onto a fresh overlay
+    // publish the status, and predict every outbox mutation onto a fresh overlay
     this.#refresh({}, true);
   }
 
-  // the most specific in-flight ref that covers ref, other than itself, so the parent of a child
-  #parentOf(ref: string): string | null {
+  // the most specific in-flight selector that covers selector, other than itself, so the parent of
+  // a child
+  #parentOf(selector: string): string | null {
     let parent: string | null = null;
     for (const other of this.#backfills.keys()) {
-      if (other === ref || !refCovers(other, ref)) continue;
+      if (other === selector || !selectorCovers(other, selector)) continue;
       if (parent === null || other.length > parent.length) parent = other;
     }
     return parent;
@@ -3453,9 +3547,9 @@ export class Engine<QX, FX, C, N = never> {
 
   /* Our main logic is a loop, run whenever work is scheduled until none is left.  Each pass takes
      one kind of work, does it in its own transactions, and starts over, so the order of the
-     branches is the priority: what the user is waiting on first, the app's commands and queries,
-     then the live stream, then the outcomes of our own calls, then background work that batches
-     well and can wait, and a new connection last.
+     branches is the priority: what the user is waiting on first, the app's mutations and queries,
+     then the live connection, then the outcomes of our own calls, then background work that
+     batches well and can wait, and a new connection last.
 
      Anything thrown out of a pass ends the Engine.  The transaction rolled back, so the store
      resumes from the same point on the next start, and memory changed inside a transaction is
@@ -3476,7 +3570,7 @@ export class Engine<QX, FX, C, N = never> {
       }
 
       if (this.#submitted.length > 0 || this.#resend) {
-        // the tightest loop we serve: write to the outbox, forecast, and the UI sees the
+        // the tightest loop we serve: write to the outbox, predict, and the UI sees the
         // optimistic update; then send through the connection in submission order
         this.#onSubmitted();
         continue;
@@ -3489,15 +3583,15 @@ export class Engine<QX, FX, C, N = never> {
       }
 
       if (this.#inbox.length > 0) {
-        // the stream, in arrival order: events reduce or park, and a view, vouch, live, or end
-        // is handled alone
+        // the connection's frames, in arrival order: edits apply or park, and a view, vouch,
+        // live, or end is handled alone
         this.#onInbox();
         continue;
       }
 
-      if (this.#commandOutcomes.length > 0) {
+      if (this.#mutationOutcomes.length > 0) {
         // ack, dup, reject, and conflict from sends: release the outbox and rebuild the overlay
-        this.#onCommandOutcomes();
+        this.#onMutationOutcomes();
         continue;
       }
 
@@ -3509,7 +3603,7 @@ export class Engine<QX, FX, C, N = never> {
       }
 
       if (this.#backfillWork.length > 0) {
-        // header, values, events, and done marks from in-flight backfills, parked in one
+        // header, pages, edits, and done marks from in-flight backfills, parked in one
         // transaction that also lands whatever they completed, each resolving the connection's
         // promise after commit.  Background work: it orders against nothing above, and the
         // connection waits on it while the app is busy.
@@ -3530,21 +3624,21 @@ export class Engine<QX, FX, C, N = never> {
   }
 
   /* The app's submissions, sent in submission order.  A new connection first resends every outbox
-     command it has not been handed, in ordinal order, each under the series and number it was
+     mutation it has not been handed, in ordinal order, each under the series and number it was
      minted with.  Then each submission in turn takes the next number of the Engine's series: an
-     outbox command goes into the outbox and joins the current call, and an @online command goes
+     outbox mutation goes into the outbox and joins the current call, and an @online mutation goes
      in a call of its own.  So numbers reach the database in the order they were minted, which is
      what lets it answer a number at or below one it decided as decided already.  The connection
      fails every call behind a failed one, which keeps that order.  Without a connection the outbox
-     waits for the next connection, and every @online command rejects. */
+     waits for the next connection, and every @online mutation rejects. */
   #onSubmitted(): void {
     const submitted = this.#submitted.splice(0);
     const connection = this.#connection;
     const resend = this.#resend && connection !== null;
     this.#resend = false;
 
-    // the calls in order: runs of outbox commands, and each @online command alone between them
-    const calls: { wire: Command<Uint8Array>[]; online: OnlineCommand | null }[] = [
+    // the calls in order: runs of outbox mutations, and each @online mutation alone between them
+    const calls: { wire: Mutation<Uint8Array>[]; online: OnlineMutation | null }[] = [
       { wire: [], online: null },
     ];
     let fresh = false;
@@ -3556,43 +3650,49 @@ export class Engine<QX, FX, C, N = never> {
             .filter(([id]) => !this.#sent.has(id) && !this.#acked.has(id))
             .sort((a, b) => a[1] - b[1]);
           for (const [, ordinal] of pending) {
-            calls[0].wire.push(txn.get(commandKey(ordinal), '.command', JS) as Command<Uint8Array>);
+            const row = txn.get(mutationKey(ordinal), '.mutation', JS) as Mutation<Uint8Array>;
+            calls[0].wire.push(row);
           }
         }
 
         // each submission, converted to wire bytes here by the vocabulary that made it
         for (const s of submitted) {
           if ('online' in s) {
-            const data = this.#reg.convert(this.#reg.commands, s.online, JS, MSGPACK) as Uint8Array;
+            const data = this.#reg.convert(this.#reg.mutations, s.online, JS, MSGPACK);
             const online = { resolve: s.resolve, reject: s.reject, ack: null, seen: false };
-            const command = { id: generateUuid(), series: this.#series, n: this.#nextN++, data };
-            calls.push({ wire: [command], online }, { wire: [], online: null });
+            const mutation = {
+              id: generateUuid(),
+              series: this.#series,
+              n: this.#nextN++,
+              data: data as Uint8Array,
+            };
+            calls.push({ wire: [mutation], online }, { wire: [], online: null });
             continue;
           }
 
-          // an outbox command takes the next ordinal
-          const command: Command<Uint8Array> = {
+          // an outbox mutation takes the next ordinal
+          const mutation: Mutation<Uint8Array> = {
             id: generateUuid(),
             series: this.#series,
             n: this.#nextN++,
-            data: this.#reg.convert(this.#reg.commands, s.outbox, JS, MSGPACK) as Uint8Array,
+            data: this.#reg.convert(this.#reg.mutations, s.outbox, JS, MSGPACK) as Uint8Array,
           };
           const ordinal = this.#nextOrdinal++;
-          txn.set(commandKey(ordinal), '.command', JS, command);
-          this.#outbox.set(command.id, ordinal);
-          calls[calls.length - 1].wire.push(command);
+          txn.set(mutationKey(ordinal), '.mutation', JS, mutation);
+          this.#outbox.set(mutation.id, ordinal);
+          calls[calls.length - 1].wire.push(mutation);
           fresh = true;
         }
       });
     } catch (e: unknown) {
-      // the pass ends the Engine, and the @online commands taken from the queue reject with it
+      // the pass ends the Engine, and the @online mutations taken from the queue reject with it
       for (const s of submitted) if ('online' in s) s.reject(e);
       throw e;
     }
     if (fresh) this.#outboxChanged = true;
     this.#refresh({});
 
-    // no connection, so every @online command rejects at once
+    // no connection, so every @online mutation rejects at once
     if (connection === null) {
       const e = new Error('no connection');
       for (const { online } of calls) online?.reject(e);
@@ -3602,19 +3702,19 @@ export class Engine<QX, FX, C, N = never> {
     // each call on this connection; the results come back through the outcomes
     for (const { wire, online } of calls) {
       if (wire.length === 0) continue;
-      const ids = wire.map((c) => c.id);
+      const ids = wire.map((m) => m.id);
       if (online !== null) {
         this.#online.set(ids[0], online);
       } else {
         for (const id of ids) this.#sent.add(id);
       }
-      connection.sendCommands(wire).then(
+      connection.sendMutations(wire).then(
         (results) => {
-          this.#commandOutcomes.push({ ids, results });
+          this.#mutationOutcomes.push({ ids, results });
           this.#schedule();
         },
         (e: unknown) => {
-          this.#commandOutcomes.push({ ids, results: { failed: e } });
+          this.#mutationOutcomes.push({ ids, results: { failed: e } });
           this.#schedule();
         },
       );
@@ -3648,8 +3748,8 @@ export class Engine<QX, FX, C, N = never> {
       abort.signal,
       {
         onOpen: (epoch, head) => push({ open: { epoch, head } }),
-        onView: (token, position, refs) => push({ view: { token, position, refs } }),
-        onEvents: (events) => push({ events }),
+        onView: (token, position, selectors) => push({ view: { token, position, selectors } }),
+        onEdits: (edits) => push({ edits }),
         onLive: (position) => push({ live: position }),
         onVouch: (position) => push({ vouch: position }),
         onEnd: (code, reason, fatal) => push({ end: { code, reason, fatal } }),
@@ -3658,8 +3758,9 @@ export class Engine<QX, FX, C, N = never> {
     );
 
     // restart the downloads; one in backoff starts when its timer fires
-    for (const [ref, entry] of this.#backfills) {
-      if (entry.status === 'downloading' && entry.retryTimer === null) this.#startBackfill(ref);
+    for (const [selector, entry] of this.#backfills) {
+      if (entry.status === 'downloading' && entry.retryTimer === null)
+        this.#startBackfill(selector);
     }
     this.#resend = true;
   }
@@ -3673,10 +3774,10 @@ export class Engine<QX, FX, C, N = never> {
     // a push for a backfill that was dropped while it was queued fails on its own
     while (this.#backfillWork.length > 0) {
       const work = this.#backfillWork.shift()!;
-      if (this.#backfills.has(work.ref)) {
+      if (this.#backfills.has(work.selector)) {
         pushes.push(work);
       } else {
-        work.reject(new Error(`backfill ${work.ref} is no longer in flight`));
+        work.reject(new Error(`backfill ${work.selector} is no longer in flight`));
       }
     }
     if (pushes.length === 0) return;
@@ -3684,7 +3785,7 @@ export class Engine<QX, FX, C, N = never> {
     // park every push, land what completed, and settle every promise the way the transaction went
     try {
       this.#store.write((txn) => {
-        for (const { ref, item } of pushes) this.#parkPushIn(txn, ref, item);
+        for (const { selector, item } of pushes) this.#parkPushIn(txn, selector, item);
         this.#tryLandIn(txn, dirty);
       });
     } catch (e: unknown) {
@@ -3698,8 +3799,8 @@ export class Engine<QX, FX, C, N = never> {
   /* one push of a backfill: what it delivered is parked, and the record carries the resume point
      it brought the download to.  The push that completes both halves makes the backfill ready, so
      it lands in this same transaction: complete on disk and landed commit together, or neither. */
-  #parkPushIn(txn: WTxn, ref: string, item: BackfillItem): void {
-    const entry = this.#backfills.get(ref)!;
+  #parkPushIn(txn: WTxn, selector: string, item: BackfillItem): void {
+    const entry = this.#backfills.get(selector)!;
     const record = entry.record;
 
     // the blob's length is for the status alone, and parks nothing
@@ -3715,48 +3816,49 @@ export class Engine<QX, FX, C, N = never> {
       record.resume = {
         position,
         skipBytes: 0,
+        checksum: '',
         fromPosition,
         snapshotDone: false,
         tailDone: false,
       };
-      txn.set(`!backfill-seqs:${ref}`, '.json', JS, seqs);
-    } else if ('values' in item) {
-      // park each value under this backfill's own range, and mark its stream
-      for (const [key, bytes] of item.values) {
-        // a key no slice declares is from a newer vocabulary, so it is dropped
-        const type = storeTypeOf(this.#reg, key);
-        if (type === undefined) continue;
-        txn.set(`!park-kv:${ref}!${key}`, type, MSGPACK, bytes);
-        this.#maybeMarkBackfilling(txn, key.slice(0, key.indexOf('!')), record.replacing);
+      txn.set(`!backfill-seqs:${selector}`, '.json', JS, seqs);
+
+      // the header names every slice the blob holds, so each is marked now
+      for (const slice of Object.keys(seqs)) {
+        this.#maybeMarkBackfilling(txn, slice, record.replacing);
       }
+    } else if ('page' in item) {
+      // park the page raw, keyed by the offset it starts at
+      txn.set(parkedPageKey(selector, record.resume!.skipBytes), '.page', MSGPACK, item.page);
       record.resume!.skipBytes = item.skip;
-    } else if ('valuesDone' in item) {
+      record.resume!.checksum = item.checksum;
+    } else if ('pagesDone' in item) {
       record.resume!.snapshotDone = true;
-    } else if ('events' in item) {
-      // park each event by stream and seq, and mark its stream
-      for (const ev of item.events) {
-        txn.set(parkedEventKey(ev.stream, ev.seq), '.event', MSGPACK, ev.raw);
-        this.#maybeMarkBackfilling(txn, ev.stream, record.replacing);
-        record.resume!.fromPosition = Math.max(record.resume!.fromPosition, ev.position);
+    } else if ('edits' in item) {
+      // park each edit by slice and seq, and mark its slice
+      for (const e of item.edits) {
+        txn.set(parkedEditKey(e.slice, e.seq), '.edits', MSGPACK, e.raw);
+        this.#maybeMarkBackfilling(txn, e.slice, record.replacing);
+        record.resume!.fromPosition = Math.max(record.resume!.fromPosition, e.position);
       }
       entry.scanned = Math.max(entry.scanned, item.scanned);
-    } else if ('eventsDone' in item) {
+    } else if ('editsDone' in item) {
       record.resume!.tailDone = true;
     } else {
       throw new Error('unexpected backfill item');
     }
 
     if (record.resume!.snapshotDone && record.resume!.tailDone) entry.status = 'ready';
-    txn.set(`!backfill:${ref}`, '.json', JS, record);
+    txn.set(`!backfill:${selector}`, '.json', JS, record);
   }
 
-  // an additive backfill leaves a held stream held and lands around it; a replacing one takes it
-  #maybeMarkBackfilling(txn: WTxn, stream: string, replacing: boolean): void {
-    const held = this.#streams.get(stream);
+  // an additive backfill leaves a held slice held and lands around it; a replacing one takes it
+  #maybeMarkBackfilling(txn: WTxn, slice: string, replacing: boolean): void {
+    const held = this.#slices.get(slice);
     if (held === 'backfill' || (typeof held === 'number' && !replacing)) return;
-    this.#streams.set(stream, 'backfill');
-    txn.set(`!seq:${stream}`, '.json', JS, 'backfill');
-    this.#episode?.resolved.delete(stream);
+    this.#slices.set(slice, 'backfill');
+    txn.set(`!seq:${slice}`, '.json', JS, 'backfill');
+    this.#episode?.resolved.delete(slice);
   }
 
   /* every queued outcome in one transaction.  Completion is known from the pushes themselves, so
@@ -3764,27 +3866,29 @@ export class Engine<QX, FX, C, N = never> {
   #onBackfillOutcomes(): void {
     this.#store.write((txn) => {
       while (this.#backfillOutcomes.length > 0) {
-        const { ref, outcome, conn } = this.#backfillOutcomes.shift()!;
+        const { selector, outcome, conn } = this.#backfillOutcomes.shift()!;
 
         // an outcome from a connection that has ended means nothing; the next connection
         // restarts the download
         if (conn !== this.#connectionAbort) continue;
 
         // was the backfill dropped while its outcome was queued?
-        const entry = this.#backfills.get(ref);
+        const entry = this.#backfills.get(selector);
         if (entry === undefined) continue;
 
         if (outcome === 'done') {
           entry.attempts = 0;
         } else if (outcome === 'stale') {
-          // the blob is gone: the parked values go, the parked events stay, and the download
+          // the blob is gone: the parked pages go, the parked edits stay, and the download
           // starts over under the same until
           entry.attempts = 0;
-          txn.delPrefix(`!park-kv:${ref}!`);
+          txn.delPrefix(`!park-snap:${selector}!`);
           const r = entry.record.resume;
-          if (r !== null) entry.record.resume = { ...r, skipBytes: 0, snapshotDone: false };
-          txn.set(`!backfill:${ref}`, '.json', JS, entry.record);
-          this.#startBackfill(ref);
+          if (r !== null) {
+            entry.record.resume = { ...r, skipBytes: 0, checksum: '', snapshotDone: false };
+          }
+          txn.set(`!backfill:${selector}`, '.json', JS, entry.record);
+          this.#startBackfill(selector);
         } else {
           // a rejection: ours, if the entry's signal fired, else a failure to retry after backoff
           if (entry.controller.signal.aborted) continue;
@@ -3795,8 +3899,8 @@ export class Engine<QX, FX, C, N = never> {
             entry.retryTimer = null;
             entry.retryAt = null;
             // the entry may have gone, or the Engine, while the timer ran
-            if (this.#backfills.get(ref) === entry && !this.#signal.aborted) {
-              this.#startBackfill(ref);
+            if (this.#backfills.get(selector) === entry && !this.#signal.aborted) {
+              this.#startBackfill(selector);
               this.#schedule();
             }
           }, delay);
@@ -3808,21 +3912,21 @@ export class Engine<QX, FX, C, N = never> {
   // one backfill() call on the current connection; its pushes and its outcome come back through
   // the advancer's queues.  Without a connection nothing starts, and the next connection restarts
   // every backfill that is still downloading.
-  #startBackfill(ref: string): void {
-    const entry = this.#backfills.get(ref)!;
+  #startBackfill(selector: string): void {
+    const entry = this.#backfills.get(selector)!;
     if (this.#connection === null) return;
     const conn = this.#connectionAbort;
     entry.status = 'downloading';
 
     // the backfill's cancellation is its own or the connection's
     const backfill: Backfill = {
-      ref,
+      selector,
       until: entry.record.until,
       resume: entry.record.resume,
       signal: host.AbortSignal.any([conn.signal, entry.controller.signal]),
       push: (item) =>
         new Promise<void>((resolve, reject) => {
-          this.#backfillWork.push({ ref, item, resolve, reject });
+          this.#backfillWork.push({ selector, item, resolve, reject });
           this.#schedule();
         }),
     };
@@ -3830,11 +3934,11 @@ export class Engine<QX, FX, C, N = never> {
     // the outcome is tagged with its connection, so a late one from an ended connection is known
     this.#connection.backfill(backfill).then(
       (outcome) => {
-        this.#backfillOutcomes.push({ ref, outcome, conn });
+        this.#backfillOutcomes.push({ selector, outcome, conn });
         this.#schedule();
       },
       (e: unknown) => {
-        this.#backfillOutcomes.push({ ref, outcome: { failed: e }, conn });
+        this.#backfillOutcomes.push({ selector, outcome: { failed: e }, conn });
         this.#schedule();
       },
     );
@@ -3842,130 +3946,131 @@ export class Engine<QX, FX, C, N = never> {
 
   /* Land what can land.  Chains are checked key-only before anything is written.  While a
      replacing backfill is in flight the base is frozen: nothing lands unless every replacing entry
-     is in a landing subtree and the frozen events chain, and then the frozen events land with
+     is in a landing subtree and the frozen edits chain, and then the frozen edits land with
      them, so this is the pass that unfreezes. */
   #tryLandIn(txn: WTxn, dirty: Record<string, true>): void {
     // the base is frozen while any replacing backfill is in flight
     const frozen = this.#replacing > 0;
 
     // check every ready child on its own, so a broken one restarts without waiting on its parent
-    for (const ref of [...this.#backfills.keys()]) {
-      const entry = this.#backfills.get(ref)!;
+    for (const selector of [...this.#backfills.keys()]) {
+      const entry = this.#backfills.get(selector)!;
       if (entry.parent === null || entry.status !== 'ready') continue;
-      const streams = this.#brokenStreamsIn(txn, ref);
-      if (streams.length > 0) this.#repairIn(txn, ref, streams);
+      const slices = this.#brokenSlicesIn(txn, selector);
+      if (slices.length > 0) this.#repairIn(txn, selector, slices);
     }
 
-    // check the frozen events; a break there is a gap on a held stream
+    // check the frozen edits; a break there is a gap on a held slice
     let frozenClean = true;
     if (frozen) {
-      const streams = this.#brokenStreamsIn(txn, null);
-      if (streams.length > 0) this.#repairIn(txn, null, streams);
-      frozenClean = streams.length === 0;
+      const slices = this.#brokenSlicesIn(txn, null);
+      if (slices.length > 0) this.#repairIn(txn, null, slices);
+      frozenClean = slices.length === 0;
     }
 
-    // check every top-level ref whose whole subtree is ready
+    // check every top-level selector whose whole subtree is ready
     const clean: string[] = [];
-    for (const ref of [...this.#backfills.keys()]) {
-      if (this.#backfills.get(ref)!.parent !== null || !this.#landable(ref)) continue;
-      const streams = this.#brokenStreamsIn(txn, ref);
-      if (streams.length > 0) {
-        // a broken seq chain: a stream with an entry restarts, one without becomes a child
-        this.#repairIn(txn, ref, streams);
+    for (const selector of [...this.#backfills.keys()]) {
+      if (this.#backfills.get(selector)!.parent !== null || !this.#landable(selector)) continue;
+      const slices = this.#brokenSlicesIn(txn, selector);
+      if (slices.length > 0) {
+        // a broken seq chain: a slice with an entry restarts, one without becomes a child
+        this.#repairIn(txn, selector, slices);
       } else {
-        clean.push(ref);
+        clean.push(selector);
       }
     }
 
     // frozen, and some replacing backfill is not landing in this pass?
     if (frozen) {
-      const landing = new Set(clean.flatMap((ref) => this.#subtree(ref)));
+      const landing = new Set(clean.flatMap((selector) => this.#subtree(selector)));
       const pending = [...this.#backfills].some(
-        ([ref, e]) => e.record.replacing && !landing.has(ref),
+        ([selector, e]) => e.record.replacing && !landing.has(selector),
       );
       // then nothing lands, or the base would show a partial replacement
       if (pending || !frozenClean) return;
     }
 
     // land every clean subtree
-    for (const ref of clean) this.#landRefIn(txn, ref, dirty);
+    for (const selector of clean) this.#landSelectorIn(txn, selector, dirty);
 
-    // frozen, so this is the unfreeze: the frozen events land and the base catches up
+    // frozen, so this is the unfreeze: the frozen edits land and the base catches up
     if (frozen) {
-      this.#reduceParkedIn(txn, null, {}, dirty);
-      this.#reducedTo(txn, this.#checkpoint?.position ?? -1);
+      this.#applyParkedIn(txn, null, {}, dirty);
+      this.#appliedTo(txn, this.#checkpoint?.position ?? -1);
     }
   }
 
-  // a ref's children that are still in flight
-  #childrenOf(ref: string): string[] {
-    return this.#backfills.get(ref)!.record.children.filter((c) => this.#backfills.has(c));
+  // a selector's children that are still in flight
+  #childrenOf(selector: string): string[] {
+    return this.#backfills.get(selector)!.record.children.filter((c) => this.#backfills.has(c));
   }
 
-  // a ref and every descendant
-  #subtree(ref: string): string[] {
-    return [ref, ...this.#childrenOf(ref).flatMap((c) => this.#subtree(c))];
+  // a selector and every descendant
+  #subtree(selector: string): string[] {
+    return [selector, ...this.#childrenOf(selector).flatMap((c) => this.#subtree(c))];
   }
 
-  // whether a ref's whole subtree has finished downloading
-  #landable(ref: string): boolean {
+  // whether a selector's whole subtree has finished downloading
+  #landable(selector: string): boolean {
     return (
-      this.#backfills.get(ref)!.status === 'ready' &&
-      this.#childrenOf(ref).every((c) => this.#landable(c))
+      this.#backfills.get(selector)!.status === 'ready' &&
+      this.#childrenOf(selector).every((c) => this.#landable(c))
     );
   }
 
-  // the parked event range of a ref, or of every stream for the frozen events (null)
-  #parkRange(ref: string | null, values: ScanRequest['values']): ScanRequest {
-    const match = ref === null ? null : { prefix: refPrefix(ref) };
-    return { pattern: engineKeys('park-ev', match), limit: 1000, values };
+  // the parked edit range of a selector, or of every slice for the frozen edits (null)
+  #parkRange(selector: string | null, values: ScanRequest['values']): ScanRequest {
+    const match = selector === null ? null : { prefix: selectorPrefix(selector) };
+    return { pattern: engineKeys('park-ed', match), limit: 1000, values };
   }
 
-  // a ref's blob header: the seq of every stream in its blob at the cut
-  #headerOf(txn: RTxn, ref: string): Record<string, number> {
-    return (txn.get(`!backfill-seqs:${ref}`, '.json', JS) ?? {}) as Record<string, number>;
+  // a selector's blob header: the seq of every slice in its blob at the cut
+  #headerOf(txn: RTxn, selector: string): Record<string, number> {
+    return (txn.get(`!backfill-seqs:${selector}`, '.json', JS) ?? {}) as Record<string, number>;
   }
 
-  // a subtree's seqs at its cuts: the ref's header with each child's laid over it, deepest winning
-  #mergedHeaderIn(txn: RTxn, ref: string): Record<string, number> {
-    let header = this.#headerOf(txn, ref);
-    for (const child of this.#childrenOf(ref)) {
+  // a subtree's seqs at its cuts: the selector's header with each child's laid over it, deepest
+  // winning
+  #mergedHeaderIn(txn: RTxn, selector: string): Record<string, number> {
+    let header = this.#headerOf(txn, selector);
+    for (const child of this.#childrenOf(selector)) {
       header = { ...header, ...this.#mergedHeaderIn(txn, child) };
     }
     return header;
   }
 
-  /* The streams among a subtree's parked events, or among the frozen events (null), whose chain
-     does not continue from the state that will be in place.  Key-only while a chain continues; a
-     gap reads the stream's values once, since a reset after it mends it, and so does the cut for
-     a stream no blob names. */
-  #brokenStreamsIn(txn: RTxn, ref: string | null): string[] {
-    const header = ref === null ? {} : this.#mergedHeaderIn(txn, ref);
+  /* The slices among a subtree's parked edits, or among the frozen edits (null), whose chain does
+     not continue from the state that will be in place.  Key-only while a chain continues; a gap
+     reads the slice's envelopes once, since a reset after it mends it, and so does the cut for a
+     slice no blob names. */
+  #brokenSlicesIn(txn: RTxn, selector: string | null): string[] {
+    const header = selector === null ? {} : this.#mergedHeaderIn(txn, selector);
     const broken: string[] = [];
-    let range = this.#parkRange(ref, false);
-    let stream = '';
+    let range = this.#parkRange(selector, false);
+    let slice = '';
     let last = 0;
-    // whether the stream was judged at a gap, which settles the rest of its run
+    // whether the slice was judged at a gap, which settles the rest of its run
     let judged = false;
 
-    // walk the parked keys in stream then seq order
+    // walk the parked keys in slice then seq order
     for (;;) {
       const { entries, next } = txn.scan(range);
       for (const [key] of entries) {
         const park = parsePark(key);
-        const held = this.#streams.get(park.stream);
+        const held = this.#slices.get(park.slice);
 
-        // a stream under some other backfill is not ours to check
-        if (ref === null && held === 'backfill') continue;
+        // a slice under some other backfill is not ours to check
+        if (selector === null && held === 'backfill') continue;
 
-        // a new stream: its base is the newest state in place, the held seq or the cut
-        if (park.stream !== stream) {
-          stream = park.stream;
-          last = Math.max(typeof held === 'number' ? held : 0, header[stream] ?? 0);
+        // a new slice: its base is the newest state in place, the held seq or the cut
+        if (park.slice !== slice) {
+          slice = park.slice;
+          last = Math.max(typeof held === 'number' ? held : 0, header[slice] ?? 0);
           judged = false;
         }
 
-        // at or below the base, the snapshot covers this event
+        // at or below the base, the snapshot covers this edit
         if (judged || park.seq <= last) continue;
 
         // does the chain continue?
@@ -3974,322 +4079,312 @@ export class Engine<QX, FX, C, N = never> {
           continue;
         }
 
-        // a gap: the run's values settle the stream, once
+        // a gap: the run's envelopes settle the slice, once
         judged = true;
-        const cut = this.#cutOf(ref, header, stream);
-        if (!this.#mendsIn(txn, stream, park.seq, cut)) broken.push(stream);
+        const cut = this.#cutOf(selector, header, slice);
+        if (!this.#mendsIn(txn, slice, park.seq, cut)) broken.push(slice);
       }
       if (next === null) return broken;
       range = { ...range, after: next };
     }
   }
 
-  /* Whether a stream's parked run holds past a gap at gapSeq, walking its values backwards from
-     the newest: it does when a reset follows the gap and the events after that reset chain, since
-     nothing before a reset is reduced, or when the whole run from the gap on lies at or below cut,
-     which covers it. */
-  #mendsIn(txn: RTxn, stream: string, gapSeq: number, cut: number | null): boolean {
+  /* Whether a slice's parked run holds past a gap at gapSeq, walking its envelopes backwards from
+     the newest: it does when a reset follows the gap and the edits after that reset chain, since
+     nothing before a reset survives it, or when the whole run from the gap on lies at or below
+     cut, which covers it. */
+  #mendsIn(txn: RTxn, slice: string, gapSeq: number, cut: number | null): boolean {
     let range: ScanRequest = {
-      pattern: engineKeys('park-ev', { prefix: `${stream}!` }),
+      pattern: engineKeys('park-ed', { prefix: `${slice}!` }),
       reverse: true,
       limit: 1000,
-      values: { type: '.event', rep: JS },
+      values: { type: '.edits', rep: JS },
     };
-    // the seq the next event walked must have, and whether the newest lies at or below the cut
+    // the seq the next edit walked must have, and whether the newest lies at or below the cut
     let expected: number | null = null;
     let covered = false;
     for (;;) {
       const { entries, next } = txn.scan(range);
       for (const [, value] of entries) {
-        const ev = value as DbEvent<unknown>;
+        const env = value as EditEnvelope;
         if (expected === null) {
-          covered = cut !== null && ev.position <= cut;
-        } else if (ev.seq !== expected) {
+          covered = cut !== null && env.position <= cut;
+        } else if (env.seq !== expected) {
           return false;
         }
-        expected = ev.seq - 1;
-        if (sysOf(ev.data) !== null) return true;
-        if (ev.seq === gapSeq) return covered;
+        expected = env.seq - 1;
+        if (env.lifecycle !== 'normal') return true;
+        if (env.seq === gapSeq) return covered;
       }
       if (next === null) return false;
       range = { ...range, after: next };
     }
   }
 
-  /* The cut covering a stream that no blob of a subtree names: the newest among the subtree's
-     entries whose ref covers it, each of which found the stream dead or unborn at its cut.  Null
-     for a stream some blob names or that is held, whose seq is its base, and among the frozen
-     events (null). */
-  #cutOf(ref: string | null, header: Record<string, number>, stream: string): number | null {
-    if (ref === null || stream in header) return null;
-    if (typeof this.#streams.get(stream) === 'number') return null;
+  /* The cut covering a slice that no blob of a subtree names: the newest among the subtree's
+     entries whose selector covers it, each of which found the slice deleted or unborn at its cut.
+     Null for a slice some blob names or that is held, whose seq is its base, and among the frozen
+     edits (null). */
+  #cutOf(selector: string | null, header: Record<string, number>, slice: string): number | null {
+    if (selector === null || slice in header) return null;
+    if (typeof this.#slices.get(slice) === 'number') return null;
     let cut: number | null = null;
-    for (const r of this.#subtree(ref)) {
+    for (const r of this.#subtree(selector)) {
       const position = this.#backfills.get(r)!.record.resume?.position;
-      if (position === undefined || !refCovers(r, stream)) continue;
+      if (position === undefined || !selectorCovers(r, slice)) continue;
       if (cut === null || position > cut) cut = position;
     }
     return cut;
   }
 
-  // a broken stream with an entry restarts it; the rest become children of the ref checked, or
-  // top-level replacing backfills for a break among the frozen events (null), which is a gap on a
-  // held stream
-  #repairIn(txn: WTxn, ref: string | null, streams: string[]): void {
+  // a broken slice with an entry restarts it; the rest become children of the selector checked, or
+  // top-level replacing backfills for a break among the frozen edits (null), which is a gap on a
+  // held slice
+  #repairIn(txn: WTxn, selector: string | null, slices: string[]): void {
     const fresh: string[] = [];
-    for (const stream of streams) {
-      if (this.#backfills.has(stream)) {
-        this.#restartIn(txn, stream);
+    for (const slice of slices) {
+      if (this.#backfills.has(slice)) {
+        this.#restartIn(txn, slice);
       } else {
-        fresh.push(stream);
+        fresh.push(slice);
       }
     }
     if (fresh.length > 0) {
-      const replacing = ref === null || this.#backfills.get(ref)!.record.replacing;
-      this.#spawnIn(txn, ref, fresh, this.#checkpoint?.position ?? 0, replacing);
+      const replacing = selector === null || this.#backfills.get(selector)!.record.replacing;
+      this.#spawnIn(txn, selector, fresh, this.#checkpoint?.position ?? 0, replacing);
     }
   }
 
-  // a top-level ref's subtree lands as one
-  #landRefIn(txn: WTxn, ref: string, dirty: Record<string, true>): void {
-    const header = this.#mergedHeaderIn(txn, ref);
-    const subtree = this.#subtree(ref);
+  // a top-level selector's subtree lands as one
+  #landSelectorIn(txn: WTxn, selector: string, dirty: Record<string, true>): void {
+    const header = this.#mergedHeaderIn(txn, selector);
 
-    // per stream under the ref, the newest state wins
+    // per slice under the selector, the newest state wins
     const kept = new Set<string>();
-    for (const [stream, held] of this.#streams) {
-      if (!refCovers(ref, stream)) continue;
-      if (typeof held === 'number' && held >= (header[stream] ?? 0)) {
-        // a held stream at or past the cut keeps its state, and the blob values for it go
-        kept.add(stream);
-        delete header[stream];
-        for (const r of subtree) txn.delPrefix(`!park-kv:${r}!${stream}!`);
+    for (const [slice, held] of this.#slices) {
+      if (!selectorCovers(selector, slice)) continue;
+      if (typeof held === 'number' && held >= (header[slice] ?? 0)) {
+        // a held slice at or past the cut keeps its state, and the snapshots skip it
+        kept.add(slice);
+        delete header[slice];
       } else {
-        // otherwise the stream loses its state to the blob
-        markDirty(dirty, txn.delPrefix(`${stream}!`));
+        // otherwise the slice loses its state to the snapshot
+        markDirty(dirty, txn.delPrefix(`${slice}!`));
 
-        // a stream no blob names was dead or unborn at the cut, so it leaves the streams table;
-        // its parked events, if any, hold it again as they reduce
-        if (!(stream in header)) {
-          this.#streams.delete(stream);
-          txn.del(`!seq:${stream}`);
+        // a slice no blob names was deleted or unborn at the cut, so it leaves the slices table;
+        // its parked edits, if any, hold it again as they apply
+        if (!(slice in header)) {
+          this.#slices.delete(slice);
+          txn.del(`!seq:${slice}`);
         }
       }
     }
 
-    // move the values in, reduce the parked events onto them, and forget the subtree
-    this.#moveValuesIn(txn, ref, dirty, kept);
-    this.#reduceParkedIn(txn, ref, header, dirty);
-    this.#dropIn(txn, ref);
+    // apply the snapshots, apply the parked edits onto them, and forget the subtree
+    this.#applySnapshotsIn(txn, selector, dirty, [...kept]);
+    this.#applyParkedIn(txn, selector, header, dirty);
+    this.#dropIn(txn, selector);
   }
 
-  // a ref's parked values move into place, then each child's over them for the streams in the
-  // child's blob, the deepest winning; a kept stream is never touched
-  #moveValuesIn(txn: WTxn, ref: string, dirty: Record<string, true>, kept: Set<string>): void {
-    markDirty(dirty, txn.move(`!park-kv:${ref}!`, ''));
-    for (const child of this.#childrenOf(ref)) {
-      // clear the parent's values for the child's streams, so a key the child's blob lacks goes too
-      for (const stream of Object.keys(this.#headerOf(txn, child))) {
-        if (!kept.has(stream)) markDirty(dirty, txn.delPrefix(`${stream}!`));
+  // a selector's snapshot applies, then each child's over it for the slices in the child's blob,
+  // the deepest winning; a kept slice is never touched
+  #applySnapshotsIn(
+    txn: WTxn,
+    selector: string,
+    dirty: Record<string, true>,
+    kept: string[],
+  ): void {
+    markDirty(dirty, txn.applySnapshot(selector, kept));
+    for (const child of this.#childrenOf(selector)) {
+      // clear the parent's values for the child's slices, so a key the child's blob lacks goes too
+      for (const slice of Object.keys(this.#headerOf(txn, child))) {
+        if (!kept.includes(slice)) markDirty(dirty, txn.delPrefix(`${slice}!`));
       }
-      this.#moveValuesIn(txn, child, dirty, kept);
+      this.#applySnapshotsIn(txn, child, dirty, kept);
     }
   }
 
-  // every in-flight top-level ref that a new ref covers becomes its child
-  #adoptChildrenIn(txn: WTxn, ref: string): void {
-    const entry = this.#backfills.get(ref)!;
+  // every in-flight top-level selector that a new selector covers becomes its child
+  #adoptChildrenIn(txn: WTxn, selector: string): void {
+    const entry = this.#backfills.get(selector)!;
     for (const [other, e] of this.#backfills) {
-      if (other === ref || e.parent !== null || !refCovers(ref, other)) continue;
-      e.parent = ref;
+      if (other === selector || e.parent !== null || !selectorCovers(selector, other)) continue;
+      e.parent = selector;
       entry.record.children.push(other);
     }
-    txn.set(`!backfill:${ref}`, '.json', JS, entry.record);
+    txn.set(`!backfill:${selector}`, '.json', JS, entry.record);
   }
 
-  // a replacing ref takes every held stream under it, so their events park from here
-  #markUnderIn(txn: WTxn, ref: string): void {
-    for (const [stream, held] of this.#streams) {
-      if (typeof held === 'number' && refCovers(ref, stream)) {
-        this.#maybeMarkBackfilling(txn, stream, true);
+  // a replacing selector takes every held slice under it, so their edits park from here
+  #markUnderIn(txn: WTxn, selector: string): void {
+    for (const [slice, held] of this.#slices) {
+      if (typeof held === 'number' && selectorCovers(selector, slice)) {
+        this.#maybeMarkBackfilling(txn, slice, true);
       }
     }
   }
 
-  // a landed subtree's records and entries go
-  #dropIn(txn: WTxn, ref: string): void {
-    for (const child of this.#childrenOf(ref)) this.#dropIn(txn, child);
-    txn.del(`!backfill:${ref}`);
-    txn.del(`!backfill-seqs:${ref}`);
-    const entry = this.#backfills.get(ref)!;
-    this.#backfills.delete(ref);
+  // a landed subtree's records, parked pages, and entries go
+  #dropIn(txn: WTxn, selector: string): void {
+    for (const child of this.#childrenOf(selector)) this.#dropIn(txn, child);
+    txn.del(`!backfill:${selector}`);
+    txn.del(`!backfill-seqs:${selector}`);
+    txn.delPrefix(`!park-snap:${selector}!`);
+    const entry = this.#backfills.get(selector)!;
+    this.#backfills.delete(selector);
     if (entry.record.replacing) this.#replacing--;
   }
 
-  /* Reduce the parked events of a subtree, or of every stream under no backfill for the frozen
-     events (null), each stream's run in one reducer call, then clear each walked stream's range.
-     Chains were checked before any write.  Every landed stream's seq is written once: the last
-     walked for a stream with events, covered ones included, the cut's for a header stream
-     without. */
-  #reduceParkedIn(
+  /* Apply the parked edits of a subtree, or of every slice under no backfill for the frozen edits
+     (null), each slice's run in one store call, then clear each walked slice's range.  Chains were
+     checked before any write.  Every landed slice's seq is written once: the last walked for a
+     slice with edits, covered ones included, the cut's for a header slice without; a slice whose
+     last edit walked is a death is forgotten instead. */
+  #applyParkedIn(
     txn: WTxn,
-    ref: string | null,
+    selector: string | null,
     header: Record<string, number>,
     dirty: Record<string, true>,
   ): void {
-    // {stream: seq}, the header seqs, then the last seq walked
+    // {slice: seq}, the header seqs, then the last seq walked, and the slices whose last edit
+    // walked is a death
     const seqs = new Map(Object.entries(header));
+    const dead = new Set<string>();
     const walked: string[] = [];
-    let range = this.#parkRange(ref, { type: '.event', rep: JS });
-    let stream = '';
-    let run: DbEvent<unknown>[] = [];
-    // the cut covering the stream, for one no blob names
+    let range = this.#parkRange(selector, { type: '.edits', rep: JS });
+    let slice = '';
+    // the run to apply: the seq it starts from, its first edit's or its last reset's
+    let from: number | null = null;
+    // the cut covering the slice, for one no blob names
     let cut: number | null = null;
 
-    // walk the parked events in stream then seq order, reducing each stream's run as it ends
+    // walk the parked envelopes in slice then seq order, applying each slice's run as it ends
     for (;;) {
       const { entries, next } = txn.scan(range);
       for (const [, value] of entries) {
-        const ev = value as DbEvent<unknown>;
-        const held = this.#streams.get(ev.stream);
+        const env = value as EditEnvelope;
+        const held = this.#slices.get(env.slice);
 
-        // a stream under some other backfill is not ours to land
-        if (ref === null && held === 'backfill') continue;
+        // a slice under some other backfill is not ours to land
+        if (selector === null && held === 'backfill') continue;
 
-        // a new stream: reduce the last run, and start from the newest state in place
-        if (ev.stream !== stream) {
-          if (run.length > 0) this.#reduceStreamIn(txn, stream, run, dirty);
-          stream = ev.stream;
-          run = [];
-          walked.push(stream);
-          seqs.set(stream, Math.max(typeof held === 'number' ? held : 0, seqs.get(stream) ?? 0));
-          cut = this.#cutOf(ref, header, stream);
+        // a new slice: apply the last run, and start from the newest state in place
+        if (env.slice !== slice) {
+          if (from !== null) markDirty(dirty, txn.applyParked(slice, from));
+          slice = env.slice;
+          from = null;
+          walked.push(slice);
+          seqs.set(slice, Math.max(typeof held === 'number' ? held : 0, seqs.get(slice) ?? 0));
+          cut = this.#cutOf(selector, header, slice);
         }
 
-        // at or below the base, the snapshot covers this event; so does the cut, for a stream no
-        // blob names, and the stream is held at the covered seq
-        if (ev.seq <= seqs.get(stream)!) continue;
-        seqs.set(stream, ev.seq);
-        if (cut !== null && ev.position <= cut) continue;
-        run.push(ev);
+        // at or below the base, the snapshot covers this edit; so does the cut, for a slice no
+        // blob names, and the slice is held at the covered seq
+        if (env.seq <= seqs.get(slice)!) continue;
+        seqs.set(slice, env.seq);
+        if (env.lifecycle === 'death') {
+          dead.add(slice);
+        } else {
+          dead.delete(slice);
+        }
+        if (cut !== null && env.position <= cut) continue;
+
+        // the edit joins the run, which starts over at a reset
+        this.#roundTrip(txn, env.id);
+        if (from === null || env.lifecycle !== 'normal') from = env.seq;
       }
       if (next === null) break;
       range = { ...range, after: next };
     }
-    if (run.length > 0) this.#reduceStreamIn(txn, stream, run, dirty);
+    if (from !== null) markDirty(dirty, txn.applyParked(slice, from));
 
-    // clear only the streams walked; a skipped stream's events stay for its own backfill's land
-    for (const name of walked) txn.delPrefix(`!park-ev:${name}!`);
+    // clear only the slices walked; a skipped slice's edits stay for its own backfill's land
+    for (const name of walked) txn.delPrefix(`!park-ed:${name}!`);
 
-    // hold every landed stream at its new seq
+    // hold every landed slice at its new seq, and forget every dead one
     for (const [name, seq] of seqs) {
-      this.#streams.set(name, seq);
-      txn.set(`!seq:${name}`, '.json', JS, seq);
+      if (dead.has(name)) {
+        this.#forgetIn(txn, name);
+      } else {
+        this.#slices.set(name, seq);
+        txn.set(`!seq:${name}`, '.json', JS, seq);
+      }
       this.#resolve(name);
     }
   }
 
-  /* One stream's run of events, in order, through its slice's reducer.  Births and deaths are the
-     Engine's: either is a reset, after which the stream's state is empty whatever came before, so
-     a reset drops the stream's keys, nothing before the run's last reset reaches a reducer, and
-     the stream stays known so a rebirth chains.  This is where events enter the base, so an event
-     carrying the id of an outbox or @online command is that command's round trip, whichever path
-     parked or delivered it. */
-  #reduceStreamIn(
-    txn: WTxn,
-    stream: string,
-    events: DbEvent<unknown>[],
-    dirty: Record<string, true>,
-  ): void {
-    // the server sends nothing outside the wants, and the wants are the families with reducers
-    const slice = this.#reducers[stream.split(':')[0]];
-    if (slice === undefined) throw new Error(`no reducer for ${stream}`);
-    const data: unknown[] = [];
-
-    // the run's last reset, if any
-    let from = 0;
-    for (let i = events.length - 1; i >= 0; i--) {
-      if (sysOf(events[i].data) !== null) {
-        from = i;
-        break;
-      }
-    }
-
-    for (let i = 0; i < events.length; i++) {
-      const ev = events[i];
-
-      // our own command's event: the round trip is observed
-      if (this.#outbox.has(ev.id)) this.#releaseIn(txn, [ev.id]);
-      const online = this.#online.get(ev.id);
-      if (online !== undefined) online.seen = true;
-
-      if (i < from) continue;
-      if (sysOf(ev.data) !== null) {
-        // the last reset: the stream's state is empty from here
-        markDirty(dirty, txn.delPrefix(`${stream}!`));
-      } else {
-        data.push(ev.data);
-      }
-    }
-    if (data.length > 0) slice.reducer(reducerTxn(txn, stream, dirty), data, stream, false);
+  // a dead slice leaves the slices table, so a birth chains on it from empty and any other edit
+  // is a missed start
+  #forgetIn(txn: WTxn, slice: string): void {
+    this.#slices.delete(slice);
+    txn.del(`!seq:${slice}`);
   }
 
-  // a ref whose tail did not reach its parked live events downloads again from a fresh snapshot,
-  // whose cut is past the gap; the parked events stay and chain from the live cut
-  #restartIn(txn: WTxn, ref: string): void {
-    const entry = this.#backfills.get(ref)!;
-    txn.delPrefix(`!park-kv:${ref}!`);
+  /* An edit entering the base, live or parked: one carrying the id of an outbox or @online
+     mutation is that mutation's round trip, whichever path delivered it. */
+  #roundTrip(txn: WTxn, id: string): void {
+    if (this.#outbox.has(id)) this.#releaseIn(txn, [id]);
+    const online = this.#online.get(id);
+    if (online !== undefined) online.seen = true;
+  }
+
+  // a selector whose tail did not reach its parked live edits downloads again from a fresh
+  // snapshot, whose cut is past the gap; the parked edits stay and chain from the live cut
+  #restartIn(txn: WTxn, selector: string): void {
+    const entry = this.#backfills.get(selector)!;
+    txn.delPrefix(`!park-snap:${selector}!`);
     entry.record.resume = null;
     entry.status = 'downloading';
     entry.attempts = 0;
-    txn.set(`!backfill:${ref}`, '.json', JS, entry.record);
-    this.#startBackfill(ref);
+    txn.set(`!backfill:${selector}`, '.json', JS, entry.record);
+    this.#startBackfill(selector);
   }
 
-  // new backfills, each downloading at once into its own values range; with a parent they are
+  // new backfills, each downloading at once into its own parked range; with a parent they are
   // its children, and it lands when they have too
   #spawnIn(
     txn: WTxn,
     parent: string | null,
-    refs: string[],
+    selectors: string[],
     until: number,
     replacing: boolean,
   ): void {
-    for (const ref of refs) {
+    for (const selector of selectors) {
       const record: BackfillRecord = { until, resume: null, replacing, children: [] };
-      txn.set(`!backfill:${ref}`, '.json', JS, record);
-      this.#backfills.set(ref, newBackfillEntry(record, parent));
+      txn.set(`!backfill:${selector}`, '.json', JS, record);
+      this.#backfills.set(selector, newBackfillEntry(record, parent));
       if (replacing) this.#replacing++;
 
-      // a stream ref is marked; a family has nothing to mark until its blob names its members
-      if (!ref.endsWith('*')) this.#maybeMarkBackfilling(txn, ref, replacing);
-      if (replacing) this.#markUnderIn(txn, ref);
-      this.#startBackfill(ref);
+      // an exact selector's slice is marked; a prefix selector has nothing to mark until its blob
+      // names its slices
+      if (!selector.endsWith('*')) this.#maybeMarkBackfilling(txn, selector, replacing);
+      if (replacing) this.#markUnderIn(txn, selector);
+      this.#startBackfill(selector);
     }
 
     if (parent !== null) {
       const p = this.#backfills.get(parent)!;
-      p.record.children.push(...refs);
+      p.record.children.push(...selectors);
       txn.set(`!backfill:${parent}`, '.json', JS, p.record);
     }
   }
 
-  // an in-flight backfill ends: its download is aborted, its values range and records go, and its
+  // an in-flight backfill ends: its download is aborted, its parked pages and records go, and its
   // children carry on under the parent they have left, if any
-  #dropBackfillIn(txn: WTxn, ref: string): void {
-    const entry = this.#backfills.get(ref)!;
+  #dropBackfillIn(txn: WTxn, selector: string): void {
+    const entry = this.#backfills.get(selector)!;
     entry.controller.abort();
     if (entry.retryTimer !== null) host.clearTimeout(entry.retryTimer);
-    txn.delPrefix(`!park-kv:${ref}!`);
-    txn.del(`!backfill:${ref}`);
-    txn.del(`!backfill-seqs:${ref}`);
-    this.#backfills.delete(ref);
+    txn.delPrefix(`!park-snap:${selector}!`);
+    txn.del(`!backfill:${selector}`);
+    txn.del(`!backfill-seqs:${selector}`);
+    this.#backfills.delete(selector);
     if (entry.record.replacing) this.#replacing--;
 
     // leave the parent's children list
     if (entry.parent !== null) {
       const p = this.#backfills.get(entry.parent)!;
-      p.record.children = p.record.children.filter((c) => c !== ref);
+      p.record.children = p.record.children.filter((c) => c !== selector);
       txn.set(`!backfill:${entry.parent}`, '.json', JS, p.record);
     }
 
@@ -4305,12 +4400,12 @@ export class Engine<QX, FX, C, N = never> {
     }
   }
 
-  // a stream leaves the Engine: its state, its seq, and its parked events
-  #dropStreamIn(txn: WTxn, stream: string, dirty: Record<string, true>): void {
-    markDirty(dirty, txn.delPrefix(`${stream}!`));
-    txn.del(`!seq:${stream}`);
-    txn.delPrefix(`!park-ev:${stream}!`);
-    this.#streams.delete(stream);
+  // a slice leaves the Engine: its state, its seq, and its parked edits
+  #dropSliceIn(txn: WTxn, slice: string, dirty: Record<string, true>): void {
+    markDirty(dirty, txn.delPrefix(`${slice}!`));
+    txn.del(`!seq:${slice}`);
+    txn.delPrefix(`!park-ed:${slice}!`);
+    this.#slices.delete(slice);
   }
 
   // every queued item, in arrival order, in one transaction; the connection's end is not a store
@@ -4332,15 +4427,15 @@ export class Engine<QX, FX, C, N = never> {
       while (this.#inbox.length > 0 && !('end' in this.#inbox[0])) {
         const item = this.#inbox.shift()!;
 
-        // any frame after the open confirms the ref list: a view replaces it, and any other
+        // any frame after the open confirms the selector list: a view replaces it, and any other
         // frame means the token presented was current
         if (!('open' in item)) this.#confirmed = true;
 
-        if ('events' in item) {
-          this.#onEventsIn(txn, item.events, dirty);
+        if ('edits' in item) {
+          this.#onEditsIn(txn, item.edits, dirty);
         } else if ('open' in item) {
           // a different epoch is a replaced log, where the positions we hold mean nothing.
-          // Dropping everything and backfilling every ref is the answer, and until that exists
+          // Dropping everything and backfilling every selector is the answer, and until that exists
           // this ends.
           const { epoch, head } = item.open;
           if (this.#checkpoint !== null && this.#checkpoint.epoch !== epoch) {
@@ -4359,13 +4454,13 @@ export class Engine<QX, FX, C, N = never> {
       }
     });
 
-    // history is done: the backoff starts over, and the replay has proven every held stream that
+    // history is done: the backoff starts over, and the replay has proven every held slice that
     // no backfill has taken
     if (wentLive) {
       this.#live = true;
       this.#attempt = 0;
-      for (const [stream, held] of this.#streams) {
-        if (typeof held === 'number') this.#resolve(stream);
+      for (const [slice, held] of this.#slices) {
+        if (typeof held === 'number') this.#resolve(slice);
       }
     }
 
@@ -4374,101 +4469,116 @@ export class Engine<QX, FX, C, N = never> {
     this.#refresh(dirty, revoked);
   }
 
-  // one atom's events; each event reduces or parks by a streams-table lookup
-  #onEventsIn(txn: WTxn, events: WireEvent[], dirty: Record<string, true>): void {
-    // {stream: seq} for every held stream that advanced, and {stream: events} to reduce
+  // one frame's edits; each applies or parks by a slices-table lookup
+  #onEditsIn(txn: WTxn, edits: WireEdit[], dirty: Record<string, true>): void {
+    // {slice: seq} for every held slice that advanced, and {slice: edits} to apply
     const seqs = new Map<string, number>();
-    const runs = new Map<string, DbEvent<unknown>[]>();
-    // streams born in this atom: held ones are in seqs, parked ones here
+    const runs = new Map<string, WireEdit[]>();
+    // slices born in this frame: held ones are in seqs, parked ones here
     const born = new Set<string>();
-    let reduced = this.#reduced;
+    let applied = this.#applied;
 
-    // route each event
-    for (let i = 0; i < events.length; i++) {
-      const ev = events[i];
-      const held = this.#streams.get(ev.stream);
+    // route each edit
+    for (let i = 0; i < edits.length; i++) {
+      const e = edits[i];
+      const reset = e.lifecycle !== 'normal';
+      const held = this.#slices.get(e.slice);
       let park = held === 'backfill';
-      let decoded: DbEvent<unknown> | null = null;
 
-      // an unknown stream?
-      if (held === undefined && !seqs.has(ev.stream) && !born.has(ev.stream)) {
-        const parent = this.#parentOf(ev.stream);
+      // an unknown slice?
+      if (held === undefined && !seqs.has(e.slice) && !born.has(e.slice)) {
+        const parent = this.#parentOf(e.slice);
         if (parent !== null) {
-          // under an in-flight ref, whose land will chain it: mark it and park
+          // under an in-flight selector, whose land will chain it: mark it and park
           const replacing = this.#backfills.get(parent)!.record.replacing;
-          this.#maybeMarkBackfilling(txn, ev.stream, replacing);
+          this.#maybeMarkBackfilling(txn, e.slice, replacing);
           park = true;
-        } else {
-          // a reset starts the stream afresh below; any other event is one we missed the birth
-          // of, so the stream is backfilled on its own, and the event parks
-          decoded = this.#decode(ev);
-          if (sysOf(decoded.data) === null) {
-            this.#spawnIn(txn, null, [ev.stream], ev.position, false);
-            park = true;
-          }
+        } else if (!reset) {
+          // a reset starts the slice afresh below; a normal edit is one we missed the birth of,
+          // so the slice is backfilled on its own, and the edit parks
+          this.#spawnIn(txn, null, [e.slice], e.position, false);
+          park = true;
         }
       }
 
       // frozen, so everything else parks too
       if (!park && this.#replacing > 0) {
         park = true;
-        if (held === undefined) born.add(ev.stream);
+        if (held === undefined) born.add(e.slice);
       }
 
-      // a held stream, or an unknown one's reset: does the event chain?
+      // a held slice, or an unknown one's reset: does the edit chain?
       if (!park) {
-        const last = seqs.get(ev.stream) ?? (typeof held === 'number' ? held : 0);
-        if (ev.seq <= last) continue;
-        if (decoded === null) decoded = this.#decode(ev);
+        const last = seqs.get(e.slice) ?? (typeof held === 'number' ? held : 0);
+        if (e.seq <= last) continue;
 
-        /* The next event chains.  So does a reset at any seq above the last, since the stream's
-           state is empty after it whatever was missed, and so does an event that a reset follows
-           within this atom, since the run's reduction starts at its last reset.  The event joins
-           the stream's run, and proves the stream needs no backfill. */
-        if (ev.seq === last + 1 || sysOf(decoded.data) !== null || this.#resetAhead(events, i)) {
-          seqs.set(ev.stream, ev.seq);
-          this.#resolve(ev.stream);
-          if (!runs.has(ev.stream)) runs.set(ev.stream, []);
-          runs.get(ev.stream)!.push(decoded);
-          reduced = ev.position;
+        /* The next edit chains.  So does a reset at any seq above the last, since the slice's
+           state is empty after it whatever was missed, and so does an edit that a reset follows
+           within this frame, since the run applies from its last reset.  The edit joins the
+           slice's run, and proves the slice needs no backfill. */
+        if (e.seq === last + 1 || reset || this.#resetAhead(edits, i)) {
+          seqs.set(e.slice, e.seq);
+          this.#resolve(e.slice);
+          if (!runs.has(e.slice)) runs.set(e.slice, []);
+          runs.get(e.slice)!.push(e);
+          applied = e.position;
+
+          // a death forgets the slice at once, so its next edit in this frame is an unknown
+          // slice's, as it would be in a later frame
+          if (e.lifecycle === 'death') {
+            seqs.delete(e.slice);
+            this.#forgetIn(txn, e.slice);
+          }
           continue;
         }
 
-        // a gap: replace the stream, under the in-flight ref covering it if any, and park
-        this.#spawnIn(txn, this.#parentOf(ev.stream), [ev.stream], ev.position, true);
-        seqs.delete(ev.stream);
+        // a gap: replace the slice, under the in-flight selector covering it if any, and park
+        this.#spawnIn(txn, this.#parentOf(e.slice), [e.slice], e.position, true);
+        seqs.delete(e.slice);
         park = true;
       }
 
-      txn.set(parkedEventKey(ev.stream, ev.seq), '.event', MSGPACK, ev.raw);
+      txn.set(parkedEditKey(e.slice, e.seq), '.edits', MSGPACK, e.raw);
     }
 
-    // reduce each stream's run and hold it at its new seq
-    for (const [stream, run] of runs) this.#reduceStreamIn(txn, stream, run, dirty);
-    for (const [stream, seq] of seqs) {
-      this.#streams.set(stream, seq);
-      txn.set(`!seq:${stream}`, '.json', JS, seq);
+    // each run is its mutations' round trips, and applies from its last reset, since nothing
+    // before a reset survives it
+    const apply: WireEdit[] = [];
+    for (const run of runs.values()) {
+      let from = 0;
+      run.forEach((e, i) => {
+        this.#roundTrip(txn, e.id);
+        if (e.lifecycle !== 'normal') from = i;
+      });
+      apply.push(...run.slice(from));
+    }
+    if (apply.length > 0) markDirty(dirty, txn.applyEdits(apply));
+
+    // hold each slice at its new seq
+    for (const [slice, seq] of seqs) {
+      this.#slices.set(slice, seq);
+      txn.set(`!seq:${slice}`, '.json', JS, seq);
     }
 
-    // an atom that froze part way reduced up to the event before the gap
-    const last = events[events.length - 1].position;
-    this.#reducedTo(txn, this.#replacing > 0 ? reduced : last);
+    // a frame that froze part way applied up to the edit before the gap
+    const last = edits[edits.length - 1].position;
+    this.#appliedTo(txn, this.#replacing > 0 ? applied : last);
     this.#advanceCursorIn(txn, last);
   }
 
-  // whether a reset for the event's stream follows it within its atom
-  #resetAhead(events: WireEvent[], i: number): boolean {
-    for (let j = i + 1; j < events.length; j++) {
-      const e = events[j];
-      if (e.stream === events[i].stream && sysOf(this.#decode(e).data) !== null) return true;
+  // whether a reset of the edit's slice follows it within its frame
+  #resetAhead(edits: WireEdit[], i: number): boolean {
+    for (let j = i + 1; j < edits.length; j++) {
+      if (edits[j].slice === edits[i].slice && edits[j].lifecycle !== 'normal') return true;
     }
     return false;
   }
 
   /* After a commit, the status is published and the graph learns what changed.  Base changes
-     reach queries only when not frozen, outbox changes always, since forecasts are not base state;
-     either rebuilds the overlay.  A changed status or a new query alone runs the graph over the
-     overlay as it is.  Then each @online command whose round trip the queries now show settles. */
+     reach queries only when not frozen, outbox changes always, since predictions are not base
+     state; either rebuilds the overlay.  A changed status or a new query alone runs the graph over
+     the overlay as it is.  Then each @online mutation whose round trip the queries now show
+     settles. */
   #refresh(dirty: Record<string, true>, always = false): void {
     // the status first, so every query this pass runs sees the status that goes with its state
     const status = this.#publish();
@@ -4487,68 +4597,53 @@ export class Engine<QX, FX, C, N = never> {
     this.#settleOnline();
   }
 
-  /* An acked @online command has made its round trip once an event carrying its id is reduced, or
-     the base is reduced through its ack's position.  Queries show the base only when it exists and
-     is not frozen, so it settles then. */
+  /* An acked @online mutation has made its round trip once an edit carrying its id is applied, or
+     the base is applied through its ack's position.  Queries show the base only when it exists
+     and is not frozen, so it settles then. */
   #settleOnline(): void {
-    if (this.#reduced < 0 || this.#replacing > 0) return;
+    if (this.#applied < 0 || this.#replacing > 0) return;
     for (const [id, online] of this.#online) {
       if (online.ack === null) continue;
-      if (!online.seen && online.ack.position > this.#reduced) continue;
+      if (!online.seen && online.ack.position > this.#applied) continue;
       this.#online.delete(id);
       online.resolve(online.ack);
     }
   }
 
-  // every @online command, queued or in flight, rejects with the reason the Engine ended
+  // every @online mutation, queued or in flight, rejects with the reason the Engine ended
   #rejectOnline(reason: unknown): void {
     for (const s of this.#submitted) if ('online' in s) s.reject(reason);
     for (const online of this.#online.values()) online.reject(reason);
     this.#online.clear();
   }
 
-  // a live event as the reducers see it; one that fails its schema is an error naming it, since
-  // the client and the database can run different versions of the model
-  #decode(ev: WireEvent): DbEvent<unknown> {
-    try {
-      return this.#reg.convert('.event', ev.raw, MSGPACK, JS) as DbEvent<unknown>;
-    } catch (e: unknown) {
-      const why = e instanceof Error ? e.message : String(e);
-      throw new Error(`event ${ev.stream}@${ev.position}: ${why}`);
-    }
-  }
-
   // the checkpoint moves forward, never back, under the connection's epoch
   #advanceCursorIn(txn: WTxn, position: number): void {
     if (this.#epoch === null) throw new Error('cursor with no epoch');
     if (this.#checkpoint !== null && position <= this.#checkpoint.position) return;
-    this.#checkpoint = { epoch: this.#epoch, position, reduced: this.#reduced };
+    this.#checkpoint = { epoch: this.#epoch, position, applied: this.#applied };
     txn.set('!checkpoint', '.json', JS, this.#checkpoint);
   }
 
-  // the base has been reduced through position, so every acked command at or below it is in the
-  // base, events or none, and leaves the outbox
-  #reducedTo(txn: WTxn, position: number): void {
-    if (position <= this.#reduced) return;
-    this.#reduced = position;
+  // the base has been applied through position, so every acked mutation at or below it is in the
+  // base, edits or none, and leaves the outbox
+  #appliedTo(txn: WTxn, position: number): void {
+    if (position <= this.#applied) return;
+    this.#applied = position;
     if (this.#checkpoint !== null) {
-      this.#checkpoint = { ...this.#checkpoint, reduced: position };
+      this.#checkpoint = { ...this.#checkpoint, applied: position };
       txn.set('!checkpoint', '.json', JS, this.#checkpoint);
     }
-    this.#releaseAckedIn(txn);
-  }
-
-  #releaseAckedIn(txn: WTxn): void {
-    const done = [...this.#acked].filter(([, p]) => p <= this.#reduced).map(([id]) => id);
+    const done = [...this.#acked].filter(([, p]) => p <= this.#applied).map(([id]) => id);
     this.#releaseIn(txn, done);
   }
 
-  // commands leave the outbox
+  // mutations leave the outbox
   #releaseIn(txn: WTxn, ids: string[]): void {
     for (const id of ids) {
       const ordinal = this.#outbox.get(id);
       if (ordinal === undefined) continue;
-      txn.del(commandKey(ordinal));
+      txn.del(mutationKey(ordinal));
       this.#outbox.delete(id);
       this.#sent.delete(id);
       this.#acked.delete(id);
@@ -4557,21 +4652,21 @@ export class Engine<QX, FX, C, N = never> {
   }
 
   // a vouch, or the live mark: unless frozen, nothing below it was withheld, so the base is
-  // reduced through it
+  // applied through it
   #onCursorIn(txn: WTxn, position: number): void {
-    if (this.#replacing === 0) this.#reducedTo(txn, position);
+    if (this.#replacing === 0) this.#appliedTo(txn, position);
     this.#advanceCursorIn(txn, position);
   }
 
-  // every queued sendCommands result, and one release for all of them
-  #onCommandOutcomes(): void {
+  // every queued sendMutations result, and one release for all of them
+  #onMutationOutcomes(): void {
     const drop: string[] = [];
-    while (this.#commandOutcomes.length > 0) {
-      const { ids, results } = this.#commandOutcomes.shift()!;
+    while (this.#mutationOutcomes.length > 0) {
+      const { ids, results } = this.#mutationOutcomes.shift()!;
 
-      /* A failed call rejects its @online command, which is never resent.  Its outbox commands
-         wait for the connection's end, which a failed call brings, and the next connection resends
-         them. */
+      /* A failed call rejects its @online mutation, which is never resent.  Its outbox mutations
+         wait for the connection's end, which a failed call brings, and the next connection
+         resends them. */
       if ('failed' in results) {
         for (const id of ids) {
           const online = this.#online.get(id);
@@ -4586,7 +4681,7 @@ export class Engine<QX, FX, C, N = never> {
       results.forEach((r, i) => {
         const id = ids[i];
 
-        // an @online command: a reject or a conflict settles it now, and an ok waits for the
+        // an @online mutation: a reject or a conflict settles it now, and an ok waits for the
         // round trip, which the refresh after this commit may already find
         const online = this.#online.get(id);
         if (online !== undefined) {
@@ -4599,13 +4694,13 @@ export class Engine<QX, FX, C, N = never> {
           return;
         }
 
-        // a command already released, by its round trip or by an earlier answer to a resend
+        // a mutation already released, by its round trip or by an earlier answer to a resend
         if (!this.#outbox.has(id)) return;
 
         if (r.kind === 'ok') {
-          // the command was decided by a position; it leaves once the base has reduced through it
+          // the mutation was decided by a position; it leaves once the base has applied through it
           this.#acked.set(id, r.position);
-          if (r.position <= this.#reduced) drop.push(id);
+          if (r.position <= this.#applied) drop.push(id);
         } else {
           // a reject or a conflict is final
           drop.push(id);
@@ -4619,44 +4714,46 @@ export class Engine<QX, FX, C, N = never> {
     this.#refresh({});
   }
 
-  /* A view frame, reconciled against state.  Drops come first, then every ref of the new set that
-     nothing accounts for starts a backfill, and the view is written with them.  Returns whether
-     the drops removed state from the base. */
+  /* A view frame, reconciled against state.  Drops come first, then every selector of the new set
+     that nothing accounts for starts a backfill, and the view is written with them.  Returns
+     whether the drops removed state from the base. */
   #onViewIn(txn: WTxn, view: ViewRecord, dirty: Record<string, true>): boolean {
     const wasFrozen = this.#replacing > 0;
     // the keys this frame removes, apart from any that earlier items in the batch marked
     const removed: Record<string, true> = {};
-    const covered = (refs: string[], x: string) => refs.some((r) => refCovers(r, x));
-    const old = this.#view?.refs ?? [];
+    const covered = (selectors: string[], x: string) => selectors.some((r) => selectorCovers(r, x));
+    const old = this.#view?.selectors ?? [];
     const atStart = [...this.#backfills.keys()];
 
-    // drop every in-flight ref the new set does not fully cover
-    for (const ref of atStart) {
-      if (!covered(view.refs, ref)) this.#dropBackfillIn(txn, ref);
+    // drop every in-flight selector the new set does not fully cover
+    for (const selector of atStart) {
+      if (!covered(view.selectors, selector)) this.#dropBackfillIn(txn, selector);
     }
 
-    // drop every stream the new set does not cover
-    for (const stream of [...this.#streams.keys()]) {
-      if (!covered(view.refs, stream)) this.#dropStreamIn(txn, stream, removed);
+    // drop every slice the new set does not cover
+    for (const slice of [...this.#slices.keys()]) {
+      if (!covered(view.selectors, slice)) this.#dropSliceIn(txn, slice, removed);
     }
 
-    // grant, broadest first so a covered ref finds its cover.  The first view's grants replace
+    // grant, broadest first so a covered selector finds its cover.  The first view's grants replace
     // an empty base: frozen until they land as a group, so the first frame shown is complete.
     // Every later grant is additive.
     const bootstrap = this.#view === null;
-    const refs = [...view.refs].sort((a, b) => refPrefix(a).length - refPrefix(b).length);
-    for (const ref of refs) {
+    const selectors = [...view.selectors].sort(
+      (a, b) => selectorPrefix(a).length - selectorPrefix(b).length,
+    );
+    for (const selector of selectors) {
       // does an entry already cover it?
       const entries = [...this.#backfills.keys()];
-      if (entries.some((e) => refCovers(e, ref))) continue;
+      if (entries.some((e) => selectorCovers(e, selector))) continue;
 
       // is it held: covered by the old set, and by no entry at the start of the frame?
-      const held = covered(old, ref) && !atStart.some((e) => refCovers(e, ref));
-      if (held || typeof this.#streams.get(ref) === 'number') continue;
+      const held = covered(old, selector) && !atStart.some((e) => selectorCovers(e, selector));
+      if (held || typeof this.#slices.get(selector) === 'number') continue;
 
-      // otherwise it is new: backfill it, adopting the in-flight refs it covers
-      this.#spawnIn(txn, null, [ref], view.position, bootstrap);
-      this.#adoptChildrenIn(txn, ref);
+      // otherwise it is new: backfill it, adopting the in-flight selectors it covers
+      this.#spawnIn(txn, null, [selector], view.position, bootstrap);
+      this.#adoptChildrenIn(txn, selector);
     }
 
     txn.set('!view', '.json', JS, view);
@@ -4669,16 +4766,16 @@ export class Engine<QX, FX, C, N = never> {
     return Object.keys(removed).length > 0;
   }
 
-  // the last replacing backfill is gone: the frozen events land, the reduced position catches up
+  // the last replacing backfill is gone: the frozen edits land, the applied position catches up
   // to the checkpoint, and whatever finished downloading during the freeze lands
   #unfreezeIn(txn: WTxn, dirty: Record<string, true>): void {
-    this.#reduceParkedIn(txn, null, {}, dirty);
-    this.#reducedTo(txn, this.#checkpoint?.position ?? -1);
+    this.#applyParkedIn(txn, null, {}, dirty);
+    this.#appliedTo(txn, this.#checkpoint?.position ?? -1);
     this.#tryLandIn(txn, dirty);
   }
 
   // the connection ended.  Every call in flight on it is dead: backfills wait for the next
-  // connection to restart them, and commands handed to it are unsent again for the next resend.
+  // connection to restart them, and mutations handed to it are unsent again for the next resend.
   #onEnd(): void {
     this.#connection = null;
     this.#asked = false;
@@ -4697,7 +4794,7 @@ export class Engine<QX, FX, C, N = never> {
     }, delay);
   }
 
-  // a fresh overlay over the base, every outbox command forecast onto it in order, and the graph
+  // a fresh overlay over the base, every outbox mutation predicted onto it in order, and the graph
   // run on the result
   #rebuildOverlay(): void {
     const discarded: Record<string, true> = {};
@@ -4705,31 +4802,33 @@ export class Engine<QX, FX, C, N = never> {
     this.#graph.dirty(discarded);
     this.#overlay = new Overlay(this.#reg);
 
-    // one base read for the whole rebuild, so every forecast and every query sees one snapshot
+    // one base read for the whole rebuild, so every prediction and every query sees one snapshot
     const cbs = this.#store.read((base) => {
-      // forecast each outbox command, each seeing what the ones before it left
-      const forecaster = this.#forecaster;
-      if (forecaster !== null && this.#outbox.size > 0) {
+      // predict each outbox mutation, each seeing what the ones before it left
+      const predictor = this.#predictor;
+      if (predictor !== null && this.#outbox.size > 0) {
         const rows = scanAll(base, {
-          pattern: engineKeys('command'),
+          pattern: engineKeys('mutation'),
           limit: 1000,
-          values: { type: '.command', rep: JS },
+          values: { type: '.mutation', rep: JS },
         });
         for (const [, value] of rows) {
-          const command = value as Command<Uint8Array>;
+          const mutation = value as Mutation<Uint8Array>;
 
-          // a command this vocabulary cannot read is still sent; it just forecasts nothing
-          const data = this.#commandData(command.data);
+          // a mutation this vocabulary cannot read is still sent; it just predicts nothing
+          const data = this.#mutationData(mutation.data);
           if (data === undefined) continue;
 
-          /* Each command forecasts in its own scratch layer, so a throw cancels its events alone.
-             A throw from the forecast is its way of forecasting nothing; a reducer can also throw
-             on correct code, when real events have moved the base underneath a forecast that no
-             longer applies.  Either way the command is in flight and the server decides. */
+          /* Each mutation predicts in its own scratch layer, so a throw cancels its writes alone.
+             A throw from the predictor is its way of predicting nothing, and it can also throw on
+             correct code, when real edits have moved the base underneath a prediction that no
+             longer applies.  Either way the mutation is in flight and the server decides. */
           try {
-            const dirty = this.#overlay.apply(base, (txn) =>
-              this.#forecastIn(txn, forecaster, data),
+            const written = this.#overlay.apply(base, (txn) =>
+              this.#predictIn(txn, predictor, data),
             );
+            const dirty: Record<string, true> = {};
+            markDirty(dirty, written);
             this.#graph.dirty(dirty);
           } catch {
             continue;
@@ -4755,7 +4854,7 @@ export class Engine<QX, FX, C, N = never> {
 
   // what queries read: the status, and the overlay over the base, held until the base exists
   #queryView(base: RTxn): RTxn {
-    return statusView(this.#overlay.view(base), this.#status, this.#reduced < 0);
+    return statusView(this.#overlay.view(base), this.#status, this.#applied < 0);
   }
 
   // the status the Engine's state gives, with each part that changed published whole in place of
@@ -4793,18 +4892,20 @@ export class Engine<QX, FX, C, N = never> {
     return {
       state,
       nextAttemptAt: state === 'offline' && next !== null ? new Date(next) : null,
-      hasBase: this.#reduced >= 0,
+      hasBase: this.#applied >= 0,
       frozen: this.#replacing > 0,
     };
   }
 
   #progressStatus(): ProgressStatus {
-    const backfills = [...this.#backfills].map(([ref, entry]) => backfillStatus(ref, entry));
+    const backfills = [...this.#backfills].map(([selector, entry]) =>
+      backfillStatus(selector, entry),
+    );
     const log = {
       since: this.#since,
       head: this.#head,
       committed: this.#checkpoint?.position ?? -1,
-      reduced: this.#reduced,
+      applied: this.#applied,
     };
     return { estimate: this.#estimate(backfills), log, backfills };
   }
@@ -4818,8 +4919,8 @@ export class Engine<QX, FX, C, N = never> {
     if (e === null) return null;
 
     // every backfill of the episode as last seen
-    for (const b of backfills) e.backfills.set(b.ref, b);
-    const inFlight = new Set(backfills.map((b) => b.ref));
+    for (const b of backfills) e.backfills.set(b.selector, b);
+    const inFlight = new Set(backfills.map((b) => b.selector));
     e.confirmed ||= this.#confirmed;
 
     // the share done, held to what has been shown
@@ -4832,7 +4933,7 @@ export class Engine<QX, FX, C, N = never> {
   // whether an episode's work is done: a boot's once the base exists, a resync's once the replay
   // has reached head and every backfill has landed, a backfill episode's once they have landed
   #episodeDone(e: Episode): boolean {
-    if (e.kind === 'boot') return this.#reduced >= 0;
+    if (e.kind === 'boot') return this.#applied >= 0;
     if (e.kind === 'resync') return this.#live && this.#backfills.size === 0;
     return this.#backfills.size === 0;
   }
@@ -4841,7 +4942,7 @@ export class Engine<QX, FX, C, N = never> {
   #startEpisode(): Episode | null {
     // no base yet, a connection replaying onto one, or downloads onto a live one?
     let kind: Episode['kind'];
-    if (this.#reduced < 0) {
+    if (this.#applied < 0) {
       kind = 'boot';
     } else if (this.#connection !== null && !this.#live) {
       kind = 'resync';
@@ -4851,10 +4952,10 @@ export class Engine<QX, FX, C, N = never> {
       return null;
     }
 
-    // a resync resolves the streams held as it starts
+    // a resync resolves the slices held as it starts
     const held = new Set<string>();
     if (kind === 'resync') {
-      for (const [stream, seq] of this.#streams) if (typeof seq === 'number') held.add(stream);
+      for (const [slice, seq] of this.#slices) if (typeof seq === 'number') held.add(slice);
     }
     return {
       kind,
@@ -4871,10 +4972,10 @@ export class Engine<QX, FX, C, N = never> {
   #downloadShare(e: Episode, inFlight: Set<string>): number {
     // a boot before its first view knows of no work yet
     if (e.kind === 'boot' && this.#view === null) return 0;
-    const landed = e.kind === 'boot' ? this.#reduced >= 0 : inFlight.size === 0;
+    const landed = e.kind === 'boot' ? this.#applied >= 0 : inFlight.size === 0;
     const all = [...e.backfills.values()];
     if (all.length === 0) return 0.9 + (landed ? 0.1 : 0);
-    const going = (b: BackfillStatus) => inFlight.has(b.ref);
+    const going = (b: BackfillStatus) => inFlight.has(b.selector);
 
     // a size is known once the response states a length or the blob's header arrives
     const sized = all.filter((b) => !going(b) || b.snapshot.length !== null || b.tail !== null);
@@ -4906,7 +5007,7 @@ export class Engine<QX, FX, C, N = never> {
 
   // a resync's share done
   #resyncShare(e: Episode, inFlight: Set<string>): number {
-    // the backfills: the held streams resolved, and the download, whole until a backfill is in
+    // the backfills: the held slices resolved, and the download, whole until a backfill is in
     // flight and then the curve over every byte the episode's backfills have downloaded
     const resolved = e.held.size === 0 ? 1 : e.resolved.size / e.held.size;
     let downloaded = 1;
@@ -4930,69 +5031,51 @@ export class Engine<QX, FX, C, N = never> {
     return 0.05 * (e.confirmed ? 1 : 0) + 0.2 * backfill + 0.75 * replay;
   }
 
-  // a held stream of a resync is proven to need no backfill
-  #resolve(stream: string): void {
+  // a held slice of a resync is proven to need no backfill
+  #resolve(slice: string): void {
     const e = this.#episode;
-    if (e?.kind === 'resync' && e.held.has(stream)) e.resolved.add(stream);
+    if (e?.kind === 'resync' && e.held.has(slice)) e.resolved.add(slice);
   }
 
-  // a command's wire bytes as the forecaster sees them, or undefined when the current vocabulary
+  // a mutation's wire bytes as the predictor sees them, or undefined when the current vocabulary
   // cannot read them, which is an outbox row written by an earlier build of the app
-  #commandData(bytes: Uint8Array): C | undefined {
+  #mutationData(bytes: Uint8Array): M | undefined {
     try {
-      return this.#reg.convert(this.#reg.commands, bytes, MSGPACK, JS) as C;
+      return this.#reg.convert(this.#reg.mutations, bytes, MSGPACK, JS) as M;
     } catch {
       return undefined;
     }
   }
 
-  // one command's forecast folded onto the overlay: each run of consecutive events on one stream
-  // goes through its slice's reducer as pending, and a death drops the stream's keys; returns the
-  // keys it changed
-  #forecastIn(txn: WTxn, forecaster: Forecaster<FX, C>, command: C): Record<string, true> {
-    const dirty: Record<string, true> = {};
-    let stream = '';
-    let run: unknown[] = [];
-
-    // reduce the pending run; a family with no reducer forecasts nothing
-    const flush = () => {
-      if (run.length === 0) return;
-      const slice = this.#reducers[stream.split(':')[0]];
-      if (slice !== undefined) slice.reducer(reducerTxn(txn, stream, dirty), run, stream, true);
-      run = [];
+  /* One mutation's prediction, written onto the overlay's scratch layer through a WriteTxn.
+     Deleting a slice deletes its keys in the overlay. */
+  #predictIn(txn: WTxn, predictor: Predictor<PX, M>, mutation: M): void {
+    // the predictor's transaction: its reads are its own to change
+    const wtx: WriteTxn = {
+      get: (key, type) => txn.get(key, type, JS),
+      scan(req) {
+        const values: ScanRequest['values'] =
+          req.type === false ? false : { type: req.type, rep: JS };
+        return txn.scan({ ...req, values });
+      },
+      set(key, type, value) {
+        txn.set(key, type, JS, value);
+      },
+      del(key) {
+        txn.del(key);
+      },
+      deleteSlice(slice) {
+        txn.delPrefix(`${slice}!`);
+      },
     };
 
-    // forecast over the overlay; the transaction closes when the forecaster returns
-    const rtx = readTxn(txn);
-    let outs: ForecastOutput[];
+    // predict over the overlay; the transaction closes when the predictor returns
+    this.#predictions.$ref.txn = wtx;
     try {
-      outs = forecaster(this.#forecastContext(rtx), command);
+      predictor(this.#predictions.ctx, mutation, true);
     } finally {
-      closedTxns.add(rtx);
+      closedTxns.add(wtx);
     }
-
-    for (const out of outs) {
-      // the label fills its slice's family template, or has the shape of a stream name when this
-      // Engine holds no slice of its family; an invalid one throws, forecasting nothing
-      const pattern = this.#streamPatterns[out.stream.split(':')[0]] ?? ANY_STREAM_RE;
-      const valid = pattern.test(out.stream);
-      if (!valid) {
-        throw new Error(`forecast labels an invalid stream ${JSON.stringify(out.stream)}`);
-      }
-
-      if (out.stream !== stream) {
-        flush();
-        stream = out.stream;
-      }
-      if ('death' in out) {
-        flush();
-        markDirty(dirty, txn.delPrefix(`${stream}!`));
-      } else {
-        run.push(out.event);
-      }
-    }
-    flush();
-    return dirty;
   }
 
   // ends everything the Engine drives; nothing is persisted, since the store is already consistent
@@ -5015,26 +5098,26 @@ export class Engine<QX, FX, C, N = never> {
     for (const work of this.#backfillWork) work.reject(reason);
     this.#backfillWork = [];
 
-    // the @online commands, which can never settle now
+    // the @online mutations, which can never settle now
     this.#rejectOnline(reason);
   }
 }
 
-/** Posts one command of a database outside any Engine, given in rich format (Date, Maps, and Sets
-    intact), as the session or as anonymous, and answers with the database's outcome.  The command
-    is numbered in a series of its own, so the transport may retry a failed request, and the
-    database answers a resend of one that landed as decided.  A request that fails for good
-    rejects, and the command may or may not have run.  Generated code calls it as
-    post{Database}Command, with the database's registry data. */
+/** Posts one mutation of a database outside any Engine, given in rich format (Date, Maps, and
+    Sets intact), as the session or as anonymous, and answers with the database's outcome.  The
+    mutation is numbered in a series of its own, so the transport may retry a failed request, and
+    the database answers a resend of one that landed as decided.  A request that fails for good
+    rejects, and the mutation may or may not have run.  Generated code calls it as
+    post{Database}Mutation, with the database's registry data. */
 export async function postWithSchema(
   schema: Schema,
   transport: Transport,
-  command: unknown,
+  mutation: unknown,
   options: { session?: Session | null },
-): Promise<CommandResult> {
+): Promise<MutationResult> {
   checkHost();
   const reg = registryFor(transport, schema);
-  const data = reg.convert(reg.commands, command, JS, MSGPACK) as Uint8Array;
+  const data = reg.convert(reg.mutations, mutation, JS, MSGPACK) as Uint8Array;
   const wire = { id: generateUuid(), series: generateSeries(), n: 1, data };
   const [result] = await transport.post([wire], options.session ?? null);
   return result;

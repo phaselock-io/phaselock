@@ -3,47 +3,48 @@ using TypeSpec.Reflection;
 namespace PhaseLock;
 
 /**
- * A Slice is one family of event streams and the state its reducer folds from them.  `Family`
- * names the streams: `"book"` is a single stream, and `"patron:{patron}"` or
- * `"chat:{org},{channel}"` is one stream per value of each parameter.  `Events` is the named union
- * of the event models the slice folds, and `Spec` lays out its state as key templates:
+ * A Slice is one family of slices: each slice is the keys under one prefix, and a client holds a
+ * slice completely or not at all.  `Family` names the slices: `"book"` is a single slice, and
+ * `"patron:{patron}"` or `"chat:{org},{channel}"` is one slice per value of each parameter.  `Spec`
+ * lays out each slice's keys as key templates:
  *
  * ```typespec
- * interface PatronSlice extends Slice<"patron:{patron}", PatronEvents, {
+ * interface PatronSlice extends Slice<"patron:{patron}", {
  *   "patron": Patron;
  *   "patron_hold:{hold}": PatronHold;
  * }> {}
  * ```
  *
- * Key templates are local to one stream: the machinery owns the `{stream}!` prefix, so a
- * reducer names `patron_hold:{hold}` and never the patron it belongs to.  A template is a name,
- * then optionally ':' and its parameters separated by ','; the name identifies the item, and must
- * be unique among the slices composed together.
+ * Key templates are local to one slice: a key is `{slice}!{local key}`, as in
+ * `patron:bob!patron_hold:h1`.  A template is a name, then optionally ':' and its parameters
+ * separated by ','; the name identifies the item, and must be unique among the slices composed
+ * together.
  */
-interface Slice<Family extends string, Events, Spec extends {}> {}
+interface Slice<Family extends string, Spec extends {}> {}
 
 /**
- * An Engine is one audience's view of the database: the slices it syncs and folds, and the
- * commands it may send.
+ * An Engine is one audience's view of the database: the slices it syncs, and the mutations it may
+ * send.
  *
  * ```typespec
- * interface UserEngine extends Engine<[BookSlice, PatronSlice], UserCommands> {}
+ * interface UserEngine extends Engine<[BookSlice, PatronSlice], UserMutations> {}
  * ```
  *
- * `Commands` is a named union of `@command` models, or a single one.
+ * `Mutations` is a named union of models, or a single named model; each model it lists is a
+ * mutation.
  */
-interface Engine<Slices extends unknown[], Commands> {}
+interface Engine<Slices extends unknown[], Mutations> {}
 
 /**
- * A Database holds every slice its engines sync and decides every command they send, plus the
- * slices and commands it keeps for itself: slices no client syncs (credentials, uniqueness
- * indexes), and commands no engine sends.
+ * A Database holds every slice its engines sync and decides every mutation they send, plus the
+ * slices and mutations it keeps for itself: slices no client syncs (credentials, uniqueness
+ * indexes), and mutations no engine sends.
  *
  * ```typespec
- * interface LibraryDB extends Database<[UserEngine, AdminEngine], [LoginSlice], DatabaseCommands> {}
+ * interface LibraryDB extends Database<[UserEngine, AdminEngine], [LoginSlice], DbMutations> {}
  * ```
  */
-interface Database<Engines extends unknown[], Slices extends unknown[] = [], Commands = never> {}
+interface Database<Engines extends unknown[], Slices extends unknown[] = [], Mutations = never> {}
 
 /**
  * A Queries interface declares a typed query contract: each operation names a query, with its
@@ -63,42 +64,24 @@ interface Database<Engines extends unknown[], Slices extends unknown[] = [], Com
 interface Queries {}
 
 /**
- * Marks a model as a command and declares what its precommit handler returns, taken literally:
- * `@command(HoldOpened | HoldFailed)` returns exactly one of the two, a tuple returns each of its
- * members, and an array any number.  Each event is labelled with a stream of a slice that folds it.
- * A passthrough names its own type, `@command(AddBook)` on `AddBook`; `Death` ends the stream it
- * is labelled with, and `Erasure` ends it and erases its history.
- */
-extern dec command(target: Model, output: unknown);
-
-/**
- * Marks a command that only makes sense online: its UI waits for the database's answer instead of
- * a forecast, so it is sent once with `sendOnlineCommand` and never queued in the outbox.  A
- * command carrying a field the database prepares for precommit, such as a `NewPassword`, must be
- * `@online`.
+ * Marks a mutation that only makes sense online: its UI waits for the database's answer instead of
+ * a prediction, so it is sent once with `sendOnlineMutation` and never queued in the outbox.  A
+ * mutation carrying a field the database prepares for its decider, such as a `NewPassword`, must
+ * be `@online`.
  */
 extern dec online(target: Model);
 
-/** The end of a stream, in a `@command` output. */
-model Death {}
-
-/**
- * The end of a stream and the erasure of its history, in a `@command` output: the stream's
- * state and every event before its death are deleted, and the death stays as its last event.
- */
-model Erasure {}
-
-// Fields the database prepares for precommit.  Each is a top-level field of an `@online`
-// command, which the database replaces before precommit runs: a NewPassword with its
+// Fields the database prepares for the decider.  Each is a top-level field of an `@online`
+// mutation, which the database replaces before the decider runs: a NewPassword with its
 // PasswordHash, a CaptchaToken with its CaptchaResult, and so on.  No client can send a
-// replacement, so no command carries one.
+// replacement, so no mutation carries one.
 
-/** A password to store: precommit sees its salted hash. */
+/** A password to store: the decider sees its salted hash. */
 scalar NewPassword extends string;
 
 /**
  * A password's salted hash, which the database puts in place of a NewPassword when it prepares a
- * command for precommit, and which bootstrap's `hashPassword` makes.
+ * mutation for its decider, and which bootstrap's `hashPassword` makes.
  */
 scalar PasswordHash extends string;
 
@@ -107,14 +90,14 @@ scalar CaptchaToken extends string;
 
 /**
  * A verified captcha token, which the database puts in place of a CaptchaToken when it prepares a
- * command for precommit.
+ * mutation for its decider.
  */
 model CaptchaResult {
   hostname: string;
 }
 
-/** A proof of a credential the account has registered, for commands that re-authenticate. */
-union CommandAuth {
+/** A proof of a credential the account has registered, for mutations that re-authenticate. */
+union MutationAuth {
   password: {
     kind: "password";
     password: string;
@@ -140,10 +123,10 @@ union CommandAuth {
 }
 
 /**
- * The kind of credential a CommandAuth proved, which the database puts in its place when it
- * prepares a command for precommit.
+ * The kind of credential a MutationAuth proved, which the database puts in its place when it
+ * prepares a mutation for its decider.
  */
-model CommandAuthResult {
+model MutationAuthResult {
   kind: "password" | "totp" | "email-code" | "webauthn" | "yubikey-otp";
 }
 
@@ -152,7 +135,7 @@ scalar IdentityProof extends string;
 
 /**
  * A verified identity proof, which the database puts in place of an IdentityProof when it
- * prepares a command for precommit.
+ * prepares a mutation for its decider.
  */
 model IdentityResult {
   provider: string;

@@ -1,17 +1,14 @@
 # PhaseLock Roadmap
 
 PhaseLock is currently in Alpha.  All the core sync engine features are
-implemented, a few of them are tested, and none of them are properly
+implemented, the database is still in draft form, and nothing is properly
 documented.
 
 There's still a lot to do:
 
-- PhaseLockDB: the whole backend in a process
-  - user-defined plugins embed backend behaviors in the db:
-    - lookup() function to define authN
-    - maySee() to implement read-side autZ
-    - precommit() to implement the write path
-  - eventually view-stamped replication (revisited) for HA between nodes
+- PhaseLockDB: the real thing
+  - use a custom log plus LMDB for key-value storage
+  - add view-stamped replication (revisited) for HA between nodes
 
 - PhaseLock cloud
   - hosted PhaseLockDB instances
@@ -27,24 +24,30 @@ There's still a lot to do:
 
 - Support aliases in TypeSpec... today they cause confusing/broken generated code.
 
-- Reimplement go and python bindings to match new cross-language plan:
+- Reimplement old go and python bindings to match the latest Engine patterns:
   - No more JS wrapper types; native types should be fully-native
   - Native queries read native types directly from storage, no JS layer
-  - Generate type registry per framework for handling conversions
-  - StoreGenerator redesign around the type registry
-  - Eliminate "plain-json object" as central type in Engine API.
+  - Provide a type registry to the Engine for conversions
 
-- Support additional languages, starting with Kotlin and Swift
+- Support new languages, starting with Kotlin and Swift
 
 - Additional frontend demos:
   - React Native
   - iOS
   - Android
-  - PhaseLock engine in a Shared Worker serving multiple tabs
+  - PhaseLock + OPFS serving one or more tabs with durable storage
 
-- Add indices as a formal concept in the PhaseLock Engine
-  - possibly a plugin interface, for define-your-own index?
-  - include a btree implementation at a minimum
+- Add indices to PhaseLock
+  - automatically maintained in either database or Engine
+  - available to both queries and decider/predictors
+  - in-mem indices should be possible
+  - on-disk indices should be possible, as subtree of KV store
+
+- Additional plugins
+  - email plugin
+  - signed webhook plugin
+  - payment provider integrations
+  - timers
 
 - Add support for time-based triggers
   - reducers currently only wake due to events
@@ -58,8 +61,3 @@ There's still a lot to do:
   - Bottleneck analysis and optimization.
   - How do different designs scale, especially on the read side?
   - Use this data to pick recommended backend architecture(s).
-
-- Investigate snapshot tooling
-  - Snapshots can greatly reduce cold-start times
-  - Snapshots may require per-user sanitization
-  - How can we offer tooling to make this easier?

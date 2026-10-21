@@ -1,16 +1,17 @@
-import type { DbMarker, DbTypes, Output, Plugin, PluginInstall, RawTxn } from './plugin.js';
+import type { DbMarker, DbTypes, Plugin, PluginInstall } from './plugin.js';
 
 /** One tick of a cron entry: the entry's name; the slot it was scheduled for, which names the
-    occurrence (which day's sheet); and the server time of its atom, which bounds what is due. */
+    occurrence (which day's sheet); and the server time of the tick's mutation, which bounds what
+    is due. */
 export type Tick = { name: string; slot: Date; now: Date };
 
 /** A cron entry: its spec, a robfig/cron standard spec of five fields or a descriptor, in UTC
-    unless it starts with `CRON_TZ=`; and its hook, which runs over the database's txn at each
-    tick and answers what the tick adds to the log.  A hook must not throw: a throw is a bug,
-    which drops the tick's atom. */
+    unless it starts with `CRON_TZ=`; and its hook, which carries out each tick by writing through
+    the database's txn, as a decider does.  A hook must not throw: a throw is a bug, which
+    discards the tick's writes. */
 export type CronEntry<DB extends DbTypes> = {
   spec: string;
-  hook(txn: DB['txn'], tick: Tick): DB['output'] | DB['output'][];
+  hook(txn: DB['txn'], tick: Tick): void;
 };
 
 /** the cron plugin as a plugin set names it; it makes no requests */
@@ -19,8 +20,8 @@ export type CronPlugin = PluginInstall<{}>;
 /** what the database reads of a cron install when it opens: every entry's name and spec */
 export type CronConfig = { entries: { name: string; spec: string }[] };
 
-// the command the database hands cron's run: one tick of one entry
-type TickCommand = { entry: string; slot: Date; now: Date };
+// the mutation the database hands cron's run: one tick of one entry
+type TickMutation = { entry: string; slot: Date; now: Date };
 
 // an entry's name, at most 64 bytes, part of the series key that holds its mark
 const ENTRY_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -42,30 +43,17 @@ export const Cron = {
       kind: 'cron',
       db: (db) => db,
       create(name: string, ctx: unknown): Plugin<{}> {
-        let raw: RawTxn | undefined;
-
-        // each entry's hook, called over the database's context, its outputs emitted
-        const hooks = new Map<string, (tick: Tick) => void>();
-        for (const [entry, e] of Object.entries(entries)) {
-          hooks.set(entry, (tick) => {
-            const out = e.hook(ctx as DB['txn'], tick);
-            raw!.emit!([out].flat() as Output[]);
-          });
-        }
-
+        const byName = new Map(Object.entries(entries));
         return {
           name,
           api: {},
           config,
-          bind(txn) {
-            raw = txn;
-          },
-          run(cmd) {
-            const { entry, slot, now } = cmd as TickCommand;
-            const hook = hooks.get(entry);
-            if (hook === undefined) throw new Error(`cron install ${name} has no entry ${entry}`);
-            hook({ name: entry, slot, now });
-            return [];
+          bind() {}, // the hooks run over ctx, which the database binds itself
+          run(mutation) {
+            const { entry, slot, now } = mutation as TickMutation;
+            const e = byName.get(entry);
+            if (e === undefined) throw new Error(`cron install ${name} has no entry ${entry}`);
+            e.hook(ctx as DB['txn'], { name: entry, slot, now });
           },
         };
       },

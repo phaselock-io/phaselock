@@ -5,11 +5,10 @@ library.
 
 `model.tsp`: overall data model declarations.
 
-- Command and event types.
-- Which events are produced by each command.
 - Store types and layouts.
 - Slice definitions.
 - Which slices each sync engine will consume.
+- Mutation types.
 - Named query declarations.
 
 `model.gen.ts`: generated output from `model.tsp`.
@@ -18,19 +17,18 @@ library.
 - Contains TypeScript type definitions.
 - Defines the sync engine classes: `AdminEngine` and `UserEngine`.
 
-`reducers.ts`: defines how each event is processed to update the Store.
-
-`outcomes.ts`: core business logic used by both `forecasters` and `precommit`.
+`predictors.ts`: core business logic.
+- Defines how each mutation type is handled to update state.
+- Each mutation's predictor is just that handler.
+- Each mutation's decider checks authorization, then calls the handler.
 
 `ui.ts`: the stub of exports and functions that ship with the client.
 
-- `forecasters` defines how commands are expected to produce events.
-
 `db.ts`: the stub of exports and functions that deploy into the database.
 
-- `precommit` defines how commands are accepted and what events they emit.
+- `deciders` defines if mutations are accepted and how they are handled.
 - `lookup` returns authentication information for a user.
-- `maySee` defines which slices each signed-in user is allowed to see.
+- `grant` defines which slices each signed-in user is allowed to see.
 - Configures the `cron` plugin for the library's daily sheet and room resets.
 
 `queries.ts`: definitions of named queries.

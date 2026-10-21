@@ -173,7 +173,7 @@ export class PUnion extends PType {
 }
 
 /**
- * A value the database's intake puts in a command, such as a PasswordHash.  `kind` names the
+ * A value the database's intake puts in a mutation, such as a PasswordHash.  `kind` names the
  * vocabulary type, and the value travels as its base type.
  */
 export class PResult extends PType {
@@ -193,8 +193,8 @@ export class PResult extends PType {
 }
 
 /**
- * A command field the database transforms at intake, before precommit runs: the client sends
- * `wire`, and precommit sees `result`.  `kind` names the vocabulary type, e.g. 'NewPassword'.
+ * A mutation field the database transforms at intake, before the decider runs: the client sends
+ * `wire`, and the decider sees `result`.  `kind` names the vocabulary type, e.g. 'NewPassword'.
  */
 export class PIntake extends PType {
   readonly kind: string;
@@ -321,7 +321,7 @@ export class PTypeRegistry {
   }
 }
 
-// Slice, Command, Engine, Database, and Queries IR
+// Slice, Mutation, Engine, Database, and Queries IR
 
 const TPL_PATTERN = /\{([^}]*)\}/g;
 
@@ -369,7 +369,7 @@ export class PStoreItem {
   }
 }
 
-/** The key layout of one slice: its templates, which are local to one stream. */
+/** The key layout of one slice: its templates, which are local to one slice. */
 export class PStore {
   /** sorted by name */
   readonly items: readonly PStoreItem[];
@@ -398,27 +398,18 @@ export class PStore {
 }
 
 /**
- * One family of event streams and the state folded from them.  `family` and `params` come from
- * the family template: `"chat:{org},{channel}"` is family 'chat' with params ['org', 'channel'].
+ * One family of slices and the keys of each.  `family` and `params` come from the family template:
+ * `"chat:{org},{channel}"` is family 'chat' with params ['org', 'channel'].
  */
 export class PSlice {
   readonly name: string;
   readonly family: string;
   readonly params: readonly string[];
-  /** the named events union */
-  readonly events: PType;
   readonly store: PStore;
-  constructor(
-    name: string,
-    family: string,
-    params: readonly string[],
-    events: PType,
-    store: PStore,
-  ) {
+  constructor(name: string, family: string, params: readonly string[], store: PStore) {
     this.name = name;
     this.family = family;
     this.params = params;
-    this.events = events;
     this.store = store;
   }
 
@@ -427,83 +418,64 @@ export class PSlice {
     if (this.params.length === 0) return this.family;
     return `${this.family}:${this.params.map((p) => `{${p}}`).join(',')}`;
   }
-
-  /** the event models, in declaration order */
-  get eventTypes(): readonly PType[] {
-    return members(this.events);
-  }
 }
 
-/**
- * What a command's precommit handler returns, from its `@command`: one event labelled with a
- * stream of any of the slices that fold it, a death, with or without the erasure of the stream's
- * history, exactly one of several options, each of several items in order, or any number of one
- * item.
- */
-export type POutput =
-  | { kind: 'event'; type: PType; slices: readonly PSlice[] }
-  | { kind: 'death'; erase: boolean }
-  | { kind: 'oneOf'; options: readonly POutput[] }
-  | { kind: 'all'; items: readonly POutput[] }
-  | { kind: 'many'; item: POutput };
-
-/** A model carrying `@command`: its type, its declared output, and whether it is `@online`. */
-export class PCommand {
+/** A model an Engine's or a Database's mutations union lists: its type, and whether it is
+    `@online`. */
+export class PMutation {
   readonly name: string;
   readonly type: PType;
-  readonly output: POutput;
   readonly online: boolean;
-  constructor(name: string, type: PType, output: POutput, online: boolean) {
+  constructor(name: string, type: PType, online: boolean) {
     this.name = name;
     this.type = type;
-    this.output = output;
     this.online = online;
   }
 }
 
-/** One audience's view of the database: the slices it syncs and the commands it may send. */
+/** One audience's view of the database: the slices it syncs and the mutations it may send. */
 export class PEngine {
   readonly name: string;
   readonly slices: readonly PSlice[];
-  /** the named commands union, or the one named command */
-  readonly commandType: PType;
-  readonly commands: readonly PCommand[];
+  /** the named mutations union, or the one named mutation */
+  readonly mutationType: PType;
+  readonly mutations: readonly PMutation[];
   constructor(
     name: string,
     slices: readonly PSlice[],
-    commandType: PType,
-    commands: readonly PCommand[],
+    mutationType: PType,
+    mutations: readonly PMutation[],
   ) {
     this.name = name;
     this.slices = slices;
-    this.commandType = commandType;
-    this.commands = commands;
+    this.mutationType = mutationType;
+    this.mutations = mutations;
   }
 }
 
-/** The database: its engines, and the slices and commands it keeps for itself. */
+/** The database: its engines, and the slices and mutations it keeps for itself. */
 export class PDatabase {
   /** every slice of every engine, then the database's own, each once */
   readonly slices: readonly PSlice[];
-  /** every command of every engine, then the database's own, each once */
-  readonly commands: readonly PCommand[];
+  /** every mutation of every engine, then the database's own, each once */
+  readonly mutations: readonly PMutation[];
 
   readonly name: string;
   readonly engines: readonly PEngine[];
   readonly extraSlices: readonly PSlice[];
-  readonly extraCommands: readonly PCommand[];
+  readonly extraMutations: readonly PMutation[];
   constructor(
     name: string,
     engines: readonly PEngine[],
     extraSlices: readonly PSlice[],
-    extraCommands: readonly PCommand[],
+    extraMutations: readonly PMutation[],
   ) {
     this.name = name;
     this.engines = engines;
     this.extraSlices = extraSlices;
-    this.extraCommands = extraCommands;
+    this.extraMutations = extraMutations;
     this.slices = [...new Set([...engines.flatMap((e) => e.slices), ...extraSlices])];
-    this.commands = [...new Set([...engines.flatMap((e) => e.commands), ...extraCommands])];
+    this.mutations = [...new Set([...engines.flatMap((e) => e.mutations), ...extraMutations])];
   }
 }
 

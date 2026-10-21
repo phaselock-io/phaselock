@@ -1,15 +1,11 @@
 import {
   AdminEngine,
-  adminForecasters,
-  adminReducers,
-  bookReducers,
+  adminPredictors,
   parseUser,
-  patronReducers,
-  postLibraryCommand,
+  postLibraryMutation,
   ROOM_RE,
-  roomReducers,
   UserEngine,
-  userForecasters,
+  userPredictors,
 } from '@library/model/ui';
 import {
   AuthError,
@@ -31,7 +27,7 @@ import.meta.hot?.dispose(() => controller.abort());
 
 /** A window's own way to the database, with a switch that takes it offline as a dropped network
     would: the live connection ends, every attempt after it fails at once, and the Engine queues
-    its commands and retries until the switch is on again. */
+    its mutations and retries until the switch is on again. */
 export class SwitchedTransport implements Transport {
   #online = true;
   // ends each live connection when the switch goes off
@@ -62,7 +58,7 @@ export class SwitchedTransport implements Transport {
     if (!this.#online) {
       setTimeout(() => hooks.onEnd(0, 'offline'));
       const offline = () => Promise.reject(new Error('offline'));
-      return { backfill: offline, sendCommands: offline };
+      return { backfill: offline, sendMutations: offline };
     }
 
     // online, the connection lasts until the Engine ends it or the switch goes off
@@ -70,9 +66,9 @@ export class SwitchedTransport implements Transport {
     return http.connect(since, view, wants, lifetime, hooks, session);
   }
 
-  post: Transport['post'] = (commands, session) => {
+  post: Transport['post'] = (mutations, session) => {
     if (!this.#online) return Promise.reject(new Error('offline'));
-    return http.post(commands, session);
+    return http.post(mutations, session);
   };
 }
 
@@ -111,11 +107,11 @@ export const { room, joined } = pageRoom();
 export const invite = `${window.location.origin}/${room}`;
 
 // the room exists before anyone signs in to it; for a room that exists, CreateRoom writes nothing
-const created = await postLibraryCommand(http, { type: 'create-room', room });
+const created = await postLibraryMutation(http, { type: 'create-room', room });
 if (created.kind !== 'ok') throw new Error(`the room was not created: ${JSON.stringify(created)}`);
 if (joined) history.replaceState(null, '', '/');
 
-/** a command without its room, which the window sending it names */
+/** a mutation without its room, which the window sending it names */
 export type Unroomed<C> = C extends unknown ? Omit<C, 'room'> : never;
 
 /** one window's Engine, the switch on its way to the database, and who it is signed in as */
@@ -147,8 +143,7 @@ function patron(session: Session): Client<UserEngine> {
   const transport = new SwitchedTransport();
   const engine = new UserEngine(transport, {
     session,
-    reducers: { book: bookReducers, patron: patronReducers, room: roomReducers },
-    forecasters: userForecasters,
+    predictors: userPredictors,
     signal: controller.signal,
     onError,
   });
@@ -159,13 +154,7 @@ function librarian(session: Session): Client<AdminEngine> {
   const transport = new SwitchedTransport();
   const engine = new AdminEngine(transport, {
     session,
-    reducers: {
-      book: bookReducers,
-      patron: patronReducers,
-      admin: adminReducers,
-      room: roomReducers,
-    },
-    forecasters: adminForecasters,
+    predictors: adminPredictors,
     signal: controller.signal,
     onError,
   });

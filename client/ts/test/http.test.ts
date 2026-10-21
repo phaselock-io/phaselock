@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { decode, decodeMulti, encode } from '@msgpack/msgpack';
-import { HTTPTransport, postCommand } from '../src/http.js';
+import { HTTPTransport, postMutation } from '../src/http.js';
 import { AuthError, restoreSession, type Session } from '../src/session.js';
 import { uuidString } from '../src/uuid.js';
 import type {
@@ -12,7 +12,8 @@ import type {
   Schema,
 } from '../src/contract.js';
 import { blob } from './blob.js';
-import { crc32c } from '../src/checksum.js';
+import { Fnv64 } from '../src/checksum.js';
+import { editOps } from '../src/edits.js';
 
 // a scriptable origin: each route is a handler the test replaces as it likes
 type Handler = (req: IncomingMessage, body: Uint8Array, res: ServerResponse) => void;
@@ -89,9 +90,12 @@ class Stub {
 function hooks(log: unknown[][]): ConnectionHooks {
   return {
     onOpen: (epoch, head) => log.push(['open', epoch, head]),
-    onView: (token, position, refs) => log.push(['view', token, position, refs]),
-    onEvents: (events) =>
-      log.push(['events', events.map((e) => [e.position, e.stream, e.seq, decode(e.data)])]),
+    onView: (token, position, selectors) => log.push(['view', token, position, selectors]),
+    onEdits: (edits) =>
+      log.push([
+        'edits',
+        edits.map((e) => [e.position, e.slice, e.seq, e.lifecycle, decode(e.raw)]),
+      ]),
     onLive: (p) => log.push(['live', p]),
     onVouch: (p) => log.push(['vouch', p]),
     onEnd: (code, reason) => log.push(['end', code, reason]),
@@ -119,7 +123,7 @@ function connector(session: Session | null = null) {
   ): Connection => new HTTPTransport(stub.url).connect(since, view, wants, signal, h, session);
 }
 
-// a test's command id as the wire carries it: its name in 16 bytes, zero-padded
+// a test's mutation id as the wire carries it: its name in 16 bytes, zero-padded
 function label(name: string): Uint8Array {
   const b = new Uint8Array(16);
   b.set(new TextEncoder().encode(name));
@@ -129,7 +133,7 @@ function label(name: string): Uint8Array {
 function nameOf(b: Uint8Array): string {
   return new TextDecoder().decode(b).replace(/\0+$/, '');
 }
-// a test's command id as the Engine mints it, a uuid
+// a test's mutation id as the Engine mints it, a uuid
 const uuidOf = (name: string) => uuidString(label(name));
 
 let stub: Stub;
@@ -147,7 +151,7 @@ describe('the live stream', () => {
     connector(restoreSession(JWT))(-1, null, ['*', 'book'], ctl.signal, hooks(log));
     await s.opened;
     s.push(['live', 0]);
-    s.push(['events', [[[1, 'book', 1, label('c1'), new Date(5)], { $sys: 'birth' }]]]);
+    s.push(['edits', [[[1, 'book', 1, label('c1'), new Date(5), 1], 0, 'book!title', 'Dune']]]);
     s.push(['view', 't2', 2, ['book', 'patron:p1']]);
     s.push(['vouch', 3]);
     s.push(['end', 7, 'done']);
@@ -157,7 +161,18 @@ describe('the live stream', () => {
     expect(log).toEqual([
       ['open', 'e3', 3],
       ['live', 0],
-      ['events', [[1, 'book', 1, { $sys: 'birth' }]]],
+      [
+        'edits',
+        [
+          [
+            1,
+            'book',
+            1,
+            'birth',
+            [[1, 'book', 1, label('c1'), new Date(5), 1], 0, 'book!title', 'Dune'],
+          ],
+        ],
+      ],
       ['view', 't2', 2, ['book', 'patron:p1']],
       ['vouch', 3],
       ['end', 7, 'done'],
@@ -259,7 +274,7 @@ describe('the live stream', () => {
   });
 });
 
-describe('sendCommands', () => {
+describe('sendMutations', () => {
   let conn: Connection;
   let stream: ReturnType<Stub['stream']>;
   let seen: string[];
@@ -275,7 +290,7 @@ describe('sendCommands', () => {
     failStatus = 500;
     endStreamOnFirst = false;
     log = [];
-    stub.routes.set('/commands', (req, body, res) => {
+    stub.routes.set('/mutations', (req, body, res) => {
       seen.push(nameOf((decode(body) as unknown[])[2] as Uint8Array));
       if (endStreamOnFirst && seen.length === 1) stream.end();
       if (failures > 0) {
@@ -305,7 +320,7 @@ describe('sendCommands', () => {
   });
   const ends = () => log.filter((entry) => entry[0] === 'end');
   const send = (id: string) =>
-    conn.sendCommands([{ id: uuidOf(id), series: 's1', n: 1, data: encode({ type: 'noop' }) }]);
+    conn.sendMutations([{ id: uuidOf(id), series: 's1', n: 1, data: encode({ type: 'noop' }) }]);
 
   test('calls are applied in call order even when the first is slow', async () => {
     const [a, b, c] = await Promise.all([send('a'), send('b'), send('c')]);
@@ -315,31 +330,31 @@ describe('sendCommands', () => {
       { kind: 'ok', position: 2 },
       { kind: 'ok', position: 3 },
     ]);
-    const req = stub.requests.find((r) => r.path === '/commands')!;
+    const req = stub.requests.find((r) => r.path === '/mutations')!;
     expect(req.headers['content-type']).toBe('application/msgpack');
     expect(decode(req.body)).toEqual(['s1', 1, label('a'), { type: 'noop' }]);
   });
 
   test('a call past the limit goes in requests under it, in order', async () => {
-    stub.routes.set('/commands', (_req, body, res) => {
-      const cmds = [...decodeMulti(body)] as unknown[][];
-      seen.push(...cmds.map((c) => nameOf(c[2] as Uint8Array)));
-      if (cmds.length > 4) {
-        res.writeHead(413, { 'PhaseLock-Max-Commands': '4' });
+    stub.routes.set('/mutations', (_req, body, res) => {
+      const muts = [...decodeMulti(body)] as unknown[][];
+      seen.push(...muts.map((c) => nameOf(c[2] as Uint8Array)));
+      if (muts.length > 4) {
+        res.writeHead(413, { 'PhaseLock-Max-Mutations': '4' });
         res.end('too many');
         return;
       }
       res.writeHead(200);
-      res.end(Buffer.from(encode(cmds.map((c) => ['ok', c[1]]))));
+      res.end(Buffer.from(encode(muts.map((c) => ['ok', c[1]]))));
     });
     const ids = Array.from({ length: 10 }, (_, i) => `k${i}`);
-    const results = await conn.sendCommands(
+    const results = await conn.sendMutations(
       ids.map((id, i) => ({ id: uuidOf(id), series: 's1', n: i + 1, data: encode({}) })),
     );
     expect(results.map((r) => (r.kind === 'ok' ? r.position : null))).toEqual(
       ids.map((_, i) => i + 1),
     );
-    const posts = stub.requests.filter((r) => r.path === '/commands');
+    const posts = stub.requests.filter((r) => r.path === '/mutations');
     expect(posts.map((r) => [...decodeMulti(r.body)].length)).toEqual([10, 4, 4, 2]);
     expect(seen.slice(10)).toEqual(ids);
     expect(ends()).toEqual([]);
@@ -359,7 +374,7 @@ describe('sendCommands', () => {
     const results = await Promise.allSettled([send('b'), send('c'), send('d')]);
     expect(results.map((r) => r.status)).toEqual(['rejected', 'rejected', 'rejected']);
     expect(seen).toEqual(['a', 'b', 'b', 'b', 'b']);
-    expect(ends()).toEqual([['end', 500, expect.stringContaining('commands: 500')]]);
+    expect(ends()).toEqual([['end', 500, expect.stringContaining('mutations: 500')]]);
     await expect(send('e')).rejects.toThrow('the connection has ended');
     expect(seen.length).toBe(5);
   });
@@ -367,9 +382,9 @@ describe('sendCommands', () => {
   test('a 4xx is not retried', async () => {
     failures = Infinity;
     failStatus = 400;
-    await expect(send('a')).rejects.toThrow('commands: 400');
+    await expect(send('a')).rejects.toThrow('mutations: 400');
     expect(seen).toEqual(['a']);
-    expect(ends()).toEqual([['end', 400, expect.stringContaining('commands: 400')]]);
+    expect(ends()).toEqual([['end', 400, expect.stringContaining('mutations: 400')]]);
   });
 
   test('a request that gets no response is retried, then ends the connection with code 0', async () => {
@@ -384,17 +399,17 @@ describe('sendCommands', () => {
     failures = Infinity;
     failStatus = 503;
     endStreamOnFirst = true;
-    await expect(send('a')).rejects.toThrow('commands: 503');
+    await expect(send('a')).rejects.toThrow('mutations: 503');
     expect(seen).toEqual(['a']);
     expect(ends()).toEqual([['end', 0, 'stream closed']]);
   });
 
-  test('every outcome kind, and several commands in one call', async () => {
-    stub.routes.set('/commands', (_req, body, res) => {
-      // the body is back-to-back command frames
-      const cmds = [...decodeMulti(body)] as unknown[][];
-      expect(cmds.map((c) => nameOf(c[2] as Uint8Array))).toEqual(['a', 'b', 'c', 'd']);
-      expect(cmds.map((c) => [c[0], c[1]])).toEqual([
+  test('every outcome kind, and several mutations in one call', async () => {
+    stub.routes.set('/mutations', (_req, body, res) => {
+      // the body is back-to-back mutations
+      const muts = [...decodeMulti(body)] as unknown[][];
+      expect(muts.map((c) => nameOf(c[2] as Uint8Array))).toEqual(['a', 'b', 'c', 'd']);
+      expect(muts.map((c) => [c[0], c[1]])).toEqual([
         ['s1', 1],
         ['s1', 2],
         [null, null],
@@ -418,7 +433,7 @@ describe('sendCommands', () => {
       [null, null],
       ['s2', 7],
     ];
-    const r = await conn.sendCommands(
+    const r = await conn.sendMutations(
       ['a', 'b', 'c', 'd'].map((id, i) => ({
         id: uuidOf(id),
         series: series[i][0],
@@ -454,9 +469,9 @@ describe('HTTPTransport', () => {
     return { bodies };
   }
 
-  // a /commands that answers every command ok, or refuses with status
-  function commands(refuse?: number): void {
-    stub.routes.set('/commands', (_req, body, res) => {
+  // a /mutations that answers every mutation ok, or refuses with status
+  function mutations(refuse?: number): void {
+    stub.routes.set('/mutations', (_req, body, res) => {
       if (refuse !== undefined) {
         res.writeHead(refuse);
         res.end('token rejected');
@@ -484,23 +499,23 @@ describe('HTTPTransport', () => {
 
   test('a session past half its lifetime is refreshed in place before it is presented', async () => {
     const { bodies } = auth();
-    commands();
+    mutations();
     const old = token('ann', Math.floor(Date.now() / 1000) - 100, 150);
     const s = restoreSession(old);
     const seen: string[] = [];
     s.onRefresh = (r) => seen.push(r.token);
-    const command = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
+    const mutation = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
     const t = new HTTPTransport(stub.url);
 
     // two posts at once share one refresh, and both present the new token
-    await Promise.all([t.post([command], s), t.post([command], s)]);
+    await Promise.all([t.post([mutation], s), t.post([mutation], s)]);
     expect(bodies).toEqual([{ kind: 'refresh' }]);
     const refresh = stub.requests.find((r) => r.path === '/auth/token')!;
     expect(refresh.headers.authorization).toBe(`Bearer ${old}`);
     expect(seen).toEqual([s.token]);
     expect(s.token).not.toBe(old);
     expect(s.exp).toBe(99);
-    const posts = stub.requests.filter((r) => r.path === '/commands');
+    const posts = stub.requests.filter((r) => r.path === '/mutations');
     expect(posts.map((r) => r.headers.authorization)).toEqual([
       `Bearer ${s.token}`,
       `Bearer ${s.token}`,
@@ -509,10 +524,10 @@ describe('HTTPTransport', () => {
 
   test('a session in the first half of its lifetime is presented as it is', async () => {
     const { bodies } = auth();
-    commands();
+    mutations();
     const s = restoreSession(JWT);
-    const command = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
-    expect(await new HTTPTransport(stub.url).post([command], s)).toEqual([
+    const mutation = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
+    expect(await new HTTPTransport(stub.url).post([mutation], s)).toEqual([
       { kind: 'ok', position: 7 },
     ]);
     expect(bodies).toEqual([]);
@@ -520,13 +535,13 @@ describe('HTTPTransport', () => {
   });
 
   test('a refused post ends its session, and a post with an ended session sends nothing', async () => {
-    commands(401);
+    mutations(401);
     const s = restoreSession(JWT);
     const t = new HTTPTransport(stub.url);
-    const command = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
-    await expect(t.post([command], s)).rejects.toThrow(AuthError);
+    const mutation = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
+    await expect(t.post([mutation], s)).rejects.toThrow(AuthError);
     expect(s.ended).toBe(true);
-    await expect(t.post([command], s)).rejects.toThrow(AuthError);
+    await expect(t.post([mutation], s)).rejects.toThrow(AuthError);
     expect(stub.requests.length).toBe(1);
   });
 
@@ -547,9 +562,9 @@ describe('HTTPTransport', () => {
     expect(s.ended).toBe(true);
   });
 
-  test('a refused command send ends the connection fatally', async () => {
+  test('a refused mutation send ends the connection fatally', async () => {
     const st = stub.stream();
-    commands(401);
+    mutations(401);
     const s = restoreSession(JWT);
     const log: unknown[][] = [];
     let fatal: unknown;
@@ -561,9 +576,9 @@ describe('HTTPTransport', () => {
       },
     });
     await st.opened;
-    const command = { id: uuidOf('c1'), series: 's', n: 1, data: encode({}) };
-    await expect(conn.sendCommands([command])).rejects.toThrow();
-    expect(log.at(-1)).toEqual(['end', 401, 'commands: 401 Unauthorized']);
+    const mutation = { id: uuidOf('c1'), series: 's', n: 1, data: encode({}) };
+    await expect(conn.sendMutations([mutation])).rejects.toThrow();
+    expect(log.at(-1)).toEqual(['end', 401, 'mutations: 401 Unauthorized']);
     expect(fatal).toBeInstanceOf(AuthError);
     expect(s.ended).toBe(true);
   });
@@ -582,9 +597,9 @@ describe('HTTPTransport', () => {
     expect(stub.requests).toEqual([]);
   });
 
-  // a /commands that fails with each status in turn, then answers every command ok
+  // a /mutations that fails with each status in turn, then answers every mutation ok
   function flaky(...statuses: number[]): void {
-    stub.routes.set('/commands', (_req, body, res) => {
+    stub.routes.set('/mutations', (_req, body, res) => {
       const status = statuses.shift();
       if (status !== undefined) {
         res.writeHead(status);
@@ -598,8 +613,8 @@ describe('HTTPTransport', () => {
 
   test('a numbered post that fails for a reason that may not recur is retried under the same ids', async () => {
     flaky(503, 502);
-    const command = { id: uuidOf('c1'), series: 's1', n: 1, data: encode({}) };
-    expect(await new HTTPTransport(stub.url).post([command])).toEqual([
+    const mutation = { id: uuidOf('c1'), series: 's1', n: 1, data: encode({}) };
+    expect(await new HTTPTransport(stub.url).post([mutation])).toEqual([
       { kind: 'ok', position: 7 },
     ]);
     expect(stub.requests.length).toBe(3);
@@ -609,30 +624,30 @@ describe('HTTPTransport', () => {
 
   test('an unnumbered post is tried once', async () => {
     flaky(503);
-    const command = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
-    await expect(new HTTPTransport(stub.url).post([command])).rejects.toThrow('commands: 503');
+    const mutation = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
+    await expect(new HTTPTransport(stub.url).post([mutation])).rejects.toThrow('mutations: 503');
     expect(stub.requests.length).toBe(1);
   });
 
   test('a 4xx stands at once, numbered or not', async () => {
     flaky(400);
-    const command = { id: uuidOf('c1'), series: 's1', n: 1, data: encode({}) };
-    await expect(new HTTPTransport(stub.url).post([command])).rejects.toThrow('commands: 400');
+    const mutation = { id: uuidOf('c1'), series: 's1', n: 1, data: encode({}) };
+    await expect(new HTTPTransport(stub.url).post([mutation])).rejects.toThrow('mutations: 400');
     expect(stub.requests.length).toBe(1);
   });
 
-  // a /commands that takes at most max commands a request, refusing more with a 413 that names
-  // max, and answers each command it takes ok at its number
+  // a /mutations that takes at most max mutations a request, refusing more with a 413 that names
+  // max, and answers each mutation it takes ok at its number
   function limited(max: number): void {
-    stub.routes.set('/commands', (_req, body, res) => {
-      const cmds = [...decodeMulti(body)] as unknown[][];
-      if (cmds.length > max) {
-        res.writeHead(413, { 'PhaseLock-Max-Commands': String(max) });
+    stub.routes.set('/mutations', (_req, body, res) => {
+      const muts = [...decodeMulti(body)] as unknown[][];
+      if (muts.length > max) {
+        res.writeHead(413, { 'PhaseLock-Max-Mutations': String(max) });
         res.end('too many');
         return;
       }
       res.writeHead(200);
-      res.end(Buffer.from(encode(cmds.map((c) => ['ok', c[1]]))));
+      res.end(Buffer.from(encode(muts.map((c) => ['ok', c[1]]))));
     });
   }
   const numbered = (n: number) =>
@@ -643,10 +658,12 @@ describe('HTTPTransport', () => {
       data: encode({}),
     }));
   const sizes = () =>
-    stub.requests.filter((r) => r.path === '/commands').map((r) => [...decodeMulti(r.body)].length);
+    stub.requests
+      .filter((r) => r.path === '/mutations')
+      .map((r) => [...decodeMulti(r.body)].length);
   const positions = (rs: { kind: string; position?: number }[]) => rs.map((r) => r.position);
 
-  test('a post goes in requests of 8 commands without a session, and of 128 with one', async () => {
+  test('a post goes in requests of 8 mutations without a session, and of 128 with one', async () => {
     limited(128);
     const t = new HTTPTransport(stub.url);
     const anonymous = await t.post(numbered(20));
@@ -667,8 +684,8 @@ describe('HTTPTransport', () => {
   test('a session this library did not make is refused before anything is sent', async () => {
     const t = new HTTPTransport(stub.url);
     const foreign = { token: JWT, user: 'u1', exp: 0, ended: false } as unknown as Session;
-    const command = { id: uuidOf('c1'), series: 's1', n: 1, data: encode({}) };
-    await expect(t.post([command], foreign)).rejects.toThrow(/not a session from @phaselock/);
+    const mutation = { id: uuidOf('c1'), series: 's1', n: 1, data: encode({}) };
+    await expect(t.post([mutation], foreign)).rejects.toThrow(/not a session from @phaselock/);
     expect(() =>
       t.connect(-1, null, ['*'], new AbortController().signal, hooks([]), foreign),
     ).toThrow(TypeError);
@@ -677,7 +694,7 @@ describe('HTTPTransport', () => {
   });
 
   test('builds each schema into a Registry once', () => {
-    const schema: Schema = { nodes: [], ids: {}, commands: null, eventTypes: {}, storeTypes: {} };
+    const schema: Schema = { nodes: [], ids: {}, mutations: null };
     const t = new HTTPTransport(stub.url);
     expect(t.buildRegistry(schema)).toBe(t.buildRegistry(schema));
     expect(t.buildRegistry({ ...schema })).not.toBe(t.buildRegistry(schema));
@@ -686,36 +703,36 @@ describe('HTTPTransport', () => {
 
 describe('the base URL', () => {
   test("every route is under the base URL's path, with or without a trailing slash", async () => {
-    stub.routes.set('/phaselock/commands', (_req, _body, res) => {
+    stub.routes.set('/phaselock/mutations', (_req, _body, res) => {
       res.writeHead(200);
       res.end(Buffer.from(encode([['ok', 7]])));
     });
-    const command = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
+    const mutation = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
     for (const base of [`${stub.url}/phaselock`, `${stub.url}/phaselock/`]) {
-      await new HTTPTransport(base).post([command]);
-      await postCommand(base, command);
+      await new HTTPTransport(base).post([mutation]);
+      await postMutation(base, mutation);
     }
-    expect(stub.requests.map((r) => r.path)).toEqual(Array(4).fill('/phaselock/commands'));
+    expect(stub.requests.map((r) => r.path)).toEqual(Array(4).fill('/phaselock/mutations'));
   });
 });
 
-describe('postCommand', () => {
-  test('one command, with the token when given, answered with its outcome', async () => {
-    stub.routes.set('/commands', (_req, _body, res) => {
+describe('postMutation', () => {
+  test('one mutation, with the token when given, answered with its outcome', async () => {
+    stub.routes.set('/mutations', (_req, _body, res) => {
       res.writeHead(200);
       res.end(Buffer.from(encode([['reject', 'taken']])));
     });
-    const command = {
+    const mutation = {
       id: uuidOf('c1'),
       series: null,
       n: null,
       data: encode({ type: 'create-account' }),
     };
-    expect(await postCommand(stub.url, command, JWT)).toEqual({
+    expect(await postMutation(stub.url, mutation, JWT)).toEqual({
       kind: 'reject',
       reason: 'taken',
     });
-    expect(await postCommand(stub.url, command)).toEqual({ kind: 'reject', reason: 'taken' });
+    expect(await postMutation(stub.url, mutation)).toEqual({ kind: 'reject', reason: 'taken' });
     const [signed, anonymous] = stub.requests;
     expect(signed.headers.authorization).toBe(`Bearer ${JWT}`);
     expect(signed.headers['content-type']).toBe('application/msgpack');
@@ -724,78 +741,92 @@ describe('postCommand', () => {
   });
 
   test('a failed request rejects and is not retried', async () => {
-    stub.routes.set('/commands', (_req, _body, res) => {
+    stub.routes.set('/mutations', (_req, _body, res) => {
       res.writeHead(503);
       res.end('busy');
     });
-    const command = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
-    await expect(postCommand(stub.url, command)).rejects.toThrow('commands: 503');
+    const mutation = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
+    await expect(postMutation(stub.url, mutation)).rejects.toThrow('mutations: 503');
     expect(stub.requests.length).toBe(1);
   });
 });
 
 describe('backfill', () => {
-  const records = Object.fromEntries(
+  const values = Object.fromEntries(
     Array.from({ length: 2500 }, (_, i) => [
       `patron:p${String(i).padStart(4, '0')}!patron`,
       { name: 'n'.repeat(200), i },
     ]),
   );
-  const streams = Object.fromEntries(Object.keys(records).map((k) => [k.split('!')[0], 2]));
-  const built = blob({ ref: 'patron:*', position: 40, streams, records });
+  const slices = Object.fromEntries(Object.keys(values).map((k) => [k.split('!')[0], 2]));
+  const built = blob({ selector: 'patron:*', position: 40, epoch: 'e3', slices, values });
+  // the body's operations, from the first to the end marker
+  const body = built.bytes.subarray(built.start, built.opEnds.at(-1));
+  // the checksum a page ending with operation i carries: the count and the hash through it
+  function checksumAt(i: number): string {
+    const fnv = new Fnv64();
+    fnv.update(built.bytes.subarray(built.start, built.opEnds[i]));
+    return `${i + 1}:${fnv.state()}`;
+  }
 
   type Run = {
     outcome: BackfillOutcome;
     header: { position: number; seqs: Record<string, number> } | null;
-    batches: { keys: string[]; skip: number }[];
+    pages: { bytes: Uint8Array; keys: string[]; skip: number; checksum: string }[];
     tails: [number, string, number][][];
     scanned: number[];
     lengths: number[];
-    done: ('values' | 'events')[];
+    done: ('pages' | 'edits')[];
   };
 
   async function run(
     conn: Connection,
-    ref: string,
+    selector: string,
     until: number,
     resume: Backfill['resume'] = null,
   ): Promise<Run> {
     const got: Run = {
       outcome: 'done',
       header: null,
-      batches: [],
+      pages: [],
       tails: [],
       scanned: [],
       lengths: [],
       done: [],
     };
     got.outcome = await conn.backfill({
-      ref,
+      selector,
       until,
       resume,
       signal: new AbortController().signal,
       push: async (item) => {
-        if ('length' in item) got.lengths.push(item.length);
-        else if ('header' in item) got.header = item.header;
-        else if ('values' in item)
-          got.batches.push({ keys: item.values.map(([k]) => k), skip: item.skip });
-        else if ('valuesDone' in item) got.done.push('values');
-        else if ('events' in item) {
-          got.tails.push(item.events.map((e) => [e.position, e.stream, e.seq]));
+        if ('length' in item) {
+          got.lengths.push(item.length);
+        } else if ('header' in item) {
+          got.header = item.header;
+        } else if ('page' in item) {
+          const keys = editOps(item.page, false).map(([k]) => k);
+          got.pages.push({ bytes: item.page, keys, skip: item.skip, checksum: item.checksum });
+        } else if ('pagesDone' in item) {
+          got.done.push('pages');
+        } else if ('edits' in item) {
+          got.tails.push(item.edits.map((e) => [e.position, e.slice, e.seq]));
           got.scanned.push(item.scanned);
-        } else got.done.push('events');
+        } else {
+          got.done.push('edits');
+        }
       },
     });
     return got;
   }
 
-  // serve the blob inline at position 40, honoring Range
-  function serveBlob(bytes = built.bytes, position = 40) {
+  // serve the blob inline at position 40 of the stream's log, honoring Range
+  function serveBlob(bytes = built.bytes, position = 40, epoch = 'e3') {
     stub.routes.set('/snapshot/', (req, _body, res) => {
       const range = /bytes=(\d+)-/.exec(req.headers.range ?? '');
       const skip = range ? Number(range[1]) : 0;
       if (skip >= bytes.length) {
-        res.writeHead(416, { 'PhaseLock-Position': String(position) });
+        res.writeHead(416, { 'PhaseLock-Position': String(position), 'PhaseLock-Epoch': epoch });
         res.end();
         return;
       }
@@ -806,17 +837,25 @@ describe('backfill', () => {
       res.writeHead(skip > 0 ? 206 : 200, {
         'Content-Type': 'application/octet-stream',
         'PhaseLock-Position': String(position),
+        'PhaseLock-Epoch': epoch,
         ...length,
       });
       res.end(Buffer.from(bytes.subarray(skip)));
     });
   }
 
-  // a tail: pages of events for `ref` between after and before, from a fixed log
+  // a tail: pages of edits for `selector` between after and before, from a fixed log of one edit
+  // per position
   const log: [number, string, number][] = [];
   for (let p = 41; p <= 3500; p++) log.push([p, `patron:p${String(p % 7).padStart(4, '0')}`, p]);
+  const wireEdit = ([p, slice, seq]: [number, string, number]) => [
+    [p, slice, seq, label(`c${p}`), new Date(0), 0],
+    0,
+    `${slice}!n`,
+    p,
+  ];
   function serveTail() {
-    stub.routes.set('/events/', (req, _body, res) => {
+    stub.routes.set('/edits/', (req, _body, res) => {
       const u = new URL(req.url!, stub.url);
       const after = Number(u.searchParams.get('after'));
       const before = Number(u.searchParams.get('before') ?? Infinity);
@@ -827,10 +866,8 @@ describe('backfill', () => {
         'Content-Type': 'application/msgpack',
         'PhaseLock-Scanned': String(scanned),
       });
-      const body = page.map(([p, s, seq]) =>
-        encode(['events', [[[p, s, seq, label(`c${p}`), new Date(0)], { p }]]]),
-      );
-      res.end(Buffer.concat(body.map((b) => Buffer.from(b))));
+      const frames = page.map((e) => encode(['edits', [wireEdit(e)]]));
+      res.end(Buffer.concat(frames.map((b) => Buffer.from(b))));
     });
   }
 
@@ -840,31 +877,48 @@ describe('backfill', () => {
     conn = connector(restoreSession(JWT))(-1, null, ['*'], new AbortController().signal, hooks([]));
   });
 
-  test('header, batched values with record-boundary skips, checksums, and an empty tail', async () => {
+  test('header, pages with operation-boundary skips, checksums, and an empty tail', async () => {
     serveBlob();
     serveTail();
     const r = await run(conn, 'patron:*', 40);
     expect(r.outcome).toBe('done');
     expect(r.lengths).toEqual([built.bytes.length]);
-    expect(r.header).toEqual({ position: 40, seqs: streams });
-    const keys = r.batches.flatMap((b) => b.keys);
-    expect(keys).toEqual(Object.keys(records).sort());
-    // batches are bounded by records or bytes, and each skip is the offset after its last record
-    expect(r.batches.length).toBeGreaterThan(1);
+    expect(r.header).toEqual({ position: 40, seqs: slices });
+    const keys = r.pages.flatMap((p) => p.keys);
+    expect(keys).toEqual(Object.keys(values).sort());
+    // pages are bounded by operations or bytes; each skip is the offset after its last one, and
+    // each checksum the count and the hash through it
+    expect(r.pages.length).toBeGreaterThan(1);
     let n = 0;
-    for (const b of r.batches) {
-      n += b.keys.length;
-      expect(b.skip).toBe(built.recordEnds[n - 1]);
+    for (const p of r.pages) {
+      n += p.keys.length;
+      expect(p.skip).toBe(built.opEnds[n - 1]);
+      expect(p.checksum).toBe(checksumAt(n - 1));
     }
-    // each half ends with exactly one done call, and no empty batch is ever delivered
+    // each half ends with exactly one done call, and no empty page is ever delivered
     expect(r.tails).toEqual([]);
-    expect(r.done.sort()).toEqual(['events', 'values']);
-    const reqs = stub.requests.filter((q) => q.path.startsWith('/events/'));
+    expect(r.done.sort()).toEqual(['edits', 'pages']);
+    const reqs = stub.requests.filter((q) => q.path.startsWith('/edits/'));
     expect(reqs).toHaveLength(1);
     expect(reqs[0].headers.authorization).toBe(`Bearer ${JWT}`);
   });
 
-  test('the tail pages forward from the blob position to until and stops on a short page', async () => {
+  test("the pages are the blob's operations as it holds them, values undecoded", async () => {
+    serveBlob();
+    serveTail();
+    const r = await run(conn, 'patron:*', 40);
+    const joined = new Uint8Array(r.pages.reduce((n, p) => n + p.bytes.length, 0));
+    let at = 0;
+    for (const p of r.pages) {
+      joined.set(p.bytes, at);
+      at += p.bytes.length;
+    }
+    expect(Buffer.from(joined).equals(body)).toBe(true);
+    const [key, value] = editOps(r.pages[0].bytes, false)[0];
+    expect([key, decode(value!)]).toEqual(['patron:p0000!patron', { name: 'n'.repeat(200), i: 0 }]);
+  });
+
+  test('the tail pages forward from the blob position to until and stops on reaching it', async () => {
     serveBlob();
     serveTail();
     const r = await run(conn, 'patron:*', 2600);
@@ -873,15 +927,51 @@ describe('backfill', () => {
     expect(positions.at(-1)).toBe(2599);
     expect(positions).toHaveLength(2559);
     expect(r.tails).toHaveLength(3);
-    // each page reports how far its scan reached: a full page its last event, a short one until
+    // each page reports how far its scan reached: a full page its last edit, a short one until
     expect(r.scanned).toEqual([1040, 2040, 2600]);
-    expect(r.done.filter((d) => d === 'events')).toEqual(['events']);
-    const pages = stub.requests.filter((q) => q.path.startsWith('/events/')).map((q) => q.path);
-    expect(pages).toHaveLength(3);
-    const urls =
-      stub.server.listeners('request') &&
-      stub.requests.filter((q) => q.path.startsWith('/events/'));
-    expect(urls).toHaveLength(3);
+    expect(r.done.filter((d) => d === 'edits')).toEqual(['edits']);
+    expect(stub.requests.filter((q) => q.path.startsWith('/edits/'))).toHaveLength(3);
+  });
+
+  test('a page of fewer edits than asked for continues while its scan is short of until', async () => {
+    serveBlob();
+    // pages of two positions, each with an edit to two slices, whatever max asks for
+    stub.routes.set('/edits/', (req, _body, res) => {
+      const after = Number(new URL(req.url!, stub.url).searchParams.get('after'));
+      const scanned = Math.min(after + 2, 46);
+      res.writeHead(200, { 'PhaseLock-Scanned': String(scanned) });
+      const frames: Uint8Array[] = [];
+      for (let p = after + 1; p <= scanned && p < 46; p++) {
+        frames.push(encode(['edits', [wireEdit([p, 'a', p]), wireEdit([p, 'b', p])]]));
+      }
+      res.end(Buffer.concat(frames.map((b) => Buffer.from(b))));
+    });
+    const r = await run(conn, 'patron:*', 46);
+    expect(r.tails.flat().map(([p, s]) => `${p}${s}`)).toEqual([
+      '41a',
+      '41b',
+      '42a',
+      '42b',
+      '43a',
+      '43b',
+      '44a',
+      '44b',
+      '45a',
+      '45b',
+    ]);
+    expect(r.scanned).toEqual([42, 44, 46]);
+  });
+
+  test('a tail page without a scan ends the tail', async () => {
+    serveBlob();
+    stub.routes.set('/edits/', (_req, _body, res) => {
+      res.writeHead(200);
+      res.end(Buffer.from(encode(['edits', [wireEdit([41, 'a', 1])]])));
+    });
+    const r = await run(conn, 'patron:*', 1000);
+    expect(r.scanned).toEqual([41]);
+    expect(r.done).toContain('edits');
+    expect(stub.requests.filter((q) => q.path.startsWith('/edits/'))).toHaveLength(1);
   });
 
   test('the tail honors the fromPosition floor and a newer blob overrides it', async () => {
@@ -889,12 +979,13 @@ describe('backfill', () => {
     serveTail();
     const seenAfter: number[] = [];
     stub.server.on('request', (req) => {
-      if (req.url!.startsWith('/events/'))
+      if (req.url!.startsWith('/edits/'))
         seenAfter.push(Number(new URL(req.url!, stub.url).searchParams.get('after')));
     });
     await run(conn, 'patron:*', 200, {
       position: 40,
       skipBytes: 0,
+      checksum: '',
       fromPosition: 100,
       snapshotDone: false,
       tailDone: false,
@@ -904,6 +995,7 @@ describe('backfill', () => {
     await run(conn, 'patron:*', 200, {
       position: 10,
       skipBytes: 0,
+      checksum: '',
       fromPosition: 20,
       snapshotDone: false,
       tailDone: false,
@@ -911,13 +1003,14 @@ describe('backfill', () => {
     expect(seenAfter).toEqual([40]);
   });
 
-  test('resume: 206 continues at skipBytes with no header call', async () => {
+  test('resume: 206 continues at skipBytes with no header call, and the footer checks out', async () => {
     serveBlob();
     serveTail();
-    const skip = built.recordEnds[1000];
+    const skip = built.opEnds[1000];
     const r = await run(conn, 'patron:*', 40, {
       position: 40,
       skipBytes: skip,
+      checksum: checksumAt(1000),
       fromPosition: 40,
       snapshotDone: false,
       tailDone: false,
@@ -925,7 +1018,8 @@ describe('backfill', () => {
     expect(r.outcome).toBe('done');
     expect(r.header).toBeNull();
     expect(r.lengths).toEqual([built.bytes.length]);
-    expect(r.batches.flatMap((b) => b.keys)).toEqual(Object.keys(records).sort().slice(1001));
+    expect(r.pages.flatMap((p) => p.keys)).toEqual(Object.keys(values).sort().slice(1001));
+    expect(r.pages[0].skip).toBeGreaterThan(skip);
     expect(stub.requests.find((q) => q.path.startsWith('/snapshot/'))!.headers.range).toBe(
       `bytes=${skip}-`,
     );
@@ -936,19 +1030,64 @@ describe('backfill', () => {
       res.writeHead(200, {
         'Content-Type': 'application/octet-stream',
         'PhaseLock-Position': '40',
+        'PhaseLock-Epoch': 'e3',
       });
       res.end(Buffer.from(built.bytes));
     });
     serveTail();
     const r = await run(conn, 'patron:*', 40, {
       position: 40,
-      skipBytes: built.recordEnds[2400],
+      skipBytes: built.opEnds[2400],
+      checksum: checksumAt(2400),
       fromPosition: 40,
       snapshotDone: false,
       tailDone: false,
     });
-    expect(r.batches.flatMap((b) => b.keys)).toEqual(Object.keys(records).sort().slice(2401));
+    expect(r.pages.flatMap((p) => p.keys)).toEqual(Object.keys(values).sort().slice(2401));
   });
+
+  test.each([
+    // a value's last byte, its `i`, changed to another valid int, past the resume point
+    ['content hash', checksumAt(1000), (b: Uint8Array) => (b[built.opEnds[2000] - 1] ^= 1)],
+    // the resume point's hash, with a count one short
+    ['operation count', checksumAt(1000).replace(/^\d+/, '1000'), () => {}],
+    // a count that matches, with the hash of a different resume point
+    ['content hash', `1001:${checksumAt(999).split(':')[1]}`, () => {}],
+  ])(
+    'resume: the footer is checked through the resumed checksum: %s',
+    async (what, checksum, corrupt) => {
+      const bytes = built.bytes.slice();
+      corrupt(bytes);
+      serveBlob(bytes);
+      serveTail();
+      const resume = {
+        position: 40,
+        skipBytes: built.opEnds[1000],
+        checksum,
+        fromPosition: 40,
+        snapshotDone: false,
+        tailDone: false,
+      };
+      await expect(run(conn, 'patron:*', 40, resume)).rejects.toThrow(new RegExp(what));
+    },
+  );
+
+  test.each(['', '1001', `1001:${'0'.repeat(15)}`, `x:${'0'.repeat(16)}`, `01:${'0'.repeat(16)}`])(
+    'resume: a malformed checksum is an error: %j',
+    async (checksum) => {
+      serveBlob();
+      serveTail();
+      const resume = {
+        position: 40,
+        skipBytes: built.opEnds[1000],
+        checksum,
+        fromPosition: 40,
+        snapshotDone: false,
+        tailDone: false,
+      };
+      await expect(run(conn, 'patron:*', 40, resume)).rejects.toThrow(/bad resume checksum/);
+    },
+  );
 
   test('resume: 416 means nothing is left', async () => {
     serveBlob();
@@ -956,13 +1095,14 @@ describe('backfill', () => {
     const r = await run(conn, 'patron:*', 40, {
       position: 40,
       skipBytes: built.bytes.length,
+      checksum: checksumAt(2499),
       fromPosition: 40,
       snapshotDone: false,
       tailDone: false,
     });
     expect(r.outcome).toBe('done');
-    expect(r.batches).toEqual([]);
-    expect(r.done).toContain('values');
+    expect(r.pages).toEqual([]);
+    expect(r.done).toContain('pages');
   });
 
   test('resume: a finished half is skipped outright', async () => {
@@ -971,6 +1111,7 @@ describe('backfill', () => {
     const snapshotDone = {
       position: 40,
       skipBytes: 0,
+      checksum: '',
       fromPosition: 40,
       snapshotDone: true,
       tailDone: false,
@@ -978,12 +1119,13 @@ describe('backfill', () => {
     const r = await run(conn, 'patron:*', 100, snapshotDone);
     expect(r.outcome).toBe('done');
     expect(r.header).toBeNull();
-    expect(r.batches).toEqual([]);
-    expect(r.done).toEqual(['events']);
+    expect(r.pages).toEqual([]);
+    expect(r.done).toEqual(['edits']);
     expect(stub.requests.filter((q) => q.path.startsWith('/snapshot/'))).toHaveLength(0);
     const tailDone = {
       position: 40,
       skipBytes: 0,
+      checksum: '',
       fromPosition: 99,
       snapshotDone: false,
       tailDone: true,
@@ -992,8 +1134,8 @@ describe('backfill', () => {
     expect(r2.outcome).toBe('done');
     expect(r2.header!.position).toBe(40);
     expect(r2.tails).toEqual([]);
-    expect(r2.done).toEqual(['values']);
-    expect(stub.requests.filter((q) => q.path.startsWith('/events/'))).toHaveLength(1);
+    expect(r2.done).toEqual(['pages']);
+    expect(stub.requests.filter((q) => q.path.startsWith('/edits/'))).toHaveLength(1);
   });
 
   test('stale: a resumed position that no longer matches', async () => {
@@ -1002,19 +1144,24 @@ describe('backfill', () => {
     const r = await run(conn, 'patron:*', 40, {
       position: 40,
       skipBytes: 100,
+      checksum: '',
       fromPosition: 40,
       snapshotDone: false,
       tailDone: false,
     });
     expect(r.outcome).toBe('stale');
     expect(r.header).toBeNull();
-    expect(r.batches).toEqual([]);
+    expect(r.pages).toEqual([]);
   });
 
   test('the pointer form, and stale when the pointer target is gone', async () => {
     let gone = false;
     stub.routes.set('/snapshot/', (_req, _body, res) => {
-      res.writeHead(200, { 'Content-Type': 'text/plain', 'PhaseLock-Position': '40' });
+      res.writeHead(200, {
+        'Content-Type': 'text/plain',
+        'PhaseLock-Position': '40',
+        'PhaseLock-Epoch': 'e3',
+      });
       res.end(`${stub.url}/blob/xyz`);
     });
     stub.routes.set('/blob/', (req, _body, res) => {
@@ -1031,7 +1178,7 @@ describe('backfill', () => {
     const r = await run(conn, 'patron:*', 40);
     expect(r.outcome).toBe('done');
     expect(r.header!.position).toBe(40);
-    expect(r.batches.flatMap((b) => b.keys)).toHaveLength(2500);
+    expect(r.pages.flatMap((p) => p.keys)).toHaveLength(2500);
     gone = true;
     expect((await run(conn, 'patron:*', 40)).outcome).toBe('stale');
   });
@@ -1039,28 +1186,137 @@ describe('backfill', () => {
   test('a 403 on the snapshot rejects, and is not mistaken for a pointer', async () => {
     stub.routes.set('/snapshot/', (_req, _body, res) => {
       res.writeHead(403, { 'Content-Type': 'text/plain' });
-      res.end('ref not visible');
+      res.end('selector not visible');
     });
     await expect(run(conn, 'patron:*', 40)).rejects.toThrow(/403/);
   });
 
+  test('a snapshot response without a position rejects', async () => {
+    stub.routes.set('/snapshot/', (_req, _body, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'PhaseLock-Epoch': 'e3' });
+      res.end(Buffer.from(built.bytes));
+    });
+    serveTail();
+    await expect(run(conn, 'patron:*', 40)).rejects.toThrow(/no position/);
+  });
+
+  test('a snapshot response without an epoch rejects', async () => {
+    stub.routes.set('/snapshot/', (_req, _body, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'PhaseLock-Position': '40',
+      });
+      res.end(Buffer.from(built.bytes));
+    });
+    serveTail();
+    await expect(run(conn, 'patron:*', 40)).rejects.toThrow(/no epoch/);
+  });
+
+  test("stale: an origin epoch other than the stream's, fresh or resumed", async () => {
+    serveBlob(built.bytes, 40, 'e4');
+    serveTail();
+    const fresh = await run(conn, 'patron:*', 40);
+    expect(fresh.outcome).toBe('stale');
+    expect(fresh.header).toBeNull();
+    expect(fresh.pages).toEqual([]);
+    const resumed = await run(conn, 'patron:*', 40, {
+      position: 40,
+      skipBytes: built.opEnds[1000],
+      checksum: checksumAt(1000),
+      fromPosition: 40,
+      snapshotDone: false,
+      tailDone: false,
+    });
+    expect(resumed.outcome).toBe('stale');
+    expect(resumed.pages).toEqual([]);
+    expect(stub.requests.filter((q) => q.path.startsWith('/edits/'))).toHaveLength(0);
+  });
+
+  test("stale: a blob whose header names an epoch other than the origin's", async () => {
+    const other = blob({ selector: 'patron:*', position: 40, epoch: 'e9', slices, values });
+    stub.routes.set('/snapshot/', (_req, _body, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'text/plain',
+        'PhaseLock-Position': '40',
+        'PhaseLock-Epoch': 'e3',
+      });
+      res.end(`${stub.url}/blob/xyz`);
+    });
+    stub.routes.set('/blob/', (_req, _body, res) => {
+      res.writeHead(200);
+      res.end(Buffer.from(other.bytes));
+    });
+    serveTail();
+    const r = await run(conn, 'patron:*', 40);
+    expect(r.outcome).toBe('stale');
+    expect(r.header).toBeNull();
+    expect(r.pages).toEqual([]);
+  });
+
+  test('a backfill started before the stream opens waits for it', async () => {
+    // a stream that answers only once released
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    stub.routes.set('/stream', (_req, _body, res) => {
+      void gate.then(() => {
+        res.writeHead(200, {
+          'Content-Type': 'application/msgpack',
+          'PhaseLock-Epoch': 'e3',
+          'PhaseLock-Position': '3',
+        });
+        res.flushHeaders();
+      });
+    });
+    serveBlob();
+    serveTail();
+    const log: unknown[][] = [];
+    const early = connector(restoreSession(JWT))(
+      -1,
+      null,
+      ['*'],
+      new AbortController().signal,
+      hooks(log),
+    );
+
+    // the snapshot is requested at once, but nothing is pushed until the stream opens
+    let settled = false;
+    const p = run(early, 'patron:*', 40).finally(() => (settled = true));
+    await settle();
+    expect(stub.requests.some((q) => q.path.startsWith('/snapshot/'))).toBe(true);
+    expect(settled).toBe(false);
+    expect(log).toEqual([]);
+    release();
+    const r = await p;
+    expect(r.outcome).toBe('done');
+    expect(r.header).toEqual({ position: 40, seqs: slices });
+    expect(log).toEqual([['open', 'e3', 3]]);
+  });
+
+  test('a backfill waiting for the stream fails when the connection ends before it opens', async () => {
+    stub.routes.set('/stream', (_req, _body, res) => {
+      setTimeout(() => {
+        res.writeHead(503);
+        res.end('unavailable');
+      }, 50);
+    });
+    serveBlob();
+    serveTail();
+    const failing = connector(restoreSession(JWT))(
+      -1,
+      null,
+      ['*'],
+      new AbortController().signal,
+      hooks([]),
+    );
+    await expect(run(failing, 'patron:*', 40)).rejects.toThrow(/before its stream opened/);
+  });
+
   test.each([
     ['header crc', (b: Uint8Array) => (b[9] ^= 1)],
-    ['record crc', (b: Uint8Array) => (b[built.recordEnds[5] - 6] ^= 1)],
-    [
-      'content hash',
-      (b: Uint8Array) => {
-        // change a value byte and recompute that record's crc, so only the hash disagrees
-        const start = built.recordEnds[4];
-        const end = built.recordEnds[5];
-        const klen = (b[start] << 24) | (b[start + 1] << 16) | (b[start + 2] << 8) | b[start + 3];
-        const key = b.subarray(start + 4, start + 4 + klen);
-        const value = b.subarray(start + 8 + klen, end - 4);
-        value[value.length - 1] ^= 1;
-        const crc = crc32c(value, crc32c(key));
-        b.set([crc >>> 24, (crc >>> 16) & 0xff, (crc >>> 8) & 0xff, crc & 0xff], end - 4);
-      },
-    ],
+    // an opcode other than a set
+    ['corrupt operation', (b: Uint8Array) => (b[built.opEnds[5]] = 1)],
+    // a value's last byte, its `i`, changed to another valid int
+    ['content hash', (b: Uint8Array) => (b[built.opEnds[5] - 1] ^= 1)],
     ['footer crc', (b: Uint8Array) => (b[b.length - 1] ^= 1)],
     ['bad magic', (b: Uint8Array) => (b[0] = 0x58)],
   ])('corruption is detected: %s', async (what, corrupt) => {
@@ -1076,6 +1332,7 @@ describe('backfill', () => {
       res.writeHead(200, {
         'Content-Type': 'application/octet-stream',
         'PhaseLock-Position': '40',
+        'PhaseLock-Epoch': 'e3',
       });
       // the headers go at once, and the body starts well after the tail has answered
       res.flushHeaders();
@@ -1084,7 +1341,7 @@ describe('backfill', () => {
     serveTail();
     const order: string[] = [];
     await conn.backfill({
-      ref: 'patron:*',
+      selector: 'patron:*',
       until: 45,
       resume: null,
       signal: new AbortController().signal,
@@ -1094,7 +1351,7 @@ describe('backfill', () => {
     });
     const header = order.indexOf('header');
     expect(header).toBeGreaterThanOrEqual(0);
-    expect(order.findIndex((k) => k === 'events' || k === 'eventsDone')).toBeGreaterThan(header);
+    expect(order.findIndex((k) => k === 'edits' || k === 'editsDone')).toBeGreaterThan(header);
   });
 
   test('a position in the blob header that disagrees with the origin is an error', async () => {
@@ -1109,16 +1366,18 @@ describe('backfill', () => {
       res.writeHead(200, {
         'Content-Type': 'application/octet-stream',
         'PhaseLock-Position': '40',
+        'PhaseLock-Epoch': 'e3',
       });
-      // trickle the blob past its header and first record, so the tail failure lands mid-download
-      res.write(Buffer.from(built.bytes.subarray(0, built.recordEnds[0])));
+      // trickle the blob past its header and first operation, so the tail failure lands
+      // mid-download
+      res.write(Buffer.from(built.bytes.subarray(0, built.opEnds[0])));
       req.on('close', () => (blobAborted = true));
     });
-    stub.routes.set('/events/', (_req, _body, res) => {
+    stub.routes.set('/edits/', (_req, _body, res) => {
       res.writeHead(500);
       res.end('nope');
     });
-    await expect(run(conn, 'patron:*', 100)).rejects.toThrow(/events patron:\*: 500/);
+    await expect(run(conn, 'patron:*', 100)).rejects.toThrow(/edits patron:\*: 500/);
     await settle();
     expect(blobAborted).toBe(true);
   });
@@ -1128,13 +1387,14 @@ describe('backfill', () => {
       res.writeHead(200, {
         'Content-Type': 'application/octet-stream',
         'PhaseLock-Position': '40',
+        'PhaseLock-Epoch': 'e3',
       });
       res.write(Buffer.from(built.bytes.subarray(0, 100)));
     });
     serveTail();
     const ctl = new AbortController();
     const p = conn.backfill({
-      ref: 'patron:*',
+      selector: 'patron:*',
       until: 40,
       resume: null,
       signal: ctl.signal,
@@ -1144,25 +1404,25 @@ describe('backfill', () => {
     await expect(p).rejects.toThrow();
   });
 
-  test('backpressure: the body is not read past one batch ahead of the Engine', async () => {
+  test('backpressure: the body is not read past one page ahead of the Engine', async () => {
     serveBlob();
     serveTail();
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
     let calls = 0;
     const p = conn.backfill({
-      ref: 'patron:*',
+      selector: 'patron:*',
       until: 40,
       resume: null,
       signal: new AbortController().signal,
       push: async (item) => {
-        if (!('values' in item)) return;
+        if (!('page' in item)) return;
         calls++;
         if (calls === 1) await gate;
       },
     });
     await settle();
-    // the first batch is held; at most one more has been handed over
+    // the first page is held; at most one more has been handed over
     expect(calls).toBeLessThanOrEqual(2);
     release();
     expect(await p).toBe('done');

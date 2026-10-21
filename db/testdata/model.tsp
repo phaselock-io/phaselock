@@ -1,6 +1,6 @@
-// The model the server tests run against: a small library domain with a singleton book stream,
-// per-patron streams, per-branch shelves that the scan tests walk, and per-account streams
-// holding credentials, which maySee never grants to a client.  A librarian's account is flagged
+// The model the server tests run against: a small library domain with a singleton book slice,
+// per-patron slices, per-branch shelves that the scan tests walk, and per-account slices holding
+// credentials, which the grantor never grants to a client.  A librarian's account is flagged
 // admin.
 
 import "@phaselock/typespec-core";
@@ -11,7 +11,7 @@ alias Id = string;
 
 // books //
 
-interface BookSlice extends Slice<"book", BookEvents, { "book:{id}": Book }> {}
+interface BookSlice extends Slice<"book", { "book:{id}": Book }> {}
 
 model Book {
   id: Id;
@@ -20,13 +20,7 @@ model Book {
   added?: utcDateTime;
 }
 
-union BookEvents {
-  AddBook,
-  HoldOpened,
-}
-
 // declares its discriminator last, which every writer still writes first
-@command(AddBook)
 model AddBook {
   id: Id;
   title: string;
@@ -34,17 +28,11 @@ model AddBook {
   type: "add-book";
 }
 
-model HoldOpened {
-  type: "hold-opened";
-  book: Id;
-}
-
 // patrons //
 
 interface PatronSlice
   extends Slice<
     "patron:{patron}",
-    PatronEvents,
     {
       "patron": Patron;
       "holds": Record<boolean>;
@@ -57,53 +45,38 @@ model Patron {
   name: string;
 }
 
-union PatronEvents {
-  AddPatron,
-  RenamePatron,
-  PatronHold,
-  HoldFailed,
-}
-
-@command(AddPatron)
 model AddPatron {
   type: "add-patron";
   id: Id;
   name: string;
 }
 
-@command(RenamePatron)
 model RenamePatron {
   type: "rename-patron";
   id: Id;
   name: string;
 }
 
-model PatronHold {
-  type: "patron-hold";
-  book: Id;
-}
-
-model HoldFailed {
-  type: "hold-failed";
-  book: Id;
-  reason: string;
-}
-
-@command(Death)
+// deletes the patron's slice
 model RemovePatron {
   type: "remove-patron";
   id: Id;
 }
 
-// ends the patron's stream and erases its history
-@command(Erasure)
+// deletes the patron's slice and erases its history
 model ForgetPatron {
   type: "forget-patron";
   id: Id;
 }
 
+// deletes the patron's slice and writes it afresh in the same mutation
+model ResetPatron {
+  type: "reset-patron";
+  id: Id;
+  name: string;
+}
+
 // the catalogue and the patron learn of the hold, or the patron alone learns why it failed
-@command([HoldOpened, PatronHold] | HoldFailed)
 model TryHold {
   type: "try-hold";
   id: Id;
@@ -113,12 +86,11 @@ model TryHold {
 
 // shelves //
 
-// a branch's copies of books, the patrons it lends to, and its copies as its reducer's scan saw
-// them
+// a branch's copies of books, the patrons it lends to, and its copies as the decider's own scan
+// saw them
 interface ShelfSlice
   extends Slice<
     "shelf:{branch}",
-    ShelfEvents,
     {
       "copy:{book}": Copy;
       "lend:{patron}": Id;
@@ -131,33 +103,19 @@ model Copy {
   title: string;
 }
 
-union ShelfEvents {
-  Shelved,
-  Lend,
-}
-
 // the shelf learns the book's title from the catalogue
-@command(Shelved)
 model Shelve {
   type: "shelve";
   branch: Id;
   book: Id;
 }
 
-model Shelved {
-  type: "shelved";
-  book: Id;
-  title: string;
-}
-
-@command(Lend)
 model Lend {
   type: "lend";
   branch: Id;
   patron: Id;
 }
 
-@command(Death)
 model CloseShelf {
   type: "close-shelf";
   branch: Id;
@@ -165,7 +123,7 @@ model CloseShelf {
 
 // accounts //
 
-interface AccountSlice extends Slice<"account:{user}", AccountEvents, { "account": Account }> {}
+interface AccountSlice extends Slice<"account:{user}", { "account": Account }> {}
 
 model Account {
   user: Id;
@@ -175,42 +133,7 @@ model Account {
   views: string[];
 }
 
-union AccountEvents {
-  AccountCreated,
-  PasswordSet,
-  SessionsRevoked,
-  ViewGranted,
-  ViewRevoked,
-}
-
-model AccountCreated {
-  type: "account-created";
-  user: Id;
-  hash: PasswordHash;
-  admin: boolean;
-}
-
-model PasswordSet {
-  type: "password-set";
-  hash: PasswordHash;
-}
-
-model SessionsRevoked {
-  type: "sessions-revoked";
-}
-
-model ViewGranted {
-  type: "view-granted";
-  prefix: string;
-}
-
-model ViewRevoked {
-  type: "view-revoked";
-  prefix: string;
-}
-
 @online
-@command(AccountCreated)
 model CreateAccount {
   type: "create-account";
   user: Id;
@@ -219,7 +142,6 @@ model CreateAccount {
 }
 
 @online
-@command(PasswordSet)
 model SetPassword {
   type: "set-password";
   user: Id;
@@ -228,46 +150,40 @@ model SetPassword {
 
 // changes the sender's own password, proving the one it has
 @online
-@command(PasswordSet)
 model ChangePassword {
   type: "change-password";
   user: Id;
-  check: CommandAuth;
+  check: MutationAuth;
   password: NewPassword;
 }
 
-@command(SessionsRevoked)
 model RevokeSessions {
   type: "revoke-sessions";
   user: Id;
 }
 
-@command(ViewGranted)
 model GrantView {
   type: "grant-view";
   user: Id;
   prefix: string;
 }
 
-@command(ViewRevoked)
 model RevokeView {
   type: "revoke-view";
   user: Id;
   prefix: string;
 }
 
-// a command proving its sender's credentials, which revokes the sender's sessions
+// a mutation proving its sender's credentials, which revokes the sender's sessions
 @online
-@command(SessionsRevoked)
-model AuthenticatedCommand {
-  type: "authenticated-command";
+model AuthenticatedMutation {
+  type: "authenticated-mutation";
   user: Id;
-  check: CommandAuth;
+  check: MutationAuth;
 }
 
-// a command whose handler makes plugin requests, each emitting a hold failure for one of its
-// reasons; `reject` rejects the command after its requests
-@command(HoldFailed)
+// a mutation whose decider makes plugin requests, each adding one of its reasons to the patron's
+// messages; `reject` rejects the mutation after its requests
 model Notify {
   type: "notify";
   patron: Id;
@@ -277,12 +193,13 @@ model Notify {
 
 // the audiences //
 
-union TestCommands {
+union TestMutations {
   AddBook,
   AddPatron,
   RenamePatron,
   RemovePatron,
   ForgetPatron,
+  ResetPatron,
   TryHold,
   Shelve,
   Lend,
@@ -292,14 +209,14 @@ union TestCommands {
   RevokeView,
 }
 
-interface TestEngine extends Engine<[BookSlice, PatronSlice, ShelfSlice], TestCommands> {}
+interface TestEngine extends Engine<[BookSlice, PatronSlice, ShelfSlice], TestMutations> {}
 
-union DbCommands {
+union DbMutations {
   CreateAccount,
   SetPassword,
   ChangePassword,
-  AuthenticatedCommand,
+  AuthenticatedMutation,
   Notify,
 }
 
-interface TestDB extends Database<[TestEngine], [AccountSlice], DbCommands> {}
+interface TestDB extends Database<[TestEngine], [AccountSlice], DbMutations> {}

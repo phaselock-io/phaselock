@@ -18,8 +18,8 @@ import { generateUuid } from './util';
 
 const { Text } = Typography;
 
-// the commands the Engine queues and sends, which are all those the window sends
-type Command = Parameters<AdminEngine['sendCommand']>[0];
+// the mutations the Engine queues and sends, which are all those the window sends
+type Mutation = Parameters<AdminEngine['sendMutation']>[0];
 
 // the state of the Engine's connection, which a query reads like any other state
 function connectionQuery(qx: AdminEngineQueryTxn) {
@@ -75,14 +75,14 @@ function CopyActions({
   selected: Selected | null;
   patrons: Patron[];
   onClose: () => void;
-  send: (command: Unroomed<Command>) => void;
+  send: (mutation: Unroomed<Mutation>) => void;
 }) {
   const book = selected?.book;
   const holder = patrons.find((p) => p.id === book?.patronId);
 
   // each action closes the modal once it is sent
-  function act(command: Unroomed<Command>) {
-    send(command);
+  function act(mutation: Unroomed<Mutation>) {
+    send(mutation);
     onClose();
   }
 
@@ -141,7 +141,9 @@ function CopyActions({
                   Check out to {holder.name}
                 </Button>
                 <Button
-                  onClick={() => act({ type: 'cancel-hold', id: book.holdId!, patron: holder.id })}>
+                  onClick={() =>
+                    act({ type: 'library-cancel-hold', id: book.holdId!, patron: holder.id })
+                  }>
                   Release hold
                 </Button>
               </Flex>
@@ -204,7 +206,7 @@ function EditionRow({
   edition: AdminEditionInfo;
   patrons: Map<string, Patron>;
   onSelect: (book: AdminBookInfo) => void;
-  send: (command: Unroomed<Command>) => void;
+  send: (mutation: Unroomed<Mutation>) => void;
 }) {
   return (
     <div className="row">
@@ -265,9 +267,9 @@ export default function AdminWindow({ client }: { client: Client<AdminEngine> })
 
   // --- handlers ---
 
-  // every command names the window's room
-  function send(command: Unroomed<Command>) {
-    eng.sendCommand({ ...command, room: client.room });
+  // every mutation names the window's room
+  function send(mutation: Unroomed<Mutation>) {
+    eng.sendMutation({ ...mutation, room: client.room });
   }
 
   // the switch takes the window's way to the database offline, and back online at once

@@ -37,7 +37,7 @@ func openScanTest(bundle, path string, budget int) (*scanTest, error) {
 
 func (s *scanTest) close() { C.pldb_scantest_close(s.t) }
 
-// put stores a string value under key, converted under typ, with no template check.
+// put stores a string value under key, converted under typ, past the write gate.
 func (s *scanTest) put(key, typ, value string) error {
 	ckey, ctyp, cval := C.CString(key), C.CString(typ), C.CString(value)
 	defer C.free(unsafe.Pointer(ckey))

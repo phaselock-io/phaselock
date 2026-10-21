@@ -19,7 +19,10 @@ function join(parts: Uint8Array[]): Uint8Array {
 describe('ByteReader', () => {
   const body = join([
     encode(['vouch', 1]),
-    encode(['events', [[[1, 's', 1, new Uint8Array(16), new Date(0)], 'x'.repeat(100000)]]]),
+    encode([
+      'edits',
+      [[[1, 's', 1, new Uint8Array(16), new Date(0), 0], 0, 's!k', 'x'.repeat(100000)]],
+    ]),
     encode(['end', 0, '']),
   ]);
 
@@ -35,7 +38,7 @@ describe('ByteReader', () => {
         if (!(await br.more())) break;
         refills++;
       }
-      expect(tags).toEqual(['vouch', 'events', 'end']);
+      expect(tags).toEqual(['vouch', 'edits', 'end']);
       expect(br.available).toBe(0);
       expect(br.offset).toBe(10 + body.length);
       // awaits track chunks, never values
@@ -69,6 +72,23 @@ describe('ByteReader', () => {
     await expect(br.fill(body.length + 1)).rejects.toThrow(/ended early/);
     expect(await br.more()).toBe(false);
     expect(await br.more()).toBe(false);
+  });
+
+  test('peek reads the next byte, and tryValues takes several whole values or none', async () => {
+    const run = join([encode(0), encode('k'), encode('v'.repeat(40)), encode(0)]);
+    const br = new ByteReader(stream(run, 8));
+    await br.fill(1);
+    expect(br.peek()).toBe(0);
+    let three: Uint8Array | null;
+    while ((three = br.tryValues(3)) === null) {
+      // a run not yet whole consumes nothing
+      expect(br.offset).toBe(0);
+      expect(await br.more()).toBe(true);
+    }
+    expect(three).toEqual(run.subarray(0, run.length - 1));
+    expect(br.offset).toBe(run.length - 1);
+    expect(br.tryValues(2)).toBeNull();
+    expect(br.offset).toBe(run.length - 1);
   });
 
   test('take returns a view that is valid until the next refill', async () => {

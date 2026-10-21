@@ -42,9 +42,10 @@ function fakeRegistry(): Registry & { asked: [string, 'toBytes' | 'toJs'][] } {
   const asked: [string, 'toBytes' | 'toJs'][] = [];
   return {
     asked,
-    commands: '',
-    eventTypes: {},
-    storeTypes: {},
+    mutations: '',
+    ops() {
+      throw new Error('queries apply no edits');
+    },
     convert(type: string, value: unknown, from: Rep, to: Rep): unknown {
       if (from === JS && to === MSGPACK) {
         asked.push([type, 'toBytes']);

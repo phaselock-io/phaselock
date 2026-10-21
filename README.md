@@ -1,54 +1,94 @@
-# PhaseLock
+# PhaseLock: live apps that work offline
 
-No more polling for new data.  No more writing REST APIs.
+PhaseLock is a sync-first backend with generated, typed clients that work
+offline.
 
-Define your data types and how to process them once, and reuse that in your web
-app, your mobile apps, and your backend workers.
+Compared to a standard CRUD app, PhaseLockDB replaces both your database and
+your REST API server.  The PhaseLock sync engine replaces your HTTP client and
+enables offline mode, optimistic updates, and live sync.
 
 ## How does PhaseLock work?
 
-     ______________________________
-    |          Frontend            |
-    |  _________   _______   ____  |
-    | |         | |       | |    | |
-    | | Reducer | | State | | UI | |
-    | |_________| |_______| |____| |
-    |___^____________________|_____|
-        |                    |
-        | Events             | Commands
-        | are                | are
-        | read               | written
-     ___|____________________v_____
-    |                              |
-    |         PhaseLockDB          |
-    |______________________________|
+In PhaseLock, your app populates its UI from a local client-side **store**.
 
-PhaseLock assumes you save all your **events** (like, "user X
-did Y") in a log.
+When a user takes an action, it gets encoded as a **mutation** and sent to
+PhaseLockDB.  You declare the types of mutations allowed in your system ahead of
+time.
 
-Then you write a **reducer** function that reads events and
-builds state in a key-value store.
+In the database, a **decider** function that you write receives that mutation
+and updates the server-side store.  Changes made by the decider function are
+captured in PhaseLockDB's **edit log**.
 
-Then the sync engine behavior is obvious:
+The PhaseLock sync engine streams edits from the log and applies them to your
+client's store, updating your UI in real-time.
 
-- An offline-capable client streams events since it last connected.
-- The reducer updates local state, triggering UI updates.
-- User actions (called **commands** until they're accepted as
-  events) are queued in an outbox until they can be sent.
-- Optimistic updates are calculated using the reducer you already wrote.
-
-PhaseLock is tooling around this simple architecture to unlock:
-
-- Live queries against current state
-- Optimistic updates without modifying reducers or UI
-- Offline-capable clients that maintain state locally
-- Backend workers that watch the event log to trigger side-effects
+     _____________________________
+    |          Frontend           |
+    |  __________     __________  |
+    | |          |   |          | |
+    | |  Store   |-->|    UI    | |
+    | |__________|   |__________| |
+    |_____^________________|______|
+          |                |
+          | Edits          | Mutations
+     _____|________________|______
+    |     |   PhaseLockDB  |      |
+    |     |           _____v____  |
+    |     |          |          | |
+    |     |          | Decider  | |
+    |  ___|______    |__________| |
+    | |          |         |      |
+    | | Edit log |<--------|      |
+    | |__________|    _____v____  |
+    |                |          | |
+    |                |   Store  | |
+    |                |__________| |
+    |_____________________________|
 
 Next step: check out one of our [examples][examples].
 
+## How is a PhaseLock app built?
+
+You declare ahead of time, in TypeSpec:
+- your store schema
+- what mutations your clients will send
+- what queries your clients will make
+
+From those declarations, PhaseLock generates type signatures for everything you
+need to implement:
+- A decider function for each declared mutation.  These are basically your POST
+  handlers: they take the mutation, check authorization, validate against
+  current state, and finally make updates to state.
+- A query function for each declared query.  These are like your GET handlers,
+  but they run in the client against a local store, not the server.  They are
+  functions with read-only access to the client's store, and PhaseLock
+  automatically reruns them whenever the data changes so you get not one
+  result, but a stream of live results that you can plug into your UI.
+- Optionally: a predictor function for each declared mutation to enable
+  optimistic updates.  Like a decider function, a predictor takes a mutation,
+  checks current state, and makes updates to state.  Unlike a decider, this
+  runs client-side and does not do authorization checks.  Typically the
+  predictor is simply factored out of the decider, rather than requiring net
+  new code.
+
+Then PhaseLock provides:
+- A live, sync-based UI.  PhaseLock captures the edits made by the decider
+  functions and streams them to your clients.  The edits are applied to a
+  client-side store, then queries are rerun, and the UI is updated to reflect
+  fresh state.
+- Zero-latency page loads.  PhaseLock queries run locally on your client so new
+  pages load from disk, not across the network.
+- Offline mode.  If you provided predictor functions, then your UI continues to
+  work in read/write mode while offline.  User actions are encoded as mutations
+  and stored in an outbox until resync, meanwhile predictor functions run
+  locally to provide optimistic UI updates.
+- Cross-platform support.  Non-TypeScript PhaseLock client libraries run your
+  business logic unmodified in an embedded JavaScript engine, and generated
+  query wrappers return their results in the host language representation.
+
 ## How do I start using PhaseLock?
 
-PhaseLock is still in alpha.  Tests are sparse, docs are missing.
+PhaseLock is still in alpha, and docs are missing.
 
 Your coding agent can help until our docs are ready.  Try:
 
