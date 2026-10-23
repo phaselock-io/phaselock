@@ -183,7 +183,7 @@ describe('resets at a land', () => {
     expect(log(r.data(), 'book:b1')).toEqual([]);
   });
 
-  test('a slice the blob does not name has its parked edits at or below the cut covered: held at the last, nothing applied, no child', async () => {
+  test('a slice the blob does not name has its parked edits at or below the cut covered: forgotten, nothing applied, no child', async () => {
     const r = await held();
     const hold = await withBooks(r);
     // b3 was alive when these were read, and dead by the time the blob was cut
@@ -192,11 +192,11 @@ describe('resets at a land', () => {
     r.server.blobs.set('book:*', { position: 20, seqs: {}, values: [] });
     hold.go();
     await settle();
-    expect(seq(r.data(), 'book:b3')).toBe(8);
+    expect(seq(r.data(), 'book:b3')).toBeUndefined();
     expect(keys(r.data(), 'book:b3!')).toEqual([]);
     expect(keys(r.data(), '!backfill')).toEqual([]);
     expect(keys(r.data(), '!park-ed:')).toEqual([]);
-    // the death the blob reflected arrives from the replay, chains, and forgets the slice
+    // the death the blob reflected arrives from the replay, and the slice stays forgotten
     r.server.edits(death('book:b3', 9, 21));
     await settle();
     expect(seq(r.data(), 'book:b3')).toBeUndefined();

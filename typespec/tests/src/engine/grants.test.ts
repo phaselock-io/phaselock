@@ -42,7 +42,7 @@ describe('widening grants', () => {
     const hold = r.server.hold('patron:*');
     r.server.view('t2', 11, ['patron:*']);
     await settle();
-    expect(record(r, 'patron:*')).toMatchObject({ until: 11, replacing: false });
+    expect(record(r, 'patron:*')).toMatchObject({ until: 12, replacing: false });
     // live edits keep applying; the marker never appears
     r.server.edits(ev('patron:p1', 3, 12));
     await settle();
@@ -571,7 +571,7 @@ describe('stacked grants', () => {
       'book:*',
       'patron:p1',
     ]);
-    expect(record(r, 'patron:p1')).toMatchObject({ until: 15, replacing: false });
+    expect(record(r, 'patron:p1')).toMatchObject({ until: 16, replacing: false });
     // the redo landed at once: b1 stayed held and kept its state, and b7, born after the blob's
     // cut, landed from its parked birth at seq 1
     expect(record(r, 'book:*')).toBeUndefined();

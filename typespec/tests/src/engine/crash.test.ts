@@ -86,7 +86,7 @@ describe('crash and resume', () => {
       seed: {
         '!view': { token: 't1', position: 11, selectors: ['book:b1'] },
         '!checkpoint': { epoch: 'e1', position: 12, applied: 12 },
-        '!backfill:book:b1': { until: 11, resume: { ...resume }, replacing: false, children: [] },
+        '!backfill:book:b1': { until: 12, resume: { ...resume }, replacing: false, children: [] },
         '!backfill-seqs:book:b1': { 'book:b1': 3 },
         [parkedPage('book:b1', 0)]: page([['book:b1!state', { count: 3, fields: {} }]]),
         [parkedEdit('book:b1', 5)]: ev('book:b1', 5, 12, { type: 'bump' }, 'x'),
@@ -96,7 +96,7 @@ describe('crash and resume', () => {
     await settle();
     expect(server.conn.since).toBe(12);
     expect(server.conn.view).toBe('t1');
-    expect(server.backfills).toEqual([{ selector: 'book:b1', until: 11, resume }]);
+    expect(server.backfills).toEqual([{ selector: 'book:b1', until: 12, resume }]);
     server.open();
     server.live(12);
     await settle();
@@ -132,7 +132,7 @@ describe('crash and resume', () => {
     expect(parkedKeys(r.data(), 'book:*')).toEqual(['book:b1!state']);
     expect(state(r.data(), 'book:b1')).toBeUndefined();
     const r2 = await restart(r, blobs);
-    expect(r2.server.backfills).toEqual([{ selector: 'book:*', until: 12, resume: mid }]);
+    expect(r2.server.backfills).toEqual([{ selector: 'book:*', until: 13, resume: mid }]);
     r2.server.open();
     r2.server.live(12);
     await settle();

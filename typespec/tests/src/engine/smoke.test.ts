@@ -23,7 +23,7 @@ describe('smoke', () => {
         ],
       },
     });
-    expect(r.server.backfills.map((b) => [b.selector, b.until])).toEqual([['patron:*', 10]]);
+    expect(r.server.backfills.map((b) => [b.selector, b.until])).toEqual([['patron:*', 11]]);
     expect(state(r.data(), 'patron:p1')).toEqual({ count: 2, fields: {} });
     expect(seq(r.data(), 'patron:p1')).toBe(2);
     expect(seq(r.data(), 'patron:p2')).toBe(1);

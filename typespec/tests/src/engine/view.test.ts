@@ -83,7 +83,7 @@ describe('view reconciliation', () => {
     r.server.view('t2', 11, ['patron:*', 'book:*', 'book:b1']);
     await settle();
     expect(r.server.backfills.map((b) => b.selector)).toEqual(['patron:*', 'book:*']);
-    expect(record(r, 'book:*')).toMatchObject({ until: 11, replacing: false });
+    expect(record(r, 'book:*')).toMatchObject({ until: 12, replacing: false });
     expect(record(r, 'book:b1')).toBeUndefined();
   });
 
@@ -122,7 +122,7 @@ describe('view reconciliation', () => {
     expect(parkedKeys(r.data(), '*')).toEqual([]);
     expect(seq(r.data(), 'book:b1')).toBeUndefined();
     expect(state(r.data(), 'book:b1')).toBeUndefined();
-    expect(record(r, 'patron:*')).toMatchObject({ until: 14, replacing: false });
+    expect(record(r, 'patron:*')).toMatchObject({ until: 15, replacing: false });
     expect(r.server.backfills.map((b) => b.selector)).toEqual(['book:*', '*', 'patron:*']);
     expect(seq(r.data(), 'patron:p1')).toBe('backfill');
     expect(keys(r.data(), '!park-ed:patron:p1!')).toEqual([parkedEdit('patron:p1', 3)]);
@@ -239,11 +239,11 @@ describe('view reconciliation', () => {
     const b2 = r.server.hold('book:b2');
     r.server.view('t2', 11, ['book:b1', 'book:b2']);
     await settle();
-    expect(record(r, 'book:b2')).toMatchObject({ until: 11 });
+    expect(record(r, 'book:b2')).toMatchObject({ until: 12 });
     r.server.hold('book:*');
     r.server.view('t3', 12, ['book:*']);
     await settle();
-    expect(record(r, 'book:b2')).toMatchObject({ until: 11 });
+    expect(record(r, 'book:b2')).toMatchObject({ until: 12 });
     expect(record(r, 'book:*')?.children).toEqual(['book:b2']);
     expect(r.server.backfills.map((b) => b.selector)).toEqual(['book:b1', 'book:b2', 'book:*']);
     expect(seq(r.data(), 'book:b1')).toBe(1);
@@ -270,7 +270,7 @@ describe('view reconciliation', () => {
     r.server.hold('patron:*');
     r.server.view('t2', 11, ['patron:*']);
     await settle();
-    expect(record(r, 'patron:*')).toMatchObject({ until: 11 });
+    expect(record(r, 'patron:*')).toMatchObject({ until: 12 });
     r.server.view('t3', 12, ['patron:p1']);
     await settle();
     expect(record(r, 'patron:*')).toBeUndefined();
@@ -296,7 +296,7 @@ describe('view reconciliation', () => {
     expect(keys(r.data(), '!park-ed:patron:p2!')).toEqual([]);
     expect(seq(r.data(), 'patron:p1')).toBe('backfill');
     expect(keys(r.data(), '!park-ed:patron:p1!')).toEqual([parkedEdit('patron:p1', 5)]);
-    expect(record(r, 'patron:p1')).toMatchObject({ until: 13, replacing: false });
+    expect(record(r, 'patron:p1')).toMatchObject({ until: 14, replacing: false });
     r.server.blobs.set('patron:p1', {
       position: 13,
       seqs: { 'patron:p1': 4 },
@@ -379,7 +379,7 @@ describe('view reconciliation', () => {
     r.server.live(12);
     await settle();
     expect(view(r)).toEqual({ token: 't2', position: 12, selectors: ['patron:*', 'book:*'] });
-    expect(record(r, 'book:*')).toMatchObject({ until: 12, replacing: false });
+    expect(record(r, 'book:*')).toMatchObject({ until: 13, replacing: false });
     expect(seq(r.data(), 'book:b1')).toBe('backfill');
     expect(keys(r.data(), '!park-ed:book:b1!')).toEqual([parkedEdit('book:b1', 4)]);
   });

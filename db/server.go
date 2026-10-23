@@ -4,6 +4,7 @@ package main
 // core's results out to connections.
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -51,6 +52,12 @@ type Options struct {
 
 	// tests only: the clock tokens and their keys are minted and checked by, time.Now when nil
 	now func() time.Time
+	// tests only: the interval between a connection's heartbeat vouches, heartbeat when zero
+	heartbeat time.Duration
+	// tests only: called by the dispatcher with a commit's position before it pushes the commit's
+	// frames, and by a connection once its cold catchup is done, before it switches to streaming
+	beforePush      func(position uint64)
+	beforeStreaming func()
 }
 
 type Server struct {
@@ -77,8 +84,11 @@ type Server struct {
 	conns    map[uint64]*conn
 	nextReq  atomic.Uint64
 	nextConn atomic.Uint64
+	// the last commit's position, published under mu once the commit's frames are queued
 	position atomic.Uint64
 	done     chan struct{}
+	// the interval between a connection's heartbeat vouches
+	heartbeat time.Duration
 
 	// the bundle's cron entries, in the core's order, and the scheduler's end
 	cron     []cronEntry
@@ -87,6 +97,9 @@ type Server struct {
 	// tests only: called once a login's password, or a request's proofs, have been checked,
 	// before what they were checked against is read again
 	proved func()
+	// tests only: see Options
+	beforePush      func(position uint64)
+	beforeStreaming func()
 }
 
 // conn is one connection.  Its view is what the grantor allows cut down to what it wants, and its
@@ -201,8 +214,11 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 		pending:               map[uint64]chan result{},
 		conns:                 map[uint64]*conn{},
 		done:                  make(chan struct{}),
+		heartbeat:             cmp.Or(o.heartbeat, heartbeat),
 		cron:                  entries,
 		cronDone:              make(chan struct{}),
+		beforePush:            o.beforePush,
+		beforeStreaming:       o.beforeStreaming,
 	}
 	go s.dispatch()
 
@@ -352,7 +368,9 @@ func (s *Server) dispatch() {
 				s.reply(r)
 			}
 		case rCommit:
-			s.position.Store(r.position)
+			if s.beforePush != nil {
+				s.beforePush(r.position)
+			}
 			mutations := groupPositions(r.items)
 			s.mu.Lock()
 			for _, c := range s.conns {
@@ -367,6 +385,12 @@ func (s *Server) dispatch() {
 					}
 				}
 			}
+
+			/* Publish the position once every streaming connection holds the commit's frames, and
+			   under the lock: a connection that forwards its queue after reading the position has
+			   then written every frame at or below it, and one that switches to streaming gets
+			   each commit from exactly one of its hot catchup and its queue. */
+			s.position.Store(r.position)
 			s.mu.Unlock()
 		}
 	}
@@ -732,13 +756,29 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// switch to streaming, then a hot catchup through the dispatcher's
-	// position as of the switch
+	// switch to streaming, then a hot catchup through the dispatcher's position as of the switch
+	if s.beforeStreaming != nil {
+		s.beforeStreaming()
+	}
 	s.mu.Lock()
 	c.streaming = true
 	hot := s.position.Load()
 	selectors = append([]string(nil), c.selectors...)
+	// the queue holds only view frames until the switch, since the dispatcher pushes commits to
+	// streaming connections alone, and it queues only under the lock
+	views := len(c.out)
 	s.mu.Unlock()
+
+	// the view frames queued before the switch, whose selectors the hot catchup replays under, go
+	// ahead of it
+	for range views {
+		f := <-c.out
+		if !write(f.data) || f.end {
+			return
+		}
+	}
+
+	// the hot catchup
 	if !replay(cursor+1, hot) {
 		return
 	}
@@ -747,26 +787,45 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ticker := time.NewTicker(heartbeat)
+	// forward writes a frame from the queue, its edits advancing the cursor; returns false when the
+	// connection is done
+	forward := func(f frame, ok bool) bool {
+		if !ok {
+			write(mpEncode([]any{"end", "overflow", "connection could not keep up"}))
+			return false
+		}
+		if !f.view && f.pos <= cursor {
+			return true
+		}
+		if !f.view {
+			cursor = f.pos
+		}
+		return write(f.data) && !f.end
+	}
+
+	ticker := time.NewTicker(s.heartbeat)
 	defer ticker.Stop()
 	for {
 		select {
 		case f, ok := <-c.out:
-			if !ok {
-				write(mpEncode([]any{"end", "overflow", "connection could not keep up"}))
-				return
-			}
-			if !f.view && f.pos <= cursor {
-				continue
-			}
-			if !f.view {
-				cursor = f.pos
-			}
-			if !write(f.data) || f.end {
+			if !forward(f, ok) {
 				return
 			}
 		case <-ticker.C:
-			if !write(mpEncode([]any{"vouch", s.position.Load()})) {
+			/* The vouch names the cursor, so it never runs ahead of an edits frame still queued.
+			   Every commit the dispatcher has published already has its frames queued, so
+			   forwarding the queue as it stands brings the cursor up to the published position,
+			   and a submitter whose mutation touched no slice it can see gets its position on
+			   this heartbeat. */
+			published := s.position.Load()
+			for n := len(c.out); n > 0; n-- {
+				f, ok := <-c.out
+				if !forward(f, ok) {
+					return
+				}
+			}
+			cursor = max(cursor, published)
+			if !write(mpEncode([]any{"vouch", cursor})) {
 				return
 			}
 		case <-r.Context().Done():

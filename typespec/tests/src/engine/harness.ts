@@ -214,6 +214,17 @@ export type Blob = {
 
 export type BackfillCall = { selector: string; until: number; resume: Backfill['resume'] };
 
+/** a tail read: the positions above after and below before */
+export type TailRead = { selector: string; after: number; before: number };
+
+/** a backfill call the test drives by hand: the Engine's Backfill, to push to, and how the call
+    ends */
+export type DrivenCall = {
+  backfill: Backfill;
+  done: (outcome: BackfillOutcome) => void;
+  fail: (e: unknown) => void;
+};
+
 type Hold = {
   promise: Promise<'go' | 'fail' | 'stale'>;
   resolve: (how: 'go' | 'fail' | 'stale') => void;
@@ -273,6 +284,10 @@ export class FakeServer {
   holds = new Map<string, Hold>();
   /** a backfill of the selector fails once with this error */
   failOnce = new Map<string, unknown>();
+  /** every tail read, in order */
+  tails: TailRead[] = [];
+  /** backfills of the selector that the test drives by hand, each call as it arrives */
+  driven = new Map<string, DrivenCall[]>();
 
   /** the transport the Engine is handed: the harness's registry for any schema, and connections
       to this server */
@@ -336,6 +351,13 @@ export class FakeServer {
     conn.hooks.onEnd(code, reason, fatal);
   }
 
+  /** drive every backfill of the selector by hand from here; answers the calls as they arrive */
+  drive(selector: string): DrivenCall[] {
+    const calls: DrivenCall[] = [];
+    this.driven.set(selector, calls);
+    return calls;
+  }
+
   /** hold every backfill of the selector at its start until released */
   hold(selector: string): { go: () => void; fail: () => void; stale: () => void } {
     const h = newHold();
@@ -362,6 +384,13 @@ export class FakeServer {
       until: b.until,
       resume: b.resume === null ? null : { ...b.resume },
     });
+    const driven = this.driven.get(b.selector);
+    if (driven !== undefined) {
+      const call = new Promise<BackfillOutcome>((done, fail) => {
+        driven.push({ backfill: b, done, fail });
+      });
+      return raceAbort(b.signal, call);
+    }
     const hold = this.holds.get(b.selector);
     if (hold !== undefined) {
       const how = await raceAbort(b.signal, hold.promise);
@@ -392,7 +421,8 @@ export class FakeServer {
     }
     if (!r?.tailDone) {
       const from = Math.max(r?.fromPosition ?? blob.position, blob.position);
-      const run = (blob.tail ?? []).filter((e) => e.position > from && e.position <= b.until);
+      this.tails.push({ selector: b.selector, after: from, before: b.until });
+      const run = (blob.tail ?? []).filter((e) => e.position > from && e.position < b.until);
       if (run.length > 0) await push({ edits: run, scanned: run[run.length - 1].position });
       await push({ editsDone: true });
     }

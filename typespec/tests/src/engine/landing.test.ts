@@ -504,7 +504,7 @@ describe('landing', () => {
     expect(seq(r.data(), 'patron:p2')).toBe(1);
   });
 
-  test('a land runs the graph only while live', async () => {
+  test("a bootstrap's land shows the base at the view position, before any later frame", async () => {
     const server = new FakeServer();
     server.blobs.set('patron:*', patrons);
     const r = rig({ server });
@@ -513,10 +513,11 @@ describe('landing', () => {
     r.server.open();
     r.server.view('t1', 10, ['patron:*']);
     await settle();
-    // landed, but no frame was delivered
+    // the view frame set the cursor, so the land applies the base through it
     expect(state(r.data(), 'patron:p1')).toEqual({ count: 2, fields: {} });
     expect(keys(r.data(), '!backfill')).toEqual([]);
-    expect(values).toEqual([]);
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 10, applied: 10 });
+    expect(values).toEqual([{ count: 2, fields: {} }]);
     r.server.live(10);
     await settle();
     expect(values).toEqual([{ count: 2, fields: {} }]);

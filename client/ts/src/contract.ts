@@ -51,8 +51,12 @@ export interface Signal {
 export type Backfill = {
   // what selector are we backfilling (slice name or prefix)
   selector: string;
-  // the tail's exclusive upper bound: the cursor when this backfill started.  Anything at or
-  // above it arrives on the live connection and is parked.  Retries keep the original value.
+  /* The tail's exclusive upper bound, which retries keep: the tail delivers the positions below
+     it, and the live connection those at or above it, which the Engine parks.  Between a
+     bootstrap's backfills and its connection the contract is this: once the view frame that
+     answers the bootstrap, at V, is processed, the cursor is V; the backfills cover every position
+     at or below V, and the connection every position above it.  So a view frame's backfills take
+     V + 1, and an edit at V that the connection delivers too parks again under the same key. */
   until: number;
   // what a previous attempt got through, or null for a fresh backfill.  A finished half is
   // skipped outright.  Otherwise skipBytes > 0 resumes the blob download, and the header's

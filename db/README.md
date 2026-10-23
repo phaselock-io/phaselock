@@ -338,6 +338,12 @@ Every frame is an array whose first element is a tag.
   windows of the log's positions, and a window that ends past the
   last edits frame is followed by a vouch at its end, so a client
   whose view matches little of the log still sees the replay advance.
+- A bootstrap splits the log at the view's position V.  Once the
+  client has processed the bootstrap's view frame at V, its cursor is
+  V, so a reconnect presents `since=V`; the backfills cover every
+  position at or below V, a backfill the view frame spawns tailing
+  through V inclusive; and the connection covers every position above
+  V.
 - Server side, a replay of any length buffers nothing: the connection
   registers its grant up front, replays from the log unbuffered, then
   starts receiving live commits and replays the small gap up to the
@@ -409,10 +415,13 @@ Every frame is an array whose first element is a tag.
   connection's view covers, so a client holding only some of a
   mutation's slices receives its part at once; invisible commits
   produce nothing.  The heartbeat vouch, sent on a fixed interval, is
-  the only other cursor signal: it carries the current position so a
-  reconnect skips history the client could not see, and a submitter
-  whose mutation's edits all landed in slices it cannot see passes
-  its ack position on the next heartbeat.
+  the only other cursor signal.  A vouch at N means the connection has
+  sent every edit at or below N the client may see: the heartbeat
+  first forwards every commit the server has published, then vouches
+  the last position it has sent through.  So a reconnect skips
+  history the client could not see, and a submitter whose mutation's
+  edits all landed in slices it cannot see passes its ack position on
+  the next heartbeat.
 
     POST /mutations                    body: [S, n, id, data, expect?]*
       → msgpack array of outcomes, one per mutation, in order:
@@ -492,9 +501,16 @@ Every frame is an array whose first element is a tag.
   and expose only the final response's headers, which would lose the
   origin's.
 - `/edits` is the tail read behind a snapshot: load the blob, then
-  read the selector forward from the blob's position up to the first
-  position the client parked, or to the head if nothing is parked,
-  apply, and unpark.  Both bounds are exclusive.  A page never splits
+  read the selector forward from the blob's position up to the
+  backfill's `until`, apply, and unpark.  Both bounds are exclusive:
+  the tail delivers the positions below `until`, and the connection
+  those at or above it, which the client parks until the backfill
+  lands.  `until` is where the connection's share begins: the
+  position of the edit that revealed a gap or an unknown slice, for a
+  backfill that edit spawns; the client's cursor, for one a landing's
+  repair spawns; and the view's position plus one, for one a view
+  frame spawns, so a bootstrap's backfills tail through the view's
+  position V as the contract above requires.  A page never splits
   the edits of one mutation, so a page's edit count says nothing about
   whether more follow.  `PhaseLock-Scanned` is the client's next
   bound, used as-is with no arithmetic: forward it becomes the next

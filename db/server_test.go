@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1977,6 +1978,128 @@ func TestLongCatchupNoOverflow(t *testing.T) {
 	pos := h.accept(admin, mut("final", "rename-patron", "id", "p1", "name", "done"))
 	if evs := edits(s.nextTagged("edits")); evs[0].position != pos {
 		t.Fatalf("expected live edit at %d, got %+v", pos, evs)
+	}
+}
+
+// a vouch at N follows every edit at or below N that the connection can see
+func TestAVouchNeverOvertakesAnEditItCovers(t *testing.T) {
+	// the dispatcher holds the commit it is armed for before pushing its frames, while
+	// heartbeats keep firing
+	var armed atomic.Bool
+	held := make(chan int64)
+	release := make(chan struct{})
+	h := startWith(t, t.Context(), Options{heartbeat: time.Millisecond,
+		beforePush: func(position uint64) {
+			if armed.CompareAndSwap(true, false) {
+				held <- int64(position)
+				<-release
+			}
+		}})
+	free := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(free)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "add-patron", "id", "p2", "name", "Bob"))
+	s := h.connect(h.token("p1"), -1)
+
+	// every frame read is checked against the highest vouch before it
+	vouched := int64(-1)
+	read := func() []any {
+		t.Helper()
+		f := s.next()
+		switch f[0] {
+		case "vouch", "live":
+			vouched = max(vouched, asInt(f[1]))
+		case "edits":
+			if at := edits(f)[0].position; at <= vouched {
+				t.Fatalf("an edits frame at %d follows a vouch at %d", at, vouched)
+			}
+		}
+		return f
+	}
+	for read()[0] != "live" {
+	}
+
+	// a visible commit is held before its frames are pushed, for many heartbeats
+	armed.Store(true)
+	posted := make(chan error, 1)
+	go func() {
+		body := mut("c3", "rename-patron", "id", "p1", "name", "Anne").encode(nil)
+		req, _ := http.NewRequest("POST", h.web.URL+"/mutations", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+admin)
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		posted <- err
+	}()
+	pos := <-held
+	time.Sleep(50 * time.Millisecond)
+	free()
+
+	// its edits arrive after no vouch at or above their position
+	for f := read(); f[0] != "edits" || edits(f)[0].position != pos; f = read() {
+	}
+	if err := <-posted; err != nil {
+		t.Fatal(err)
+	}
+
+	// a commit the connection cannot see is vouched for on a heartbeat
+	invisible := h.accept(admin, mut("c4", "rename-patron", "id", "p2", "name", "Robert"))
+	for i := 0; vouched < invisible; i++ {
+		if i == 1000 {
+			t.Fatalf("no vouch at %d, the last at %d", invisible, vouched)
+		}
+		if f := read(); f[0] == "edits" {
+			t.Fatalf("an invisible commit's edits: %v", f)
+		}
+	}
+	if vouched != invisible {
+		t.Fatalf("vouched %d past the head %d", vouched, invisible)
+	}
+}
+
+// a view change reaches the client ahead of the edits of the commit that caused it, even when the
+// view changes while the connection switches from its replay to streaming
+func TestAViewFrameLeadsTheEditsItGrantsIntoStreaming(t *testing.T) {
+	// the connection pauses once its replay is done, before it switches to streaming
+	paused := make(chan struct{}, 1)
+	resume := make(chan struct{})
+	h := startWith(t, t.Context(), Options{beforeStreaming: func() {
+		paused <- struct{}{}
+		<-resume
+	}})
+	t.Cleanup(sync.OnceFunc(func() { close(resume) }))
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	s := h.connect(h.token("p1"), -1)
+
+	// while it is paused, a lend births a shelf and grants it to the patron in one mutation
+	<-paused
+	pos := h.accept(admin, mut("c2", "lend", "branch", "x", "patron", "p1"))
+	resume <- struct{}{}
+
+	// the view frame granting the shelf comes before the shelf's edits, which the hot catchup
+	// replays
+	granted, shelved := false, false
+	for f := s.next(); f[0] != "live"; f = s.next() {
+		switch f[0] {
+		case "view":
+			if asInt(f[2]) != pos || !slices.Contains(strs(f[3]), "shelf:x") {
+				t.Fatalf("expected the view at %d granting shelf:x, got %v", pos, f)
+			}
+			granted = true
+		case "edits":
+			if e := edits(f)[0]; e.slice == "shelf:x" {
+				if !granted {
+					t.Fatalf("the shelf's edits at %d came before its grant", e.position)
+				}
+				shelved = true
+			}
+		}
+	}
+	if !shelved {
+		t.Fatalf("the shelf's edits never came")
 	}
 }
 

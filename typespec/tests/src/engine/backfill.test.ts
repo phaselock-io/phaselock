@@ -62,7 +62,7 @@ afterEach(() => {
 });
 
 describe('backfill lifecycle', () => {
-  test('a grant writes its record with the view, until = the frame position', async () => {
+  test('a grant writes its record with the view, its tail through the frame position: until = position + 1', async () => {
     const r = await held();
     r.server.hold('book:*');
     r.server.view('t2', 11, ['patron:*', 'book:*']);
@@ -73,14 +73,14 @@ describe('backfill lifecycle', () => {
       selectors: ['patron:*', 'book:*'],
     });
     expect(record(r, 'book:*')).toEqual({
-      until: 11,
+      until: 12,
       resume: null,
       replacing: false,
       children: [],
     });
     expect(r.server.backfills.at(-1)).toMatchObject({
       selector: 'book:*',
-      until: 11,
+      until: 12,
       resume: null,
     });
   });
@@ -203,7 +203,7 @@ describe('backfill lifecycle', () => {
       seed: {
         '!view': { token: 't1', position: 11, selectors: ['book:b1'] },
         '!checkpoint': { epoch: 'e1', position: 11, applied: 11 },
-        '!backfill:book:b1': { until: 11, resume: { ...resume }, replacing: false, children: [] },
+        '!backfill:book:b1': { until: 12, resume: { ...resume }, replacing: false, children: [] },
         '!backfill-seqs:book:b1': { 'book:b1': 3 },
         [parkedPage('book:b1', 0)]: page([['book:b1!state', { count: 3, fields: {} }]]),
         '!seq:book:b1': 'backfill',
@@ -213,12 +213,12 @@ describe('backfill lifecycle', () => {
     r.server.open();
     r.server.live(11);
     await settle();
-    expect(r.server.backfills).toEqual([{ selector: 'book:b1', until: 11, resume }]);
+    expect(r.server.backfills).toEqual([{ selector: 'book:b1', until: 12, resume }]);
     expect(record(r, 'book:b1')?.resume).toEqual(resume);
     await vi.advanceTimersByTimeAsync(60_000);
     await settle();
     expect(r.server.backfills.length).toBe(2);
-    expect(r.server.backfills[1]).toEqual({ selector: 'book:b1', until: 11, resume });
+    expect(r.server.backfills[1]).toEqual({ selector: 'book:b1', until: 12, resume });
     expect(state(r.data(), 'book:b1')).toEqual({ count: 4, fields: {} });
     expect(log(r.data(), 'book:b1')).toEqual(['bump']);
     expect(seq(r.data(), 'book:b1')).toBe(4);

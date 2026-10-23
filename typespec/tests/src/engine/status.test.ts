@@ -37,7 +37,11 @@ describe('first boot', () => {
     r.server.live(10);
     await settle();
     expect(p1.values).toEqual([]);
-    expect(last(status.connection)).toMatchObject({ state: 'live', hasBase: false, frozen: true });
+    expect(last(status.connection)).toMatchObject({
+      state: 'syncing',
+      hasBase: false,
+      frozen: true,
+    });
 
     // the land is the first answer
     hold.go();

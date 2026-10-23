@@ -114,7 +114,7 @@ describe('freeze and group land', () => {
     r.server.view('t2', 12, ['patron:*', 'book:b1', 'book:b2']);
     await settle();
     // downloaded and ready, but the base is frozen
-    expect(record(r, 'book:b2')).toMatchObject({ replacing: false, until: 12 });
+    expect(record(r, 'book:b2')).toMatchObject({ replacing: false, until: 13 });
     expect(state(r.data(), 'book:b2')).toBeUndefined();
     expect(seq(r.data(), 'book:b2')).toBe('backfill');
     expect(parkedKeys(r.data(), 'book:b2')).toEqual(['book:b2!state']);
@@ -271,14 +271,18 @@ describe('freeze and group land', () => {
     expect(keys(r.data(), '!park')).toEqual([]);
   });
 
-  test('the status shows the freeze: frozen while a replacing backfill is in flight, unfrozen after the group land, and frozen again on a gap', async () => {
+  test('the status shows the freeze: syncing and frozen while a replacing backfill is in flight, live and unfrozen after the group land, and syncing and frozen again on a gap', async () => {
     const r = await held();
     const status = watchStatus(r);
     await settle();
     expect(last(status.connection)).toMatchObject({ state: 'live', hasBase: true, frozen: false });
 
     const { release } = await freeze(r);
-    expect(last(status.connection)).toMatchObject({ state: 'live', hasBase: true, frozen: true });
+    expect(last(status.connection)).toMatchObject({
+      state: 'syncing',
+      hasBase: true,
+      frozen: true,
+    });
     release();
     await settle();
     expect(last(status.connection)).toMatchObject({ state: 'live', frozen: false });
@@ -286,7 +290,7 @@ describe('freeze and group land', () => {
     r.server.hold('patron:p1');
     r.server.edits(ev('patron:p1', 9, 20));
     await settle();
-    expect(last(status.connection)).toMatchObject({ frozen: true });
+    expect(last(status.connection)).toMatchObject({ state: 'syncing', frozen: true });
   });
 
   test('optimistic updates keep flowing during a freeze: a new mutation is predicted against the frozen base and the graph runs', async () => {
