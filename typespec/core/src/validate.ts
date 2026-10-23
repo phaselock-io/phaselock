@@ -113,8 +113,9 @@ function findResult(t: PType, seen = new Set<PType>()): PResult | undefined {
   if (t instanceof PObject) return findResult(t.valueType, seen);
   if (t instanceof PTuple) return t.itemTypes.map((x) => findResult(x, seen)).find((b) => b);
   if (t instanceof PUnion) return t.types.map((x) => findResult(x, seen)).find((b) => b);
-  if (t instanceof PStruct)
+  if (t instanceof PStruct) {
     return [...t.fields.values()].map((x) => findResult(x, seen)).find((b) => b);
+  }
   return undefined;
 }
 

@@ -316,8 +316,9 @@ export class Reader {
   // the byte length of the string at the cursor, consuming its header
   #strHeader(): number {
     const n = this.#tryStrHeader();
-    if (n < 0)
+    if (n < 0) {
       throw new Error(`expected msgpack string, got 0x${this.#buf[this.#pos].toString(16)}`);
+    }
     return n;
   }
 
@@ -588,8 +589,9 @@ export class Reader {
     this.#need(header + 1 + size);
     const d = this.#data;
     const type = d.getInt8(this.#pos + header);
-    if (type !== EXT_TIMESTAMP)
+    if (type !== EXT_TIMESTAMP) {
       throw new Error(`expected msgpack timestamp, got extension ${type}`);
+    }
     const at = this.#pos + header + 1;
     let sec: number;
     let nsec: number;

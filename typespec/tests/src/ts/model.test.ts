@@ -180,7 +180,7 @@ const SNIPPETS: Record<string, string> = {
       addItem: (txn, m) => {
         txn.set.item(m.id, { id: m.id, title: m.title, added: m.added });
       },
-    } satisfies WriterEnginePredictors;
+    } satisfies Partial<WriterEnginePredictors>;
 
     // a helper typed by the generated names
     function sweep(auth: Auth, txn: AppDBTxn, m: Sweep): void {
@@ -257,9 +257,9 @@ const SNIPPETS: Record<string, string> = {
       },
     };
 
-    // a table may leave mutations out, which predict nothing, and a predictor may mark what it
-    // writes as pending
-    export const writer: WriterEnginePredictors = {
+    // a Partial table leaves mutations out, which predict nothing, and a predictor may mark what
+    // it writes as pending
+    export const writer: Partial<WriterEnginePredictors> = {
       note: (txn, m, pending) => {
         void txn.get.profile(m.org, m.user);
         txn.set.note(m.org, m.user, m.note, pending ? m.text + ' (sending)' : m.text);
@@ -267,6 +267,11 @@ const SNIPPETS: Record<string, string> = {
       forget: (txn, m) => txn.deleteSlice.inbox(m.org, m.user),
       // @ts-expect-error an @online mutation is never predicted
       leave: () => {},
+    };
+
+    // @ts-expect-error a complete table lists every mutation that is not @online
+    export const incomplete: WriterEnginePredictors = {
+      forget: (txn, m) => txn.deleteSlice.inbox(m.org, m.user),
     };
   `,
 
@@ -359,6 +364,8 @@ const SNIPPETS: Record<string, string> = {
     export const anonymous = new WriterEngine(transport, { session: null, store });
     // a table of a narrower engine predicts the mutations both send
     export const narrow = new WriterEngine(transport, { session, predictors: readerPredictors });
+    // an Engine takes a Partial table
+    export const some = new WriterEngine(transport, { session, predictors: { forget: () => {} } });
     // @ts-expect-error the session is required, null for anonymous
     new WriterEngine(transport, { predictors });
     // @ts-expect-error a predictor for a mutation the engine does not send
@@ -1015,7 +1022,8 @@ describe('deciders', () => {
 describe('predictors', () => {
   it('generates a predictor table per engine, with no entry for an @online mutation', () => {
     expect(text).toContain('export type WriterEnginePredictors = {');
-    expect(text).not.toMatch(/leave\?: Predictor/);
+    expect(text).toMatch(/ {2}note: Predictor</);
+    expect(text).not.toMatch(/leave\??: Predictor/);
     compiles('predictors');
   });
 

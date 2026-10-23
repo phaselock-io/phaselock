@@ -412,8 +412,9 @@ class HTTPConnection implements Connection {
       });
       const okStatus = (r: Response) => r.status === 200 || r.status === 206 || r.status === 416;
       if (first.status === 401) throw this.#refuse(await first.text());
-      if (!okStatus(first))
+      if (!okStatus(first)) {
         throw new Error(`snapshot ${b.selector}: ${first.status} ${first.statusText}`);
+      }
 
       // the origin's response carries the position and the epoch; a blob store owes only the bytes
       position = headerInt(first, 'PhaseLock-Position');
@@ -433,8 +434,9 @@ class HTTPConnection implements Connection {
         const target = await first.text();
         blob = await fetch(target, { signal, headers: range });
         if (blob.status === 404 || blob.status === 410) return 'stale';
-        if (!okStatus(blob))
+        if (!okStatus(blob)) {
           throw new Error(`snapshot ${b.selector}: ${blob.status} ${blob.statusText}`);
+        }
       }
 
       // a fresh blob's header reaches the Engine before anything of the tail
@@ -494,8 +496,9 @@ class HTTPConnection implements Connection {
       if (crc !== crc32c(hdr)) throw new Error(`snapshot ${b.selector}: header crc`);
       const header = decodeAny(hdr) as BlobHeader;
       if (header.epoch !== epoch) return 'stale'; // a pointer that led to another log's blob
-      if (header.position !== position)
+      if (header.position !== position) {
         throw new Error(`snapshot ${b.selector}: position mismatch`);
+      }
       await b.push({ header: { position, seqs: header.slices ?? {} } });
       return { br, count: 0, fnv: new Fnv64() };
     }
@@ -554,8 +557,9 @@ class HTTPConnection implements Connection {
       if (br.peek() !== SET) throw new Error(`snapshot ${b.selector}: corrupt operation`);
       let op: Uint8Array | null;
       while ((op = br.tryValues(3)) === null) {
-        if (br.available > maxOperation)
+        if (br.available > maxOperation) {
           throw new Error(`snapshot ${b.selector}: corrupt operation`);
+        }
         if (!(await br.more())) throw new Error('body ended early');
       }
 

@@ -591,8 +591,9 @@ class Walk {
       case JSONTYPE: {
         const jt = jsTypeOf(subj);
         const sub = (jt >= 0 ? s.byType[jt] : null) ?? s.any;
-        if (sub === null)
+        if (sub === null) {
           this.fail(`type ${jt >= 0 ? JT_NAMES[jt] : typeof subj} not allowed here`);
+        }
         return this.writeUnion(w, sub, obj, subj, root);
       }
       case LITERAL: {

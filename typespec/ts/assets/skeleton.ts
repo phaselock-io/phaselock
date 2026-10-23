@@ -3759,8 +3759,9 @@ export class Engine<QX, PX, M, N = never> {
 
     // restart the downloads; one in backoff starts when its timer fires
     for (const [selector, entry] of this.#backfills) {
-      if (entry.status === 'downloading' && entry.retryTimer === null)
+      if (entry.status === 'downloading' && entry.retryTimer === null) {
         this.#startBackfill(selector);
+      }
     }
     this.#resend = true;
   }

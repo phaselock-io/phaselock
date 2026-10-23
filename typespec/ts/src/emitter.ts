@@ -856,14 +856,16 @@ function generateEngine(d: Denter, annos: Annos, registry: PTypeRegistry, e: PEn
   d.print('  return { ctx, $ref };\n');
   d.print('}\n');
 
-  // the predictor table: one optional predictor per mutation that is not @online
+  // the predictor table: one predictor per mutation that is not @online, every one required, so
+  // a table claiming to be complete is checked; an Engine takes a Partial of it
   d.print(
-    `\n/** ${e.name}'s predictors, one per mutation; a mutation left out predicts nothing */\n`,
+    `\n/** ${e.name}'s predictors, one per mutation that is not @online.  An Engine takes a Partial of`,
   );
+  d.print(' it, and a mutation left out predicts nothing. */\n');
   d.print(`export type ${tableType} = {\n`);
   d.indent('  ');
   for (const m of offline) {
-    d.print(`${prop(lowerFirst(m.name))}?: Predictor<${txnType}, ${anno(m)}>;\n`);
+    d.print(`${prop(lowerFirst(m.name))}: Predictor<${txnType}, ${anno(m)}>;\n`);
   }
   d.dedent();
   d.print('};\n');
@@ -874,7 +876,7 @@ function generateEngine(d: Denter, annos: Annos, registry: PTypeRegistry, e: PEn
   generateDispatch(
     d,
     registry,
-    `${predict}(table: ${tableType}, txn: ${txnType}, val: any, pending?: true): void`,
+    `${predict}(table: Partial<${tableType}>, txn: ${txnType}, val: any, pending?: true): void`,
     e.mutationType,
     (t) => {
       const m = mutationOf.get(t)!;
@@ -893,7 +895,7 @@ function generateEngine(d: Denter, annos: Annos, registry: PTypeRegistry, e: PEn
   const N = online.length === 0 ? 'never' : online.map(anno).join(' | ');
 
   d.print(`\n/** the Predictor that runs ${e.name}'s predictors */\n`);
-  d.print(`export function ${lowerFirst(e.name)}Predictor(table: ${tableType}): `);
+  d.print(`export function ${lowerFirst(e.name)}Predictor(table: Partial<${tableType}>): `);
   d.print(`Predictor<${txnType}, ${M}> {\n`);
   d.print(`  return (txn, mutation, pending) => ${predict}(table, txn, mutation, pending);\n`);
   d.print('}\n');
@@ -909,7 +911,7 @@ export class ${e.name} extends Engine<${queryTxnType}, ${txnType}, ${M}, ${N}> {
       // who the Engine syncs as, or null for anonymous
       session: Session | null;
       // optional: predict what the database will do with a mutation
-      predictors?: ${tableType};
+      predictors?: Partial<${tableType}>;
       // optional: makes the Engine's store from its Registry; without it, an InMemStore
       store?: StoreFactory;
       // optional: ends the Engine, its connection, and every backfill

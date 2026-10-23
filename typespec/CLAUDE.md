@@ -93,9 +93,11 @@ layout, build commands, and the test suite.
   different versions of the model.  A store call and a conversion take one representation each
   way as plain arguments (`JS`, `HOST`, `MSGPACK`); a caller wanting two asks twice.
 - **Handler tables.**  User code is object literals typed by generated interfaces: one predictor
-  per engine mutation that is not `@online` (`{Engine}Predictors`, entries optional), and one
-  decider per database mutation (`{Database}Deciders`, all required), keyed by camelCased model
-  name, so a missing or misspelled handler is a compile error.  The generated wrapper dispatches
+  per engine mutation that is not `@online` (`{Engine}Predictors`), and one decider per database
+  mutation (`{Database}Deciders`), keyed by camelCased model name.  Every entry of both is
+  required, so a missing or misspelled handler is a compile error; an Engine takes a
+  `Partial<{Engine}Predictors>`, so an app that predicts only some mutations says so by typing
+  its table `Partial`, and a mutation left out predicts nothing.  The generated wrapper dispatches
   by the union solver's decision tree.  Helpers are plain functions outside the table; middleware
   wraps a handler.  A function is named with the plain verb (`predict`, `decide`, `grant`), and
   its type with the agent noun (`Predictor`, `Decider`, `Grantor`).
