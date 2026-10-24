@@ -290,6 +290,10 @@ export class FakeServer {
   tails: TailRead[] = [];
   /** backfills of the selector that the test drives by hand, each call as it arrives */
   driven = new Map<string, DrivenCall[]>();
+  /** whether the Engine's store is inside a write transaction, which rig wires up */
+  writing: () => boolean = () => false;
+  /** backfill() calls made while the Engine's store was inside a write transaction */
+  callsInTransaction = 0;
 
   /** the transport the Engine is handed: the harness's registry for any schema, and connections
       to this server */
@@ -381,6 +385,7 @@ export class FakeServer {
   }
 
   async #backfill(conn: FakeConn, b: Backfill): Promise<BackfillOutcome> {
+    if (this.writing()) this.callsInTransaction++;
     this.backfills.push({
       selector: b.selector,
       until: b.until,
@@ -504,6 +509,21 @@ export function rig(
   const store = opts.store ?? seeded(opts.seed ?? {});
   const abort = new AbortController();
   const { queries, predictions } = contexts();
+
+  // the Engine's store, telling the server when a write transaction is open
+  let writes = 0;
+  server.writing = () => writes > 0;
+  const counted: Store = {
+    write: (fn) => {
+      writes++;
+      try {
+        return store.write(fn);
+      } finally {
+        writes--;
+      }
+    },
+    read: (fn) => store.read(fn),
+  };
   const engine = new Engine<QueryTxn, WriteTxn, unknown, unknown>(
     queries,
     predictions,
@@ -511,7 +531,7 @@ export function rig(
     server.transport,
     {
       session: opts.session ?? null,
-      store: () => store,
+      store: () => counted,
       wants: opts.wants ?? ['patron:*', 'book:*'],
       predictor: opts.predictor,
       signal: abort.signal,

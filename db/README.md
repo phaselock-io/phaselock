@@ -652,7 +652,8 @@ Chaining:
 - P5.  Per slice, the in-flight backfill whose selector covers it and
   whose blob has the newest cut wins, and its blob's state replaces the
   slice's, unless the client holds the slice at or past the blob's seq,
-  when the slice keeps its state.  A slice the winning blob does not name
+  or the blob is cut at or below the base, when the slice keeps its
+  state.  A slice the winning blob does not name
   was deleted or unborn at that cut: its parked edits at or below the cut
   never apply, its run above the cut must start at a reset, and when
   nothing above the cut applies, the client neither holds the slice nor

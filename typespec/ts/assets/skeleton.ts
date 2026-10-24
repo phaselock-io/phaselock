@@ -2916,8 +2916,10 @@ export function selectorCovers(selector: string, name: string): boolean {
 /** one push from a backfill, queued for the advancer with the promise's resolvers */
 type BackfillWork = {
   selector: string;
-  // the backfill the push belongs to, which a revoke and a regrant of the selector replace
+  // the backfill the push belongs to, which a revoke and a regrant of the selector replace, and the
+  // connection its call runs on, which a reconnect replaces
   entry: BackfillEntry;
+  conn: SignalController;
   item: BackfillItem;
   resolve: () => void;
   reject: (e: unknown) => void;
@@ -3314,6 +3316,8 @@ export class Engine<QX, PX, M, N = never> {
   #inbox: Inbound[] = [];
   // backfill progress from the connection's hooks; each item resolves its promise after commit
   #backfillWork: BackfillWork[] = [];
+  // backfill calls asked for in a transaction, started once it commits
+  #starts: { selector: string; entry: BackfillEntry }[] = [];
   // how each backfill() call ended, and on which connection
   #backfillOutcomes: {
     selector: string;
@@ -3322,7 +3326,11 @@ export class Engine<QX, PX, M, N = never> {
     conn: SignalController;
   }[] = [];
   // how each sendMutations() call ended, with the ids it carried in order
-  #mutationOutcomes: { ids: string[]; results: MutationResult[] | { failed: unknown } }[] = [];
+  #mutationOutcomes: {
+    ids: string[];
+    results: MutationResult[] | { failed: unknown };
+    conn: SignalController;
+  }[] = [];
   // work received from the app
   #submitted: Submission<M, N>[] = [];
   #newQueries: boolean = false;
@@ -3452,8 +3460,11 @@ export class Engine<QX, PX, M, N = never> {
     try {
       this.#advancer();
     } catch (e: unknown) {
+      // the Engine ends: its @online mutations reject with the error, and its connection, timers,
+      // and pending pushes end with it
       this.#ended = true;
       this.#rejectOnline(e);
+      this.#shutdown();
       this.#onError(e);
     }
   }
@@ -3563,6 +3574,9 @@ export class Engine<QX, PX, M, N = never> {
         this.#ended = true;
         return;
       }
+
+      // the backfill calls the last pass asked for, now that its transactions have committed
+      this.#startCalls();
 
       if (this.#submitted.length > 0 || this.#resend) {
         // the tightest loop we serve: write to the outbox, predict, and the UI sees the
@@ -3694,7 +3708,8 @@ export class Engine<QX, PX, M, N = never> {
       return;
     }
 
-    // each call on this connection; the results come back through the outcomes
+    // each call on this connection; the results come back through the outcomes, tagged with it
+    const conn = this.#connectionAbort;
     for (const { wire, online } of calls) {
       if (wire.length === 0) continue;
       const ids = wire.map((m) => m.id);
@@ -3705,11 +3720,11 @@ export class Engine<QX, PX, M, N = never> {
       }
       connection.sendMutations(wire).then(
         (results) => {
-          this.#mutationOutcomes.push({ ids, results });
+          this.#mutationOutcomes.push({ ids, results, conn });
           this.#schedule();
         },
         (e: unknown) => {
-          this.#mutationOutcomes.push({ ids, results: { failed: e } });
+          this.#mutationOutcomes.push({ ids, results: { failed: e }, conn });
           this.#schedule();
         },
       );
@@ -3730,7 +3745,7 @@ export class Engine<QX, PX, M, N = never> {
     // hooks queue for the advancer; a hook from a connection we have since replaced is dropped
     const abort = this.#connectionAbort;
     const push = (item: Inbound) => {
-      if (this.#connectionAbort !== abort) return;
+      if (this.#ended || this.#connectionAbort !== abort) return;
       this.#inbox.push(item);
       this.#schedule();
     };
@@ -3768,10 +3783,14 @@ export class Engine<QX, PX, M, N = never> {
     const dirty: Record<string, true> = {};
 
     // a push for a backfill that was dropped while it was queued fails on its own, even when a
-    // regrant has since made a new backfill of the same selector
+    // regrant has since made a new backfill of the same selector, and so does one from a call on a
+    // connection that has since ended
     while (this.#backfillWork.length > 0) {
       const work = this.#backfillWork.shift()!;
-      if (this.#backfills.get(work.selector) === work.entry) {
+      if (
+        this.#backfills.get(work.selector) === work.entry &&
+        work.conn === this.#connectionAbort
+      ) {
         pushes.push(work);
       } else {
         work.reject(new Error(`backfill ${work.selector} is no longer in flight`));
@@ -3888,7 +3907,7 @@ export class Engine<QX, PX, M, N = never> {
             entry.retryTimer = null;
             entry.retryAt = null;
             // the entry may have gone, or the Engine, while the timer ran
-            if (this.#backfills.get(selector) === entry && !this.#signal.aborted) {
+            if (this.#backfills.get(selector) === entry && !this.#ended && !this.#signal.aborted) {
               this.#startBackfill(selector);
               this.#schedule();
             }
@@ -3898,14 +3917,27 @@ export class Engine<QX, PX, M, N = never> {
     });
   }
 
-  // one backfill() call on the current connection; its pushes and its outcome come back through
-  // the advancer's queues.  Without a connection nothing starts, and the next connection restarts
-  // every backfill that is still downloading.
+  /* A backfill to download on the current connection, its call started once the transaction that
+     asked for it has committed, by #startCalls; its pushes and its outcome come back through the
+     advancer's queues.  Without a connection nothing starts, and the next connection restarts
+     every backfill that is still downloading. */
   #startBackfill(selector: string): void {
     const entry = this.#backfills.get(selector)!;
-    if (this.#connection === null) return;
-    const conn = this.#connectionAbort;
     entry.status = 'downloading';
+    this.#starts.push({ selector, entry });
+  }
+
+  // every backfill call asked for, each started if its backfill is still the one asked for
+  #startCalls(): void {
+    for (const { selector, entry } of this.#starts.splice(0)) {
+      if (this.#connection === null || this.#backfills.get(selector) !== entry) continue;
+      this.#callBackfill(this.#connection, selector, entry);
+    }
+  }
+
+  // one backfill() call, on the connection
+  #callBackfill(connection: Connection, selector: string, entry: BackfillEntry): void {
+    const conn = this.#connectionAbort;
 
     // the backfill's cancellation is its own or the connection's
     const backfill: Backfill = {
@@ -3915,14 +3947,18 @@ export class Engine<QX, PX, M, N = never> {
       signal: host.AbortSignal.any([conn.signal, entry.controller.signal]),
       push: (item) =>
         new Promise<void>((resolve, reject) => {
-          this.#backfillWork.push({ selector, entry, item, resolve, reject });
+          if (this.#ended) {
+            reject(new Error('engine ended'));
+            return;
+          }
+          this.#backfillWork.push({ selector, entry, conn, item, resolve, reject });
           this.#schedule();
         }),
     };
 
     // the outcome is tagged with its backfill and its connection, so a late one from a dropped
     // backfill or an ended connection is known
-    this.#connection.backfill(backfill).then(
+    connection.backfill(backfill).then(
       (outcome) => {
         this.#backfillOutcomes.push({ selector, entry, outcome, conn });
         this.#schedule();
@@ -3949,7 +3985,8 @@ export class Engine<QX, PX, M, N = never> {
   /* The land, in one transaction: every backfill's blob, then every parked edit, then the view's
      drops, and the base is applied through the cursor.  Per slice, the covering blob with the
      newest cut wins, and one that does not name the slice found it deleted or unborn there; a
-     slice held at or past the winning blob's seq keeps its own state.  A slice's parked run
+     slice held at or past the winning blob's seq, or under a blob cut at or below the base, keeps
+     its own state.  A slice's parked run
      applies onto its base: edits at or below the winning cut skip, and the rest chain, the next
      seq or a reset above the last.  A run that does not chain, a gap or a
      missed birth, lands nothing: its slice backfills by its exact selector, and the land waits. */
@@ -4004,12 +4041,17 @@ export class Engine<QX, PX, M, N = never> {
     for (const slice of touched) {
       if (!inView(slice)) continue;
 
-      // the base: the winning blob's state, or the held state, which a slice held at or past the
-      // blob's seq keeps
+      // the base: the winning blob's state, or the held state, which a held slice keeps when it
+      // is at or past the blob's seq, or when the blob is cut at or below the base, which is newer
+      // than the blob for every slice it holds
       const w = winner(slice);
       const held = this.#slices.get(slice) ?? null;
       const named = w === null ? null : (w.header[slice] ?? null);
-      const blob = w !== null && !(named !== null && held !== null && held >= named);
+      const newer =
+        w !== null &&
+        held !== null &&
+        (w.cut <= this.#applied || (named !== null && held >= named));
+      const blob = w !== null && !newer;
       const cut = blob ? w!.cut : -1;
       let last: number | null = blob ? named : held;
       const seq = last;
@@ -4216,6 +4258,7 @@ export class Engine<QX, PX, M, N = never> {
      normal edit of a slice the Engine does not hold, whose birth it missed, backfills that slice
      by its exact selector, and the frame parks with the base frozen behind it. */
   #onEditsIn(txn: WTxn, edits: WireEdit[], dirty: Record<string, true>): void {
+    if (edits.length === 0) return;
     const last = edits[edits.length - 1].position;
 
     // does every edit chain?  The edits to apply, each slice's seq as the frame leaves it, null
@@ -4260,8 +4303,7 @@ export class Engine<QX, PX, M, N = never> {
         txn.set(`!seq:${slice}`, '.json', JS, seq);
       }
     }
-    this.#appliedTo(txn, last);
-    this.#advanceCursorIn(txn, last);
+    this.#advanceCursorIn(txn, last, true);
   }
 
   /* After a commit, the status is published and the graph learns what changed.  A base change or
@@ -4308,22 +4350,33 @@ export class Engine<QX, PX, M, N = never> {
   }
 
   // the checkpoint moves forward, never back, under the connection's epoch
-  #advanceCursorIn(txn: WTxn, position: number): void {
+  // the cursor moves forward to position, never back, under the connection's epoch, and with
+  // applied the base is applied through it too, in one write of the checkpoint
+  #advanceCursorIn(txn: WTxn, position: number, applied = false): void {
     if (this.#epoch === null) throw new Error('cursor with no epoch');
-    if (this.#checkpoint !== null && position <= this.#checkpoint.position) return;
-    this.#checkpoint = { epoch: this.#epoch, position, applied: this.#applied };
+    if (applied) this.#releaseThroughIn(txn, position);
+    const cursor = Math.max(position, this.#checkpoint?.position ?? -1);
+    const c = this.#checkpoint;
+    if (c !== null && c.position === cursor && c.applied === this.#applied) return;
+    this.#checkpoint = { epoch: this.#epoch, position: cursor, applied: this.#applied };
     txn.set('!checkpoint', '.json', JS, this.#checkpoint);
   }
 
-  // the base has been applied through position, so every acked mutation at or below it is in the
-  // base, edits or none, and leaves the outbox
+  // the base has been applied through position, the cursor as it stands
   #appliedTo(txn: WTxn, position: number): void {
     if (position <= this.#applied) return;
-    this.#applied = position;
+    this.#releaseThroughIn(txn, position);
     if (this.#checkpoint !== null) {
       this.#checkpoint = { ...this.#checkpoint, applied: position };
       txn.set('!checkpoint', '.json', JS, this.#checkpoint);
     }
+  }
+
+  // the applied position moves to position, so every acked mutation at or below it is in the base,
+  // edits or none, and leaves the outbox
+  #releaseThroughIn(txn: WTxn, position: number): void {
+    if (position <= this.#applied) return;
+    this.#applied = position;
     const done = [...this.#acked].filter(([, p]) => p <= this.#applied).map(([id]) => id);
     this.#releaseIn(txn, done);
   }
@@ -4344,19 +4397,19 @@ export class Engine<QX, PX, M, N = never> {
   // a vouch, or the live mark: unless frozen, nothing below it was withheld, so the base is
   // applied through it
   #onCursorIn(txn: WTxn, position: number): void {
-    if (!this.#frozen) this.#appliedTo(txn, position);
-    this.#advanceCursorIn(txn, position);
+    this.#advanceCursorIn(txn, position, !this.#frozen);
   }
 
   // every queued sendMutations result, and one release for all of them
   #onMutationOutcomes(): void {
     const drop: string[] = [];
     while (this.#mutationOutcomes.length > 0) {
-      const { ids, results } = this.#mutationOutcomes.shift()!;
+      const { ids, results, conn } = this.#mutationOutcomes.shift()!;
 
       /* A failed call rejects its @online mutation, which is never resent.  Its outbox mutations
          wait for the connection's end, which a failed call brings, and the next connection
-         resends them. */
+         resends them; a connection the failure left open is ended here, so they are never
+         stranded on it. */
       if ('failed' in results) {
         for (const id of ids) {
           const online = this.#online.get(id);
@@ -4364,6 +4417,7 @@ export class Engine<QX, PX, M, N = never> {
           this.#online.delete(id);
           online.reject(results.failed);
         }
+        if (conn === this.#connectionAbort) conn.abort();
         continue;
       }
 
@@ -4775,7 +4829,8 @@ export class Engine<QX, PX, M, N = never> {
       if (entry.retryTimer !== null) host.clearTimeout(entry.retryTimer);
     }
 
-    // the pushes waiting for a transaction they will never get
+    // the calls not started, and the pushes waiting for a transaction they will never get
+    this.#starts = [];
     const reason = new Error('engine shut down');
     for (const work of this.#backfillWork) work.reject(reason);
     this.#backfillWork = [];

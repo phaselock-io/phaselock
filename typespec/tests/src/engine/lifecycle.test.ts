@@ -239,3 +239,74 @@ describe('connector lifecycle', () => {
     expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 11, applied: 11 });
   });
 });
+
+describe('robustness', () => {
+  test('an error that ends the Engine ends its connection and its backfill retries with it', async () => {
+    const r = await held();
+
+    // a missed birth whose backfill fails once, so its retry waits on a timer
+    r.server.failOnce.set('patron:p9', new Error('boom'));
+    r.server.edits(ev('patron:p9', 7, 11));
+    await settle();
+    const calls = r.server.backfills.length;
+
+    // a reconnect to another log ends the Engine
+    r.server.end();
+    r.engine.reconnectNow();
+    await settle();
+    r.server.open('e2');
+    await expect(settle()).rejects.toThrow(/epoch e2/);
+    expect(r.server.conn.signal.aborted).toBe(true);
+
+    // the retry never runs
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(r.server.backfills.length).toBe(calls);
+  });
+
+  test('no backfill call starts inside a store transaction', async () => {
+    const r = await held();
+    r.server.blobs.set('patron:p1', { position: 11, seqs: { 'patron:p1': 9 }, values: [] });
+    r.server.blobs.set('book:*', { position: 12, seqs: {}, values: [] });
+    r.server.edits(ev('patron:p1', 9, 11));
+    r.server.view('t2', 12, ['patron:*', 'book:*']);
+    r.server.vouch(12);
+    await settle();
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['patron:*', 'patron:p1', 'book:*']);
+    expect(r.server.callsInTransaction).toBe(0);
+    expect(keys(r.data(), '!backfill')).toEqual([]);
+  });
+
+  test('an empty edits frame changes nothing', async () => {
+    const r = await held();
+    r.server.edits();
+    await settle();
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 10, applied: 10 });
+  });
+
+  test('a late push from a call on an ended connection is refused, even for the same backfill', async () => {
+    const r = rig();
+    const calls = r.server.drive('patron:*');
+    await settle();
+    r.server.open();
+    r.server.view('t1', 10, ['patron:*']);
+    await settle();
+
+    // the connection drops, and the next one restarts the download
+    r.server.end();
+    r.engine.reconnectNow();
+    await settle();
+    expect(calls.length).toBe(2);
+
+    // the first call's late header is refused, and the record keeps no resume from it
+    let refused: unknown = null;
+    const late = calls[0].backfill
+      .push({ header: { position: 10, seqs: { 'patron:p1': 2 }, visible: 10 } })
+      .catch((e: unknown) => {
+        refused = e;
+      });
+    await settle();
+    await late;
+    expect(refused).toBeInstanceOf(Error);
+    expect(r.data()['!backfill:patron:*']).toEqual({ until: 11, resume: null });
+  });
+});

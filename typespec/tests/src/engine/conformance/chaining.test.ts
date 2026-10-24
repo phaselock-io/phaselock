@@ -274,6 +274,28 @@ describe('P4: a parked run applies only if it continues its base, and a break ho
     expect(state(r.data(), 'patron:p9')).toEqual({ count: 3, fields: {} });
     expect(seq(r.data(), 'patron:p9')).toBe(3);
   });
+});
+
+describe('P5: per slice the newest cut wins, and a slice it does not name was deleted or unborn there', () => {
+  test('P5: a held slice keeps its state under a blob cut below the base, though the blob does not name it', async () => {
+    const r = await held();
+    const p3 = watch(r, 'patron:p3');
+
+    // p3 is born live at 11, after a cut the next grant's blob will have
+    r.server.edits(named('patron:p3', 1, 11, 'Cy'));
+    await settle();
+    expect(seq(r.data(), 'patron:p3')).toBe(1);
+
+    // a wider grant whose blob, from a cache, is cut at 9 and knows nothing of p3
+    r.server.blobs.set('*', { ...patrons, position: 9 });
+    r.server.view('t2', 12, ['*']);
+    await settle();
+    expect(keys(r.data(), '!backfill')).toEqual([]);
+    const born = p3.values.findIndex((v) => v !== undefined);
+    expect(p3.values.slice(born).every((v) => v?.fields.name === 'Cy')).toBe(true);
+    expect(seq(r.data(), 'patron:p3')).toBe(1);
+    expect(state(r.data(), 'patron:p1')).toEqual({ count: 2, fields: {} });
+  });
 
   test("P5: a held slice past its widening blob's seq keeps its state, and the tail edits it has are covered", async () => {
     const r = rig();
@@ -303,9 +325,6 @@ describe('P4: a parked run applies only if it continues its base, and a break ho
     await settle();
     expect(seq(r.data(), 'patron:p1')).toBe(5);
   });
-});
-
-describe('P5: per slice the newest cut wins, and a slice it does not name was deleted or unborn there', () => {
   test('P5: a slice deleted at the cut is not held, so no state the client shows is one the server never had', async () => {
     const r = rig();
     const p1 = watch(r, 'patron:p1');

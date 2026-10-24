@@ -172,7 +172,7 @@ describe('outbox rows and sends', () => {
     expect(state(r.data(), 'patron:p1')).toEqual({ count: 2, fields: { a: 1 } });
   });
 
-  test("a failed call's mutations wait for the connection's end; the next connection resends them in order in one call", async () => {
+  test('a failed call ends its connection, if the transport has not; the next connection resends its mutations in order in one call', async () => {
     const r = await held();
     const calls = sendControl(r.server);
     r.engine.sendMutation({ field: 'a' });
@@ -181,20 +181,17 @@ describe('outbox rows and sends', () => {
     calls[0].reject(new Error('500'));
     await settle();
     expect(outbox(r.data()).length).toBe(2);
-    // the connection has not ended yet, so a new mutation goes alone
+    expect(r.server.conns[0].signal.aborted).toBe(true);
+
+    // with no connection, a new mutation waits in the outbox
     r.engine.sendMutation({ field: 'c' });
     await settle();
-    expect(r.server.sends.map((call) => call.map((c) => parse(c.data)))).toEqual([
-      [{ field: 'a' }, { field: 'b' }],
-      [{ field: 'c' }],
-    ]);
-    calls[1].reject(new Error('500'));
-    r.server.end();
+    expect(r.server.sends.length).toBe(1);
     r.engine.reconnectNow();
     await settle();
     expect(r.server.conns.length).toBe(2);
-    expect(r.server.sends.length).toBe(3);
-    expect(r.server.sends[2].map((c) => parse(c.data))).toEqual([
+    expect(r.server.sends.length).toBe(2);
+    expect(r.server.sends[1].map((c) => parse(c.data))).toEqual([
       { field: 'a' },
       { field: 'b' },
       { field: 'c' },
