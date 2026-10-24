@@ -615,9 +615,9 @@ export interface WTxn extends RTxn {
   delPrefix(prefix: string): string[];
   /** apply live edits, in order */
   applyEdits(edits: WireEdit[]): string[];
-  /** apply a slice's parked edits, `!park-ed:{slice}!{seq}` from fromSeq on, in seq order.  The
-      edits applied always form a contiguous range of seqs, through the slice's last parked one,
-      and stay parked. */
+  /** apply a slice's parked edits, `!park-edit:{slice}!{seq}` from fromSeq on, in seq order.
+      The edits applied always form a contiguous range of seqs, through the slice's last parked
+      one, and stay parked. */
   applyParked(slice: string, fromSeq: number): string[];
   /** apply a backfill's parked snapshot pages, `!park-snap:{selector}!{offset}`, in order, skipping
       every key of a slice in skip; the pages stay parked */
@@ -1360,7 +1360,7 @@ class InMemTxn implements WTxn {
     const from = parkedEditKey(slice, fromSeq);
 
     // the slice's parked edits from the seq on, each as its envelope says
-    for (const key of this.#keysUnder(`!park-ed:${slice}!`)) {
+    for (const key of this.#keysUnder(`!park-edit:${slice}!`)) {
       if (compareKeys(key, from) < 0) continue;
       const bytes = this.#bytes(key);
       const env = this.#reg.convert('.edits', bytes, MSGPACK, JS) as EditEnvelope;
@@ -2696,11 +2696,13 @@ export type Backfill = {
   // what selector are we backfilling (slice name or prefix)
   selector: string;
   /* The tail's exclusive upper bound, which retries keep: the tail delivers the positions below
-     it, and the live connection those at or above it, which the Engine parks.  Between a
-     bootstrap's backfills and its connection the contract is this: once the view frame that
-     answers the bootstrap, at V, is processed, the cursor is V; the backfills cover every position
-     at or below V, and the connection every position above it.  So a view frame's backfills take
-     V + 1, and an edit at V that the connection delivers too parks again under the same key. */
+     it, and the live connection those at or above it, which the Engine parks.  A view frame's
+     position is the last position its connection sent under the previous view: everything the
+     connection sends after the frame is filtered by the new view, and the new view's edits at or
+     below the position are its backfills' to deliver, so a grant's backfill takes the position
+     plus one.  A bootstrap's view frame, at V, is where its connection starts: once it is
+     processed the cursor is V, the backfills cover every position at or below V, and the
+     connection every position above it. */
   until: number;
   // what a previous attempt got through, or null for a fresh backfill.  A finished half is
   // skipped outright.  Otherwise skipBytes > 0 resumes the blob download, and the header's
@@ -2710,9 +2712,10 @@ export type Backfill = {
   // blob overrides the floor.  It reads forward, which may result in gaps if retention
   // pruning happens concurrently, so it must be checked for gaps just before landing.  The
   // checksum is the last parked page's, handed back so a resumed download continues its check;
-  // it is '' when skipBytes is 0.
+  // it is '' when skipBytes is 0.  visible is the header's, kept for the land.
   resume: null | {
     position: number;
+    visible: number;
     skipBytes: number;
     checksum: string;
     fromPosition: number;
@@ -2726,16 +2729,18 @@ export type Backfill = {
 };
 
 /** One delivery of a backfill: the blob's whole length in bytes, when its response states one;
-    the blob's header, its cut position and the seq of every slice in it, which names every slice
-    the blob holds; a page of the blob's set operations, whole ones, with the byte offset after
-    it, to resume past, and the transport's running check over every page delivered so far; a run
-    of tail edits with the position its scan reached; or the end of either half.  The length and
+    the blob's header, its cut position, the seq of every slice in it, which names every slice
+    the blob holds, and visible, the last position at or below the cut where any slice under the
+    selector changed, a deleted one included; a page of the blob's set operations, whole ones,
+    with the byte offset after it, to resume past, and the transport's running check over every
+    page delivered so far; a run of tail edits with the position its scan reached; or the end of
+    either half.  The length and
     the scan feed the Engine's progress status alone, and the checksum is opaque to it, kept only
     to hand back on a resume.  A download without a resume pushes its header before anything else
     but its length, since the header is what the rest is parked against. */
 export type BackfillItem =
   | { length: number }
-  | { header: { position: number; seqs: Record<string, number> } }
+  | { header: { position: number; seqs: Record<string, number>; visible: number } }
   | { page: RawBytes; skip: number; checksum: string }
   | { pagesDone: true }
   | { edits: WireEdit[]; scanned: number }
@@ -2835,24 +2840,19 @@ function registryFor(transport: Transport, schema: Schema): Registry {
 
 // engines ////////////////////////////////////////////////////////////////////
 
-/** the view, as persisted at !view when a reconciliation commits */
+/** the latest view the connection delivered, as persisted at !view when its frame arrives */
 export type ViewRecord = { token: string; position: number; selectors: string[] };
-/** the cursor, as persisted at !checkpoint with a bootstrap's view frame and every batch, vouch,
-    and live mark */
+/** The cursor, as persisted at !checkpoint: the epoch of the log it is in; position, the last
+    position delivered, every edit at or below it applied or parked, which a reconnect resumes
+    from; and applied, how far the base has been applied, which the cursor passes while frozen */
 export type CheckpointRecord = { epoch: string; position: number; applied: number };
 /** a backfill in flight, as persisted at !backfill:{selector} */
-export type BackfillRecord = {
-  until: number;
-  resume: Backfill['resume'];
-  replacing: boolean;
-  children: string[];
-};
+export type BackfillRecord = { until: number; resume: Backfill['resume'] };
 /** the in-memory side of a backfill: its record, written through, plus what the disk needs not */
 type BackfillEntry = {
   record: BackfillRecord;
   controller: SignalController;
   status: 'downloading' | 'ready';
-  parent: string | null;
   // failed attempts in a row, for backoff, and the retry waiting to run, due at retryAt
   attempts: number;
   retryTimer: unknown;
@@ -2863,12 +2863,11 @@ type BackfillEntry = {
 };
 
 // a backfill entry as it starts, with no attempt made
-function newBackfillEntry(record: BackfillRecord, parent: string | null): BackfillEntry {
+function newBackfillEntry(record: BackfillRecord): BackfillEntry {
   return {
     record,
     controller: new host.AbortController(),
     status: 'downloading',
-    parent,
     attempts: 0,
     retryTimer: null,
     retryAt: null,
@@ -2895,7 +2894,7 @@ function backfillStatus(selector: string, entry: BackfillEntry): BackfillStatus 
           done: r.tailDone,
         };
   const retryAt = entry.retryAt === null ? null : new Date(entry.retryAt);
-  return { selector, replacing: entry.record.replacing, snapshot, tail, retryAt };
+  return { selector, snapshot, tail, retryAt };
 }
 
 // a tail's share scanned: none before the blob's header gives its cut, and all once done
@@ -2917,6 +2916,8 @@ export function selectorCovers(selector: string, name: string): boolean {
 /** one push from a backfill, queued for the advancer with the promise's resolvers */
 type BackfillWork = {
   selector: string;
+  // the backfill the push belongs to, which a revoke and a regrant of the selector replace
+  entry: BackfillEntry;
   item: BackfillItem;
   resolve: () => void;
   reject: (e: unknown) => void;
@@ -2954,7 +2955,7 @@ export function backoffDelay(attempt: number): number {
 /** the key of a parked edit: its slice, then its seq zero-padded so a scan of the slice's prefix
     walks its chain in order; a re-parked edit overwrites itself */
 export function parkedEditKey(slice: string, seq: number): string {
-  return `!park-ed:${slice}!${String(seq).padStart(20, '0')}`;
+  return `!park-edit:${slice}!${String(seq).padStart(20, '0')}`;
 }
 
 /** the key of a parked snapshot page: its backfill's selector, then the blob offset it starts at,
@@ -2976,7 +2977,7 @@ function engineKeys(name: string, match: ParamMatch = null): KeyPattern {
 
 /** the slice and seq a parked edit's key names */
 export function parsePark(key: string): { slice: string; seq: number } {
-  const at = '!park-ed:'.length;
+  const at = '!park-edit:'.length;
   const bang = key.indexOf('!', at);
   return { slice: key.slice(at, bang), seq: Number(key.slice(bang + 1)) };
 }
@@ -2984,29 +2985,29 @@ export function parsePark(key: string): { slice: string; seq: number } {
 // status ////////////////////////////////////////////////////////////////////
 
 /* Queries read the Engine's status like any state: where the connection stands, how far syncing
-   has come, and the outbox.  Sync work comes in three kinds, which the Engine tells apart and the
-   UI may treat differently.
+   has come, and the outbox.  Every state queries show of the base is the server's state at one
+   position, restricted to the slices the Engine holds.  Sync work comes in three kinds, which the
+   Engine tells apart and the UI may treat differently.
 
    First boot.  The Engine has no base: nothing has been applied yet, on a fresh store or on one
-   whose first sync never landed.  The first view's grants download as replacing backfills and
-   land together, so the first state queries see is complete.  Until then the Engine refuses every
+   whose first sync never landed.  The first view's grants download as backfills and land
+   together, so the first state queries see is complete.  Until then the Engine refuses every
    query that reads past the status: such a query waits with no result and answers once the base
    exists, while a query that reads only the status answers at once.  The UI shows a loading
    screen, with a bar from the estimate, while `hasBase` is false, and `state` is `syncing` until
    the land.
 
-   Resync.  A connection replays history onto an existing base, from the checkpoint to the head,
-   and queries see each batch as it lands, so the app zooms forward at catch-up speed.  Every
-   state shown is a prefix of the log, consistent if stale.  With a base, the UI may show what it
-   has, the zoom included, under a syncing banner while `state` is `syncing`.  A gap partway
-   through replaces its slice with a backfill and freezes the base until it lands; queries keep
-   answering from the frozen base.
+   Resync.  A connection replays history onto an existing base, from the cursor to the head, and
+   queries see each batch as it lands, so the app zooms forward at catch-up speed.  With a base,
+   the UI may show what it has, the zoom included, under a syncing banner while `state` is
+   `syncing`.
 
-   Backfill.  Downloads on a live base: a new grant, or a gap's repair, and queries keep
-   answering through both.  A new grant is additive: the base keeps moving while it downloads,
-   and its slices appear when it lands.  A gap's repair is replacing: the base freezes until it
-   lands, queries answer from the frozen base meanwhile, and `state` is `syncing`.  The UI may
-   show progress or nothing.
+   Backfill.  Downloads for a new grant, or to repair a gap.  While any backfill is in flight the
+   base is frozen: every edit delivered waits, queries answer from the frozen base, and `state` is
+   `syncing`.  Once every backfill has downloaded and the connection has reached the newest
+   snapshot's cut, the backfills and everything that waited land in one transaction, and the base
+   moves to the connection's position.  A grant or a revoke that arrives meanwhile joins that land;
+   a revoked slice stays in the frozen base until then.
 
    The estimate runs from 0 to 1 over one episode of work, and is null between episodes.  It
    weighs the stages of each kind:
@@ -3028,16 +3029,14 @@ export function parsePark(key: string): { slice: string; seq: number } {
    forward. */
 
 /** Where the Engine stands: `connecting` until a connection opens, `syncing` while it replays
-    history or a replacing backfill is in flight (a first boot's, or a gap's repair), `live` once
-    the replay is done and nothing is replacing the base, so what queries show is current, and
-    `offline` once a connection has failed or ended, until another opens.  An additive backfill,
-    a new grant's, leaves the Engine `live`, since the base keeps moving and the new slices
-    appear when it lands.  The first attempt is `connecting`, and so is the Engine from a
+    history or a backfill is in flight, `live` once the replay is done and no backfill is in
+    flight, so what queries show is current, and `offline` once a connection has failed or ended,
+    until another opens.  The first attempt is `connecting`, and so is the Engine from a
     `reconnectNow` until a connection opens; a retry after backoff stays `offline`, so a
     connection that keeps failing never flickers to `connecting`.  `nextAttemptAt` is when the
     next retry is due, and null while one is trying.  `hasBase` is false until a first boot's
-    sync lands, while queries may read only the status; `frozen` is true while a replacing
-    backfill is in flight and the base waits for it. */
+    sync lands, while queries may read only the status; `frozen` is true while a backfill is in
+    flight and the base waits for it. */
 export type ConnectionStatus = {
   state: 'connecting' | 'syncing' | 'live' | 'offline';
   nextAttemptAt: Date | null;
@@ -3050,7 +3049,6 @@ export type ConnectionStatus = {
     scanned up to `scanned`; it is null until the blob's header gives the cut. */
 export type BackfillStatus = {
   selector: string;
-  replacing: boolean;
   snapshot: { bytes: number; length: number | null; done: boolean };
   tail: { cut: number; scanned: number; until: number; done: boolean } | null;
   retryAt: Date | null;
@@ -3209,24 +3207,23 @@ type Inbound =
     with `!`.  Its local keys follow the template grammar, and the parked keys' terminal parameter
     is itself a slice or a selector, `!`, then the rest.  Each is stored as `.json` unless noted:
 
-        !view                       ViewRecord: the view token, its position, and the selectors
-                                    granted
+        !view                       ViewRecord: the latest view delivered, its token, its
+                                    position, and the selectors granted
         !checkpoint                 CheckpointRecord: the epoch of the log the cursor is in, the
                                     cursor, set by a bootstrap's view frame and advanced with
                                     every batch, vouch, and live mark, and how far the base is
                                     applied
-        !seq:{slice}                the slice's last held seq, or 'backfill' while a backfill
-                                    covering it is in flight; deleted when the slice dies
+        !seq:{slice}                the held slice's last applied seq; deleted when the slice
+                                    leaves the base
         !mutation:{ordinal}         Mutation<Uint8Array> (`.mutation`): the outbox, in send order,
                                     each mutation's data as its wire bytes, under the series and
                                     number it was minted with; ordinal zero-padded to 20 digits
                                     so a scan walks the outbox in order
-        !backfill:{selector}        BackfillRecord: an in-flight backfill's until, resume,
-                                    replacing, and children
+        !backfill:{selector}        BackfillRecord: an in-flight backfill's until and resume
         !backfill-seqs:{selector}   the backfill blob's header seqs, slice name to seq
-        !park-ed:{slice}!{seq}      a parked edit (`.edits`), raw as delivered; seq zero-padded
-                                    to 20 digits so a slice's range walks its chain; a selector's
-                                    key prefix after `!park-ed:` covers its slices' edits
+        !park-edit:{slice}!{seq}    an edit waiting for the land (`.edits`), raw as delivered by
+                                    the connection while frozen or by a tail; seq zero-padded to
+                                    20 digits so a slice's range walks its chain
         !park-snap:{selector}!{offset}
                                     a page of the selector's backfill blob (`.page`), raw: a run
                                     of its whole set operations, offset the byte it starts at in
@@ -3284,9 +3281,8 @@ export class Engine<QX, PX, M, N = never> {
   // the persisted state, held in memory and written through
   #view: ViewRecord | null = null;
   #checkpoint: CheckpointRecord | null = null;
-  // seq per held slice, or the marker for a slice under an in-flight selector; the marker is
-  // persisted at !seq:{slice} on first sight during the backfill, in the transaction that parks
-  #slices: Map<string, number | 'backfill'> = new Map();
+  // the last applied seq per held slice
+  #slices: Map<string, number> = new Map();
   #backfills: Map<string, BackfillEntry> = new Map();
   // the outbox in send order: mutation id to its ordinal in !mutation:{ordinal}
   #outbox: Map<string, number> = new Map();
@@ -3304,16 +3300,15 @@ export class Engine<QX, PX, M, N = never> {
   #online: Map<string, OnlineMutation> = new Map();
   // set by a release inside a transaction, read by the refresh after its commit
   #outboxChanged: boolean = false;
-  // how far the base has been applied, -1 for never: the checkpoint, except while frozen, when it
-  // stays at the last edit that applied.  Persisted in the checkpoint record.  An acked mutation
-  // at or below it is in the base, edits or none
+  // how far the base has been applied, -1 for never: the cursor, except while frozen, when it stays
+  // where the freeze began.  Persisted in the checkpoint record.  An acked mutation at or below it
+  // is in the base, edits or none
   #applied: number = -1;
 
   // the connection has delivered `live`
   #live: boolean = false;
   // the log this connection's positions belong to, from its first hook; null between connections
   #epoch: string | null = null;
-  #replacing: number = 0;
 
   // work received from the connection, in arrival order
   #inbox: Inbound[] = [];
@@ -3322,6 +3317,7 @@ export class Engine<QX, PX, M, N = never> {
   // how each backfill() call ended, and on which connection
   #backfillOutcomes: {
     selector: string;
+    entry: BackfillEntry;
     outcome: BackfillOutcome | { failed: unknown };
     conn: SignalController;
   }[] = [];
@@ -3436,6 +3432,11 @@ export class Engine<QX, PX, M, N = never> {
 
   //// end of public api ////
 
+  // the base is frozen while any backfill is in flight
+  get #frozen(): boolean {
+    return this.#backfills.size > 0;
+  }
+
   #schedule(): void {
     if (this.#scheduled) return;
     this.#scheduled = true;
@@ -3464,11 +3465,11 @@ export class Engine<QX, PX, M, N = never> {
       this.#checkpoint = checkpoint ?? null;
       this.#view = (txn.get('!view', '.json', JS) as ViewRecord | undefined) ?? null;
 
-      // the slices table: seq per held slice, or the marker for a slice under a backfill
+      // the slices table: seq per held slice
       const json = { type: '.json', rep: JS } as const;
       const seqRows = scanAll(txn, { pattern: engineKeys('seq'), limit: 1000, values: json });
       for (const [key, value] of seqRows) {
-        this.#slices.set(key.slice('!seq:'.length), value as number | 'backfill');
+        this.#slices.set(key.slice('!seq:'.length), value as number);
       }
 
       // the outbox in ordinal order; the next ordinal continues from the last key
@@ -3491,14 +3492,12 @@ export class Engine<QX, PX, M, N = never> {
       });
       for (const [key, value] of backfillRows) {
         const record = value as BackfillRecord;
-        this.#backfills.set(key.slice('!backfill:'.length), newBackfillEntry(record, null));
-        if (record.replacing) this.#replacing++;
+        this.#backfills.set(key.slice('!backfill:'.length), newBackfillEntry(record));
       }
     });
 
     // a backfill whose download finished before the crash is ready to land
-    for (const [selector, entry] of this.#backfills) {
-      entry.parent = this.#parentOf(selector);
+    for (const entry of this.#backfills.values()) {
       const r = entry.record;
       if (r.resume?.snapshotDone && r.resume.tailDone) entry.status = 'ready';
     }
@@ -3509,7 +3508,7 @@ export class Engine<QX, PX, M, N = never> {
     // outside the wants is an earlier build's.  Every one goes now, so the view frame that answers
     // our token finds the base as this build would have made it.
     const wanted = (x: string) => this.#wants.some((w) => selectorCovers(w, x));
-    const wasFrozen = this.#replacing > 0;
+    const wasFrozen = this.#frozen;
     const dirty: Record<string, true> = {};
     this.#store.write((txn) => {
       // every backfill outside the wants
@@ -3529,13 +3528,9 @@ export class Engine<QX, PX, M, N = never> {
         txn.set('!view', '.json', JS, this.#view);
       }
 
-      // did the purge end the last replacing backfill?  Then this is the unfreeze.  Either way,
-      // whatever waits ready on disk lands now.
-      if (wasFrozen && this.#replacing === 0) {
-        this.#unfreezeIn(txn, dirty);
-      } else {
-        this.#tryLandIn(txn, dirty);
-      }
+      // whatever waits ready on disk lands now, and so does what waited for a backfill the purge
+      // dropped
+      if (wasFrozen) this.#tryLandIn(txn, dirty);
     });
 
     // the first connection attempt
@@ -3543,17 +3538,6 @@ export class Engine<QX, PX, M, N = never> {
 
     // publish the status, and predict every outbox mutation onto a fresh overlay
     this.#refresh({}, true);
-  }
-
-  // the most specific in-flight selector that covers selector, other than itself, so the parent of
-  // a child
-  #parentOf(selector: string): string | null {
-    let parent: string | null = null;
-    for (const other of this.#backfills.keys()) {
-      if (other === selector || !selectorCovers(other, selector)) continue;
-      if (parent === null || other.length > parent.length) parent = other;
-    }
-    return parent;
   }
 
   /* Our main logic is a loop, run whenever work is scheduled until none is left.  Each pass takes
@@ -3783,10 +3767,11 @@ export class Engine<QX, PX, M, N = never> {
     const pushes: BackfillWork[] = [];
     const dirty: Record<string, true> = {};
 
-    // a push for a backfill that was dropped while it was queued fails on its own
+    // a push for a backfill that was dropped while it was queued fails on its own, even when a
+    // regrant has since made a new backfill of the same selector
     while (this.#backfillWork.length > 0) {
       const work = this.#backfillWork.shift()!;
-      if (this.#backfills.has(work.selector)) {
+      if (this.#backfills.get(work.selector) === work.entry) {
         pushes.push(work);
       } else {
         work.reject(new Error(`backfill ${work.selector} is no longer in flight`));
@@ -3827,6 +3812,7 @@ export class Engine<QX, PX, M, N = never> {
       const fromPosition = Math.max(record.resume?.fromPosition ?? position, position);
       record.resume = {
         position,
+        visible: item.header.visible,
         skipBytes: 0,
         checksum: '',
         fromPosition,
@@ -3834,11 +3820,6 @@ export class Engine<QX, PX, M, N = never> {
         tailDone: false,
       };
       txn.set(`!backfill-seqs:${selector}`, '.json', JS, seqs);
-
-      // the header names every slice the blob holds, so each is marked now
-      for (const slice of Object.keys(seqs)) {
-        this.#maybeMarkBackfilling(txn, slice, record.replacing);
-      }
     } else if ('page' in item) {
       // park the page raw, keyed by the offset it starts at
       txn.set(parkedPageKey(selector, record.resume!.skipBytes), '.page', MSGPACK, item.page);
@@ -3847,10 +3828,9 @@ export class Engine<QX, PX, M, N = never> {
     } else if ('pagesDone' in item) {
       record.resume!.snapshotDone = true;
     } else if ('edits' in item) {
-      // park each edit by slice and seq, and mark its slice
+      // park each edit by slice and seq
       for (const e of item.edits) {
         txn.set(parkedEditKey(e.slice, e.seq), '.edits', MSGPACK, e.raw);
-        this.#maybeMarkBackfilling(txn, e.slice, record.replacing);
         record.resume!.fromPosition = Math.max(record.resume!.fromPosition, e.position);
       }
       entry.scanned = Math.max(entry.scanned, item.scanned);
@@ -3864,36 +3844,26 @@ export class Engine<QX, PX, M, N = never> {
     txn.set(`!backfill:${selector}`, '.json', JS, record);
   }
 
-  // an additive backfill leaves a held slice held and lands around it; a replacing one takes it
-  #maybeMarkBackfilling(txn: WTxn, slice: string, replacing: boolean): void {
-    const held = this.#slices.get(slice);
-    if (held === 'backfill' || (typeof held === 'number' && !replacing)) return;
-    this.#slices.set(slice, 'backfill');
-    txn.set(`!seq:${slice}`, '.json', JS, 'backfill');
-    this.#episode?.resolved.delete(slice);
-  }
-
   /* every queued outcome in one transaction.  Completion is known from the pushes themselves, so
      a done outcome only clears the attempt count; stale and failure decide what downloads again. */
   #onBackfillOutcomes(): void {
     this.#store.write((txn) => {
       while (this.#backfillOutcomes.length > 0) {
-        const { selector, outcome, conn } = this.#backfillOutcomes.shift()!;
+        const { selector, entry, outcome, conn } = this.#backfillOutcomes.shift()!;
 
         // an outcome from a connection that has ended means nothing; the next connection
         // restarts the download
         if (conn !== this.#connectionAbort) continue;
 
-        // was the backfill dropped while its outcome was queued?
-        const entry = this.#backfills.get(selector);
-        if (entry === undefined) continue;
+        // was the backfill dropped while its outcome was queued, and perhaps granted anew?
+        if (this.#backfills.get(selector) !== entry) continue;
 
         if (outcome === 'done') {
           entry.attempts = 0;
         } else if (outcome === 'stale') {
           /* The blob is gone: the parked pages go, the parked edits stay, and the download
-             starts over under the same until.  Both halves start over, since a tail is read
-             from its snapshot's position, and the new snapshot's may lie anywhere. */
+             starts over under the same until.  Both halves start over, the tail from the new
+             snapshot's position or from where the parked tail reached, whichever is later. */
           entry.attempts = 0;
           txn.delPrefix(`!park-snap:${selector}!`);
           const r = entry.record.resume;
@@ -3909,9 +3879,9 @@ export class Engine<QX, PX, M, N = never> {
           txn.set(`!backfill:${selector}`, '.json', JS, entry.record);
           this.#startBackfill(selector);
         } else {
-          // a rejection: ours, if the entry's signal fired, else a failure to retry after backoff
-          if (entry.controller.signal.aborted) continue;
-          entry.status = 'downloading';
+          // a rejection: ours, if the entry's signal fired, else a failure to retry after backoff;
+          // one after both halves were in leaves the backfill ready to land
+          if (entry.controller.signal.aborted || entry.status === 'ready') continue;
           const delay = backoffDelay(entry.attempts++);
           entry.retryAt = Date.now() + delay;
           entry.retryTimer = host.setTimeout(() => {
@@ -3941,404 +3911,186 @@ export class Engine<QX, PX, M, N = never> {
     const backfill: Backfill = {
       selector,
       until: entry.record.until,
-      resume: entry.record.resume,
+      resume: entry.record.resume === null ? null : { ...entry.record.resume },
       signal: host.AbortSignal.any([conn.signal, entry.controller.signal]),
       push: (item) =>
         new Promise<void>((resolve, reject) => {
-          this.#backfillWork.push({ selector, item, resolve, reject });
+          this.#backfillWork.push({ selector, entry, item, resolve, reject });
           this.#schedule();
         }),
     };
 
-    // the outcome is tagged with its connection, so a late one from an ended connection is known
+    // the outcome is tagged with its backfill and its connection, so a late one from a dropped
+    // backfill or an ended connection is known
     this.#connection.backfill(backfill).then(
       (outcome) => {
-        this.#backfillOutcomes.push({ selector, outcome, conn });
+        this.#backfillOutcomes.push({ selector, entry, outcome, conn });
         this.#schedule();
       },
       (e: unknown) => {
-        this.#backfillOutcomes.push({ selector, outcome: { failed: e }, conn });
+        this.#backfillOutcomes.push({ selector, entry, outcome: { failed: e }, conn });
         this.#schedule();
       },
     );
   }
 
-  /* Land what can land.  Chains are checked key-only before anything is written.  While a
-     replacing backfill is in flight the base is frozen: nothing lands unless every replacing entry
-     is in a landing subtree and the frozen edits chain, and then the frozen edits land with
-     them, so this is the pass that unfreezes. */
+  /* Land once nothing waits: every backfill downloaded, and the cursor at or past each one's
+     visible, the last position where any slice under its selector changed.  No blob's slices have
+     changed since the cursor, so each blob is as the slices were there, and the slices they bring
+     and the slices the connection kept delivering reach the cursor together. */
   #tryLandIn(txn: WTxn, dirty: Record<string, true>): void {
-    // the base is frozen while any replacing backfill is in flight
-    const frozen = this.#replacing > 0;
-
-    // check every ready child on its own, so a broken one restarts without waiting on its parent
-    for (const selector of [...this.#backfills.keys()]) {
-      const entry = this.#backfills.get(selector)!;
-      if (entry.parent === null || entry.status !== 'ready') continue;
-      const slices = this.#brokenSlicesIn(txn, selector);
-      if (slices.length > 0) this.#repairIn(txn, selector, slices);
+    const cursor = this.#checkpoint?.position ?? -1;
+    for (const entry of this.#backfills.values()) {
+      if (entry.status !== 'ready' || entry.record.resume!.visible > cursor) return;
     }
+    this.#landIn(txn, dirty);
+  }
 
-    // check the frozen edits; a break there is a gap on a held slice
-    let frozenClean = true;
-    if (frozen) {
-      const slices = this.#brokenSlicesIn(txn, null);
-      if (slices.length > 0) this.#repairIn(txn, null, slices);
-      frozenClean = slices.length === 0;
-    }
+  /* The land, in one transaction: every backfill's blob, then every parked edit, then the view's
+     drops, and the base is applied through the cursor.  Per slice, the covering blob with the
+     newest cut wins, and one that does not name the slice found it deleted or unborn there; a
+     slice held at or past the winning blob's seq keeps its own state.  A slice's parked run
+     applies onto its base: edits at or below the winning cut skip, and the rest chain, the next
+     seq or a reset above the last.  A run that does not chain, a gap or a
+     missed birth, lands nothing: its slice backfills by its exact selector, and the land waits. */
+  #landIn(txn: WTxn, dirty: Record<string, true>): void {
+    const cursor = this.#checkpoint?.position ?? -1;
+    const selectors = this.#view?.selectors ?? [];
+    const inView = (slice: string) => selectors.some((r) => selectorCovers(r, slice));
 
-    // check every top-level selector whose whole subtree is ready
-    const clean: string[] = [];
-    for (const selector of [...this.#backfills.keys()]) {
-      if (this.#backfills.get(selector)!.parent !== null || !this.#landable(selector)) continue;
-      const slices = this.#brokenSlicesIn(txn, selector);
-      if (slices.length > 0) {
-        // a broken seq chain: a slice with an entry restarts, one without becomes a child
-        this.#repairIn(txn, selector, slices);
-      } else {
-        clean.push(selector);
+    // each blob's cut and header, and the blob that wins a slice
+    const blobs = [...this.#backfills].map(([selector, entry]) => ({
+      selector,
+      cut: entry.record.resume!.position,
+      header: this.#headerOf(txn, selector),
+    }));
+    const winner = (slice: string) => {
+      let best: (typeof blobs)[number] | null = null;
+      for (const b of blobs) {
+        if (selectorCovers(b.selector, slice) && (best === null || b.cut > best.cut)) best = b;
       }
+      return best;
+    };
+
+    // every parked edit's envelope, by slice in seq order
+    const parked = new Map<string, EditEnvelope[]>();
+    const rows = scanAll(txn, {
+      pattern: engineKeys('park-edit'),
+      limit: 1000,
+      values: { type: '.edits', rep: JS },
+    });
+    for (const [, value] of rows) {
+      const env = value as EditEnvelope;
+      if (!parked.has(env.slice)) parked.set(env.slice, []);
+      parked.get(env.slice)!.push(env);
     }
 
-    // frozen, and some replacing backfill is not landing in this pass?
-    if (frozen) {
-      const landing = new Set(clean.flatMap((selector) => this.#subtree(selector)));
-      const pending = [...this.#backfills].some(
-        ([selector, e]) => e.record.replacing && !landing.has(selector),
+    // a tail edit past the cursor, which a blob cut below the view's position brings, waits for
+    // the connection to reach it, so the land stays at one position
+    for (const run of parked.values()) {
+      if (run.some((env) => env.position > cursor)) return;
+    }
+
+    // every slice the land touches: the blobs' slices, the held slices they cover, and every slice
+    // with parked edits
+    const touched = new Set<string>(parked.keys());
+    for (const b of blobs) for (const slice of Object.keys(b.header)) touched.add(slice);
+    for (const slice of this.#slices.keys()) if (winner(slice) !== null) touched.add(slice);
+
+    // plan each slice in the view: its base, and the run that applies onto it
+    type Plan = { blob: boolean; seq: number | null; run: EditEnvelope[] };
+    const plans = new Map<string, Plan>();
+    const broken: string[] = [];
+    for (const slice of touched) {
+      if (!inView(slice)) continue;
+
+      // the base: the winning blob's state, or the held state, which a slice held at or past the
+      // blob's seq keeps
+      const w = winner(slice);
+      const held = this.#slices.get(slice) ?? null;
+      const named = w === null ? null : (w.header[slice] ?? null);
+      const blob = w !== null && !(named !== null && held !== null && held >= named);
+      const cut = blob ? w!.cut : -1;
+      let last: number | null = blob ? named : held;
+      const seq = last;
+
+      // the run: from its last reset, or the first edit past the base, and broken by a gap that no
+      // later reset mends
+      let run: EditEnvelope[] = [];
+      let gap = false;
+      for (const env of parked.get(slice) ?? []) {
+        if (env.position <= cut || (last !== null && env.seq <= last)) continue;
+        if (env.lifecycle !== 'normal') {
+          run = [env];
+          gap = false;
+        } else if (gap || last === null || env.seq !== last + 1) {
+          run = [];
+          gap = true;
+        } else {
+          run.push(env);
+        }
+        last = env.seq;
+      }
+      if (gap) broken.push(slice);
+      plans.set(slice, { blob, seq, run });
+    }
+
+    // a broken slice downloads afresh, past its break, and the land waits for it
+    if (broken.length > 0) {
+      for (const slice of broken) {
+        if (this.#backfills.has(slice)) {
+          this.#restartIn(txn, slice);
+        } else {
+          this.#spawnIn(txn, slice, cursor + 1);
+        }
+      }
+      return;
+    }
+
+    // every slice a blob wins starts from that blob alone
+    for (const [slice, plan] of plans) {
+      if (plan.blob) markDirty(dirty, txn.delPrefix(`${slice}!`));
+    }
+    for (const b of blobs) {
+      const skip = Object.keys(b.header).filter(
+        (slice) => winner(slice) !== b || plans.get(slice)?.blob !== true,
       );
-      // then nothing lands, or the base would show a partial replacement
-      if (pending || !frozenClean) return;
+      markDirty(dirty, txn.applySnapshot(b.selector, skip));
     }
 
-    // land every clean subtree
-    for (const selector of clean) this.#landSelectorIn(txn, selector, dirty);
-
-    // frozen, so this is the unfreeze: the frozen edits land and the base catches up
-    if (frozen) {
-      this.#applyParkedIn(txn, null, {}, dirty);
-      this.#appliedTo(txn, this.#checkpoint?.position ?? -1);
+    // then its run, and the slice is held at the run's last seq, or forgotten when it ends dead
+    for (const [slice, plan] of plans) {
+      const end = plan.run[plan.run.length - 1];
+      if (end !== undefined) {
+        markDirty(dirty, txn.applyParked(slice, plan.run[0].seq));
+        for (const env of plan.run) this.#roundTrip(txn, env.id);
+      }
+      const seq = end === undefined ? plan.seq : end.lifecycle === 'death' ? null : end.seq;
+      if (seq === null) {
+        this.#forgetIn(txn, slice);
+      } else {
+        this.#slices.set(slice, seq);
+        txn.set(`!seq:${slice}`, '.json', JS, seq);
+      }
+      this.#resolve(slice);
     }
+
+    // the view's drops, then nothing parked or in flight is left, and the base reaches the cursor
+    for (const slice of [...this.#slices.keys()]) {
+      if (!inView(slice)) this.#dropSliceIn(txn, slice, dirty);
+    }
+    txn.delPrefix('!park-edit:');
+    for (const selector of [...this.#backfills.keys()]) this.#dropBackfillIn(txn, selector);
+    this.#appliedTo(txn, cursor);
   }
 
-  // a selector's children that are still in flight
-  #childrenOf(selector: string): string[] {
-    return this.#backfills.get(selector)!.record.children.filter((c) => this.#backfills.has(c));
-  }
-
-  // a selector and every descendant
-  #subtree(selector: string): string[] {
-    return [selector, ...this.#childrenOf(selector).flatMap((c) => this.#subtree(c))];
-  }
-
-  // whether a selector's whole subtree has finished downloading
-  #landable(selector: string): boolean {
-    return (
-      this.#backfills.get(selector)!.status === 'ready' &&
-      this.#childrenOf(selector).every((c) => this.#landable(c))
-    );
-  }
-
-  // the parked edit range of a selector, or of every slice for the frozen edits (null)
-  #parkRange(selector: string | null, values: ScanRequest['values']): ScanRequest {
-    const match = selector === null ? null : { prefix: selectorPrefix(selector) };
-    return { pattern: engineKeys('park-ed', match), limit: 1000, values };
-  }
-
-  // a selector's blob header: the seq of every slice in its blob at the cut
+  // a blob's header: the seq of every slice in it at the cut
   #headerOf(txn: RTxn, selector: string): Record<string, number> {
     return (txn.get(`!backfill-seqs:${selector}`, '.json', JS) ?? {}) as Record<string, number>;
   }
 
-  // a subtree's seqs at its cuts: the selector's header with each child's laid over it, deepest
-  // winning
-  #mergedHeaderIn(txn: RTxn, selector: string): Record<string, number> {
-    let header = this.#headerOf(txn, selector);
-    for (const child of this.#childrenOf(selector)) {
-      header = { ...header, ...this.#mergedHeaderIn(txn, child) };
-    }
-    return header;
-  }
-
-  /* The slices among a subtree's parked edits, or among the frozen edits (null), whose chain does
-     not continue from the state that will be in place.  Key-only while a chain continues; a gap
-     reads the slice's envelopes once, since a reset after it mends it, and so does the cut for a
-     slice no blob names. */
-  #brokenSlicesIn(txn: RTxn, selector: string | null): string[] {
-    const header = selector === null ? {} : this.#mergedHeaderIn(txn, selector);
-    const broken: string[] = [];
-    let range = this.#parkRange(selector, false);
-    let slice = '';
-    let last = 0;
-    // whether the slice was judged at a gap, which settles the rest of its run
-    let judged = false;
-
-    // walk the parked keys in slice then seq order
-    for (;;) {
-      const { entries, next } = txn.scan(range);
-      for (const [key] of entries) {
-        const park = parsePark(key);
-        const held = this.#slices.get(park.slice);
-
-        // a slice under some other backfill is not ours to check
-        if (selector === null && held === 'backfill') continue;
-
-        // a new slice: its base is the newest state in place, the held seq or the cut
-        if (park.slice !== slice) {
-          slice = park.slice;
-          last = Math.max(typeof held === 'number' ? held : 0, header[slice] ?? 0);
-          judged = false;
-        }
-
-        // at or below the base, the snapshot covers this edit
-        if (judged || park.seq <= last) continue;
-
-        // does the chain continue?
-        if (park.seq === last + 1) {
-          last = park.seq;
-          continue;
-        }
-
-        // a gap: the run's envelopes settle the slice, once
-        judged = true;
-        const cut = this.#cutOf(selector, header, slice);
-        if (!this.#mendsIn(txn, slice, park.seq, cut)) broken.push(slice);
-      }
-      if (next === null) return broken;
-      range = { ...range, after: next };
-    }
-  }
-
-  /* Whether a slice's parked run holds past a gap at gapSeq, walking its envelopes backwards from
-     the newest: it does when a reset follows the gap and the edits after that reset chain, since
-     nothing before a reset survives it, or when the whole run from the gap on lies at or below
-     cut, which covers it. */
-  #mendsIn(txn: RTxn, slice: string, gapSeq: number, cut: number | null): boolean {
-    let range: ScanRequest = {
-      pattern: engineKeys('park-ed', { prefix: `${slice}!` }),
-      reverse: true,
-      limit: 1000,
-      values: { type: '.edits', rep: JS },
-    };
-    // the seq the next edit walked must have, and whether the newest lies at or below the cut
-    let expected: number | null = null;
-    let covered = false;
-    for (;;) {
-      const { entries, next } = txn.scan(range);
-      for (const [, value] of entries) {
-        const env = value as EditEnvelope;
-        if (expected === null) {
-          covered = cut !== null && env.position <= cut;
-        } else if (env.seq !== expected) {
-          return false;
-        }
-        expected = env.seq - 1;
-        if (env.lifecycle !== 'normal') return true;
-        if (env.seq === gapSeq) return covered;
-      }
-      if (next === null) return false;
-      range = { ...range, after: next };
-    }
-  }
-
-  /* The cut covering a slice that no blob of a subtree names: the newest among the subtree's
-     entries whose selector covers it, each of which found the slice deleted or unborn at its cut.
-     Null for a slice some blob names or that is held, whose seq is its base, and among the frozen
-     edits (null). */
-  #cutOf(selector: string | null, header: Record<string, number>, slice: string): number | null {
-    if (selector === null || slice in header) return null;
-    if (typeof this.#slices.get(slice) === 'number') return null;
-    let cut: number | null = null;
-    for (const r of this.#subtree(selector)) {
-      const position = this.#backfills.get(r)!.record.resume?.position;
-      if (position === undefined || !selectorCovers(r, slice)) continue;
-      if (cut === null || position > cut) cut = position;
-    }
-    return cut;
-  }
-
-  // a broken slice with an entry restarts it; the rest become children of the selector checked, or
-  // top-level replacing backfills for a break among the frozen edits (null), which is a gap on a
-  // held slice
-  #repairIn(txn: WTxn, selector: string | null, slices: string[]): void {
-    const fresh: string[] = [];
-    for (const slice of slices) {
-      if (this.#backfills.has(slice)) {
-        this.#restartIn(txn, slice);
-      } else {
-        fresh.push(slice);
-      }
-    }
-    if (fresh.length > 0) {
-      const replacing = selector === null || this.#backfills.get(selector)!.record.replacing;
-      this.#spawnIn(txn, selector, fresh, this.#checkpoint?.position ?? 0, replacing);
-    }
-  }
-
-  // a top-level selector's subtree lands as one
-  #landSelectorIn(txn: WTxn, selector: string, dirty: Record<string, true>): void {
-    const header = this.#mergedHeaderIn(txn, selector);
-
-    // per slice under the selector, the newest state wins
-    const kept = new Set<string>();
-    for (const [slice, held] of this.#slices) {
-      if (!selectorCovers(selector, slice)) continue;
-      if (typeof held === 'number' && held >= (header[slice] ?? 0)) {
-        // a held slice at or past the cut keeps its state, and the snapshots skip it
-        kept.add(slice);
-        delete header[slice];
-      } else {
-        // otherwise the slice loses its state to the snapshot
-        markDirty(dirty, txn.delPrefix(`${slice}!`));
-
-        // a slice no blob names was deleted or unborn at the cut, so it leaves the slices table;
-        // its parked edits, if any, hold it again as they apply
-        if (!(slice in header)) {
-          this.#slices.delete(slice);
-          txn.del(`!seq:${slice}`);
-        }
-      }
-    }
-
-    // apply the snapshots, apply the parked edits onto them, and forget the subtree
-    this.#applySnapshotsIn(txn, selector, dirty, [...kept]);
-    this.#applyParkedIn(txn, selector, header, dirty);
-    this.#dropIn(txn, selector);
-  }
-
-  // a selector's snapshot applies, then each child's over it for the slices in the child's blob,
-  // the deepest winning; a kept slice is never touched
-  #applySnapshotsIn(
-    txn: WTxn,
-    selector: string,
-    dirty: Record<string, true>,
-    kept: string[],
-  ): void {
-    markDirty(dirty, txn.applySnapshot(selector, kept));
-    for (const child of this.#childrenOf(selector)) {
-      // clear the parent's values for the child's slices, so a key the child's blob lacks goes too
-      for (const slice of Object.keys(this.#headerOf(txn, child))) {
-        if (!kept.includes(slice)) markDirty(dirty, txn.delPrefix(`${slice}!`));
-      }
-      this.#applySnapshotsIn(txn, child, dirty, kept);
-    }
-  }
-
-  // every in-flight top-level selector that a new selector covers becomes its child
-  #adoptChildrenIn(txn: WTxn, selector: string): void {
-    const entry = this.#backfills.get(selector)!;
-    for (const [other, e] of this.#backfills) {
-      if (other === selector || e.parent !== null || !selectorCovers(selector, other)) continue;
-      e.parent = selector;
-      entry.record.children.push(other);
-    }
-    txn.set(`!backfill:${selector}`, '.json', JS, entry.record);
-  }
-
-  // a replacing selector takes every held slice under it, so their edits park from here
-  #markUnderIn(txn: WTxn, selector: string): void {
-    for (const [slice, held] of this.#slices) {
-      if (typeof held === 'number' && selectorCovers(selector, slice)) {
-        this.#maybeMarkBackfilling(txn, slice, true);
-      }
-    }
-  }
-
-  // a landed subtree's records, parked pages, and entries go
-  #dropIn(txn: WTxn, selector: string): void {
-    for (const child of this.#childrenOf(selector)) this.#dropIn(txn, child);
-    txn.del(`!backfill:${selector}`);
-    txn.del(`!backfill-seqs:${selector}`);
-    txn.delPrefix(`!park-snap:${selector}!`);
-    const entry = this.#backfills.get(selector)!;
-    this.#backfills.delete(selector);
-    if (entry.record.replacing) this.#replacing--;
-  }
-
-  /* Apply the parked edits of a subtree, or of every slice under no backfill for the frozen edits
-     (null), each slice's run in one store call, then clear each walked slice's range.  Chains were
-     checked before any write.  Every landed slice's seq is written once: the last applied for a
-     slice with edits, the cut's for a header slice without.  A slice that ends deleted or unborn
-     is forgotten instead: one whose last edit applied is a death, and one no blob names whose
-     parked edits all lie at or below the cut. */
-  #applyParkedIn(
-    txn: WTxn,
-    selector: string | null,
-    header: Record<string, number>,
-    dirty: Record<string, true>,
-  ): void {
-    // {slice: seq}, the header seqs, then the last seq applied, and the slices that end deleted
-    // or unborn
-    const seqs = new Map(Object.entries(header));
-    const dead = new Set<string>();
-    const walked: string[] = [];
-    let range = this.#parkRange(selector, { type: '.edits', rep: JS });
-    let slice = '';
-    // the run to apply: the seq it starts from, its first edit's or its last reset's
-    let from: number | null = null;
-    // the cut covering the slice, for one no blob names
-    let cut: number | null = null;
-
-    // walk the parked envelopes in slice then seq order, applying each slice's run as it ends
-    for (;;) {
-      const { entries, next } = txn.scan(range);
-      for (const [, value] of entries) {
-        const env = value as EditEnvelope;
-        const held = this.#slices.get(env.slice);
-
-        // a slice under some other backfill is not ours to land
-        if (selector === null && held === 'backfill') continue;
-
-        // a new slice: apply the last run, and start from the newest state in place
-        if (env.slice !== slice) {
-          if (from !== null) markDirty(dirty, txn.applyParked(slice, from));
-          slice = env.slice;
-          from = null;
-          walked.push(slice);
-          seqs.set(slice, Math.max(typeof held === 'number' ? held : 0, seqs.get(slice) ?? 0));
-          cut = this.#cutOf(selector, header, slice);
-
-          // a slice no blob names was deleted or unborn at the cut, and stays so unless an edit
-          // past the cut applies
-          if (cut !== null) dead.add(slice);
-        }
-
-        // at or below the base, the snapshot covers this edit; so does the cut, for a slice no
-        // blob names
-        if (env.seq <= seqs.get(slice)!) continue;
-        if (cut !== null && env.position <= cut) continue;
-
-        // the edit joins the run, which starts over at a reset, and leaves the slice dead or live
-        seqs.set(slice, env.seq);
-        if (env.lifecycle === 'death') {
-          dead.add(slice);
-        } else {
-          dead.delete(slice);
-        }
-        this.#roundTrip(txn, env.id);
-        if (from === null || env.lifecycle !== 'normal') from = env.seq;
-      }
-      if (next === null) break;
-      range = { ...range, after: next };
-    }
-    if (from !== null) markDirty(dirty, txn.applyParked(slice, from));
-
-    // clear only the slices walked; a skipped slice's edits stay for its own backfill's land
-    for (const name of walked) txn.delPrefix(`!park-ed:${name}!`);
-
-    // hold every landed slice at its new seq, and forget every dead one
-    for (const [name, seq] of seqs) {
-      if (dead.has(name)) {
-        this.#forgetIn(txn, name);
-      } else {
-        this.#slices.set(name, seq);
-        txn.set(`!seq:${name}`, '.json', JS, seq);
-      }
-      this.#resolve(name);
-    }
-  }
-
   // a dead slice leaves the slices table, so a birth chains on it from empty and any other edit
-  // is a missed start
+  // is a missed birth
   #forgetIn(txn: WTxn, slice: string): void {
     this.#slices.delete(slice);
     txn.del(`!seq:${slice}`);
@@ -4352,8 +4104,7 @@ export class Engine<QX, PX, M, N = never> {
     if (online !== undefined) online.seen = true;
   }
 
-  // a selector whose tail did not reach its parked live edits downloads again from a fresh
-  // snapshot, whose cut is past the gap; the parked edits stay and chain from the live cut
+  // a backfill whose run broke downloads again from a fresh snapshot, whose cut is past the break
   #restartIn(txn: WTxn, selector: string): void {
     const entry = this.#backfills.get(selector)!;
     txn.delPrefix(`!park-snap:${selector}!`);
@@ -4364,37 +4115,16 @@ export class Engine<QX, PX, M, N = never> {
     this.#startBackfill(selector);
   }
 
-  // new backfills, each downloading at once into its own parked range; with a parent they are
-  // its children, and it lands when they have too
-  #spawnIn(
-    txn: WTxn,
-    parent: string | null,
-    selectors: string[],
-    until: number,
-    replacing: boolean,
-  ): void {
-    for (const selector of selectors) {
-      const record: BackfillRecord = { until, resume: null, replacing, children: [] };
-      txn.set(`!backfill:${selector}`, '.json', JS, record);
-      this.#backfills.set(selector, newBackfillEntry(record, parent));
-      if (replacing) this.#replacing++;
-
-      // an exact selector's slice is marked; a prefix selector has nothing to mark until its blob
-      // names its slices
-      if (!selector.endsWith('*')) this.#maybeMarkBackfilling(txn, selector, replacing);
-      if (replacing) this.#markUnderIn(txn, selector);
-      this.#startBackfill(selector);
-    }
-
-    if (parent !== null) {
-      const p = this.#backfills.get(parent)!;
-      p.record.children.push(...selectors);
-      txn.set(`!backfill:${parent}`, '.json', JS, p.record);
-    }
+  // a new backfill, downloading at once into its own parked range; the base is frozen from here
+  // until it lands
+  #spawnIn(txn: WTxn, selector: string, until: number): void {
+    const record: BackfillRecord = { until, resume: null };
+    txn.set(`!backfill:${selector}`, '.json', JS, record);
+    this.#backfills.set(selector, newBackfillEntry(record));
+    this.#startBackfill(selector);
   }
 
-  // an in-flight backfill ends: its download is aborted, its parked pages and records go, and its
-  // children carry on under the parent they have left, if any
+  // an in-flight backfill ends: its download is aborted, and its parked pages and records go
   #dropBackfillIn(txn: WTxn, selector: string): void {
     const entry = this.#backfills.get(selector)!;
     entry.controller.abort();
@@ -4403,44 +4133,24 @@ export class Engine<QX, PX, M, N = never> {
     txn.del(`!backfill:${selector}`);
     txn.del(`!backfill-seqs:${selector}`);
     this.#backfills.delete(selector);
-    if (entry.record.replacing) this.#replacing--;
-
-    // leave the parent's children list
-    if (entry.parent !== null) {
-      const p = this.#backfills.get(entry.parent)!;
-      p.record.children = p.record.children.filter((c) => c !== selector);
-      txn.set(`!backfill:${entry.parent}`, '.json', JS, p.record);
-    }
-
-    // re-parent each child to the next covering entry, if any
-    for (const child of entry.record.children) {
-      const c = this.#backfills.get(child);
-      if (c === undefined) continue;
-      c.parent = this.#parentOf(child);
-      if (c.parent === null) continue;
-      const p = this.#backfills.get(c.parent)!;
-      p.record.children.push(child);
-      txn.set(`!backfill:${c.parent}`, '.json', JS, p.record);
-    }
   }
 
-  /* The parked edits of every slice outside keep go, found by a key-only walk of every parked
-     edit.  A parked edit's slice may have no entry in the slices table: a slice born while the
-     base is frozen parks its edits under no backfill until the unfreeze applies them. */
+  // the parked edits of every slice outside keep go, found by a key-only walk of every parked edit
   #dropParkedIn(txn: WTxn, keep: (slice: string) => boolean): void {
     const gone = new Set<string>();
-    for (const [key] of scanAll(txn, this.#parkRange(null, false))) {
+    const range = { pattern: engineKeys('park-edit'), limit: 1000, values: false } as const;
+    for (const [key] of scanAll(txn, range)) {
       const { slice } = parsePark(key);
       if (!keep(slice)) gone.add(slice);
     }
-    for (const slice of gone) txn.delPrefix(`!park-ed:${slice}!`);
+    for (const slice of gone) txn.delPrefix(`!park-edit:${slice}!`);
   }
 
   // a slice leaves the Engine: its state, its seq, and its parked edits
   #dropSliceIn(txn: WTxn, slice: string, dirty: Record<string, true>): void {
     markDirty(dirty, txn.delPrefix(`${slice}!`));
     txn.del(`!seq:${slice}`);
-    txn.delPrefix(`!park-ed:${slice}!`);
+    txn.delPrefix(`!park-edit:${slice}!`);
     this.#slices.delete(slice);
   }
 
@@ -4458,7 +4168,6 @@ export class Engine<QX, PX, M, N = never> {
 
     const dirty: Record<string, true> = {};
     let wentLive = false;
-    let revoked = false;
     this.#store.write((txn) => {
       while (this.#inbox.length > 0 && !('end' in this.#inbox[0])) {
         const item = this.#inbox.shift()!;
@@ -4480,7 +4189,7 @@ export class Engine<QX, PX, M, N = never> {
           this.#epoch = epoch;
           this.#head = head;
         } else if ('view' in item) {
-          if (this.#onViewIn(txn, item.view, dirty)) revoked = true;
+          this.#onViewIn(txn, item.view, dirty);
         } else if ('vouch' in item) {
           this.#onCursorIn(txn, item.vouch);
         } else if ('live' in item) {
@@ -4488,131 +4197,76 @@ export class Engine<QX, PX, M, N = never> {
           wentLive = true;
         }
       }
+
+      // the cursor may have reached the cut a frozen base waits for
+      if (this.#frozen) this.#tryLandIn(txn, dirty);
     });
 
-    // history is done: the backoff starts over, and the replay has proven every held slice that
-    // no backfill has taken
+    // history is done: the backoff starts over, and the replay has proven every held slice
     if (wentLive) {
       this.#live = true;
       this.#attempt = 0;
-      for (const [slice, held] of this.#slices) {
-        if (typeof held === 'number') this.#resolve(slice);
-      }
+      for (const slice of this.#slices.keys()) this.#resolve(slice);
     }
-
-    // a revoke changes what queries may see, so the graph runs even while frozen: a new query
-    // would otherwise disagree with the results already delivered
-    this.#refresh(dirty, revoked);
+    this.#refresh(dirty);
   }
 
-  // one frame's edits; each applies or parks by a slices-table lookup
+  /* One frame's edits, which apply whole or not at all.  While frozen they park.  Otherwise each
+     must chain on its slice, the next seq or a reset above the last.  A gap on a held slice, or a
+     normal edit of a slice the Engine does not hold, whose birth it missed, backfills that slice
+     by its exact selector, and the frame parks with the base frozen behind it. */
   #onEditsIn(txn: WTxn, edits: WireEdit[], dirty: Record<string, true>): void {
-    // {slice: seq} for every held slice that advanced, and {slice: edits} to apply
-    const seqs = new Map<string, number>();
-    const runs = new Map<string, WireEdit[]>();
-    // slices born in this frame: held ones are in seqs, parked ones here
-    const born = new Set<string>();
-    let applied = this.#applied;
+    const last = edits[edits.length - 1].position;
 
-    // route each edit
-    for (let i = 0; i < edits.length; i++) {
-      const e = edits[i];
-      const reset = e.lifecycle !== 'normal';
-      const held = this.#slices.get(e.slice);
-      let park = held === 'backfill';
-
-      // an unknown slice?
-      if (held === undefined && !seqs.has(e.slice) && !born.has(e.slice)) {
-        const parent = this.#parentOf(e.slice);
-        if (parent !== null) {
-          // under an in-flight selector, whose land will chain it: mark it and park
-          const replacing = this.#backfills.get(parent)!.record.replacing;
-          this.#maybeMarkBackfilling(txn, e.slice, replacing);
-          park = true;
-        } else if (!reset) {
-          // a reset starts the slice afresh below; a normal edit is one we missed the birth of,
-          // so the slice is backfilled on its own, and the edit parks
-          this.#spawnIn(txn, null, [e.slice], e.position, false);
-          park = true;
-        }
-      }
-
-      // frozen, so everything else parks too
-      if (!park && this.#replacing > 0) {
-        park = true;
-        if (held === undefined) born.add(e.slice);
-      }
-
-      // a held slice, or an unknown one's reset: does the edit chain?
-      if (!park) {
-        const last = seqs.get(e.slice) ?? (typeof held === 'number' ? held : 0);
-        if (e.seq <= last) continue;
-
-        /* The next edit chains.  So does a reset at any seq above the last, since the slice's
-           state is empty after it whatever was missed, and so does an edit that a reset follows
-           within this frame, since the run applies from its last reset.  The edit joins the
-           slice's run, and proves the slice needs no backfill. */
-        if (e.seq === last + 1 || reset || this.#resetAhead(edits, i)) {
-          seqs.set(e.slice, e.seq);
-          this.#resolve(e.slice);
-          if (!runs.has(e.slice)) runs.set(e.slice, []);
-          runs.get(e.slice)!.push(e);
-          applied = e.position;
-
-          // a death forgets the slice at once, so its next edit in this frame is an unknown
-          // slice's, as it would be in a later frame
-          if (e.lifecycle === 'death') {
-            seqs.delete(e.slice);
-            this.#forgetIn(txn, e.slice);
-          }
+    // does every edit chain?  The edits to apply, each slice's seq as the frame leaves it, null
+    // for one that dies, and the edits that break
+    const apply: WireEdit[] = [];
+    const seqs = new Map<string, number | null>();
+    const breaks: WireEdit[] = [];
+    if (!this.#frozen) {
+      for (const e of edits) {
+        const held = seqs.has(e.slice) ? seqs.get(e.slice)! : (this.#slices.get(e.slice) ?? null);
+        if (held !== null && e.seq <= held) continue;
+        if (e.lifecycle === 'normal' && (held === null || e.seq !== held + 1)) {
+          breaks.push(e);
           continue;
         }
-
-        // a gap: replace the slice, under the in-flight selector covering it if any, and park
-        this.#spawnIn(txn, this.#parentOf(e.slice), [e.slice], e.position, true);
-        seqs.delete(e.slice);
-        park = true;
+        apply.push(e);
+        seqs.set(e.slice, e.lifecycle === 'death' ? null : e.seq);
       }
-
-      txn.set(parkedEditKey(e.slice, e.seq), '.edits', MSGPACK, e.raw);
     }
 
-    // each run is its mutations' round trips, and applies from its last reset, since nothing
-    // before a reset survives it
-    const apply: WireEdit[] = [];
-    for (const run of runs.values()) {
-      let from = 0;
-      run.forEach((e, i) => {
-        this.#roundTrip(txn, e.id);
-        if (e.lifecycle !== 'normal') from = i;
-      });
-      apply.push(...run.slice(from));
+    // a frame that does not apply whole parks, and each slice it breaks backfills
+    if (this.#frozen || breaks.length > 0) {
+      for (const e of breaks) {
+        if (!this.#backfills.has(e.slice)) this.#spawnIn(txn, e.slice, e.position);
+      }
+      for (const e of edits) txn.set(parkedEditKey(e.slice, e.seq), '.edits', MSGPACK, e.raw);
+      this.#advanceCursorIn(txn, last);
+      return;
+    }
+
+    // apply the frame, each edit its mutation's round trip, and hold each slice at its new seq
+    for (const e of apply) {
+      this.#roundTrip(txn, e.id);
+      this.#resolve(e.slice);
     }
     if (apply.length > 0) markDirty(dirty, txn.applyEdits(apply));
-
-    // hold each slice at its new seq
     for (const [slice, seq] of seqs) {
-      this.#slices.set(slice, seq);
-      txn.set(`!seq:${slice}`, '.json', JS, seq);
+      if (seq === null) {
+        this.#forgetIn(txn, slice);
+      } else {
+        this.#slices.set(slice, seq);
+        txn.set(`!seq:${slice}`, '.json', JS, seq);
+      }
     }
-
-    // a frame that froze part way applied up to the edit before the gap
-    const last = edits[edits.length - 1].position;
-    this.#appliedTo(txn, this.#replacing > 0 ? applied : last);
+    this.#appliedTo(txn, last);
     this.#advanceCursorIn(txn, last);
   }
 
-  // whether a reset of the edit's slice follows it within its frame
-  #resetAhead(edits: WireEdit[], i: number): boolean {
-    for (let j = i + 1; j < edits.length; j++) {
-      if (edits[j].slice === edits[i].slice && edits[j].lifecycle !== 'normal') return true;
-    }
-    return false;
-  }
-
-  /* After a commit, the status is published and the graph learns what changed.  Base changes
-     reach queries only when not frozen, outbox changes always, since predictions are not base
-     state; either rebuilds the overlay.  A changed status or a new query alone runs the graph over
+  /* After a commit, the status is published and the graph learns what changed.  A base change or
+     an outbox change rebuilds the overlay, so every prediction stands on the base it is shown
+     over.  A changed status or a new query alone runs the graph over
      the overlay as it is.  Then each @online mutation whose round trip the queries now show
      settles. */
   #refresh(dirty: Record<string, true>, always = false): void {
@@ -4625,7 +4279,7 @@ export class Engine<QX, PX, M, N = never> {
     const outbox = this.#outboxChanged;
     this.#outboxChanged = false;
     const changed = Object.keys(dirty).length > 0;
-    if (always || outbox || (changed && this.#replacing === 0)) {
+    if (always || outbox || changed) {
       this.#rebuildOverlay();
     } else if (Object.keys(status).length > 0 || this.#newQueries) {
       this.#runGraph();
@@ -4637,7 +4291,7 @@ export class Engine<QX, PX, M, N = never> {
      the base is applied through its ack's position.  Queries show the base only when it exists
      and is not frozen, so it settles then. */
   #settleOnline(): void {
-    if (this.#applied < 0 || this.#replacing > 0) return;
+    if (this.#applied < 0 || this.#frozen) return;
     for (const [id, online] of this.#online) {
       if (online.ack === null) continue;
       if (!online.seen && online.ack.position > this.#applied) continue;
@@ -4690,7 +4344,7 @@ export class Engine<QX, PX, M, N = never> {
   // a vouch, or the live mark: unless frozen, nothing below it was withheld, so the base is
   // applied through it
   #onCursorIn(txn: WTxn, position: number): void {
-    if (this.#replacing === 0) this.#appliedTo(txn, position);
+    if (!this.#frozen) this.#appliedTo(txn, position);
     this.#advanceCursorIn(txn, position);
   }
 
@@ -4750,48 +4404,36 @@ export class Engine<QX, PX, M, N = never> {
     this.#refresh({});
   }
 
-  /* A view frame, reconciled against state.  Drops come first, then every selector of the new set
-     that nothing accounts for starts a backfill, and the view is written with them.  Returns
-     whether the drops removed state from the base. */
-  #onViewIn(txn: WTxn, view: ViewRecord, dirty: Record<string, true>): boolean {
-    const wasFrozen = this.#replacing > 0;
-    // the keys this frame removes, apart from any that earlier items in the batch marked
-    const removed: Record<string, true> = {};
+  /* A view frame, read as it arrives.  Every in-flight backfill the new set does not wholly cover
+     is canceled, and every selector of the new set that nothing accounts for starts a backfill,
+     its tail through the frame's position.  The view is written at once, so a reconnect presents
+     its token.  Its drops wait while the base is frozen, for the land, which drops whatever the
+     view of that moment does not cover; unfrozen, they happen now. */
+  #onViewIn(txn: WTxn, view: ViewRecord, dirty: Record<string, true>): void {
     const covered = (selectors: string[], x: string) => selectors.some((r) => selectorCovers(r, x));
     const old = this.#view?.selectors ?? [];
     const atStart = [...this.#backfills.keys()];
+    const wasFrozen = this.#frozen;
 
-    // drop every in-flight selector the new set does not fully cover
+    // cancel every in-flight backfill the new set does not wholly cover
     for (const selector of atStart) {
       if (!covered(view.selectors, selector)) this.#dropBackfillIn(txn, selector);
     }
 
-    // drop every slice the new set does not cover, and every parked edit of one, held or not
-    for (const slice of [...this.#slices.keys()]) {
-      if (!covered(view.selectors, slice)) this.#dropSliceIn(txn, slice, removed);
-    }
-    this.#dropParkedIn(txn, (slice) => covered(view.selectors, slice));
-
-    // grant, broadest first so a covered selector finds its cover.  The first view's grants replace
-    // an empty base: frozen until they land as a group, so the first frame shown is complete.
-    // Every later grant is additive.
-    const bootstrap = this.#view === null;
+    // grant, broadest first so a covered selector finds its cover
     const selectors = [...view.selectors].sort(
       (a, b) => selectorPrefix(a).length - selectorPrefix(b).length,
     );
     for (const selector of selectors) {
-      // does an entry already cover it?
-      const entries = [...this.#backfills.keys()];
-      if (entries.some((e) => selectorCovers(e, selector))) continue;
+      // does an in-flight backfill already cover it?
+      if ([...this.#backfills.keys()].some((e) => selectorCovers(e, selector))) continue;
 
-      // is it held: covered by the old set, and by no entry at the start of the frame?
+      // is it held: covered by the old set, and by no backfill at the start of the frame?
       const held = covered(old, selector) && !atStart.some((e) => selectorCovers(e, selector));
-      if (held || typeof this.#slices.get(selector) === 'number') continue;
+      if (held) continue;
 
-      // otherwise it is new: backfill it, its tail through the frame's position, adopting the
-      // in-flight selectors it covers
-      this.#spawnIn(txn, null, [selector], view.position + 1, bootstrap);
-      this.#adoptChildrenIn(txn, selector);
+      // otherwise it is new: backfill it, its tail through the frame's position
+      this.#spawnIn(txn, selector, view.position + 1);
     }
 
     txn.set('!view', '.json', JS, view);
@@ -4801,19 +4443,16 @@ export class Engine<QX, PX, M, N = never> {
     // backfills cover every position at or below it, and the connection every one above
     if (this.#checkpoint === null) this.#advanceCursorIn(txn, view.position);
 
-    // did a drop end the last replacing backfill?  Then this is the unfreeze, and whatever
-    // finished downloading during the freeze can land now
-    if (wasFrozen && this.#replacing === 0) this.#unfreezeIn(txn, removed);
-    Object.assign(dirty, removed);
-    return Object.keys(removed).length > 0;
-  }
-
-  // the last replacing backfill is gone: the frozen edits land, the applied position catches up
-  // to the checkpoint, and whatever finished downloading during the freeze lands
-  #unfreezeIn(txn: WTxn, dirty: Record<string, true>): void {
-    this.#applyParkedIn(txn, null, {}, dirty);
-    this.#appliedTo(txn, this.#checkpoint?.position ?? -1);
-    this.#tryLandIn(txn, dirty);
+    // frozen, the drops wait for the land; a cancel that ended the freeze lands what waited, the
+    // drops with it; and unfrozen, they happen now
+    if (this.#frozen) return;
+    if (wasFrozen) {
+      this.#landIn(txn, dirty);
+      return;
+    }
+    for (const slice of [...this.#slices.keys()]) {
+      if (!covered(view.selectors, slice)) this.#dropSliceIn(txn, slice, dirty);
+    }
   }
 
   // the connection ended.  Every call in flight on it is dead: backfills wait for the next
@@ -4927,8 +4566,8 @@ export class Engine<QX, PX, M, N = never> {
     } else if (this.#epoch === null) {
       state = this.#asked || this.#connectNow ? 'connecting' : 'offline';
     } else {
-      // what queries show is current once the replay is done and nothing is replacing the base
-      state = this.#live && this.#replacing === 0 ? 'live' : 'syncing';
+      // what queries show is current once the replay is done and no backfill is in flight
+      state = this.#live && !this.#frozen ? 'live' : 'syncing';
     }
 
     const next = this.#nextAttemptAt;
@@ -4936,7 +4575,7 @@ export class Engine<QX, PX, M, N = never> {
       state,
       nextAttemptAt: state === 'offline' && next !== null ? new Date(next) : null,
       hasBase: this.#applied >= 0,
-      frozen: this.#replacing > 0,
+      frozen: this.#frozen,
     };
   }
 
@@ -4998,7 +4637,7 @@ export class Engine<QX, PX, M, N = never> {
     // a resync resolves the slices held as it starts
     const held = new Set<string>();
     if (kind === 'resync') {
-      for (const [slice, seq] of this.#slices) if (typeof seq === 'number') held.add(slice);
+      for (const slice of this.#slices.keys()) held.add(slice);
     }
     return {
       kind,

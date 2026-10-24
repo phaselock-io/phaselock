@@ -21,7 +21,7 @@ import {
   state,
 } from './harness.ts';
 
-/** a store as a crash left it: a held slice, a marked slice, a view, and a checkpoint */
+/** a store as a crash left it: a held slice, a view, and a checkpoint */
 function persisted(): Record<string, unknown> {
   return {
     '!view': { token: 't7', position: 40, selectors: ['patron:*', 'book:*'] },
@@ -29,7 +29,6 @@ function persisted(): Record<string, unknown> {
     '!seq:patron:p1': 2,
     'patron:p1!state': { count: 2, fields: {} },
     'patron:p1!log': ['bump', 'bump'],
-    '!seq:book:b1': 'backfill',
   };
 }
 
@@ -50,25 +49,21 @@ describe('boot', () => {
     expect(r.server.conn.view).toBeNull();
   });
 
-  test('the slices table is rebuilt from !seq:: a held slice applies, a marked one parks', async () => {
+  test('the slices table is rebuilt from !seq:: a held slice applies its next edit', async () => {
     const r = rig({ seed: persisted() });
     await settle();
     r.server.open();
-    r.server.edits(
-      ev('patron:p1', 3, 43, { type: 'set', field: 'a', value: 1 }),
-      ev('book:b1', 9, 43),
-    );
+    r.server.edits(ev('patron:p1', 3, 43, { type: 'set', field: 'a', value: 1 }));
     await settle();
     expect(log(r.data(), 'patron:p1')).toEqual(['bump', 'bump', 'set a=1']);
     expect(seq(r.data(), 'patron:p1')).toBe(3);
-    expect(state(r.data(), 'book:b1')).toBeUndefined();
-    expect(keys(r.data(), '!park-ed:')).toEqual([parkedEdit('book:b1', 9)]);
-    expect(seq(r.data(), 'book:b1')).toBe('backfill');
+    expect(keys(r.data(), '!park-edit:')).toEqual([]);
   });
 
   test('in-flight backfills are rebuilt from !backfill: and resumed from their resume', async () => {
     const resume = {
       position: 38,
+      visible: 38,
       skipBytes: 3,
       checksum: 'check-3',
       fromPosition: 39,
@@ -77,7 +72,7 @@ describe('boot', () => {
     };
     const data = {
       ...persisted(),
-      '!backfill:book:*': { until: 40, resume, replacing: false, children: [] },
+      '!backfill:book:*': { until: 40, resume },
       '!backfill-seqs:book:*': { 'book:b1': 5 },
       [parkedPage('book:*', 0)]: page([['book:b1!state', { count: 5, fields: {} }]]),
     };
@@ -93,6 +88,7 @@ describe('boot', () => {
   test('a finished download boots ready and lands at boot, before any connection', async () => {
     const resume = {
       position: 40,
+      visible: 40,
       skipBytes: 3,
       checksum: 'check-3',
       fromPosition: 40,
@@ -101,7 +97,7 @@ describe('boot', () => {
     };
     const data = {
       ...persisted(),
-      '!backfill:book:*': { until: 40, resume, replacing: false, children: [] },
+      '!backfill:book:*': { until: 40, resume },
       '!backfill-seqs:book:*': { 'book:b1': 5 },
       [parkedPage('book:*', 0)]: page([['book:b1!state', { count: 5, fields: {} }]]),
     };
@@ -127,7 +123,7 @@ describe('boot', () => {
     expect(keys(r.data(), 'book:')).toEqual([]);
     expect(seq(r.data(), 'book:b1')).toBeUndefined();
     expect(seq(r.data(), 'book:b2')).toBeUndefined();
-    expect(keys(r.data(), '!park-ed:')).toEqual([]);
+    expect(keys(r.data(), '!park-edit:')).toEqual([]);
     expect(r.data()['!view']).toEqual({ token: 't7', position: 40, selectors: ['patron:*'] });
     // the wanted slice is untouched, and the connection presents the stored token
     expect(state(r.data(), 'patron:p1')).toEqual({ count: 2, fields: {} });
@@ -139,6 +135,7 @@ describe('boot', () => {
   test('a backfill outside the wants is purged at boot, values and records too', async () => {
     const resume = {
       position: 38,
+      visible: 38,
       skipBytes: 3,
       checksum: 'check-3',
       fromPosition: 39,
@@ -147,7 +144,7 @@ describe('boot', () => {
     };
     const data = {
       ...persisted(),
-      '!backfill:book:*': { until: 40, resume, replacing: false, children: [] },
+      '!backfill:book:*': { until: 40, resume },
       '!backfill-seqs:book:*': { 'book:b1': 5 },
       [parkedPage('book:*', 0)]: page([['book:b1!state', { count: 5, fields: {} }]]),
     };
@@ -167,14 +164,13 @@ describe('boot', () => {
         until: 40,
         resume: {
           position: 38,
+          visible: 38,
           skipBytes: 0,
           checksum: '',
           fromPosition: 39,
           snapshotDone: false,
           tailDone: false,
         },
-        replacing: false,
-        children: [],
       },
       '!backfill-seqs:*': {},
     };
@@ -185,8 +181,8 @@ describe('boot', () => {
     expect(purged.data()['!view']).toEqual({ token: 't7', position: 40, selectors: [] });
   });
 
-  test('purging the last replacing backfill unfreezes and lands the frozen edits', async () => {
-    // book:* is replacing, so the base is frozen; patron:p1's seq 3 arrived frozen and parked
+  test('purging the last backfill unfreezes and lands the parked edits', async () => {
+    // book:* is in flight, so the base is frozen; patron:p1's seq 3 arrived frozen and parked
     const data = {
       ...persisted(),
       '!checkpoint': { epoch: 'e1', position: 43, applied: 42 },
@@ -194,14 +190,13 @@ describe('boot', () => {
         until: 40,
         resume: {
           position: 38,
+          visible: 38,
           skipBytes: 0,
           checksum: '',
           fromPosition: 39,
           snapshotDone: false,
           tailDone: false,
         },
-        replacing: true,
-        children: [],
       },
       '!backfill-seqs:book:*': {},
       [parkedEdit('patron:p1', 3)]: ev(
@@ -217,7 +212,7 @@ describe('boot', () => {
     expect(keys(r.data(), '!backfill')).toEqual([]);
     expect(log(r.data(), 'patron:p1')).toEqual(['bump', 'bump', 'set a=1']);
     expect(seq(r.data(), 'patron:p1')).toBe(3);
-    expect(keys(r.data(), '!park-ed:')).toEqual([]);
+    expect(keys(r.data(), '!park-edit:')).toEqual([]);
     expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 43, applied: 43 });
   });
 

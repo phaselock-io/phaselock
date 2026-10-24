@@ -25,6 +25,8 @@ export type BlobSpec = {
   position: number;
   epoch: string;
   slices: Record<string, number>;
+  // the last position any slice under the selector changed, the cut unless given
+  visible?: number;
   // sorted by key by the builder
   values: Record<string, unknown>;
 };
@@ -43,6 +45,7 @@ export function blob(spec: BlobSpec): { bytes: Uint8Array; start: number; opEnds
     position: spec.position,
     epoch: spec.epoch,
     slices: spec.slices,
+    visible: spec.visible ?? spec.position,
   });
   const parts: Uint8Array[] = [
     utf8.encode('PLSN'),

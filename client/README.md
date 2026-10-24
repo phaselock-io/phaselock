@@ -140,12 +140,17 @@ export interface ConnectionHooks {
   the log's head as the connection opened.  The Engine writes no
   checkpoint without it, and a connection whose epoch differs from the
   stored checkpoint's is a replaced log.
-- `onView` is the whole view: the token, the position it is the view
-  at, and the full set of selectors.  The connection sends the Engine's
-  stored token as `view`; when it is current no view frame comes at
-  all, and when it is not the server's first frame is the view, ahead
-  of any history.  Every later change is another view frame, ahead of
-  the edits of the commit that caused it.  The Engine always diffs
+- `onView` is the whole view: the token, a position, and the full set
+  of selectors.  The position is the last one the connection sent under
+  the previous view: everything after the frame is filtered by the new
+  view, and the new view's edits at or below the position are the
+  backfills' to deliver.  The connection sends the Engine's stored
+  token as `view`; when it is current no view frame comes at all, and
+  when it is not the server's first frame is the view, ahead of any
+  history.  Every later change is another view frame, ahead of the
+  edits of the group commit that caused it.  A view changes only at a
+  group commit's end, so a client may briefly show a slice before the
+  data that grants it.  The Engine always diffs
   the set against what it holds: gone is cut by prefix, new is
   backfilled.  There is no incremental form, because the set is small
   by construction (a slice type is one selector), a whole set is idempotent
@@ -158,8 +163,8 @@ export interface ConnectionHooks {
   the current view, so the Engine's held set at its checkpoint plus
   the replay is complete whatever changed while it was away, which is
   why a content-hashed token is enough to compare.  The Engine persists
-  its view only when a reconciliation commits; a crash before that
-  presents the old token again and gets the view again.
+  each view in the transaction that reads its frame; a crash before
+  that commits presents the old token again and gets the view again.
 - Selectors, never slice names: a family grant is one selector and one
   backfill, and the Engine learns the members from the blob.  Every
   change to the set is sent, even one that leaves coverage as it was,
@@ -191,6 +196,7 @@ export type Backfill = {
   until: number;
   resume: null | {
     position: number;
+    visible: number;
     skipBytes: number;
     checksum: string;
     fromPosition: number;
@@ -203,7 +209,7 @@ export type Backfill = {
 
 export type BackfillItem =
   | { length: number }
-  | { header: { position: number; seqs: Record<string, number> } }
+  | { header: { position: number; seqs: Record<string, number>; visible: number } }
   | { page: Uint8Array; skip: number; checksum: string }
   | { pagesDone: true }
   | { edits: WireEdit[]; scanned: number }
@@ -223,8 +229,10 @@ concurrently.
 
 **The snapshot.**  `GET /snapshot/<selector>` answers either the blob inline
 or a `text/plain` pointer to a URL to fetch with `Range`.  The header
-gives the cut position and the seq of every slice in the blob; deliver
-it as one `header` item.  Then stream the pages.
+gives the cut position, the seq of every slice in the blob, and
+`visible`, the last position at or below the cut where any slice under
+the selector changed; deliver them as one `header` item.  Then stream
+the pages.
 
 **Memory.**  Snapshots need not fit in memory.  The blob's header is
 length-prefixed binary and its body a run of msgpack set operations,
@@ -264,12 +272,13 @@ nothing, since a page never splits the edits of one position.  A blob
 cut ahead of the cursor (every v0 live-cut blob) needs no special case:
 the first request has an empty range and ends the loop.
 
-**`until`** is the tail's exclusive upper bound: the cursor when the
-backfill started.  Everything at or above it arrives on the live
-connection and is parked by the Engine, so the three ranges partition
-by construction and nothing is deduplicated.  Retries keep the original
-value.  The edit that triggered a backfill sits at the cursor and is
-parked before the backfill starts.
+**`until`** is the tail's exclusive upper bound, where the live
+connection's share begins: the view frame's position plus one, for a
+grant; the position of the edit that revealed a gap or a missed birth,
+for the backfill it starts; and the cursor plus one, for a land's
+repair.  Everything at or above it arrives on the live connection and
+is parked by the Engine.  Parked edits are keyed by slice and seq, so
+an edit both deliver parks once.  Retries keep the original value.
 
 **`resume`** records what a previous attempt got through.  Each half
 reports its own end with its own item, `pagesDone` and `editsDone`,
@@ -408,35 +417,36 @@ Connections never interpret seqs; they are numbers.  The Engine owns:
   new edit reach the client on the live connection, where its seq jump
   reveals that the landed slice was stale.  The stale slice is
   visible for exactly the client's live-delivery lag, then the gap
-  starts a replacing backfill.  Closing the window costs more than it
+  starts a backfill.  Closing the window costs more than it
   is worth: a fixed backward overread proves one slice intact but is
   unbounded per family, reading forward to the head is unbounded, and
   waiting is not a fix.  So it is accepted, and it is what lazy
   detection means.  The one invariant it rests on is the retention
   floor: a slice's last edit is always kept, so an eviction always
   implies a newer edit that will arrive.
-- **Additive versus replacing backfills.**  A grant or an unknown
-  slice's first edit is additive: the slice is not held, so its
-  backfill lands whenever it finishes.  A seq gap on a held slice, or
-  a reboot, is replacing: the moment one starts, everything parks, the
-  base store freezes, and every replacing backfill lands in one
-  transaction.  Landing uses the store's `delPrefix`, `applySnapshot`,
-  and `applyParked`, which apply parked bytes without lifting values
-  into the host language and report the keys they touched for query
-  invalidation.
-- **`caughtUp` is a conjunction**: the connection delivered `live` and
-  no replacing backfill is in flight.  It can go false mid-session.
-  Each replacing backfill is complete when its snapshot and its edit
-  tail are fully downloaded and no seq gap is observed (including across
-  the initial live cursor mark).
+- **The freeze.**  While any backfill is in flight, whether a grant's,
+  a gap's, or a missed birth's, the base is frozen: every edit the
+  connection delivers parks, vouches and `live` move only the cursor,
+  and a revoke's drops wait.  The land comes once every backfill has
+  finished both halves, the cursor has reached each blob's `visible`,
+  and no parked edit lies past the cursor.  It is one transaction:
+  every blob, every slice's parked run, and the latest view's drops,
+  and the base reaches the cursor.  Landing uses the store's
+  `delPrefix`, `applySnapshot`, and `applyParked`, which apply parked
+  bytes without lifting values into the host language and report the
+  keys they touched for query invalidation.  A run that breaks, a gap
+  or a missed birth, keeps the land waiting for that slice's own
+  backfill.
+- **`live` is a conjunction**: the connection delivered `live` and no
+  backfill is in flight.  It can go false mid-session.
 - **Frames are consistent.**  The query graph runs every query from one
   read transaction and delivers every callback in one stack frame.
-  While the base is frozen, commits to the store are limited to the
-  parking prefix until a single atomic update can update the main keys of the
-  store.  During that time, predictions continue but run against the
-  base state, while backfills and live edits continue to get parked.
-  The only carve-out would be a query that reads only status keys, which
-  are in-memory keys owned by the Engine.
+  Unfrozen, a frame applies whole or not at all, so queries see a
+  mutation's edits together, and every state they show of the base is
+  the server's state at one position, for the slices the client holds.
+  While frozen, the base does not change: predictions keep running
+  against it, and a query that reads only the status, which the Engine
+  holds in memory, keeps answering.
 - **Reconnect versus reboot** is a cost choice made up front: replay
   since the checkpoint, or drop state and backfill every selector.  The
   trigger wants the server's oldest retained position alongside the
@@ -444,9 +454,10 @@ Connections never interpret seqs; they are numbers.  The Engine owns:
 
 ## Undecided
 
-- Whether the Engine, on a single-slice gap, may cut (drop the slice
-  and treat its backfill as additive) instead of freezing.  Freeze is
-  the rule; cut is a possible exception if the pause proves annoying.
+- Whether a backfill of slices the client does not hold, a grant's,
+  may land on its own without freezing the base.  Freeze is the rule;
+  landing grants separately is a possible exception if the pause proves
+  annoying in live apps.
 - Per-mutation outcomes to the UI: counts on the status, or a promise
   per mutation.
 - An app-level `wants` mask.

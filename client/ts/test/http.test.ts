@@ -771,7 +771,7 @@ describe('backfill', () => {
 
   type Run = {
     outcome: BackfillOutcome;
-    header: { position: number; seqs: Record<string, number> } | null;
+    header: { position: number; seqs: Record<string, number>; visible: number } | null;
     pages: { bytes: Uint8Array; keys: string[]; skip: number; checksum: string }[];
     tails: [number, string, number][][];
     scanned: number[];
@@ -883,7 +883,7 @@ describe('backfill', () => {
     const r = await run(conn, 'patron:*', 40);
     expect(r.outcome).toBe('done');
     expect(r.lengths).toEqual([built.bytes.length]);
-    expect(r.header).toEqual({ position: 40, seqs: slices });
+    expect(r.header).toEqual({ position: 40, seqs: slices, visible: 40 });
     const keys = r.pages.flatMap((p) => p.keys);
     expect(keys).toEqual(Object.keys(values).sort());
     // pages are bounded by operations or bytes; each skip is the offset after its last one, and
@@ -984,6 +984,7 @@ describe('backfill', () => {
     });
     await run(conn, 'patron:*', 200, {
       position: 40,
+      visible: 40,
       skipBytes: 0,
       checksum: '',
       fromPosition: 100,
@@ -994,6 +995,7 @@ describe('backfill', () => {
     seenAfter.length = 0;
     await run(conn, 'patron:*', 200, {
       position: 10,
+      visible: 10,
       skipBytes: 0,
       checksum: '',
       fromPosition: 20,
@@ -1009,6 +1011,7 @@ describe('backfill', () => {
     const skip = built.opEnds[1000];
     const r = await run(conn, 'patron:*', 40, {
       position: 40,
+      visible: 40,
       skipBytes: skip,
       checksum: checksumAt(1000),
       fromPosition: 40,
@@ -1037,6 +1040,7 @@ describe('backfill', () => {
     serveTail();
     const r = await run(conn, 'patron:*', 40, {
       position: 40,
+      visible: 40,
       skipBytes: built.opEnds[2400],
       checksum: checksumAt(2400),
       fromPosition: 40,
@@ -1062,6 +1066,7 @@ describe('backfill', () => {
       serveTail();
       const resume = {
         position: 40,
+        visible: 40,
         skipBytes: built.opEnds[1000],
         checksum,
         fromPosition: 40,
@@ -1079,6 +1084,7 @@ describe('backfill', () => {
       serveTail();
       const resume = {
         position: 40,
+        visible: 40,
         skipBytes: built.opEnds[1000],
         checksum,
         fromPosition: 40,
@@ -1094,6 +1100,7 @@ describe('backfill', () => {
     serveTail();
     const r = await run(conn, 'patron:*', 40, {
       position: 40,
+      visible: 40,
       skipBytes: built.bytes.length,
       checksum: checksumAt(2499),
       fromPosition: 40,
@@ -1110,6 +1117,7 @@ describe('backfill', () => {
     serveTail();
     const snapshotDone = {
       position: 40,
+      visible: 40,
       skipBytes: 0,
       checksum: '',
       fromPosition: 40,
@@ -1124,6 +1132,7 @@ describe('backfill', () => {
     expect(stub.requests.filter((q) => q.path.startsWith('/snapshot/'))).toHaveLength(0);
     const tailDone = {
       position: 40,
+      visible: 40,
       skipBytes: 0,
       checksum: '',
       fromPosition: 99,
@@ -1143,6 +1152,7 @@ describe('backfill', () => {
     serveTail();
     const r = await run(conn, 'patron:*', 40, {
       position: 40,
+      visible: 40,
       skipBytes: 100,
       checksum: '',
       fromPosition: 40,
@@ -1221,6 +1231,7 @@ describe('backfill', () => {
     expect(fresh.pages).toEqual([]);
     const resumed = await run(conn, 'patron:*', 40, {
       position: 40,
+      visible: 40,
       skipBytes: built.opEnds[1000],
       checksum: checksumAt(1000),
       fromPosition: 40,
@@ -1288,7 +1299,7 @@ describe('backfill', () => {
     release();
     const r = await p;
     expect(r.outcome).toBe('done');
-    expect(r.header).toEqual({ position: 40, seqs: slices });
+    expect(r.header).toEqual({ position: 40, seqs: slices, visible: 40 });
     expect(log).toEqual([['open', 'e3', 3]]);
   });
 

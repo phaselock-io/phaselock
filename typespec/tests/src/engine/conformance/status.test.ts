@@ -6,8 +6,8 @@ import { ev, last, rig, settle, watch, watchStatus } from '../harness.ts';
 
 import { held, one, patrons, restart, resumed } from './common.ts';
 
-// also: status.test.ts's group 'the connection'; freeze.test.ts 'the status shows the freeze...'
-describe('P20: the Engine is live only past its live frame with nothing replacing the base', () => {
+// also: status.test.ts's group 'the connection'
+describe('P20: the Engine is live only past its live frame with no backfill in flight', () => {
   test("P20: a resync is syncing until its live frame, and a gap's freeze is syncing until the land", async () => {
     const r = rig({ seed: resumed });
     const status = watchStatus(r);
@@ -30,21 +30,20 @@ describe('P20: the Engine is live only past its live frame with nothing replacin
     expect(last(status.connection)).toMatchObject({ state: 'live', frozen: false });
   });
 
-  test('P20: an additive backfill leaves the Engine live and unfrozen', async () => {
+  test("P20: a grant's backfill on a live Engine is syncing and frozen until it lands", async () => {
     const r = await held();
     const status = watchStatus(r);
     const books = r.server.hold('book:*');
     r.server.view('t2', 11, ['patron:*', 'book:*']);
     await settle();
-    expect(last(status.progress).backfills.map((b) => [b.selector, b.replacing])).toEqual([
-      ['book:*', false],
-    ]);
-    expect(last(status.connection)).toMatchObject({ state: 'live', frozen: false });
+    expect(last(status.progress).backfills.map((b) => b.selector)).toEqual(['book:*']);
+    expect(last(status.connection)).toMatchObject({ state: 'syncing', frozen: true });
     r.server.blobs.set('book:*', one('book:b1', 11, 1));
+    r.server.vouch(11);
     books.go();
     await settle();
     expect(last(status.connection)).toMatchObject({ state: 'live', frozen: false });
-    expect(status.connection.map((c) => c.state)).not.toContain('syncing');
+    expect(last(status.progress).backfills).toEqual([]);
   });
 
   test('P20: a live frame during the first boot is syncing until the land, and a new connection is live only after its own', async () => {
@@ -77,7 +76,7 @@ describe('P20: the Engine is live only past its live frame with nothing replacin
 });
 
 // also: status.test.ts's group 'first boot'
-describe('P21: hasBase is false only while the first view replaces an empty base', () => {
+describe("P21: hasBase is false until the first view's backfills land", () => {
   test('P21: hasBase stays false through a restart mid-bootstrap, and turns true at the land', async () => {
     const r = rig();
     r.server.hold('patron:*');

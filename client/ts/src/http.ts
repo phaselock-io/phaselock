@@ -42,7 +42,12 @@ const refreshAfter = 0.5;
 // defaults, until a 413 names the database's own
 type MutationLimits = { session: number; anonymous: number };
 
-type BlobHeader = { position: number; epoch: string; slices: Record<string, number> };
+type BlobHeader = {
+  position: number;
+  epoch: string;
+  slices: Record<string, number>;
+  visible: number;
+};
 
 // a blob body opened past its header: the reader at its first operation, and the operation count
 // and content hash of every operation before it
@@ -499,7 +504,10 @@ class HTTPConnection implements Connection {
       if (header.position !== position) {
         throw new Error(`snapshot ${b.selector}: position mismatch`);
       }
-      await b.push({ header: { position, seqs: header.slices ?? {} } });
+      if (typeof header.visible !== 'number') {
+        throw new Error(`snapshot ${b.selector}: header without visible`);
+      }
+      await b.push({ header: { position, seqs: header.slices ?? {}, visible: header.visible } });
       return { br, count: 0, fnv: new Fnv64() };
     }
 

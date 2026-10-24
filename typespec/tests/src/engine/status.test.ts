@@ -105,7 +105,6 @@ describe('first boot', () => {
     expect(last(status.progress).backfills).toEqual([
       {
         selector: 'patron:*',
-        replacing: true,
         snapshot: { bytes: 0, length: null, done: false },
         tail: null,
         retryAt: null,

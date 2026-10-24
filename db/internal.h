@@ -105,24 +105,26 @@ int store_keys(store *s, store_key_fn fn, void *arg);
 int store_key_add(store *s, const char *kid, const uint8_t *pub, size_t len, int64_t minted);
 int store_key_del(store *s, const char *kid);
 /* The slices table: one row per slice ever born, kept across its deaths, with its seq, the
-   position of its last birth, the position of its death or NULL while it is live, and the bytes
-   of its edits in the log and of its keys in the store.  A birth creates or revives the row, and
+   position of its last edit, the position of its last birth, the position of its death or NULL
+   while it is live, and the bytes of its edits in the log and of its keys in the store.  A birth creates or revives the row, and
    must come before the slice's first next_seq. */
 int store_slice_birth(store *s, const char *name, uint64_t pos);
 int store_slice_death(store *s, const char *name, uint64_t pos);
 /* the slice's edits below the position go, and its edit bytes are those of the edits that
    remain */
 int store_slice_erase(store *s, const char *name, uint64_t before);
-/* the slice's next seq, charging the edit's bytes to it */
-int store_slice_next_seq(store *s, const char *name, size_t bytes, uint64_t *seq);
+/* the slice's next seq, for an edit at pos, charging the edit's bytes to it */
+int store_slice_next_seq(store *s, const char *name, size_t bytes, uint64_t pos, uint64_t *seq);
 /* 1 with the slice's seq and whether it is live when it has a row, 0 when it was never born */
 int store_slice_state(store *s, const char *name, uint64_t *seq, bool *live);
-/* 1 with the slice's seq and byte counters when it has a row, 0 when it was never born */
-int store_slice_stats(store *s, const char *name, uint64_t *seq, uint64_t *edit_bytes,
-                      uint64_t *state_bytes);
-typedef int (*store_name_fn)(void *arg, const char *name, uint64_t seq);
-/* every live slice whose name starts with prefix, by name, with its seq */
-int store_live_slices(store *s, const char *prefix, store_name_fn fn, void *arg);
+/* 1 with the slice's seq, its last edit's position, and its byte counters when it has a row, 0
+   when it was never born */
+int store_slice_stats(store *s, const char *name, uint64_t *seq, uint64_t *pos,
+                      uint64_t *edit_bytes, uint64_t *state_bytes);
+typedef int (*store_slice_fn)(void *arg, const char *name, uint64_t seq, uint64_t pos, bool live);
+/* every slice ever born whose name starts with prefix, by name, with its seq, its last edit's
+   position, and whether it is live */
+int store_slices_under(store *s, const char *prefix, store_slice_fn fn, void *arg);
 /* 1 and the slice's seq if it is live, 0 if unborn or deleted */
 int store_live_slice(store *s, const char *name, uint64_t *seq);
 

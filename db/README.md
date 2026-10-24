@@ -338,6 +338,17 @@ Every frame is an array whose first element is a tag.
   windows of the log's positions, and a window that ends past the
   last edits frame is followed by a vouch at its end, so a client
   whose view matches little of the log still sees the replay advance.
+- A view frame's position is the last position the connection sent
+  under the previous view, whatever position the commit that changed
+  the view had: everything the connection sends after the frame is
+  filtered by the new view, and the new view's edits at or below the
+  position are the client's backfills' to deliver, which tail through
+  it.  Live, that is the end of the batch before the one that changed
+  the view, whose edits the new view filters; in a replay, it is how
+  far the replay has read.  A grantor runs once per group commit, after
+  all of it, so a view changes only at a batch's end, and every edit in
+  the batch that changed it is filtered by the new view: a client may
+  briefly show a slice before the data that grants it.
 - A bootstrap splits the log at the view's position V.  Once the
   client has processed the bootstrap's view frame at V, its cursor is
   V, so a reconnect presents `since=V`; the backfills cover every
@@ -357,12 +368,16 @@ Every frame is an array whose first element is a tag.
   through seq.  A gap observed before a birth or death is tolerated
   by the client, since the client would ignore earlier edits anyway.
   A gap on a live slice, as may occur under retention policies, is
-  repaired by an exact-selector backfill, which implies a requirement that
-  retention must not delete an edit of a live slice that is newer
-  than its slice's latest cut snapshot, and the latest available
-  snapshot is always served to backfill requests.  The exception to
-  that rule is gaps that occur prior to birth or death edits, since
-  the client would ignore those earlier edits anyway.  A server that
+  repaired by an exact-selector backfill.  So the retention floor is
+  per slice, set by the slice's own exact-selector snapshot: retention
+  must not delete an edit of a live slice newer than that slice's latest
+  exact-selector snapshot, and an exact-selector backfill is always
+  served that snapshot or a newer one.  A prefix snapshot is held to no
+  such floor: a slice in it may be older than retention allows, and the
+  client repairs the gap that leaves with the slice's exact-selector
+  backfill.  The exception to the floor is gaps that occur prior to
+  birth or death edits, since the client would ignore those earlier
+  edits anyway.  A server that
   would rather not replay a slice, because retention gapped it for
   this client or because its byte counters say a cut is cheaper,
   sends only the slice's last edit: the seq jump is the notice, and
@@ -396,7 +411,7 @@ Every frame is an array whose first element is a tag.
   token and the position it is the view at, and when the presented
   token is not current the first frame of the body is the view frame,
   ahead of any history.  Every later change is a view frame in log
-  order, ahead of the edits of the commit that caused it.  History
+  order, ahead of the edits of the group commit that caused it.  History
   from `since` is replayed under the current view, so a client's held
   set at its checkpoint plus the replay is complete whatever happened
   in between: a family revoked and regranted while the client was
@@ -507,9 +522,9 @@ Every frame is an array whose first element is a tag.
   those at or above it, which the client parks until the backfill
   lands.  `until` is where the connection's share begins: the
   position of the edit that revealed a gap or an unknown slice, for a
-  backfill that edit spawns; the client's cursor, for one a landing's
-  repair spawns; and the view's position plus one, for one a view
-  frame spawns, so a bootstrap's backfills tail through the view's
+  backfill that edit spawns; the client's cursor plus one, for one a
+  landing's repair spawns; and the view's position plus one, for one a
+  view frame spawns, so a bootstrap's backfills tail through the view's
   position V as the contract above requires.  A page never splits
   the edits of one mutation, so a page's edit count says nothing about
   whether more follow.  `PhaseLock-Scanned` is the client's next
@@ -567,7 +582,7 @@ All integers big-endian.  Operations sorted by key bytes.
     magic     "PLSN"
     u8        version = 1
     u32 hlen  + msgpack map { selector, position, epoch,
-                              slices: { name: seq, ... },
+                              slices: { name: seq, ... }, visible,
                               edit_bytes?, state_bytes? }
     u32       crc32c of the header bytes
     op*       0, key, value: a set operation, as in an edit's payload
@@ -587,7 +602,13 @@ with the selector's scope intact (`patron:X!patron`).  `slices` maps every
 live slice the selector covers to its seq at the cut, and is the
 authoritative list of what the blob holds; a live slice with no keys
 appears in the map and nowhere else, and a slice the map does not
-name was deleted or unborn at the cut.  `epoch` is the log's.  The
+name was deleted or unborn at the cut.  `visible` is the last position
+at or below the cut where any slice the selector covers changed, a
+deleted one included, read from the same rows as `slices`: a client
+whose cursor has reached it holds nothing older than the blob, so it
+lands the blob at its cursor, however far past it the cut lies.  Like
+the rest of the blob, it depends on the selector and the cut alone, the
+same for every reader.  `epoch` is the log's.  The
 optional header fields are the slice row's counters and appear only
 for an exact selector.  A blob is cut in one read transaction, so every
 slice in it is at `position`.  That is a practical requirement, not a
@@ -601,9 +622,9 @@ position, causing an unbounded waste of edit downloads.
 The rules a client Engine and the database hold each other to at the
 protocol boundary, whatever either's implementation: a client built on the
 same `Transport` contract must satisfy every one.  A client *holds* a slice
-at a seq when it has applied the slice's state through that seq, and
-*parks* an edit when it keeps it unapplied; a slice under an in-flight
-backfill is not held.  The conformance suite,
+at a seq when its base has the slice's state through that seq, and *parks*
+an edit when it keeps it unapplied for the land.  The base is *frozen*
+while any backfill is in flight.  The conformance suite,
 `typespec/tests/src/engine/conformance/`, checks each rule in a group named
 for it; the database's own halves are checked by `server_test.go`, under
 the tests these rules name.
@@ -616,29 +637,32 @@ Chaining:
   slice the client does not hold, since the slice's state after it is its
   own writes alone; of a slice's run of edits, those before its last reset
   never apply.
-- P3.  A normal edit that does not chain is parked, never applied on its
-  own.  On a held slice, a gap, the client replaces the slice with an
-  exact-selector backfill whose `until` is the edit's position, under the
-  in-flight selector covering it, if any.  On a slice it does not hold and
-  no in-flight backfill covers, a missed birth, it backfills the slice
-  additively by its exact selector, with the same `until`.  An edit of a
-  slice the client does not hold parks while an in-flight backfill covers
-  the slice.
-- P4.  At a land or an unfreeze, a slice's parked run applies only if it
-  continues the newest state put in place, the held seq or its blob's seq,
-  or starts over at a reset after its last gap.  A slice whose run breaks
-  applies none of it and is backfilled again alone, by its exact selector,
-  with `until` the checkpoint.
-- P5.  A slice a landing blob does not name was deleted or unborn at the
-  blob's cut: its parked edits at or below the cut never apply, its run
-  above the cut must start at a reset, and when nothing above the cut
-  applies, the client neither holds the slice nor keeps any state of it.
+- P3.  Unfrozen, a frame applies whole or not at all.  A normal edit that
+  does not chain, a gap on a held slice or an edit of a slice the client
+  does not hold, which is a missed birth, parks its whole frame and
+  backfills its slice by its exact selector, with `until` the edit's
+  position.  Frozen, every edit parks, and its chain is checked at the
+  land.
+- P4.  At the land, a slice's parked run applies onto its base, the
+  winning blob's seq (P5) or, for a slice no backfill covers, the held
+  seq, when it continues the base or starts over at a reset after its last
+  gap.  A slice whose run breaks keeps the whole land waiting: it is
+  backfilled again by its exact selector, with `until` the cursor plus
+  one, or its own exact backfill starts over.
+- P5.  Per slice, the in-flight backfill whose selector covers it and
+  whose blob has the newest cut wins, and its blob's state replaces the
+  slice's, unless the client holds the slice at or past the blob's seq,
+  when the slice keeps its state.  A slice the winning blob does not name
+  was deleted or unborn at that cut: its parked edits at or below the cut
+  never apply, its run above the cut must start at a reset, and when
+  nothing above the cut applies, the client neither holds the slice nor
+  keeps any state of it.
 
 Lifecycle:
 
-- P6.  A birth clears its slice, then applies its writes.  A birth of a
-  slice the client does not hold, outside every in-flight backfill, holds
-  the slice at the birth's seq with no backfill.
+- P6.  A birth clears its slice, then applies its writes.  Unfrozen, a
+  birth of a slice the client does not hold holds the slice at the
+  birth's seq with no backfill.
 - P7.  A death clears its slice, and the client forgets it, holding no
   seq: its next birth starts it from empty, and its next normal edit is a
   missed birth (P3).  A death of a slice the client does not hold costs no
@@ -647,80 +671,87 @@ Lifecycle:
 
 View:
 
-- P8.  Once a view frame is processed, the client keeps nothing of a slice
-  the view does not cover, no state, held seq, or parked edit, and no
-  in-flight backfill whose selector the view does not wholly cover, nor its
-  header or parked pages.  The same holds at boot for whatever the build's
-  wants do not cover.  The database sends a view frame ahead of the edits
-  of the commit that caused it
-  (`TestAViewFrameLeadsTheEditsItGrantsIntoStreaming`).
+- P8.  A view frame is read as it arrives: every in-flight backfill whose
+  selector the view does not wholly cover is canceled, its header and
+  parked pages gone.  Its effect on the base waits while frozen: at the
+  land, and at once when unfrozen, the client keeps nothing of a slice the
+  latest view does not cover, no state, held seq, or parked edit.  The
+  same holds at boot for whatever the build's wants do not cover.  The
+  database sends a view frame ahead of the edits of the group commit that
+  caused it (`TestAViewFrameLeadsTheEditsItGrantsIntoStreaming`), and a
+  view changes only at a group commit's end, so a frame may briefly show
+  a slice before the data that grants it.
 - P9.  A view frame backfills exactly the selectors it newly grants: a
-  selector that names a held slice, that an in-flight backfill covers, or
-  that the previous view covered with no backfill in flight over it as the
-  frame arrived gets none.  Each new backfill tails through the frame's
-  position (`until` is the position plus one); the first view's replace
-  the base and later ones are additive; and an in-flight selector a new
-  one covers becomes its child.  The view is persisted in the
-  reconciliation's own transaction, and every connect presents its token.
+  selector that an in-flight backfill covers, or that the previous view
+  covered with no backfill in flight over it as the frame arrived, gets
+  none; one the previous view did not cover gets one, even when it names a
+  slice the frozen base still holds.  Each new backfill tails through the
+  frame's position (`until` is the position plus one), the last position
+  the connection sent under the previous view
+  (`TestAStaleTokensViewFrameIsAtTheSincePresented`).  The view is
+  persisted when its frame arrives, and every connect presents the latest
+  view's token.
 
 Bootstrap:
 
-- P10.  A client with no checkpoint connects with `since` -1 and no token.
-  Once it has processed the bootstrap's view frame at V, its checkpoint is
-  V, so a reconnect presents `since` V; the frame's backfills cover every
-  position at or below V and the connection every position above it
+- P10.  A client with no cursor connects with `since` -1 and no token.
+  Once it has read the bootstrap's view frame at V, its cursor is V, so a
+  reconnect presents `since` V; the frame's backfills cover every position
+  at or below V and the connection every position above it
   (`TestBootstrapDeliversEverythingAboveTheViewPosition`).  An edit at V
   that both deliver applies once.
 
 Cursor:
 
-- P11.  The checkpoint is the highest position of the edits, vouch, and
-  live frames processed, and of a bootstrap's view frame (P10); it never
-  moves back, commits with the frame that moved it, and is the `since` of
-  every connect.  The database sends a vouch or a live frame at N only
-  after every edit at or below N that the connection may see
+- P11.  The cursor is the highest position of the edits, vouch, and live
+  frames received, and of a bootstrap's view frame (P10); it never moves
+  back, commits with the frame that moved it, and is the `since` of every
+  connect.  The database sends a vouch or a live frame at N only after
+  every edit at or below N that the connection may see
   (`TestAVouchNeverOvertakesAnEditItCovers`).
-- P12.  The checkpoint never skips an edit: every edit at or below it of a
+- P12.  The cursor never skips an edit: every edit at or below it of a
   slice the view covers is applied, parked, or below the `until` of an
   in-flight backfill covering its slice, across reconnects and restarts,
   so a reconnect from it loses nothing.
 - P13.  An outbox mutation the database answers `ok` at P leaves the
   outbox, and its prediction the overlay, only once queries can show its
-  outcome: an edit carrying its id has applied, or the base holds every
-  edit at or below P that the client has received.  A reject or a conflict
-  releases it at once.
-- P14.  A checkpoint belongs to its log's epoch: the client takes no frame
-  from a connection whose epoch differs from its checkpoint's, and its
-  first connection's epoch becomes the checkpoint's.
+  outcome: an edit carrying its id has applied, or the base is applied
+  through P.  The applied position stays put while frozen and reaches the
+  cursor at the land.  A reject or a conflict releases it at once.
+- P14.  A cursor belongs to its log's epoch: the client takes no frame
+  from a connection whose epoch differs from its cursor's, and its first
+  connection's epoch becomes the cursor's.
 
 Freeze:
 
-- P15.  While a replacing backfill is in flight, the first view's or a
-  gap's repair, the base is frozen: every edit parks, no backfill lands,
-  queries keep the frozen base less what a view frame revokes, and the
-  checkpoint moves on.  The freeze ends in one transaction that lands every
-  clean ready backfill and every frozen edit, once every replacing backfill
-  lands in it or a view frame drops the last one.  An additive backfill
-  never freezes the base.
+- P15.  While frozen, every edit delivered parks, a vouch or a live frame
+  moves only the cursor, queries answer from the frozen base, and nothing
+  of a revoke reaches the base.  The freeze ends with the land (P16), or,
+  when view frames cancel every backfill, with a land of what parked.
 
 Backfills:
 
-- P16.  A backfill lands once both halves of it and of every child are
-  done, in one transaction: its blob, each child's blob over it for the
-  child's slices, then the parked edits (P4); a slice held at or past its
-  blob's seq keeps its state.  After the land, no record, header, parked
-  page, or parked edit of the subtree remains.
-- P17.  A backfill whose snapshot starts over, after a `stale` outcome or
-  a repair, reads its tail again from the new snapshot's position, however
-  far an earlier attempt got; a retry after any other failure resumes from
-  its record, skipping a finished half.  Its `until` never changes.
+- P16.  The land waits until every in-flight backfill has finished both
+  halves, the cursor has reached every blob's `visible`, and no parked
+  edit lies past the cursor; a grant that arrives first joins it.  Then
+  one transaction applies every blob (P5), every parked run (P4), and
+  the latest view's drops (P8), clears every backfill record, header,
+  parked page, and parked edit, and applies the base through the cursor
+  (`TestASnapshotsVisibleIsTheLastChangeUnderItsSelector`).
+- P17.  A backfill whose snapshot starts over reads its tail again: after
+  a `stale` outcome, from the later of the new snapshot's position and
+  where its parked tail reached, since what it parked stays; after a
+  broken run, from the new snapshot's position.  A retry after any other
+  failure resumes from its record, skipping a finished half, and a failure
+  after both halves are in leaves it ready to land.  Its `until` never
+  changes.
 
 Convergence:
 
-- P18.  Every state the client shows of a held slice is one the server
-  had: the slice's last birth's writes and the normal edits after it,
-  through some seq.
-- P19.  Once the client has processed a live or vouch frame at the
+- P18.  Every state queries show of the base is the server's state at one
+  position, for the slices the client holds: each held slice's last
+  birth's writes and the normal edits after it through that position.
+- P19.  Once the client has received a live or vouch frame at the
   server's head, with no backfill in flight, every slice the view covers
   that is live at the server is held at its seq with its state, and no
   other slice is held.
@@ -728,19 +759,18 @@ Convergence:
 Status:
 
 - P20.  `state` is `live` only after the current connection's live frame
-  and while no replacing backfill is in flight, and `syncing` while the
-  connection replays or the base is frozen; `frozen` is true exactly while
-  a replacing backfill is in flight.
-- P21.  On a fresh store, `hasBase` is false while the first view's
-  replacing backfills are in flight, and once true it stays true, across
-  restarts.  While it is false, a query that reads past the status waits,
-  and one that reads only the status answers.
+  and while unfrozen, and `syncing` while the connection replays or the
+  base is frozen; `frozen` is true exactly while a backfill is in flight.
+- P21.  On a fresh store, `hasBase` is false until the first view's
+  backfills land, and once true it stays true, across restarts.  While it
+  is false, a query that reads past the status waits, and one that reads
+  only the status answers.
 
 Atomicity:
 
-- P22.  A frame commits in one store transaction, and queries see it whole
-  or not at all: a mutation's edits to the slices a client holds reach
-  queries together.
+- P22.  A frame commits in one store transaction, and queries see a
+  mutation's edits to the slices a client holds whole or not at all
+  (P3, P16).
 - P23.  A tail page never splits the edits of one mutation
   (`TestAnEditsPageNeverSplitsAMutation`); the client parks each delivery
   in one transaction and resumes a tail after the highest position it

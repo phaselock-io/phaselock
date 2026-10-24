@@ -805,9 +805,9 @@ func TestGrantInvalidation(t *testing.T) {
 	if f[1].(string) == token0 {
 		t.Fatalf("token should change on grant")
 	}
-	// the frame names the commit position the view changed at
-	if asInt(f[2]) != grantPos {
-		t.Fatalf("view position %v, want %d", f[2], grantPos)
+	// the frame names the last position sent under the old view, the one before the grant's
+	if asInt(f[2]) != grantPos-1 {
+		t.Fatalf("view position %v, want %d", f[2], grantPos-1)
 	}
 	if got := strings.Join(strs(f[3]), ","); got != "book,patron:p1,patron:p2" {
 		t.Fatalf("grant frame selectors: %v", got)
@@ -1315,6 +1315,41 @@ func fnv1a(b []byte) uint64 {
 		h *= 1099511628211
 	}
 	return h
+}
+
+// a snapshot's visible is the last position any slice under its selector changed, a dead slice's
+// death included and other slices' edits not, so a client caught up to it holds what the blob does
+func TestASnapshotsVisibleIsTheLastChangeUnderItsSelector(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	renamed := h.accept(admin, mut("c2", "rename-patron", "id", "p1", "name", "Anne"))
+	h.accept(admin, mut("c3", "add-patron", "id", "p2", "name", "Bob"))
+	removed := h.accept(admin, mut("c4", "remove-patron", "id", "p2"))
+	head := h.accept(admin, mut("c5", "add-book", "id", "b1", "title", "Dune"))
+
+	// the family's last change is p2's death, which its header does not name
+	fam := h.snapshot(admin, "patron:*")
+	if asInt(fam.header["visible"]) != removed || fam.position != head {
+		t.Fatalf("family: visible %v, position %d; want %d, %d", fam.header["visible"], fam.position,
+			removed, head)
+	}
+	if _, ok := fam.slices["patron:p2"]; ok {
+		t.Fatalf("the dead p2 is named: %v", fam.slices)
+	}
+
+	// an exact selector's is its own slice's last edit, live or dead
+	if p1 := h.snapshot(admin, "patron:p1"); asInt(p1.header["visible"]) != renamed {
+		t.Fatalf("p1: visible %v, want %d", p1.header["visible"], renamed)
+	}
+	if p2 := h.snapshot(admin, "patron:p2"); asInt(p2.header["visible"]) != removed {
+		t.Fatalf("p2: visible %v, want %d", p2.header["visible"], removed)
+	}
+
+	// and a slice never born has none
+	if p9 := h.snapshot(admin, "patron:p9"); asInt(p9.header["visible"]) != 0 {
+		t.Fatalf("p9: visible %v", p9.header["visible"])
+	}
 }
 
 func TestSnapshots(t *testing.T) {
@@ -2080,13 +2115,13 @@ func TestAViewFrameLeadsTheEditsItGrantsIntoStreaming(t *testing.T) {
 	resume <- struct{}{}
 
 	// the view frame granting the shelf comes before the shelf's edits, which the hot catchup
-	// replays
+	// replays, at the last position the replay sent, the one before the lend's
 	granted, shelved := false, false
 	for f := s.next(); f[0] != "live"; f = s.next() {
 		switch f[0] {
 		case "view":
-			if asInt(f[2]) != pos || !slices.Contains(strs(f[3]), "shelf:x") {
-				t.Fatalf("expected the view at %d granting shelf:x, got %v", pos, f)
+			if asInt(f[2]) != pos-1 || !slices.Contains(strs(f[3]), "shelf:x") {
+				t.Fatalf("expected the view at %d granting shelf:x, got %v", pos-1, f)
 			}
 			granted = true
 		case "edits":
@@ -2100,6 +2135,26 @@ func TestAViewFrameLeadsTheEditsItGrantsIntoStreaming(t *testing.T) {
 	}
 	if !shelved {
 		t.Fatalf("the shelf's edits never came")
+	}
+}
+
+// a view frame's position is the last position the connection sent under the previous view: on a
+// reconnect whose token is stale, nothing has been sent yet, so it is the since presented, and
+// the replay after it is filtered by the new view
+func TestAStaleTokensViewFrameIsAtTheSincePresented(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	since := h.accept(admin, mut("c2", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, mut("c3", "lend", "branch", "x", "patron", "p1"))
+	s := h.connectView(h.token("p1"), since, "stale")
+	f := s.next()
+	if f[0] != "view" || asInt(f[2]) != since || !slices.Contains(strs(f[3]), "shelf:x") {
+		t.Fatalf("expected the view at %d granting shelf:x, got %v", since, f)
+	}
+	if e := edits(s.nextTagged("edits"))[0]; e.slice != "shelf:x" || e.position != since+1 {
+		t.Fatalf("expected the replay to bring the shelf at %d under the new view, got %+v",
+			since+1, e)
 	}
 }
 

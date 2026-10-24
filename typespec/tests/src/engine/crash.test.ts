@@ -23,13 +23,14 @@ import {
 
 type Resume = {
   position: number;
+  visible: number;
   skipBytes: number;
   checksum: string;
   fromPosition: number;
   snapshotDone: boolean;
   tailDone: boolean;
 };
-type Record_ = { until: number; resume: Resume | null; replacing: boolean; children: string[] };
+type Record_ = { until: number; resume: Resume | null };
 const record = (r: Rig, selector: string): Record_ | undefined =>
   r.data()[`!backfill:${selector}`] as Record_ | undefined;
 
@@ -68,6 +69,7 @@ describe('crash and resume', () => {
   test('a store left mid-backfill boots with the record, values, and parked edits, resumes at skipBytes and fromPosition, and lands', async () => {
     const resume: Resume = {
       position: 10,
+      visible: 10,
       skipBytes: 1,
       checksum: 'check-1',
       fromPosition: 10,
@@ -86,11 +88,10 @@ describe('crash and resume', () => {
       seed: {
         '!view': { token: 't1', position: 11, selectors: ['book:b1'] },
         '!checkpoint': { epoch: 'e1', position: 12, applied: 12 },
-        '!backfill:book:b1': { until: 12, resume: { ...resume }, replacing: false, children: [] },
+        '!backfill:book:b1': { until: 12, resume: { ...resume } },
         '!backfill-seqs:book:b1': { 'book:b1': 3 },
         [parkedPage('book:b1', 0)]: page([['book:b1!state', { count: 3, fields: {} }]]),
         [parkedEdit('book:b1', 5)]: ev('book:b1', 5, 12, { type: 'bump' }, 'x'),
-        '!seq:book:b1': 'backfill',
       },
     });
     await settle();

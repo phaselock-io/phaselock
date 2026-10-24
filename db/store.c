@@ -29,7 +29,7 @@ static const char *SCHEMA =
     "CREATE TABLE IF NOT EXISTS token_keys (kid TEXT PRIMARY KEY, public BLOB NOT NULL,"
     "  minted INTEGER NOT NULL) WITHOUT ROWID;"
     "CREATE TABLE IF NOT EXISTS slices (name TEXT PRIMARY KEY, birth INTEGER NOT NULL,"
-    "  death INTEGER, seq INTEGER NOT NULL,"
+    "  death INTEGER, seq INTEGER NOT NULL, pos INTEGER NOT NULL DEFAULT 0,"
     "  edit_bytes INTEGER NOT NULL DEFAULT 0, state_bytes INTEGER NOT NULL DEFAULT 0)"
     "  WITHOUT ROWID;";
 
@@ -110,7 +110,7 @@ int store_open(const char *path, bool writer, store **out, char *err, size_t err
                   "UPDATE slices SET edit_bytes = (SELECT COALESCE(SUM(length(edit)), 0)"
                   " FROM log WHERE slice = ?1) WHERE name = ?1") ||
              prep(s, &s->slice_seq,
-                  "UPDATE slices SET seq = seq + 1, edit_bytes = edit_bytes + ?2"
+                  "UPDATE slices SET seq = seq + 1, pos = ?3, edit_bytes = edit_bytes + ?2"
                   " WHERE name = ?1 RETURNING seq") ||
              prep(s, &s->slice_state, "SELECT seq, death IS NULL FROM slices WHERE name = ?1") ||
              prep(s, &s->kv_len, "SELECT length(value) FROM kv WHERE key = ?1") ||
@@ -118,12 +118,12 @@ int store_open(const char *path, bool writer, store **out, char *err, size_t err
                   "UPDATE slices SET state_bytes = state_bytes + ?2 WHERE name = ?1") ||
              prep(s, &s->slice_charge_zero, "UPDATE slices SET state_bytes = 0 WHERE name = ?1") ||
              prep(s, &s->slice_stats,
-                  "SELECT seq, edit_bytes, state_bytes FROM slices WHERE name = ?1") ||
+                  "SELECT seq, pos, edit_bytes, state_bytes FROM slices WHERE name = ?1") ||
              prep(s, &s->live_slices,
-                  "SELECT name, seq FROM slices WHERE name >= ?1 AND name < ?2"
-                  " AND death IS NULL ORDER BY name") ||
+                  "SELECT name, seq, pos, death IS NULL FROM slices WHERE name >= ?1 AND name < ?2"
+                  " ORDER BY name") ||
              prep(s, &s->live_slices_all,
-                  "SELECT name, seq FROM slices WHERE death IS NULL ORDER BY name") ||
+                  "SELECT name, seq, pos, death IS NULL FROM slices ORDER BY name") ||
              prep(s, &s->live_slice, "SELECT seq FROM slices WHERE name = ?1 AND death IS NULL") ||
              prep(s, &s->keys, "SELECT kid, public, minted FROM token_keys ORDER BY minted, kid") ||
              prep(s, &s->key_add, "INSERT INTO token_keys (kid, public, minted) VALUES (?1, ?2, ?3)") ||
@@ -475,9 +475,10 @@ int store_slice_erase(store *s, const char *name, uint64_t before) {
     return step_done(s, s->slice_bytes, "slice_bytes");
 }
 
-int store_slice_next_seq(store *s, const char *name, size_t bytes, uint64_t *seq) {
+int store_slice_next_seq(store *s, const char *name, size_t bytes, uint64_t pos, uint64_t *seq) {
     sqlite3_bind_text(s->slice_seq, 1, name, -1, SQLITE_STATIC);
     sqlite3_bind_int64(s->slice_seq, 2, (sqlite3_int64)bytes);
+    sqlite3_bind_int64(s->slice_seq, 3, (sqlite3_int64)pos);
     int rc = sqlite3_step(s->slice_seq);
     int out;
     if (rc == SQLITE_ROW) {
@@ -511,15 +512,16 @@ int store_slice_state(store *s, const char *name, uint64_t *seq, bool *live) {
     return out;
 }
 
-int store_slice_stats(store *s, const char *name, uint64_t *seq, uint64_t *edit_bytes,
-                      uint64_t *state_bytes) {
+int store_slice_stats(store *s, const char *name, uint64_t *seq, uint64_t *pos,
+                      uint64_t *edit_bytes, uint64_t *state_bytes) {
     sqlite3_bind_text(s->slice_stats, 1, name, -1, SQLITE_STATIC);
     int rc = sqlite3_step(s->slice_stats);
     int out;
     if (rc == SQLITE_ROW) {
         *seq = (uint64_t)sqlite3_column_int64(s->slice_stats, 0);
-        *edit_bytes = (uint64_t)sqlite3_column_int64(s->slice_stats, 1);
-        *state_bytes = (uint64_t)sqlite3_column_int64(s->slice_stats, 2);
+        *pos = (uint64_t)sqlite3_column_int64(s->slice_stats, 1);
+        *edit_bytes = (uint64_t)sqlite3_column_int64(s->slice_stats, 2);
+        *state_bytes = (uint64_t)sqlite3_column_int64(s->slice_stats, 3);
         out = 1;
     } else if (rc == SQLITE_DONE) {
         out = 0;
@@ -531,7 +533,7 @@ int store_slice_stats(store *s, const char *name, uint64_t *seq, uint64_t *edit_
     return out;
 }
 
-int store_live_slices(store *s, const char *prefix, store_name_fn fn, void *arg) {
+int store_slices_under(store *s, const char *prefix, store_slice_fn fn, void *arg) {
     char bound[1024];
     sqlite3_stmt *st;
     if (prefix_bound(prefix, bound, sizeof bound)) {
@@ -544,12 +546,13 @@ int store_live_slices(store *s, const char *prefix, store_name_fn fn, void *arg)
     int rc, out = 0;
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
         if (fn(arg, (const char *)sqlite3_column_text(st, 0),
-               (uint64_t)sqlite3_column_int64(st, 1)) != 0) {
+               (uint64_t)sqlite3_column_int64(st, 1), (uint64_t)sqlite3_column_int64(st, 2),
+               sqlite3_column_int(st, 3) != 0) != 0) {
             out = -1;
             break;
         }
     }
-    if (rc != SQLITE_DONE && rc != SQLITE_ROW) out = fail(s, "live_slices");
+    if (rc != SQLITE_DONE && rc != SQLITE_ROW) out = fail(s, "slices_under");
     sqlite3_reset(st);
     sqlite3_clear_bindings(st);
     return out;

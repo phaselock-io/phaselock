@@ -18,12 +18,44 @@ import {
 
 import { held, named, one, patrons, record, resumed, view } from './common.ts';
 
-/* Also: view.test.ts 'removing a selector drops per slice...'; backfill.test.ts 'a revoke of an
-   in-flight selector aborts it...'; freeze.test.ts 'a revoke while frozen leaves queries at
-   once...'.  The database's half is server_test.go's
-   TestAViewFrameLeadsTheEditsItGrantsIntoStreaming. */
-describe('P8: after a view frame, nothing of a slice outside the view remains', () => {
-  test('P8: a birth parked during a freeze goes with the revoke of its slice, and never shows', async () => {
+// the database's half is server_test.go's TestAViewFrameLeadsTheEditsItGrantsIntoStreaming
+describe('P8: a view cancels what it does not cover at once, and drops it from the base unfrozen or at the land', () => {
+  test('P8: unfrozen, a revoke drops the slices it no longer covers at once', async () => {
+    const r = await held();
+    const p2 = watch(r, 'patron:p2');
+    r.server.view('t2', 11, ['patron:p1']);
+    await settle();
+    expect(p2.values.at(-1)).toBeUndefined();
+    expect(keys(r.data(), 'patron:p2!')).toEqual([]);
+    expect(seq(r.data(), 'patron:p2')).toBeUndefined();
+    expect(seq(r.data(), 'patron:p1')).toBe(2);
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['patron:*']);
+  });
+
+  test('P8: frozen, a revoked slice stays in the frozen base until the land drops it', async () => {
+    const r = await held();
+    const p2 = watch(r, 'patron:p2');
+    const gap = r.server.hold('patron:p1');
+    r.server.edits(ev('patron:p1', 5, 11));
+    await settle();
+
+    // the view narrows to p1 while frozen, and queries still show p2
+    r.server.view('t2', 12, ['patron:p1']);
+    await settle();
+    expect(p2.values.at(-1)).toEqual({ count: 1, fields: {} });
+    expect(seq(r.data(), 'patron:p2')).toBe(1);
+
+    // the land takes p2 with it
+    r.server.blobs.set('patron:p1', one('patron:p1', 11, 5));
+    gap.go();
+    await settle();
+    expect(p2.values.at(-1)).toBeUndefined();
+    expect(keys(r.data(), 'patron:p2!')).toEqual([]);
+    expect(seq(r.data(), 'patron:p2')).toBeUndefined();
+    expect(state(r.data(), 'patron:p1')).toEqual({ count: 5, fields: {} });
+  });
+
+  test('P8: a birth parked during a freeze goes with a revoke of its slice at the land, and never shows', async () => {
     const r = rig();
     await bootstrap(r, ['patron:*'], { 'patron:*': one('patron:p1', 10, 2) });
     const p2 = watch(r, 'patron:p2');
@@ -32,17 +64,16 @@ describe('P8: after a view frame, nothing of a slice outside the view remains', 
     const gap = r.server.hold('patron:p1');
     r.server.edits(ev('patron:p1', 5, 11), named('patron:p2', 1, 11, 'Bo'));
     await settle();
-    expect(seq(r.data(), 'patron:p1')).toBe('backfill');
+    expect(seq(r.data(), 'patron:p1')).toBe(2);
     expect(seq(r.data(), 'patron:p2')).toBeUndefined();
-    expect(keys(r.data(), '!park-ed:patron:p2!')).toEqual([parkedEdit('patron:p2', 1)]);
+    expect(keys(r.data(), '!park-edit:patron:p2!')).toEqual([parkedEdit('patron:p2', 1)]);
 
-    // the view narrows to p1, which takes p2's parked birth with it
+    // the view narrows to p1 while frozen, so p2's parked birth waits for the land
     r.server.view('t2', 12, ['patron:p1']);
     await settle();
-    expect(keys(r.data(), '!park-ed:patron:p2!')).toEqual([]);
-    expect(seq(r.data(), 'patron:p2')).toBeUndefined();
+    expect(keys(r.data(), '!park-edit:patron:p2!')).toEqual([parkedEdit('patron:p2', 1)]);
 
-    // p1's backfill lands and unfreezes the base, and p2 never appears
+    // p1's backfill lands, the land drops p2, and p2 never appears
     r.server.blobs.set('patron:p1', one('patron:p1', 11, 5));
     gap.go();
     await settle();
@@ -66,7 +97,7 @@ describe('P8: after a view frame, nothing of a slice outside the view remains', 
     r.server.edits(ev('patron:p1', 5, 11), named('book:b9', 1, 11, 'Dune'));
     await settle();
     expect(seq(r.data(), 'book:b9')).toBeUndefined();
-    expect(keys(r.data(), '!park-ed:book:b9!')).toEqual([parkedEdit('book:b9', 1)]);
+    expect(keys(r.data(), '!park-edit:book:b9!')).toEqual([parkedEdit('book:b9', 1)]);
 
     // a build that wants patrons alone boots over the store, and lands p1's backfill
     r.abort.abort();
@@ -83,6 +114,50 @@ describe('P8: after a view frame, nothing of a slice outside the view remains', 
     expect(view(r2)?.selectors).toEqual(['patron:*']);
   });
 
+  test("P8: a revoke and a regrant of one selector refuse the old download's late pushes and outcome", async () => {
+    const r = await held();
+    const calls = r.server.drive('book:b1');
+    r.server.view('t2', 11, ['patron:*', 'book:b1']);
+    await settle();
+    const old = calls[0];
+    await old.backfill.push({
+      header: { position: 11, seqs: { 'book:b1': 1, 'visible': 11 }, visible: 11 },
+    });
+
+    // the old call's next push is queued as the revoke and the regrant arrive, then it fails
+    let refused: unknown = null;
+    const late = old.backfill.push({ pagesDone: true }).catch((e: unknown) => {
+      refused = e;
+    });
+    r.server.view('t3', 12, ['patron:*']);
+    r.server.view('t4', 13, ['patron:*', 'book:b1']);
+    await settle();
+    await late;
+    expect(refused).toBeInstanceOf(Error);
+    old.fail(new Error('aborted'));
+    await settle();
+    expect(calls.length).toBe(2);
+    expect(record(r, 'book:b1')).toEqual({ until: 14, resume: null });
+
+    // the new download alone lands, after no retry of the old one
+    const fresh = calls[1].backfill;
+    await fresh.push({
+      header: { position: 13, seqs: { 'book:b1': 2, 'visible': 13 }, visible: 13 },
+    });
+    await fresh.push({
+      page: page([['book:b1!state', { count: 2, fields: {} }]]),
+      skip: 1,
+      checksum: 'c',
+    });
+    await fresh.push({ pagesDone: true });
+    await fresh.push({ editsDone: true });
+    calls[1].done('done');
+    r.server.vouch(13);
+    await settle();
+    expect(state(r.data(), 'book:b1')).toEqual({ count: 2, fields: {} });
+    expect(calls.length).toBe(2);
+  });
+
   test("P8: a revoke mid-download drops the backfill's header, pages, and parked edits, and refuses its late pushes", async () => {
     const r = await held();
     const calls = r.server.drive('book:*');
@@ -91,7 +166,9 @@ describe('P8: after a view frame, nothing of a slice outside the view remains', 
 
     // the header and a page arrive, and a live edit of b1 parks under the family
     const call = calls[0].backfill;
-    await call.push({ header: { position: 11, seqs: { 'book:b1': 1 } } });
+    await call.push({
+      header: { position: 11, seqs: { 'book:b1': 1, 'visible': 11 }, visible: 11 },
+    });
     await call.push({
       page: page([['book:b1!state', { count: 1, fields: {} }]]),
       skip: 1,
@@ -100,7 +177,7 @@ describe('P8: after a view frame, nothing of a slice outside the view remains', 
     r.server.edits(ev('book:b1', 2, 12));
     await settle();
     expect(keys(r.data(), '!park-snap:book:*!').length).toBe(1);
-    expect(keys(r.data(), '!park-ed:book:b1!')).toEqual([parkedEdit('book:b1', 2)]);
+    expect(keys(r.data(), '!park-edit:book:b1!')).toEqual([parkedEdit('book:b1', 2)]);
 
     // the books are revoked
     r.server.view('t3', 13, ['patron:*']);
@@ -114,12 +191,34 @@ describe('P8: after a view frame, nothing of a slice outside the view remains', 
   });
 });
 
-/* also: view.test.ts 'a grant covered by another selector in the same set...', 'a grant of a
-   selector that already has an in-flight entry is a no-op', 'a held family covered by a wider
-   in-flight selector and narrowed back to...'; backfill.test.ts 'a grant writes its record...' and
-   "the first view's grants are replacing..." */
 describe('P9: a view frame backfills exactly what it newly grants', () => {
-  test('P9: a view frame in a resync backfills only its new grant, additively and through its position, while the replay goes on', async () => {
+  test('P9: frozen, a slice revoked and then granted again by its exact selector is backfilled afresh', async () => {
+    const r = await held();
+    const p1 = watch(r, 'patron:p1');
+    const gap = r.server.hold('patron:p2');
+    r.server.edits(ev('patron:p2', 9, 11));
+    await settle();
+
+    // p1 is revoked, its drop waiting for the land, and granted again; meanwhile it moved to seq 3
+    r.server.blobs.set('patron:p1', one('patron:p1', 13, 3));
+    r.server.view('t2', 12, ['patron:p2']);
+    r.server.view('t3', 13, ['patron:p2', 'patron:p1']);
+    r.server.vouch(13);
+    await settle();
+    expect(r.server.backfills.map((b) => b.selector)).toEqual([
+      'patron:*',
+      'patron:p2',
+      'patron:p1',
+    ]);
+
+    r.server.blobs.set('patron:p2', one('patron:p2', 11, 9));
+    gap.go();
+    await settle();
+    expect(p1.values.at(-1)).toEqual({ count: 3, fields: {} });
+    expect(seq(r.data(), 'patron:p1')).toBe(3);
+  });
+
+  test('P9: a view frame in a resync backfills only its new grant, through its position, and the replay waits for it', async () => {
     const r = rig({ seed: resumed });
     await settle();
     const books = r.server.hold('book:*');
@@ -129,32 +228,49 @@ describe('P9: a view frame backfills exactly what it newly grants', () => {
     r.server.live(30);
     await settle();
     expect(r.server.backfills).toEqual([{ selector: 'book:*', until: 31, resume: null }]);
-    expect(record(r, 'book:*')?.replacing).toBe(false);
     expect(view(r)).toEqual({ token: 't2', position: 30, selectors: ['patron:*', 'book:*'] });
-    expect(seq(r.data(), 'patron:p1')).toBe(3);
+    expect(seq(r.data(), 'patron:p1')).toBe(2);
+    expect(keys(r.data(), '!park-edit:')).toEqual([parkedEdit('patron:p1', 3)]);
+
+    r.server.blobs.set('book:*', one('book:b1', 30, 4));
     books.go();
+    await settle();
+    expect(seq(r.data(), 'patron:p1')).toBe(3);
+    expect(state(r.data(), 'book:b1')).toEqual({ count: 4, fields: {} });
   });
 
-  test('P9: a widening frame adopts the exact backfill it covers, and the next connect presents its token', async () => {
-    const r = await held();
+  test('P9: a grant covering an in-flight exact backfill starts its own beside it, and the next connect presents its token', async () => {
+    const r = rig();
     r.server.hold('book:b1');
-    r.server.edits(ev('book:b1', 3, 11));
+    await settle();
+    r.server.open();
+    r.server.view('t1', 10, ['book:b1']);
     await settle();
     r.server.hold('book:*');
-    r.server.view('t2', 12, ['patron:*', 'book:*']);
+    r.server.view('t2', 12, ['book:*']);
     await settle();
-    expect(r.server.backfills.map((b) => b.selector)).toEqual(['patron:*', 'book:b1', 'book:*']);
-    expect(record(r, 'book:*')).toMatchObject({
-      until: 13,
-      replacing: false,
-      children: ['book:b1'],
-    });
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['book:b1', 'book:*']);
+    expect(record(r, 'book:b1')).toEqual({ until: 11, resume: null });
+    expect(record(r, 'book:*')).toEqual({ until: 13, resume: null });
 
     r.server.end();
     r.engine.reconnectNow();
     await settle();
     expect(r.server.conn.view).toBe('t2');
-    expect(r.server.conn.since).toBe(11);
+    expect(r.server.conn.since).toBe(10);
+  });
+
+  test('P9: a selector the same frame covers twice, or an in-flight backfill already covers, gets no backfill of its own', async () => {
+    const r = rig();
+    r.server.hold('patron:*');
+    await settle();
+    r.server.open();
+    r.server.view('t1', 10, ['patron:p1', 'patron:*']);
+    await settle();
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['patron:*']);
+    r.server.view('t2', 11, ['patron:*', 'patron:p2']);
+    await settle();
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['patron:*']);
   });
 
   test('P9: narrowing to a held member backfills nothing, and regranting the family downloads it again with the member kept', async () => {

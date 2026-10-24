@@ -206,6 +206,8 @@ function reset(slice: string, seq: number, position: number, lifecycle: Lifecycl
     its response states, if any; its values come as one page, each value counting as one byte */
 export type Blob = {
   position: number;
+  // the last position any slice under the selector changed, the cut unless given
+  visible?: number;
   seqs: Record<string, number>;
   values: [string, unknown][];
   tail?: WireEdit[];
@@ -410,7 +412,8 @@ export class FakeServer {
       if (r !== null && r.skipBytes > 0 && r.position !== blob.position) return 'stale';
       if (blob.length !== undefined) await push({ length: blob.length });
       if (r === null || r.skipBytes === 0) {
-        await push({ header: { position: blob.position, seqs: blob.seqs } });
+        const visible = blob.visible ?? blob.position;
+        await push({ header: { position: blob.position, seqs: blob.seqs, visible } });
         if (blob.values.length > 0) {
           // the checksum is opaque to the Engine, so any string that names the page will do
           const skip = blob.values.length;
@@ -521,7 +524,7 @@ export function rig(
 // the store type of a key the Engine writes
 function typeOf(key: string): string {
   if (key.startsWith('!mutation:')) return '.mutation';
-  if (key.startsWith('!park-ed:')) return '.edits';
+  if (key.startsWith('!park-edit:')) return '.edits';
   if (key.startsWith('!park-snap:')) return '.page';
   if (key.startsWith('!')) return '.json';
   return 'state';
@@ -652,8 +655,8 @@ export function log(data: Record<string, unknown>, slice: string): string[] {
   return [...base, ...entries];
 }
 
-export function seq(data: Record<string, unknown>, slice: string): number | 'backfill' | undefined {
-  return data[`!seq:${slice}`] as number | 'backfill' | undefined;
+export function seq(data: Record<string, unknown>, slice: string): number | undefined {
+  return data[`!seq:${slice}`] as number | undefined;
 }
 
 export function checkpoint(
@@ -663,7 +666,7 @@ export function checkpoint(
 }
 
 export const parkedEdit = (slice: string, seq: number): string =>
-  `!park-ed:${slice}!${String(seq).padStart(20, '0')}`;
+  `!park-edit:${slice}!${String(seq).padStart(20, '0')}`;
 
 export const parkedPage = (selector: string, offset: number): string =>
   `!park-snap:${selector}!${String(offset).padStart(20, '0')}`;

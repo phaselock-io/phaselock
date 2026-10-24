@@ -191,10 +191,15 @@ describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
     expect(again).toEqual([['live', cursor]]);
     ctl2.abort();
 
-    // a family backfill: header, pages, an empty tail (the live cut is at the cursor)
+    // a family backfill: header, pages, an empty tail (the live cut is at the cursor), and the
+    // rename at the cursor the family's last change
     const fam = await run(conn, 'patron:*', cursor);
     expect(fam.outcome).toBe('done');
-    expect(fam.header).toEqual({ position: cursor, seqs: { 'patron:p1': 2, 'patron:p2': 1 } });
+    expect(fam.header).toEqual({
+      position: cursor,
+      seqs: { 'patron:p1': 2, 'patron:p2': 1 },
+      visible: cursor,
+    });
     expect(fam.values.map(([k]) => k)).toEqual([
       'patron:p1!holds',
       'patron:p1!messages',
@@ -211,6 +216,7 @@ describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
     expect(p1.header!.seqs).toEqual({ 'patron:p1': 2 });
     const back = await run(conn, 'patron:p1', cursor, {
       position: cursor,
+      visible: cursor,
       skipBytes: p1.skips[0],
       checksum: p1.checksums[0],
       fromPosition: cursor,
@@ -225,6 +231,7 @@ describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
     await conn.sendMutations([mut('c5', 5, { type: 'rename-patron', id: 'p2', name: 'Rob' })]);
     const stale = await run(conn, 'patron:p1', cursor, {
       position: cursor,
+      visible: cursor,
       skipBytes: 30,
       checksum: '',
       fromPosition: cursor,

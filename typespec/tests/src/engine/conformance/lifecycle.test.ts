@@ -6,9 +6,6 @@ import { death, ev, keys, log, rig, seq, settle, state, watch } from '../harness
 
 import { held, named, one, resumed } from './common.ts';
 
-/* also: routing.test.ts 'a birth on an unknown slice creates its !seq: and writes nothing' and 'a
-   birth that writes clears the slice...'; resets.test.ts "an unknown slice's birth above seq
-   1..." */
 describe('P6: a birth clears its slice, then applies its writes', () => {
   test('P6: a birth shows only its own writes, on a slice nothing holds and over a held one, with no backfill', async () => {
     const r = await held();
@@ -42,9 +39,7 @@ describe('P6: a birth clears its slice, then applies its writes', () => {
   });
 });
 
-/* Also: routing.test.ts 'a death drops the prefix and !seq:...', 'a normal edit of a slice a death
-   forgot...'; resets.test.ts 'a death above the held seq is accepted over the gap...'.  The
-   database's half is server_test.go's TestDeletingANonLiveSliceIsNoEdit. */
+// the database's half is server_test.go's TestDeletingANonLiveSliceIsNoEdit
 describe('P7: a death clears its slice, and the client forgets it', () => {
   test('P7: after a death, a normal edit of the slice is a missed birth, and a rebirth starts it from empty', async () => {
     const r = await held();

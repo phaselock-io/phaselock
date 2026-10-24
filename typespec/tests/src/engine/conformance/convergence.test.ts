@@ -98,11 +98,12 @@ describe("P19: at quiescence, the client holds the view's slices at the server's
     r.server.live(16);
     await settle();
 
-    // the grant, the gap, and the missed birth each backfilled their own selector
+    // the grant froze the base, and its land found the gap and the missed birth, each backfilled
+    // by its own selector
     expect(r.server.backfills.map((b) => [b.selector, b.until])).toEqual([
       ['book:*', 17],
-      ['patron:p1', 12],
-      ['patron:p3', 14],
+      ['patron:p1', 17],
+      ['patron:p3', 17],
     ]);
     expect(keys(r.data(), '!backfill')).toEqual([]);
     expect(keys(r.data(), '!park')).toEqual([]);
@@ -125,7 +126,9 @@ describe("P19: at quiescence, the client holds the view's slices at the server's
     await settle();
     r.server.view('t2', 12, ['patron:p2']);
     await settle();
-    expect(seq(r.data(), 'patron:p1')).toBeUndefined();
+
+    // the revoke waits for the land
+    expect(seq(r.data(), 'patron:p1')).toBe(2);
     const family = r.server.hold('patron:*');
     r.server.view('t3', 13, ['patron:*']);
     r.server.edits(ev('patron:p1', 3, 13));

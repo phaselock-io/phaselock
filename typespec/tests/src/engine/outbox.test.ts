@@ -18,7 +18,6 @@ import {
   readState,
   rig,
   type Rig,
-  seq,
   settle,
   state,
   type State,
@@ -95,12 +94,12 @@ function outbox(data: Record<string, unknown>): { key: string; id: string; data:
   });
 }
 
-/** freeze the base: a gap on patron:p2 whose replacing backfill is held; returns the release */
+/** freeze the base: a gap on patron:p2 whose backfill is held; returns the release */
 async function freeze(r: Rig, position = 11): Promise<() => void> {
   const hold = r.server.hold('patron:p2');
   r.server.edits(ev('patron:p2', 9, position));
   await settle();
-  expect(seq(r.data(), 'patron:p2')).toBe('backfill');
+  expect(r.data()['!backfill:patron:p2']).toBeDefined();
   return () => {
     r.server.blobs.set('patron:p2', {
       position,
@@ -379,14 +378,14 @@ describe('predictions', () => {
     await freeze(r);
     calls[0].resolve([reject]);
     await settle();
-    expect(seq(r.data(), 'patron:p2')).toBe('backfill');
+    expect(r.data()['!backfill:patron:p2']).toBeDefined();
     expect(outbox(r.data())).toEqual([]);
     expect(w.values.at(-1)).toEqual({ count: 2, fields: {} });
   });
 });
 
 describe('the applied position', () => {
-  test('a batch that froze part way, a vouch while frozen, an ack already applied past, and the unfreeze', async () => {
+  test('a frame that breaks parks whole, a vouch while frozen, an ack already applied past, and the land', async () => {
     const r = await held();
     const w = watch(r, 'patron:p1');
     const calls = sendControl(r.server);
@@ -394,33 +393,36 @@ describe('the applied position', () => {
     r.engine.sendMutation({ field: 'b', value: 2 });
     await settle();
     expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1, b: 2 } });
-    // p1 applies at 11, then p2's gap at 12 freezes the rest of the frame
+    // p2's gap at 12 parks the whole frame, p1's edit at 11 with it, and freezes the base at 10
     const hold = r.server.hold('patron:p2');
     r.server.edits(ev('patron:p1', 3, 11), ev('patron:p2', 9, 12));
     await settle();
-    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 12, applied: 11 });
-    // the edit before the gap applied, and the freeze's status change runs the graph over it
-    expect(w.values.at(-1)).toEqual({ count: 3, fields: { a: 1, b: 2 } });
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 12, applied: 10 });
+    expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1, b: 2 } });
+    // acks past the applied position release nothing while frozen
     calls[0].resolve([ok(11), ok(12)]);
     await settle();
-    expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
-    // the release rebuilds the overlay over the applied base, b's prediction still on it
-    expect(w.values.at(-1)).toEqual({ count: 3, fields: { b: 2 } });
+    expect(outbox(r.data()).map((x) => x.data)).toEqual([
+      { field: 'a', value: 1 },
+      { field: 'b', value: 2 },
+    ]);
     // a vouch moves the cursor but not the applied position while frozen
     r.server.vouch(20);
     await settle();
-    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 20, applied: 11 });
-    expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
+    expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 20, applied: 10 });
     // an ack at a position already applied past releases at once, frozen or not
     r.engine.sendMutation({ field: 'c', value: 3 });
     await settle();
-    expect(w.values.at(-1)).toEqual({ count: 3, fields: { b: 2, c: 3 } });
+    expect(w.values.at(-1)).toEqual({ count: 2, fields: { a: 1, b: 2, c: 3 } });
     calls[1].resolve([ok(5)]);
     await settle();
-    expect(outbox(r.data()).map((x) => x.data)).toEqual([{ field: 'b', value: 2 }]);
-    // b's prediction never left the overlay through the freeze
-    for (const v of w.values.slice(1)) expect(v?.fields.b).toBe(2);
-    // the unfreeze moves the applied position to the checkpoint and releases b
+    expect(outbox(r.data()).map((x) => x.data)).toEqual([
+      { field: 'a', value: 1 },
+      { field: 'b', value: 2 },
+    ]);
+    // a's and b's predictions never left the overlay through the freeze
+    for (const v of w.values.slice(1)) expect(v?.fields).toMatchObject({ a: 1, b: 2 });
+    // the land applies the base through the cursor and releases both
     r.server.blobs.set('patron:p2', {
       position: 12,
       seqs: { 'patron:p2': 9 },
@@ -435,8 +437,10 @@ describe('the applied position', () => {
 
   test('the applied position is persisted and restored on boot mid-freeze', async () => {
     const r = await held();
+    // p1's edit at 11 applies, then p2's gap at 12 freezes the base there
     const hold = r.server.hold('patron:p2');
-    r.server.edits(ev('patron:p1', 3, 11), ev('patron:p2', 9, 12));
+    r.server.edits(ev('patron:p1', 3, 11));
+    r.server.edits(ev('patron:p2', 9, 12));
     r.server.vouch(20);
     await settle();
     expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 20, applied: 11 });
@@ -479,27 +483,27 @@ describe('the applied position', () => {
     expect(outbox(r.data())).toEqual([]);
   });
 
-  test('the round trip is observed in the frozen walk', async () => {
+  test('the round trip is observed in the land', async () => {
     const r = await held();
     sendControl(r.server);
     r.engine.sendMutation({ field: 'a' });
     await settle();
     const id = outbox(r.data())[0].id;
-    const unfreeze = await freeze(r);
+    const land = await freeze(r);
     r.server.edits(ev('patron:p1', 3, 12, { type: 'set', field: 'a', value: 1 }, id));
     await settle();
     expect(outbox(r.data()).length).toBe(1);
     expect(log(r.data(), 'patron:p1')).toEqual([]);
-    unfreeze();
+    land();
     await settle();
     expect(log(r.data(), 'patron:p1')).toEqual(['set a=1']);
     expect(outbox(r.data())).toEqual([]);
   });
 
-  test('a no-op mutation acked during a freeze is released at the unfreeze', async () => {
+  test('a no-op mutation acked during a freeze is released at the land', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    const unfreeze = await freeze(r);
+    const land = await freeze(r);
     r.engine.sendMutation({ field: 'a' });
     await settle();
     calls[0].resolve([ok(15)]);
@@ -507,7 +511,7 @@ describe('the applied position', () => {
     await settle();
     expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, applied: 10 });
     expect(outbox(r.data()).length).toBe(1);
-    unfreeze();
+    land();
     await settle();
     expect(checkpoint(r.data())).toEqual({ epoch: 'e1', position: 15, applied: 15 });
     expect(outbox(r.data())).toEqual([]);
@@ -622,16 +626,16 @@ describe('@online mutations', () => {
     expect(t.value).toEqual(ok(15));
   });
 
-  test('an acked mutation whose round trip is observed during a freeze settles at the unfreeze', async () => {
+  test('an acked mutation whose round trip is observed during a freeze settles at the land', async () => {
     const r = await held();
     const calls = sendControl(r.server);
-    const unfreeze = await freeze(r);
+    const land = await freeze(r);
     const t = track(r.engine.sendOnlineMutation({ field: 'x' }));
     await settle();
     calls[0].resolve([ok(5)]);
     await settle();
     expect(t.settled).toBe(false);
-    unfreeze();
+    land();
     await settle();
     expect(t.value).toEqual(ok(5));
   });

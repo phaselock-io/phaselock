@@ -837,7 +837,9 @@ static void commit_slice(pldb *db, batch *b, const uint8_t *id, const wbuf *wb, 
     buf edit = {0};
     encode_edit(&edit, pos, name, seq + 1, id, b->servertime, life, wb, t);
     uint64_t next;
-    if (store_slice_next_seq(db->w, name, edit.len, &next)) die("next_seq: %s", store_err(db->w));
+    if (store_slice_next_seq(db->w, name, edit.len, pos, &next)) {
+        die("next_seq: %s", store_err(db->w));
+    }
     if (next != seq + 1) {
         die("slice %s: seq %llu after %llu", name, (unsigned long long)next,
             (unsigned long long)seq);
@@ -1557,11 +1559,19 @@ static int snap_cb(void *arg, const char *key, const uint8_t *val, size_t len) {
     return 0;
 }
 
-/* the header's slices map, written as it is read from the slices table */
-static int snap_slice_cb(void *arg, const char *name, uint64_t seq) {
-    mpack_writer_t *w = arg;
-    mpack_write_cstr(w, name);
-    mpack_write_u64(w, seq);
+/* the header's slices map, written as the live slices are read from the slices table, and the
+   last position any slice under the selector changed, dead ones included */
+typedef struct {
+    mpack_writer_t *w;
+    uint64_t visible;
+} snap_slices;
+
+static int snap_slice_cb(void *arg, const char *name, uint64_t seq, uint64_t pos, bool live) {
+    snap_slices *ss = arg;
+    if (pos > ss->visible) ss->visible = pos;
+    if (!live) return 0;
+    mpack_write_cstr(ss->w, name);
+    mpack_write_u64(ss->w, seq);
     return 0;
 }
 
@@ -1571,7 +1581,7 @@ int pldb_snapshot(pldb *db, const char *selector, uint8_t **out, size_t *len, ui
     else snprintf(prefix, sizeof prefix, "%s!", selector);
 
     snap_ctx sc = {0};
-    uint64_t seq = 0, edit_bytes = 0, state_bytes = 0;
+    uint64_t seq = 0, pos = 0, edit_bytes = 0, state_bytes = 0;
     int have_stats = 0, live = 0;
     char *hdr = NULL;
     size_t hsize = 0;
@@ -1584,12 +1594,13 @@ int pldb_snapshot(pldb *db, const char *selector, uint8_t **out, size_t *len, ui
     if (!rc) rc = store_max_position(db->r, position);
     if (!rc) rc = store_scan(db->r, prefix, snap_cb, &sc);
     if (!rc && !is_prefix_selector(selector)) {
-        have_stats = store_slice_stats(db->r, selector, &seq, &edit_bytes, &state_bytes);
+        have_stats = store_slice_stats(db->r, selector, &seq, &pos, &edit_bytes, &state_bytes);
         if (have_stats < 0) rc = -1;
         if (!rc && (live = store_live_slice(db->r, selector, &seq)) < 0) rc = -1;
     }
+    snap_slices ss = {.w = &w, .visible = 0};
     if (!rc) {
-        mpack_start_map(&w, have_stats > 0 ? 6 : 4);
+        mpack_start_map(&w, have_stats > 0 ? 7 : 5);
         mpack_write_cstr(&w, "selector");
         mpack_write_cstr(&w, selector);
         mpack_write_cstr(&w, "position");
@@ -1599,13 +1610,16 @@ int pldb_snapshot(pldb *db, const char *selector, uint8_t **out, size_t *len, ui
         mpack_write_cstr(&w, "slices");
         if (is_prefix_selector(selector)) {
             mpack_build_map(&w);
-            rc = store_live_slices(db->r, prefix, snap_slice_cb, &w);
+            rc = store_slices_under(db->r, prefix, snap_slice_cb, &ss);
             mpack_complete_map(&w);
         } else {
+            // an exact slice's last edit counts whether or not it is live
             mpack_start_map(&w, live ? 1 : 0);
-            if (live) snap_slice_cb(&w, selector, seq);
+            if (have_stats > 0) snap_slice_cb(&ss, selector, seq, pos, live > 0);
             mpack_finish_map(&w);
         }
+        mpack_write_cstr(&w, "visible");
+        mpack_write_u64(&w, ss.visible);
     }
     store_exec(db->r, "COMMIT");
     pthread_mutex_unlock(&db->rmu);

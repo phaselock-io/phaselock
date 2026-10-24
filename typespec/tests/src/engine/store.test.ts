@@ -423,7 +423,7 @@ describe('applying edits', () => {
     const data = contents(store);
     expect(Object.keys(data).filter((k) => !k.startsWith('!'))).toEqual(['s!b', 's!c']);
     expect(data['s!b']).toBe('b3');
-    expect(Object.keys(data).filter((k) => k.startsWith('!park-ed:s!'))).toHaveLength(4);
+    expect(Object.keys(data).filter((k) => k.startsWith('!park-edit:s!'))).toHaveLength(4);
   });
 
   test('a parked edit reads as its envelope, as often as it is read, and as its bytes in msgpack', () => {

@@ -52,11 +52,13 @@ export type Backfill = {
   // what selector are we backfilling (slice name or prefix)
   selector: string;
   /* The tail's exclusive upper bound, which retries keep: the tail delivers the positions below
-     it, and the live connection those at or above it, which the Engine parks.  Between a
-     bootstrap's backfills and its connection the contract is this: once the view frame that
-     answers the bootstrap, at V, is processed, the cursor is V; the backfills cover every position
-     at or below V, and the connection every position above it.  So a view frame's backfills take
-     V + 1, and an edit at V that the connection delivers too parks again under the same key. */
+     it, and the live connection those at or above it, which the Engine parks.  A view frame's
+     position is the last position its connection sent under the previous view: everything the
+     connection sends after the frame is filtered by the new view, and the new view's edits at or
+     below the position are its backfills' to deliver, so a grant's backfill takes the position
+     plus one.  A bootstrap's view frame, at V, is where its connection starts: once it is
+     processed the cursor is V, the backfills cover every position at or below V, and the
+     connection every position above it. */
   until: number;
   // what a previous attempt got through, or null for a fresh backfill.  A finished half is
   // skipped outright.  Otherwise skipBytes > 0 resumes the blob download, and the header's
@@ -66,9 +68,10 @@ export type Backfill = {
   // blob overrides the floor.  It reads forward, which may result in gaps if retention
   // pruning happens concurrently, so it must be checked for gaps just before landing.  The
   // checksum is the last parked page's, handed back so a resumed download continues its check;
-  // it is '' when skipBytes is 0.
+  // it is '' when skipBytes is 0.  visible is the header's, kept for the land.
   resume: null | {
     position: number;
+    visible: number;
     skipBytes: number;
     checksum: string;
     fromPosition: number;
@@ -82,8 +85,9 @@ export type Backfill = {
 };
 
 /** One delivery of a backfill: the blob's whole length in bytes, when its response states one;
-    the blob's header, its cut position and the seq of every slice in it, which names every slice
-    the blob holds; a page of the blob's set operations, whole ones, with the byte offset after
+    the blob's header, its cut position, the seq of every slice in it, which names every slice
+    the blob holds, and visible, the last position at or below the cut where any slice under the
+    selector changed, a deleted one included; a page of the blob's set operations, whole ones, with the byte offset after
     it, to resume past, and the transport's running check over every page delivered so far; a run
     of tail edits with the position its scan reached; or the end of either half.  The length and
     the scan feed the Engine's progress status alone, and the checksum is opaque to it, kept only
@@ -91,7 +95,7 @@ export type Backfill = {
     but its length, since the header is what the rest is parked against. */
 export type BackfillItem =
   | { length: number }
-  | { header: { position: number; seqs: Record<string, number> } }
+  | { header: { position: number; seqs: Record<string, number>; visible: number } }
   | { page: Uint8Array; skip: number; checksum: string }
   | { pagesDone: true }
   | { edits: WireEdit[]; scanned: number }

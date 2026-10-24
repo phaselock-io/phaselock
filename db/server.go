@@ -118,12 +118,28 @@ type conn struct {
 	out       chan frame
 }
 
-// frame is one queued wire frame with the log position it carries.
+// frame is one queued wire frame with the log position it carries.  A view frame carries the view
+// alone, and the handler encodes it as it writes it, at its own cursor (see viewFrame); any other
+// frame carries its encoded data.
 type frame struct {
-	pos  uint64
-	view bool
-	end  bool // the connection's last frame
-	data []byte
+	pos       uint64
+	view      bool
+	end       bool // the connection's last frame
+	token     string
+	selectors []string
+	data      []byte
+}
+
+/*
+viewFrame encodes a view frame at the connection's cursor as it is written.  A view frame's
+
+	position is the last position the connection sent under the previous view: everything the
+	connection sends after the frame is filtered by the new view, and the new view's edits at or
+	below the position are the client's backfills' to deliver, through it.  The handler's cursor is
+	exactly that, live and in its replay, wherever the commit that changed the view lies.
+*/
+func viewFrame(token string, cursor uint64, selectors []string) []byte {
+	return mpEncode([]any{"view", token, cursor, selectors})
 }
 
 const (
@@ -354,8 +370,7 @@ func (s *Server) dispatch() {
 					}
 				} else if c.active && changed {
 					// a grant change that left this view as it was is no frame
-					s.send(c, frame{pos: r.position, view: true,
-						data: mpEncode([]any{"view", token, r.position, view})})
+					s.send(c, frame{pos: r.position, view: true, token: token, selectors: view})
 				}
 			} else if c != nil && r.reqid == 0 && c.active {
 				// the grantor failed when a commit re-ran it, so the connection ends
@@ -673,14 +688,6 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return true
 	}
-	// a client whose stored token is not the current one gets the view as
-	// the first frame, ahead of history, so reconciliation is in order with
-	// everything that follows
-	if r.URL.Query().Get("view") != view.token {
-		if !write(mpEncode([]any{"view", view.token, view.position, view.selectors})) {
-			return
-		}
-	}
 	selectors := view.selectors
 	// the connection delivers everything above the cursor: the client's checkpoint, or on a
 	// bootstrap the view's position, which the client takes as the bound of what its snapshots
@@ -688,6 +695,23 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	cursor := view.position
 	if since >= 0 {
 		cursor = uint64(since)
+	}
+
+	// a client whose stored token is not the current one gets the view as the first frame, ahead
+	// of history, at the cursor: the replay that follows is filtered by it
+	if r.URL.Query().Get("view") != view.token {
+		if !write(viewFrame(view.token, cursor, view.selectors)) {
+			return
+		}
+	}
+
+	// writes a queued view frame at the cursor, or the end frame a failed grantor queues
+	writeView := func(f frame) bool {
+		if f.end {
+			write(f.data)
+			return false
+		}
+		return write(viewFrame(f.token, cursor, f.selectors))
 	}
 
 	// forwards queued view frames, updating the handler's selectors; returns false when the connection
@@ -703,7 +727,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 					s.mu.Lock()
 					selectors = append([]string(nil), c.selectors...)
 					s.mu.Unlock()
-					if !write(f.data) || f.end {
+					if !writeView(f) {
 						return false
 					}
 				}
@@ -772,8 +796,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// the view frames queued before the switch, whose selectors the hot catchup replays under, go
 	// ahead of it
 	for range views {
-		f := <-c.out
-		if !write(f.data) || f.end {
+		if !writeView(<-c.out) {
 			return
 		}
 	}
@@ -797,9 +820,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		if !f.view && f.pos <= cursor {
 			return true
 		}
-		if !f.view {
-			cursor = f.pos
+		if f.view {
+			return writeView(f)
 		}
+		cursor = f.pos
 		return write(f.data) && !f.end
 	}
 

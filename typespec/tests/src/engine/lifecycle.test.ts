@@ -157,22 +157,21 @@ describe('connector lifecycle', () => {
   });
 
   test('a new connection starts every backfill still downloading, except one in backoff', async () => {
+    // one frame misses two births, so both backfill at once, and b1's first attempt fails
     const r = await held();
     r.server.hold('patron:p9');
-    r.server.edits(ev('patron:p9', 7, 11));
-    await settle();
     r.server.failOnce.set('book:b1', new Error('boom'));
-    r.server.edits(ev('book:b1', 4, 12));
+    r.server.edits(ev('book:b1', 4, 11), ev('patron:p9', 7, 11));
     await settle();
-    expect(r.server.backfills.map((b) => b.selector)).toEqual(['patron:*', 'patron:p9', 'book:b1']);
+    expect(r.server.backfills.map((b) => b.selector)).toEqual(['patron:*', 'book:b1', 'patron:p9']);
     r.server.end();
     r.engine.reconnectNow();
     await settle();
     // p9 restarts on the new connection; b1 waits for its own timer
     expect(r.server.backfills.map((b) => b.selector)).toEqual([
       'patron:*',
-      'patron:p9',
       'book:b1',
+      'patron:p9',
       'patron:p9',
     ]);
     r.server.hold('book:b1');
@@ -180,8 +179,8 @@ describe('connector lifecycle', () => {
     await settle();
     expect(r.server.backfills.map((b) => b.selector)).toEqual([
       'patron:*',
-      'patron:p9',
       'book:b1',
+      'patron:p9',
       'patron:p9',
       'book:b1',
     ]);
