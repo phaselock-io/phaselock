@@ -2181,7 +2181,7 @@ func TestAConnectionThatCannotKeepUpEndsWithAnOverflow(t *testing.T) {
 	if at := edits(s.nextTagged("edits"))[0].position; at != first {
 		t.Fatalf("expected the edits at %d, got %d", first, at)
 	}
-	if f := s.nextTagged("end"); f[1] != "overflow" {
+	if f := s.nextTagged("end"); asInt(f[1]) != endOverflow {
 		t.Fatalf("expected an overflow, got %v", f)
 	}
 
@@ -3678,7 +3678,7 @@ func TestAFailingGrantGrantsNothing(t *testing.T) {
 	// a granted wildcard that cuts into a parameter ends the connection
 	h.accept(admin, mut("c3", "grant-view", "user", "p1", "prefix", "patron:p1*"))
 	f := s.nextTagged("end")
-	if f[1] != "error" || !strings.Contains(f[2].(string), "malformed selector: patron:p1*") {
+	if asInt(f[1]) != endGrantorFailed || !strings.Contains(f[2].(string), "malformed selector: patron:p1*") {
 		t.Fatalf("end frame: %v", f)
 	}
 	select {

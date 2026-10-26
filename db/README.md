@@ -328,8 +328,16 @@ Every frame is an array whose first element is a tag.
                                        to the view
     ["live", position]                 history done; live from here
     ["vouch", position]                heartbeat; converges the cursor
-    ["end", code, reason]
+    ["end", code, reason]              the last frame, its code the
+                                       database's own (below)
 
+- An end frame's code is in the 600s, which HTTP leaves unused, so a
+  client reports it beside the HTTP statuses of the ends it sees
+  outside the stream without confusing the two.  It is never sent as
+  an HTTP status.  600: the grantor failed when a commit re-ran it;
+  601: the connection's backlog overflowed; 602: a history read
+  failed.  A client ends the connection on a code it does not know as
+  on any other.
 - `since=N` replays history from N+1, then sends `live` with the last
   position the replay reached; nothing after `live` repeats a position
   at or below it.  `since=-1` means bootstrap: history from the view's
@@ -378,7 +386,7 @@ Every frame is an array whose first element is a tag.
   backlog grows as frames are queued, so an idle connection holds
   none, up to `--max-stream-backlog` frames, 2048 by default.  A
   connection whose backlog is full when a frame comes gets the frames
-  queued before it, then `["end", "overflow", reason]`, and is closed;
+  queued before it, then `["end", 601, reason]`, and is closed;
   its client reconnects from its cursor.
 - Every deletion keeps at least the last edit of every slice, even
   deleted slices, whose last edit is a death.  With that floor a
@@ -410,7 +418,7 @@ Every frame is an array whose first element is a tag.
 - A grantor that throws, writes, or returns a malformed selector fails
   closed: it grants nothing.  A connection registering under it is
   refused with a 500, and a connection it fails under when a commit
-  re-runs it gets `["end", "error", reason]` and is closed.  The
+  re-runs it gets `["end", 600, reason]` and is closed.  The
   reason is as for a mutation's bug: `internal error`, or the whole
   error from a dev bundle.
 - The grantor returns selectors (bundle form); the view is that set cut

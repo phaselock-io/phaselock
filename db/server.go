@@ -175,6 +175,15 @@ func viewFrame(token string, cursor uint64, selectors []string) []byte {
 	return mpEncode([]any{"view", token, cursor, selectors})
 }
 
+// The codes of the end frames the database sends.  They are its own, in the 600s, which HTTP
+// leaves unused, so a client reports them beside the HTTP statuses of the ends it sees outside the
+// stream without confusing the two.
+const (
+	endGrantorFailed = 600 // the grantor failed when a commit re-ran it
+	endOverflow      = 601 // the connection's backlog overflowed
+	endReadFailed    = 602 // a history read failed
+)
+
 const (
 	heartbeat = 15 * time.Second
 	maxBody   = 16 << 20
@@ -427,7 +436,8 @@ func (s *Server) dispatch() {
 				}
 			} else if c != nil && r.reqid == 0 && c.active {
 				// the grantor failed when a commit re-ran it, so the connection ends
-				s.queue(c, frame{view: &viewChange{end: mpEncode([]any{"end", "error", r.errmsg})}})
+				end := mpEncode([]any{"end", endGrantorFailed, r.errmsg})
+				s.queue(c, frame{view: &viewChange{end: end}})
 				c.active = false
 			}
 			s.mu.Unlock()
@@ -837,7 +847,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 		flusher.Flush()
 		if overflowed {
-			write(mpEncode([]any{"end", "overflow", "connection could not keep up"}))
+			write(mpEncode([]any{"end", endOverflow, "connection could not keep up"}))
 		}
 		return !ended
 	}
@@ -846,7 +856,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	replay := func(from, to uint64) bool {
 		items, err := s.core.readLog(from, to)
 		if err != nil {
-			write(mpEncode([]any{"end", "error", err.Error()}))
+			write(mpEncode([]any{"end", endReadFailed, err.Error()}))
 			return false
 		}
 		for _, edits := range groupPositions(items) {
