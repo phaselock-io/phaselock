@@ -2125,6 +2125,70 @@ func TestAVouchNeverOvertakesAnEditItCovers(t *testing.T) {
 	}
 }
 
+// a commit takes one place in a connection's backlog, however many mutations it carries
+func TestACommitOfMoreMutationsThanTheBacklogHoldsKeepsItsConnection(t *testing.T) {
+	h := startWith(t, t.Context(), Options{MaxStreamBacklog: 1})
+	admin := h.admin()
+	s := h.connect(admin, -1)
+	s.live()
+
+	// one request's mutations commit together, each in its own edits frame
+	outs := h.mutations(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"),
+		mut("c2", "add-patron", "id", "p2", "name", "Bob"),
+		mut("c3", "add-patron", "id", "p3", "name", "Cy"))
+	for _, o := range outs {
+		if at := edits(s.nextTagged("edits"))[0].position; at != o.position {
+			t.Fatalf("expected the edits at %d, got %d", o.position, at)
+		}
+	}
+
+	// the connection is still live
+	pos := h.accept(admin, mut("c4", "rename-patron", "id", "p1", "name", "Anne"))
+	if at := edits(s.nextTagged("edits"))[0].position; at != pos {
+		t.Fatalf("expected the edits at %d, got %d", pos, at)
+	}
+}
+
+// a connection whose backlog is full when a commit comes ends with an overflow, after what was
+// queued before it, and the commits after it pass the connection by
+func TestAConnectionThatCannotKeepUpEndsWithAnOverflow(t *testing.T) {
+	// the connection is held as it wakes for the commit it is armed for, before it takes its backlog
+	var armed atomic.Bool
+	held := make(chan struct{})
+	release := make(chan struct{})
+	h := startWith(t, t.Context(), Options{MaxStreamBacklog: 1, beforeForward: func() {
+		if armed.CompareAndSwap(true, false) {
+			held <- struct{}{}
+			<-release
+		}
+	}})
+	free := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(free)
+	admin := h.admin()
+	s := h.connect(admin, -1)
+	s.live()
+
+	// while the connection is held with one commit in its backlog, the next overflows it, and the
+	// one after that finds it ended
+	armed.Store(true)
+	first := h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	<-held
+	h.accept(admin, mut("c2", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, mut("c3", "add-patron", "id", "p3", "name", "Cy"))
+	free()
+
+	// the connection sends the first commit's edits, then the overflow
+	if at := edits(s.nextTagged("edits"))[0].position; at != first {
+		t.Fatalf("expected the edits at %d, got %d", first, at)
+	}
+	if f := s.nextTagged("end"); f[1] != "overflow" {
+		t.Fatalf("expected an overflow, got %v", f)
+	}
+
+	// the server goes on
+	h.accept(admin, mut("c4", "add-patron", "id", "p4", "name", "Di"))
+}
+
 // a view change reaches the client ahead of the edits of the commit that caused it, even when the
 // view changes while the connection switches from its replay to streaming
 func TestAViewFrameLeadsTheEditsItGrantsIntoStreaming(t *testing.T) {

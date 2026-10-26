@@ -4,6 +4,7 @@ package main
 // core's results out to connections.
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -52,15 +53,20 @@ type Options struct {
 	// the page cache of each of the store's SQLite connections, the writer's and the reader's, in
 	// MiB (default 64)
 	SqliteCacheSize int
+	// the most commits and view changes a /stream connection may have queued and unsent before it
+	// is dropped (default 2048)
+	MaxStreamBacklog int
 
 	// tests only: the clock tokens and their keys are minted and checked by, time.Now when nil
 	now func() time.Time
 	// tests only: the interval between a connection's heartbeat vouches, heartbeat when zero
 	heartbeat time.Duration
 	// tests only: called by the dispatcher with a commit's position before it pushes the commit's
-	// frames, and by a connection once its cold catchup is done, before it switches to streaming
+	// frames, by a connection once its cold catchup is done, before it switches to streaming, and
+	// by a streaming connection woken by its backlog, before it takes the backlog
 	beforePush      func(position uint64)
 	beforeStreaming func()
+	beforeForward   func()
 }
 
 type Server struct {
@@ -81,6 +87,8 @@ type Server struct {
 	maxMutations, maxAnonymousMutations int
 	// the path every route is under, "" for the root
 	pathPrefix string
+	// the most frames a streaming connection's backlog may hold
+	maxStreamBacklog int
 
 	mu       sync.Mutex
 	pending  map[uint64]chan result
@@ -103,13 +111,16 @@ type Server struct {
 	// tests only: see Options
 	beforePush      func(position uint64)
 	beforeStreaming func()
+	beforeForward   func()
 }
 
 // conn is one connection.  Its view is what the grantor allows cut down to what it wants, and its
-// token the hash of that set.  The dispatcher is the only goroutine that writes the view and sends
-// on out; the handler is the only receiver.  Commit frames are pushed only once the handler has
-// finished its cold catchup and flipped streaming, so a long replay buffers nothing; the hot
-// catchup then covers the gap and the channel is deduped by position.
+// token the hash of that set.  The dispatcher is the only goroutine that writes the view and
+// queues frames on the backlog; the handler is the only one that takes them, and both do so under
+// the server's lock.  Commit frames are queued only once the handler has finished its cold catchup
+// and flipped streaming, so a long replay buffers nothing; the hot catchup then covers the gap and
+// the backlog is deduped by position.  The backlog grows as frames are queued, up to the server's
+// limit, and the handler takes it whole, so an idle connection holds none.
 type conn struct {
 	id        uint64
 	wants     []string
@@ -118,20 +129,36 @@ type conn struct {
 	active    bool
 	ephemeral bool
 	streaming bool
-	out       chan frame
+	backlog   []frame
+	// whether the backlog reached its limit, or the server shut down; either ends the connection
+	// once the handler has written what was queued before it
+	overflowed, shutdown bool
+	// signaled, without blocking, when a frame is queued or the connection ends
+	wake chan struct{}
 }
 
-// frame is one queued wire frame with the log position it carries.  A view frame carries the view
-// and, as its position, the one the dispatcher had published before the batch that changed it;
-// the handler encodes it as it writes it (see viewFrame).  Any other frame carries its encoded
-// data.
+// frame is one queued frame: a commit whose edits the connection's view covers some of, or a
+// change of the view.
 type frame struct {
+	commit *commit
+	view   *viewChange
+}
+
+// commit is one commit's edits, each mutation's in a run of their own, in position order.  It is
+// shared by every connection it is queued to, and read only: each handler writes the edits its
+// view covers as it takes the commit from its backlog.
+type commit struct {
+	mutations [][]item
+}
+
+// viewChange is a view frame, which carries the view and, as its position, the one the dispatcher
+// had published before the batch that changed it; the handler encodes it as it writes it (see
+// viewFrame).  A grantor that failed queues the encoded end frame in its place.
+type viewChange struct {
 	pos       uint64
-	view      bool
-	end       bool // the connection's last frame
 	token     string
 	selectors []string
-	data      []byte
+	end       []byte
 }
 
 // viewFrame encodes a view frame at a position.  A view frame's position is the last position the
@@ -229,6 +256,10 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 	if maxAnonymous <= 0 {
 		maxAnonymous = 8
 	}
+	maxStreamBacklog := o.MaxStreamBacklog
+	if maxStreamBacklog <= 0 {
+		maxStreamBacklog = 2048
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Server{
 		ctx:                   ctx,
@@ -243,6 +274,7 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 		pathPrefix:            o.PathPrefix,
 		maxMutations:          maxMutations,
 		maxAnonymousMutations: min(maxAnonymous, maxMutations),
+		maxStreamBacklog:      maxStreamBacklog,
 		epoch:                 c.epoch(),
 		pending:               map[uint64]chan result{},
 		conns:                 map[uint64]*conn{},
@@ -252,6 +284,7 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 		cronDone:              make(chan struct{}),
 		beforePush:            o.beforePush,
 		beforeStreaming:       o.beforeStreaming,
+		beforeForward:         o.beforeForward,
 	}
 	go s.dispatch()
 
@@ -363,8 +396,9 @@ func (s *Server) dispatch() {
 			s.mu.Lock()
 			for _, c := range s.conns {
 				if c.active {
-					close(c.out)
 					c.active = false
+					c.shutdown = true
+					wake(c)
 				}
 			}
 			s.mu.Unlock()
@@ -388,12 +422,12 @@ func (s *Server) dispatch() {
 				} else if c.active && changed {
 					// a grant change that left this view as it was is no frame; one that did comes
 					// ahead of its batch's edits, at the position published before the batch
-					s.send(c, frame{pos: s.position.Load(), view: true, token: token, selectors: view})
+					s.queue(c, frame{view: &viewChange{pos: s.position.Load(), token: token,
+						selectors: view}})
 				}
 			} else if c != nil && r.reqid == 0 && c.active {
 				// the grantor failed when a commit re-ran it, so the connection ends
-				s.send(c, frame{pos: r.position, view: true, end: true,
-					data: mpEncode([]any{"end", "error", r.errmsg})})
+				s.queue(c, frame{view: &viewChange{end: mpEncode([]any{"end", "error", r.errmsg})}})
 				c.active = false
 			}
 			s.mu.Unlock()
@@ -404,19 +438,17 @@ func (s *Server) dispatch() {
 			if s.beforePush != nil {
 				s.beforePush(r.position)
 			}
-			mutations := groupPositions(r.items)
+			// the commit, queued once to every streaming connection whose view covers any of it
+			var cm *commit
 			s.mu.Lock()
 			for _, c := range s.conns {
-				if !c.active || !c.streaming {
+				if !c.active || !c.streaming || !coversAny(c.selectors, r.items) {
 					continue
 				}
-				for _, edits := range mutations {
-					if f := editsFrame(edits, c.selectors); f != nil {
-						// the mutation's own position: the connection's loop drops frames at or
-						// below its cursor, and a commit may carry several mutations
-						s.send(c, frame{pos: edits[0].position, data: f})
-					}
+				if cm == nil {
+					cm = &commit{mutations: groupPositions(r.items)}
 				}
+				s.queue(c, frame{commit: cm})
 			}
 
 			/* Publish the position once every streaming connection holds the commit's frames, and
@@ -439,13 +471,26 @@ func (s *Server) reply(r result) {
 	}
 }
 
-// send queues a frame; a live connection that cannot keep up is closed.
-func (s *Server) send(c *conn, f frame) {
-	select {
-	case c.out <- f:
-	default:
-		close(c.out)
+// queue adds a frame to a connection's backlog, under the server's lock, and wakes its handler.  A
+// live connection that cannot keep up, whose backlog is at the limit, ends instead, and a
+// connection that has ended takes no more frames.
+func (s *Server) queue(c *conn, f frame) {
+	if !c.active {
+		return
+	}
+	if len(c.backlog) >= s.maxStreamBacklog {
+		c.overflowed = true
 		c.active = false
+	} else {
+		c.backlog = append(c.backlog, f)
+	}
+	wake(c)
+}
+
+func wake(c *conn) {
+	select {
+	case c.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -541,22 +586,40 @@ func segmentChar(c rune) bool {
 // editsFrame encodes ["edits", [edit...]] for the edits of one mutation that are in the view, or
 // nil when none are.
 func editsFrame(edits []item, selectors []string) []byte {
-	var vis []item
-	for _, it := range edits {
-		if covers(selectors, it.slice) {
-			vis = append(vis, it)
-		}
-	}
-	if len(vis) == 0 {
+	var b bytes.Buffer
+	if sent, _ := writeEditsFrame(&b, edits, selectors); !sent {
 		return nil
 	}
-	b := mpArrayHeader(nil, 2)
-	b = mpAppendStr(b, "edits")
-	b = mpArrayHeader(b, len(vis))
-	for _, it := range vis {
-		b = append(b, it.data...)
+	return b.Bytes()
+}
+
+// writeEditsFrame writes the edits frame of one mutation's edits that are in the view, each edit's
+// bytes as they are, and nothing when none are; it answers whether it wrote a frame.
+func writeEditsFrame(w io.Writer, edits []item, selectors []string) (bool, error) {
+	n := 0
+	for _, it := range edits {
+		if covers(selectors, it.slice) {
+			n++
+		}
 	}
-	return b
+	if n == 0 {
+		return false, nil
+	}
+	head := mpArrayHeader(nil, 2)
+	head = mpAppendStr(head, "edits")
+	head = mpArrayHeader(head, n)
+	if _, err := w.Write(head); err != nil {
+		return false, err
+	}
+	for _, it := range edits {
+		if !covers(selectors, it.slice) {
+			continue
+		}
+		if _, err := w.Write(it.data); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // views ////////////////////////////////////////////////////////////////////
@@ -604,7 +667,7 @@ func (s *Server) view(p principal, wants []string, ephemeral bool) (*conn, resul
 		id:        s.nextConn.Add(1),
 		wants:     wants,
 		ephemeral: ephemeral,
-		out:       make(chan frame, 1024),
+		wake:      make(chan struct{}, 1),
 	}
 	s.mu.Lock()
 	s.conns[c.id] = c
@@ -724,35 +787,59 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// writes a queued view frame at the cursor, or the end frame a failed grantor queues
-	writeView := func(f frame) bool {
-		if f.end {
-			write(f.data)
+	writeView := func(v *viewChange) bool {
+		if v.end != nil {
+			write(v.end)
 			return false
 		}
-		return write(viewFrame(f.token, max(f.pos, cursor), f.selectors))
+		return write(viewFrame(v.token, max(v.pos, cursor), v.selectors))
 	}
 
-	// forwards queued view frames, updating the handler's selectors; returns false when the connection
-	// is gone
-	drainViews := func() bool {
-		for {
-			select {
-			case f, ok := <-c.out:
-				if !ok {
+	// takes the backlog whole, under the server's lock, with whether the connection has ended, by
+	// overflowing its backlog or with the server
+	takeLocked := func() (queued []frame, overflowed, ended bool) {
+		queued, c.backlog = c.backlog, nil
+		return queued, c.overflowed, c.overflowed || c.shutdown
+	}
+	take := func() ([]frame, bool, bool) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return takeLocked()
+	}
+
+	/* forward writes frames taken from the backlog, then the end of a connection that has ended.
+	   A view frame sets the selectors the commits queued after it are filtered by, which are the
+	   ones the dispatcher checked them against, and a commit's edits frames advance the cursor.
+	   Returns false when the connection is done. */
+	forward := func(queued []frame, overflowed, ended bool) bool {
+		for _, f := range queued {
+			if f.view != nil {
+				if !writeView(f.view) {
 					return false
 				}
-				if f.view {
-					s.mu.Lock()
-					selectors = append([]string(nil), c.selectors...)
-					s.mu.Unlock()
-					if !writeView(f) {
-						return false
-					}
+				selectors = f.view.selectors
+				continue
+			}
+			for _, edits := range f.commit.mutations {
+				// the mutation's own position: a commit may carry several mutations, and the hot
+				// catchup sent those at or below the cursor
+				if edits[0].position <= cursor {
+					continue
 				}
-			default:
-				return true
+				sent, err := writeEditsFrame(w, edits, selectors)
+				if err != nil {
+					return false
+				}
+				if sent {
+					cursor = edits[0].position
+				}
 			}
 		}
+		flusher.Flush()
+		if overflowed {
+			write(mpEncode([]any{"end", "overflow", "connection could not keep up"}))
+		}
+		return !ended
 	}
 	// the last position the client has been told of, by an edits frame or a vouch
 	told := cursor
@@ -776,9 +863,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return true
 	}
 
-	// cold catchup: unbuffered, as long as it takes
+	// cold catchup: unbuffered, as long as it takes, with the view frames queued meanwhile, the only
+	// frames queued before the switch to streaming
 	for {
-		if !drainViews() {
+		if !forward(take()) {
 			return
 		}
 		before := cursor
@@ -806,17 +894,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	c.streaming = true
 	hot := s.position.Load()
 	selectors = append([]string(nil), c.selectors...)
-	// the queue holds only view frames until the switch, since the dispatcher pushes commits to
+	// the backlog holds only view frames until the switch, since the dispatcher queues commits to
 	// streaming connections alone, and it queues only under the lock
-	views := len(c.out)
+	views, overflowed, ended := takeLocked()
 	s.mu.Unlock()
 
 	// the view frames queued before the switch, whose selectors the hot catchup replays under, go
 	// ahead of it
-	for range views {
-		if !writeView(<-c.out) {
-			return
-		}
+	if !forward(views, overflowed, ended) {
+		return
 	}
 
 	// the hot catchup
@@ -828,43 +914,26 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// forward writes a frame from the queue, its edits advancing the cursor; returns false when the
-	// connection is done
-	forward := func(f frame, ok bool) bool {
-		if !ok {
-			write(mpEncode([]any{"end", "overflow", "connection could not keep up"}))
-			return false
-		}
-		if !f.view && f.pos <= cursor {
-			return true
-		}
-		if f.view {
-			return writeView(f)
-		}
-		cursor = f.pos
-		return write(f.data) && !f.end
-	}
-
 	ticker := time.NewTicker(s.heartbeat)
 	defer ticker.Stop()
 	for {
 		select {
-		case f, ok := <-c.out:
-			if !forward(f, ok) {
+		case <-c.wake:
+			if s.beforeForward != nil {
+				s.beforeForward()
+			}
+			if !forward(take()) {
 				return
 			}
 		case <-ticker.C:
 			/* The vouch names the cursor, so it never runs ahead of an edits frame still queued.
-			   Every commit the dispatcher has published already has its frames queued, so
-			   forwarding the queue as it stands brings the cursor up to the published position,
-			   and a submitter whose mutation touched no slice it can see gets its position on
-			   this heartbeat. */
+			   Every commit the dispatcher has published is already in the backlog, so forwarding
+			   the backlog as it stands brings the cursor up to the published position, and a
+			   submitter whose mutation touched no slice it can see gets its position on this
+			   heartbeat. */
 			published := s.position.Load()
-			for n := len(c.out); n > 0; n-- {
-				f, ok := <-c.out
-				if !forward(f, ok) {
-					return
-				}
+			if !forward(take()) {
+				return
 			}
 			cursor = max(cursor, published)
 			if !write(mpEncode([]any{"vouch", cursor})) {
@@ -1048,6 +1117,16 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 func covers(selectors []string, selector string) bool {
 	for _, r := range selectors {
 		if matches(selector, r) {
+			return true
+		}
+	}
+	return false
+}
+
+// coversAny reports whether the selectors cover the slice of any of the edits.
+func coversAny(selectors []string, edits []item) bool {
+	for _, it := range edits {
+		if covers(selectors, it.slice) {
 			return true
 		}
 	}

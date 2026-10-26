@@ -369,6 +369,17 @@ Every frame is an array whose first element is a tag.
   registers its grant up front, replays from the log unbuffered, then
   starts receiving live commits and replays the small gap up to the
   first one, deduplicating by position.
+- Live, a connection's backlog holds what the dispatcher has queued
+  for it and its handler has not yet written: once, each commit its
+  view covers any of, however many mutations it carries, and each
+  view change.  A queued commit is the commit's edits as the core
+  handed them over, shared by every connection it is queued to, and
+  each handler filters it by its own view as it writes it.  The
+  backlog grows as frames are queued, so an idle connection holds
+  none, up to `--max-stream-backlog` frames, 2048 by default.  A
+  connection whose backlog is full when a frame comes gets the frames
+  queued before it, then `["end", "overflow", reason]`, and is closed;
+  its client reconnects from its cursor.
 - Every deletion keeps at least the last edit of every slice, even
   deleted slices, whose last edit is a death.  With that floor a
   replay from any checkpoint introduces every slice born since (its
