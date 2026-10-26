@@ -27,6 +27,8 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "serve HTTPS with the certificate in this PEM file, "+
 		"reloaded when the file changes; requires --tls-key")
 	tlsKey := flag.String("tls-key", "", "the private key of --tls-cert, in a PEM file")
+	sqliteCacheSize := flag.Int("sqlite-cache-size", 64,
+		"the page cache of each of the database's SQLite connections, in MiB")
 	var bootstrapEnv []string
 	flag.Func("bootstrap-env", "an environment variable the bundle's bootstrap may read (repeatable)", func(name string) error {
 		bootstrapEnv = append(bootstrapEnv, name)
@@ -58,7 +60,7 @@ func main() {
 
 	srv, err := Open(ctx, Options{DataDir: *data, Bundle: *bundle, DevAuth: *devAuth, BootstrapEnv: bootstrapEnv,
 		ClientIPHeader: *clientIPHeader, MaxMutations: *maxMutations, MaxAnonymousMutations: *maxAnonymousMutations,
-		PathPrefix: *pathPrefix})
+		PathPrefix: *pathPrefix, SqliteCacheSize: *sqliteCacheSize})
 	if err != nil {
 		log.Fatal(err)
 	}

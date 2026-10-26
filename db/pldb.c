@@ -1384,8 +1384,8 @@ static int load_cron(pldb *db, char *err, size_t errlen) {
 }
 
 int pldb_open(const char *dir, const char *host, size_t hostlen, const char *bundle,
-              pldb_hash_fn hasher, const char *const *env, int nenv, pldb **out, char *err,
-              size_t errlen) {
+              pldb_hash_fn hasher, const char *const *env, int nenv, int cache_mib, pldb **out,
+              char *err, size_t errlen) {
     pldb *db = xmalloc(sizeof *db);
     memset(db, 0, sizeof *db);
     db->dir = xstrdup(dir);
@@ -1402,7 +1402,8 @@ int pldb_open(const char *dir, const char *host, size_t hostlen, const char *bun
     }
     char path[2048];
     snprintf(path, sizeof path, "%s/pldb.sqlite", dir);
-    if (store_open(path, true, &db->w, err, errlen) || store_open(path, false, &db->r, err, errlen)) {
+    if (store_open(path, true, cache_mib, &db->w, err, errlen) ||
+        store_open(path, false, cache_mib, &db->r, err, errlen)) {
         pldb_close(db);
         return -1;
     }

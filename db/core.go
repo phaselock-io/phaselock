@@ -107,8 +107,9 @@ const (
 
 func bytesReader(b []byte) *bytes.Reader { return bytes.NewReader(b) }
 
-// openCore opens the core; on an empty log, its bootstrap may read the env variables named
-func openCore(dir, bundle string, env []string) (*core, error) {
+// openCore opens the core with a page cache of cacheMiB for each SQLite connection; on an empty
+// log, its bootstrap may read the env variables named
+func openCore(dir, bundle string, env []string, cacheMiB int) (*core, error) {
 	cdir, cbundle := C.CString(dir), C.CString(bundle)
 	defer C.free(unsafe.Pointer(cdir))
 	defer C.free(unsafe.Pointer(cbundle))
@@ -118,8 +119,8 @@ func openCore(dir, bundle string, env []string) (*core, error) {
 	errbuf := make([]byte, 2048)
 	chost := C.CString(hostJS)
 	defer C.free(unsafe.Pointer(chost))
-	rc := C.pldb_open(cdir, chost, C.size_t(len(hostJS)), cbundle, C.pldb_go_hasher(), cenv, C.int(len(env)), &db,
-		(*C.char)(unsafe.Pointer(&errbuf[0])), C.size_t(len(errbuf)))
+	rc := C.pldb_open(cdir, chost, C.size_t(len(hostJS)), cbundle, C.pldb_go_hasher(), cenv, C.int(len(env)),
+		C.int(cacheMiB), &db, (*C.char)(unsafe.Pointer(&errbuf[0])), C.size_t(len(errbuf)))
 	if rc != 0 {
 		return nil, errors.New(cstr(errbuf))
 	}

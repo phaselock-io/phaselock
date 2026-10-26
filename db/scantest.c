@@ -18,7 +18,7 @@ pldb_scantest *pldb_scantest_open(const char *host, size_t hostlen, const char *
                                   const char *path, int budget, char *err, size_t errlen) {
     pldb_scantest *t = xmalloc(sizeof *t);
     memset(t, 0, sizeof *t);
-    if (store_open(path, true, &t->st, err, errlen)) {
+    if (store_open(path, true, 0, &t->st, err, errlen)) {
         free(t);
         return NULL;
     }

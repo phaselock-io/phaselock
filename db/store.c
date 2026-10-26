@@ -43,7 +43,8 @@ static int prep(store *s, sqlite3_stmt **out, const char *sql) {
     return 0;
 }
 
-int store_open(const char *path, bool writer, store **out, char *err, size_t errlen) {
+int store_open(const char *path, bool writer, int cache_mib, store **out, char *err,
+               size_t errlen) {
     store *s = xmalloc(sizeof *s);
     memset(s, 0, sizeof *s);
     int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
@@ -58,6 +59,18 @@ int store_open(const char *path, bool writer, store **out, char *err, size_t err
         store_close(s);
         return -1;
     }
+
+    // the page cache, which SQLite sizes in KiB when the size is negative
+    if (cache_mib > 0) {
+        char pragma[64];
+        snprintf(pragma, sizeof pragma, "PRAGMA cache_size=-%lld;", (long long)cache_mib * 1024);
+        if (store_exec(s, pragma) != 0) {
+            snprintf(err, errlen, "%s", s->err);
+            store_close(s);
+            return -1;
+        }
+    }
+
     /* the upper bound of a prefix range is bound by the caller as ?2 */
     int rc = prep(s, &s->get, "SELECT value FROM kv WHERE key = ?1") ||
              prep(s, &s->set, "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)") ||

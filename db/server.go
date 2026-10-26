@@ -49,6 +49,9 @@ type Options struct {
 	// the path every route is under, such as /phaselock, so an origin the database shares with an
 	// app routes one prefix to it; "" puts the routes at the root
 	PathPrefix string
+	// the page cache of each of the store's SQLite connections, the writer's and the reader's, in
+	// MiB (default 64)
+	SqliteCacheSize int
 
 	// tests only: the clock tokens and their keys are minted and checked by, time.Now when nil
 	now func() time.Time
@@ -163,10 +166,21 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 	if err := checkPathPrefix(o.PathPrefix); err != nil {
 		return nil, err
 	}
+
+	// the page cache's size, which SQLite takes in KiB as a C int
+	cacheMiB := o.SqliteCacheSize
+	if cacheMiB <= 0 {
+		cacheMiB = 64
+	}
+	if cacheMiB > math.MaxInt32/1024 {
+		return nil, fmt.Errorf("sqlite cache size %d MiB is over the most SQLite takes, %d MiB",
+			cacheMiB, math.MaxInt32/1024)
+	}
+
 	if err := os.MkdirAll(o.DataDir, 0o755); err != nil {
 		return nil, err
 	}
-	c, err := openCore(o.DataDir, o.Bundle, o.BootstrapEnv)
+	c, err := openCore(o.DataDir, o.Bundle, o.BootstrapEnv, cacheMiB)
 	if err != nil {
 		return nil, err
 	}

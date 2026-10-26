@@ -86,7 +86,10 @@ plan above take precedence over it.
   Go-owned and decode their own small request bodies.
 - SQLite for everything in C: the log, the KV store, the series
   table, the slices table.  One write transaction per group commit,
-  WAL mode, synchronous=FULL.
+  WAL mode, synchronous=FULL.  Each connection, the writer's and the
+  reader's, has a page cache of `--sqlite-cache-size` MiB, 64 by
+  default: at SQLite's own 2 MiB, a large group commit spills pages to
+  the WAL before it commits and reads them back.
 - Threads in C: the txn loop (owns QuickJS, SQLite writer connection,
   grant registrations); a results pop thread on the Go side that
   blocks in one cgo call; a reader thread with its own SQLite

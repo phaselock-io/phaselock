@@ -50,9 +50,11 @@ uint64_t pl_fnv1a(const void *data, size_t len, uint64_t h);
    writes, a birth clears the slice first, and a death clears it and writes nothing */
 enum { EDIT_NORMAL = 0, EDIT_BIRTH = 1, EDIT_DEATH = 2 };
 
-/* store.c: one SQLite connection */
+/* store.c: one SQLite connection, with a page cache of cache_mib MiB, or SQLite's own default
+   size for 0 */
 typedef struct store store;
-int store_open(const char *path, bool writer, store **out, char *err, size_t errlen);
+int store_open(const char *path, bool writer, int cache_mib, store **out, char *err,
+               size_t errlen);
 void store_close(store *s);
 const char *store_err(store *s);
 int store_exec(store *s, const char *sql);

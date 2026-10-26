@@ -65,10 +65,11 @@ enum {
 typedef int (*pldb_hash_fn)(uintptr_t arg, const char *pw, size_t pwlen, char *out, size_t cap);
 
 /* host is the JS host's source, host.js, which the Go layer embeds; env names the variables the
-   bundle's bootstrap may read; on an empty log, open runs it. */
+   bundle's bootstrap may read; on an empty log, open runs it.  cache_mib is the page cache of
+   each SQLite connection, the writer's and the reader's, in MiB. */
 int pldb_open(const char *dir, const char *host, size_t hostlen, const char *bundle,
-              pldb_hash_fn hasher, const char *const *env, int nenv, pldb **out, char *err,
-              size_t errlen);
+              pldb_hash_fn hasher, const char *const *env, int nenv, int cache_mib, pldb **out,
+              char *err, size_t errlen);
 void pldb_close(pldb *db);
 /* the id of this log instance; positions mean nothing across epochs */
 const char *pldb_epoch(pldb *db);

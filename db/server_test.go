@@ -3333,6 +3333,12 @@ func TestAListClientIPHeaderIsRefused(t *testing.T) {
 	}
 }
 
+func TestASqliteCacheSizeOverWhatSQLiteTakesIsRefused(t *testing.T) {
+	if _, err := Open(t.Context(), Options{DataDir: t.TempDir(), SqliteCacheSize: 1 << 21}); err == nil {
+		t.Fatal("accepted")
+	}
+}
+
 func TestIntakeHashingIsRateLimitedPerClient(t *testing.T) {
 	h := startWith(t, t.Context(), Options{AuthBurst: 1, AuthRate: 0.001})
 	h.accept("", mut("c1", "create-account", "user", "ann", "password", "hunter2"))
