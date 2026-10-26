@@ -295,6 +295,7 @@ describe('P17: a backfill whose snapshot starts over reads its tail again, and a
     expect(calls.length).toBe(2);
     expect(calls[1].backfill.until).toBe(11);
     expect(calls[1].backfill.resume).toBeNull();
+    expect(r.data()['!backfill-seqs:patron:p1']).toBeUndefined();
     expect(state(r.data(), 'patron:p1')).toEqual({ count: 2, fields: {} });
 
     // the fresh blob is cut at 13, past the second gap

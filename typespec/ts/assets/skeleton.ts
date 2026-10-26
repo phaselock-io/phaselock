@@ -4150,6 +4150,7 @@ export class Engine<QX, PX, M, N = never> {
   #restartIn(txn: WTxn, selector: string): void {
     const entry = this.#backfills.get(selector)!;
     txn.delPrefix(`!park-snap:${selector}!`);
+    txn.del(`!backfill-seqs:${selector}`);
     entry.record.resume = null;
     entry.status = 'downloading';
     entry.attempts = 0;
@@ -4442,9 +4443,14 @@ export class Engine<QX, PX, M, N = never> {
         if (!this.#outbox.has(id)) return;
 
         if (r.kind === 'ok') {
-          // the mutation was decided by a position; it leaves once the base has applied through it
-          this.#acked.set(id, r.position);
-          if (r.position <= this.#applied) drop.push(id);
+          /* The mutation was decided by a position, and leaves once the base has applied through
+             it.  A mutation can be answered twice: one whose answer did not arrive is resent on the
+             next connection, and the database answers a resend it already decided at its head, so
+             the first call's answer, arriving late, is the lower one.  Every answer bounds the
+             decision from above, so the lowest is the closest. */
+          const position = Math.min(r.position, this.#acked.get(id) ?? r.position);
+          this.#acked.set(id, position);
+          if (position <= this.#applied) drop.push(id);
         } else {
           // a reject or a conflict is final
           drop.push(id);

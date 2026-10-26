@@ -345,10 +345,17 @@ Every frame is an array whose first element is a tag.
   position are the client's backfills' to deliver, which tail through
   it.  Live, that is the end of the batch before the one that changed
   the view, whose edits the new view filters; in a replay, it is how
-  far the replay has read.  A grantor runs once per group commit, after
-  all of it, so a view changes only at a batch's end, and every edit in
-  the batch that changed it is filtered by the new view: a client may
-  briefly show a slice before the data that grants it.
+  far the replay has read.  The easy mistake is to take the position
+  of the last frame the connection was sent: live, that lags every
+  commit the old view could not see, and a backfill's tail ending there
+  skips the new view's edits in those commits.  A snapshot cut fresh,
+  past them, hides the gap, and one cut earlier, from a cache, leaves
+  a slice born there missing until its next edit
+  (`TestALiveViewFramesPositionPassesCommitsTheOldViewCouldNotSee`).
+  A grantor runs once per group commit, after all of it, so a view
+  changes only at a batch's end, and every edit in the batch that
+  changed it is filtered by the new view: a client may briefly show a
+  slice before the data that grants it.
 - A bootstrap splits the log at the view's position V.  Once the
   client has processed the bootstrap's view frame at V, its cursor is
   V, so a reconnect presents `since=V`; the backfills cover every
@@ -411,7 +418,15 @@ Every frame is an array whose first element is a tag.
   token and the position it is the view at, and when the presented
   token is not current the first frame of the body is the view frame,
   ahead of any history.  Every later change is a view frame in log
-  order, ahead of the edits of the group commit that caused it.  History
+  order, ahead of the edits of the group commit that caused it.  A
+  connection that registers in the group commit that changes its grant
+  is answered with the view as of the batch's end, in one answer: one
+  built at the registration, from before the batch's writes, would race
+  the re-run grantor's answer and could leave the connection streaming
+  under the old view while the core counts it current
+  (`TestARegistrationInTheBatchThatGrantsItASliceGetsTheSlice`,
+  `TestARegistrationInTheBatchThatRevokesASliceNeverGetsItsEdits`).
+  History
   from `since` is replayed under the current view, so a client's held
   set at its checkpoint plus the replay is complete whatever happened
   in between: a family revoked and regranted while the client was
@@ -515,6 +530,25 @@ Every frame is an array whose first element is a tag.
   3xx redirect because many HTTP clients follow redirects themselves
   and expose only the final response's headers, which would lose the
   origin's.
+- Cuts never go backwards: for each selector, the database never answers
+  `/snapshot` with a cut older than one it has answered before.  The
+  origin answers every request itself (`/snapshot` is `no-store`, and
+  only the immutable blob behind a pointer is cached), so the rule is
+  about which blob the origin chooses: when the newest blob for a
+  selector is missing, the answer is `stale` or a fresh cut, never an
+  older blob, and the newest is never deleted while older ones remain.
+  A deployment with several origin servers must hold the rule across
+  all of them, reading the newest blob for a selector consistently
+  rather than from whichever replica answers.  Why it matters: a
+  backfill that starts its snapshot over, after `stale` or after a
+  failure before any page was parked, keeps the tail it already parked
+  and resumes its tail from where that tail reached, or from the new
+  cut if that is later.  A new cut older than the previous attempt's
+  leaves the positions between the two covered by neither the blob nor
+  the tail, so a slice that changed only there stays stale on the
+  client until its next edit.  Relaxing the rule means resetting the
+  tail's floor to the new cut and reading that stretch again, in the
+  Engine's `#parkPushIn` and its `stale` handling, and P17 with them.
 - `/edits` is the tail read behind a snapshot: load the blob, then
   read the selector forward from the blob's position up to the
   backfill's `until`, apply, and unpark.  Both bounds are exclusive:
@@ -752,6 +786,18 @@ Convergence:
 - P18.  Every state queries show of the base is the server's state at one
   position, for the slices the client holds: each held slice's last
   birth's writes and the normal edits after it through that position.
+  Erasure is retroactive, and P18 and P22 hold of the log as the client
+  reads it, not as it stood before the erasure: a client replaying
+  across a slice's erased edits sees frames without them, its other
+  slices' edits applying while the erased slice keeps the state it
+  held until the slice's surviving death arrives; and a client in the
+  middle of a replay when the erasure commits gets no more of that
+  slice's edits, so the slice shows stale until the replay reaches the
+  death.  Only a replaying client is touched, and the death resets the
+  slice when it arrives, so this is accepted rather than guarded
+  against.  A replay across a live slice's history that retention
+  pruned below its floor behaves the same way, until the slice's next
+  surviving edit shows the gap and its repair lands.
 - P19.  Once the client has received a live or vouch frame at the
   server's head, with no backfill in flight, every slice the view covers
   that is live at the server is held at its seq with its state, and no

@@ -2158,6 +2158,103 @@ func TestAStaleTokensViewFrameIsAtTheSincePresented(t *testing.T) {
 	}
 }
 
+// a live view frame's position is the last position before the batch that changed the view, past
+// commits the old view could not see, which no frame told the connection of: the new view's edits
+// at or below it are the backfill's, through its tail
+func TestALiveViewFramesPositionPassesCommitsTheOldViewCouldNotSee(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "add-patron", "id", "p2", "name", "Bob"))
+	s := h.connect(h.token("p1"), -1)
+	s.live()
+
+	// a commit the connection cannot see, then a lend that grants it a shelf
+	unseen := h.accept(admin, mut("c3", "rename-patron", "id", "p2", "name", "Robert"))
+	h.accept(admin, mut("c4", "lend", "branch", "x", "patron", "p1"))
+	f := s.nextTagged("view")
+	if asInt(f[2]) != unseen || !slices.Contains(strs(f[3]), "shelf:x") {
+		t.Fatalf("expected the view at %d granting shelf:x, got %v", unseen, f)
+	}
+}
+
+// together runs the calls with the core's batches held, each started once the one before it has
+// queued its request, so their requests land in one batch, in order; it answers once every call
+// has returned
+func (h *harness) together(calls ...func()) {
+	h.t.Helper()
+	h.srv.core.holdBatches(true)
+	var wg sync.WaitGroup
+	for i, call := range calls {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			call()
+		}()
+		deadline := time.Now().Add(5 * time.Second)
+		for h.srv.core.queued() < i+1 {
+			if time.Now().After(deadline) {
+				h.srv.core.holdBatches(false)
+				h.t.Fatalf("call %d queued no request", i)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	h.srv.core.holdBatches(false)
+	wg.Wait()
+}
+
+// a connection registered in the batch whose writes grant it a slice streams under the view as of
+// the batch's end, the slice included
+func TestARegistrationInTheBatchThatGrantsItASliceGetsTheSlice(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "add-book", "id", "b1", "title", "Dune"))
+
+	p1 := h.token("p1")
+	var s *connection
+	h.together(
+		func() { s = h.connect(p1, -1) },
+		func() { h.accept(admin, mut("c3", "lend", "branch", "x", "patron", "p1")) },
+	)
+	if f := s.first; f == nil || !slices.Contains(strs(f[3]), "shelf:x") {
+		t.Fatalf("expected the view granting shelf:x, got %v", f)
+	}
+	s.live()
+
+	// the shelf's edits flow
+	h.accept(admin, mut("c4", "shelve", "branch", "x", "book", "b1"))
+	if e := edits(s.nextTagged("edits"))[0]; e.slice != "shelf:x" {
+		t.Fatalf("expected the shelf's edit, got %+v", e)
+	}
+}
+
+// a connection registered in the batch whose writes revoke one of its slices streams under the view
+// as of the batch's end, and none of that slice's later edits reach it
+func TestARegistrationInTheBatchThatRevokesASliceNeverGetsItsEdits(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "add-book", "id", "b1", "title", "Dune"))
+	h.accept(admin, mut("c3", "lend", "branch", "x", "patron", "p1"))
+
+	p1 := h.token("p1")
+	var s *connection
+	h.together(
+		func() { s = h.connect(p1, -1) },
+		func() { h.accept(admin, mut("c4", "close-shelf", "branch", "x")) },
+	)
+	if f := s.first; f == nil || slices.Contains(strs(f[3]), "shelf:x") {
+		t.Fatalf("expected the view without shelf:x, got %v", f)
+	}
+	s.live()
+
+	// the shelf, written again with no lend, is no longer the patron's
+	h.accept(admin, mut("c5", "shelve", "branch", "x", "book", "b1"))
+	s.quiet()
+}
+
 func TestSliceByteCounters(t *testing.T) {
 	h := start(t)
 	admin := h.admin()

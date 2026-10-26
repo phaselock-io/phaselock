@@ -377,6 +377,18 @@ describe('sendMutations', () => {
     expect(ends()).toEqual([['end', 500, expect.stringContaining('mutations: 500')]]);
     await expect(send('e')).rejects.toThrow('the connection has ended');
     expect(seen.length).toBe(5);
+
+    // and a backfill on the ended connection is refused before any request
+    const requests = stub.requests.length;
+    const backfill = conn.backfill({
+      selector: 'patron:*',
+      until: 10,
+      resume: null,
+      signal: new AbortController().signal,
+      push: () => Promise.resolve(),
+    });
+    await expect(backfill).rejects.toThrow('the connection has ended');
+    expect(stub.requests.length).toBe(requests);
   });
 
   test('a 4xx is not retried', async () => {

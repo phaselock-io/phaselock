@@ -186,6 +186,11 @@ void pldb_free(void *p);
    string values converted under a type and past the write gate, and answers a scan request given
    as JSON with its batch as JSON, or with the message of what it threw and *failed set.  The
    caller frees the answer. */
+/* Tests only: while held, the transaction loop takes no batch, so the requests queued meanwhile
+   land in one when it is released; and how many requests are queued for the next batch. */
+void pldb_hold_batches(pldb *db, int hold);
+size_t pldb_queued(pldb *db);
+
 typedef struct pldb_scantest pldb_scantest;
 pldb_scantest *pldb_scantest_open(const char *host, size_t hostlen, const char *bundle,
                                   const char *path, int budget, char *err, size_t errlen);

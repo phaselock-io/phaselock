@@ -382,6 +382,41 @@ describe('predictions', () => {
 });
 
 describe('the applied position', () => {
+  test("a mutation answered twice, a late first answer and a resend's at the head, releases at the lower", async () => {
+    // a transport that lets an ended connection's call still answer
+    const server = new FakeServer();
+    const connect = server.connect.bind(server);
+    server.connect = (since, view, wants, signal, hooks, session) => {
+      const c = connect(since, view, wants, signal, hooks, session);
+      return { ...c, sendMutations: (mutations) => server.onSend(mutations) };
+    };
+    const r = rig({ server, predictor });
+    await bootstrap(r, ['patron:*'], { 'patron:*': patrons });
+    const calls = sendControl(server);
+    r.engine.sendMutation({ field: 'a', value: 1 });
+    await settle();
+
+    // the connection drops before the answer, and the next one resends the mutation
+    server.end();
+    r.engine.reconnectNow();
+    await settle();
+    server.open();
+    server.live(10);
+    await settle();
+    expect(calls.length).toBe(2);
+
+    // the first call's answer arrives late, at the position it was decided, then the resend's
+    calls[0].resolve([ok(12)]);
+    calls[1].resolve([ok(20)]);
+    await settle();
+    expect(outbox(r.data()).length).toBe(1);
+
+    // the base reaching the decision's position releases it
+    server.vouch(12);
+    await settle();
+    expect(outbox(r.data())).toEqual([]);
+  });
+
   test('a frame that breaks parks whole, a vouch while frozen, an ack already applied past, and the land', async () => {
     const r = await held();
     const w = watch(r, 'patron:p1');

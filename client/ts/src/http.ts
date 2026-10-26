@@ -398,6 +398,8 @@ class HTTPConnection implements Connection {
   }
 
   async backfill(b: Backfill): Promise<BackfillOutcome> {
+    if (this.#ended) throw new Error(`snapshot ${b.selector}: the connection has ended`);
+
     // when one download fails the other is pointless
     const sibling = new AbortController();
     const signal = AbortSignal.any([nativeSignal(b.signal), sibling.signal]);

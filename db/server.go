@@ -119,8 +119,9 @@ type conn struct {
 }
 
 // frame is one queued wire frame with the log position it carries.  A view frame carries the view
-// alone, and the handler encodes it as it writes it, at its own cursor (see viewFrame); any other
-// frame carries its encoded data.
+// and, as its position, the one the dispatcher had published before the batch that changed it;
+// the handler encodes it as it writes it (see viewFrame).  Any other frame carries its encoded
+// data.
 type frame struct {
 	pos       uint64
 	view      bool
@@ -130,14 +131,16 @@ type frame struct {
 	data      []byte
 }
 
-/*
-viewFrame encodes a view frame at the connection's cursor as it is written.  A view frame's
-
-	position is the last position the connection sent under the previous view: everything the
-	connection sends after the frame is filtered by the new view, and the new view's edits at or
-	below the position are the client's backfills' to deliver, through it.  The handler's cursor is
-	exactly that, live and in its replay, wherever the commit that changed the view lies.
-*/
+// viewFrame encodes a view frame at a position.  A view frame's position is the last position the
+// connection sent under the previous view: everything the connection sends after the frame is
+// filtered by the new view, and the new view's edits at or below the position are the client's
+// backfills' to deliver, through it.  The handler writes the later of its own cursor and the
+// position the dispatcher had published before the batch that changed the view.  Its cursor alone
+// would be wrong live: it moves only with the frames the connection is sent, so it lags commits
+// the old view could not see, and a backfill's tail ending there would skip the new view's edits
+// in them, a gap a fresh snapshot cut past them hides and an older cached one does not.  In a
+// replay the cursor is right on its own, since the replay moves it through every position it
+// reads, seen or not.
 func viewFrame(token string, cursor uint64, selectors []string) []byte {
 	return mpEncode([]any{"view", token, cursor, selectors})
 }
@@ -369,8 +372,9 @@ func (s *Server) dispatch() {
 						c.active = true
 					}
 				} else if c.active && changed {
-					// a grant change that left this view as it was is no frame
-					s.send(c, frame{pos: r.position, view: true, token: token, selectors: view})
+					// a grant change that left this view as it was is no frame; one that did comes
+					// ahead of its batch's edits, at the position published before the batch
+					s.send(c, frame{pos: s.position.Load(), view: true, token: token, selectors: view})
 				}
 			} else if c != nil && r.reqid == 0 && c.active {
 				// the grantor failed when a commit re-ran it, so the connection ends
@@ -711,7 +715,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			write(f.data)
 			return false
 		}
-		return write(viewFrame(f.token, cursor, f.selectors))
+		return write(viewFrame(f.token, max(f.pos, cursor), f.selectors))
 	}
 
 	// forwards queued view frames, updating the handler's selectors; returns false when the connection

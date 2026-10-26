@@ -71,6 +71,8 @@ struct pldb {
     pthread_cond_t qcv;
     req *qhead, *qtail;
     bool stop;
+    // tests only: the loop takes no batch while held, so requests queue to land in one
+    bool held;
 
     pthread_mutex_t resmu;
     pthread_cond_t rescv;
@@ -426,15 +428,12 @@ static bool normalize_bundle_selector(char *selector) {
     return ok;
 }
 
-/* what the grantor allows, sorted and unique, or its failure */
-static pldb_result *view_result(const reg *g, uint64_t conn, uint64_t position) {
-    pldb_result *r = result_new(PLDB_R_VIEW);
-    r->conn = conn;
-    r->position = position;
+/* a view result's answer: what the grantor allows, sorted and unique, or its failure */
+static void view_fill(pldb_result *r, const reg *g) {
     if (g->failure) {
         r->status = 500;
         r->errmsg = xstrdup(g->failure);
-        return r;
+        return;
     }
     strlist sorted = {0};
     for (size_t i = 0; i < g->selectors.n; i++) {
@@ -444,7 +443,45 @@ static pldb_result *view_result(const reg *g, uint64_t conn, uint64_t position) 
     r->selectors = strings_copy(&sorted);
     r->nselectors = sorted.n;
     strlist_free(&sorted);
+}
+
+/* what the grantor allows a connection, at a position */
+static pldb_result *view_result(const reg *g, uint64_t conn, uint64_t position) {
+    pldb_result *r = result_new(PLDB_R_VIEW);
+    r->conn = conn;
+    r->position = position;
+    view_fill(r, g);
     return r;
+}
+
+/* The registrations a batch takes, each answered once the batch has re-run the grantors its
+   writes touched, so a connection registered in the batch that changes its grant gets the view
+   as of the batch's end, in one answer: an answer built at the registration would carry the view
+   from before the batch's writes, and a re-run's answer for the same connection would race it. */
+typedef struct reg_replies {
+    reg **g;
+    pldb_result **r;
+    size_t n, cap;
+} reg_replies;
+
+static void reg_replies_push(reg_replies *rr, reg *g, pldb_result *r) {
+    if (rr->n == rr->cap) {
+        rr->cap = rr->cap ? rr->cap * 2 : 4;
+        rr->g = realloc(rr->g, rr->cap * sizeof *rr->g);
+        rr->r = realloc(rr->r, rr->cap * sizeof *rr->r);
+        if (!rr->g || !rr->r) die("out of memory");
+    }
+    rr->g[rr->n] = g;
+    rr->r[rr->n] = r;
+    rr->n++;
+}
+
+// whether a connection registered in the batch, and so is answered by its reply
+static bool reg_replies_has(const reg_replies *rr, uint64_t conn) {
+    for (size_t i = 0; i < rr->n; i++) {
+        if (rr->r[i]->conn == conn) return true;
+    }
+    return false;
 }
 
 /* the stale-token check: -1 stale, 0 ok */
@@ -462,7 +499,7 @@ static int check_generation(pldb *db, const char *user, int64_t gen) {
     return g == gen ? 0 : -1;
 }
 
-static void handle_register(pldb *db, req *q, pldb_result **after_tail) {
+static void handle_register(pldb *db, req *q, reg_replies *replies, pldb_result **after_tail) {
     pldb_result *r;
     if (check_generation(db, q->user, q->gen)) {
         r = result_new(PLDB_R_VIEW);
@@ -487,8 +524,12 @@ static void handle_register(pldb *db, req *q, pldb_result **after_tail) {
         free(canon);
     }
     reg_attach(g, q->conn);
-    r = view_result(g, q->conn, db->position);
+
+    // the reply goes out with the batch's other answers, its view filled at the batch's end
+    r = result_new(PLDB_R_VIEW);
+    r->conn = q->conn;
     r->reqid = q->reqid;
+    reg_replies_push(replies, g, r);
     (*after_tail)->next = r;
     *after_tail = r;
 }
@@ -548,7 +589,7 @@ static bool reads_touched(const reg *g, const strlist *written, const strlist *d
 /* after a batch's writes: re-run every grantor whose read-set was touched, and emit a view result
    to every connection of a registration whose selectors changed */
 static void invalidate_views(pldb *db, const strlist *written, const strlist *deleted,
-                             pldb_result **head, pldb_result **tail) {
+                             const reg_replies *replies, pldb_result **head, pldb_result **tail) {
     for (reg *g = db->regs; g; g = g->next) {
         if (!reads_touched(g, written, deleted)) continue;
         char old_hash[17];
@@ -559,6 +600,7 @@ static void invalidate_views(pldb *db, const strlist *written, const strlist *de
            decides whether that view changed */
         if (g->failure || strcmp(old_hash, g->hash) != 0) {
             for (size_t i = 0; i < g->nconns; i++) {
+                if (reg_replies_has(replies, g->conns[i])) continue;
                 pldb_result *r = view_result(g, g->conns[i], db->position);
                 if (*tail) (*tail)->next = r;
                 else *head = r;
@@ -575,6 +617,7 @@ typedef struct batch {
     items commit;
     strlist written;
     strlist deleted;
+    reg_replies replies;
 } batch;
 
 /* the most slices one mutation's expectations may name */
@@ -1143,7 +1186,7 @@ static void run_batch(pldb *db, req *head) {
             handle_submit(db, &b, q, &after_tail);
             break;
         case REQ_REGISTER:
-            handle_register(db, q, &after_tail);
+            handle_register(db, q, &b.replies, &after_tail);
             break;
         case REQ_UNREGISTER:
             handle_unregister(db, q);
@@ -1163,7 +1206,12 @@ static void run_batch(pldb *db, req *head) {
         }
     }
     pldb_result *views = NULL, *views_tail = NULL;
-    invalidate_views(db, &b.written, &b.deleted, &views, &views_tail);
+    invalidate_views(db, &b.written, &b.deleted, &b.replies, &views, &views_tail);
+
+    // each registration's reply, with its view as the batch leaves it
+    for (size_t i = 0; i < b.replies.n; i++) view_fill(b.replies.r[i], b.replies.g[i]);
+    free(b.replies.g);
+    free(b.replies.r);
     if (store_exec(db->w, "COMMIT")) die("commit: %s", store_err(db->w));
 
     while (views) {
@@ -1195,12 +1243,27 @@ static void run_batch(pldb *db, req *head) {
     }
 }
 
+void pldb_hold_batches(pldb *db, int hold) {
+    pthread_mutex_lock(&db->qmu);
+    db->held = hold != 0;
+    pthread_cond_signal(&db->qcv);
+    pthread_mutex_unlock(&db->qmu);
+}
+
+size_t pldb_queued(pldb *db) {
+    pthread_mutex_lock(&db->qmu);
+    size_t n = 0;
+    for (req *q = db->qhead; q; q = q->next) n++;
+    pthread_mutex_unlock(&db->qmu);
+    return n;
+}
+
 static void *txn_loop(void *arg) {
     pldb *db = arg;
     JS_UpdateStackTop(db->js.rt);
     while (true) {
         pthread_mutex_lock(&db->qmu);
-        while (!db->qhead && !db->stop) pthread_cond_wait(&db->qcv, &db->qmu);
+        while ((!db->qhead || db->held) && !db->stop) pthread_cond_wait(&db->qcv, &db->qmu);
         if (db->stop && !db->qhead) {
             pthread_mutex_unlock(&db->qmu);
             break;

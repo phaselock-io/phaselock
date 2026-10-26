@@ -201,6 +201,20 @@ func (c *core) register(reqid, conn uint64, p principal) {
 	})
 }
 
+// tests only: while held, the core takes no batch, so the requests queued meanwhile land in one
+func (c *core) holdBatches(hold bool) {
+	h := C.int(0)
+	if hold {
+		h = 1
+	}
+	C.pldb_hold_batches(c.db, h)
+}
+
+// tests only: how many requests are queued for the core's next batch
+func (c *core) queued() int {
+	return int(C.pldb_queued(c.db))
+}
+
 func (c *core) unregister(conn uint64) {
 	C.pldb_unregister(c.db, C.uint64_t(conn))
 }
