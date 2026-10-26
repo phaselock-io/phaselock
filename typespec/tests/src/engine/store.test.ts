@@ -102,13 +102,23 @@ describe('scan', () => {
     ]);
   });
 
-  test('batches of the limit, each naming the key to resume after while more follow', () => {
+  test('batches of the limit, each full one naming its last key to resume after', () => {
     const store = seeded(...five);
     const batches = store.read((txn) => batchesOf(txn, { pattern: ks(), limit: 2, values: false }));
     expect(batches).toEqual([
       [['s!k:1', 's!k:2'], 's!k:2'],
       [['s!k:3', 's!k:4'], 's!k:4'],
       [['s!k:5'], null],
+    ]);
+  });
+
+  test("a full batch says nothing of what follows it: a walk ending at a batch's end answers so with the next, empty batch", () => {
+    const store = seeded('s!k:1', 's!k:2', 's!k:3', 's!k:4');
+    const batches = store.read((txn) => batchesOf(txn, { pattern: ks(), limit: 2, values: false }));
+    expect(batches).toEqual([
+      [['s!k:1', 's!k:2'], 's!k:2'],
+      [['s!k:3', 's!k:4'], 's!k:4'],
+      [[], null],
     ]);
   });
 
@@ -720,9 +730,11 @@ describe('overlay', () => {
     const batches = base.read((b) => {
       return batchesOf(overlay.view(b), { pattern: ks(), limit: 2, values: false });
     });
+    // the last batch is full, so the walk's end is the next batch's answer, empty
     expect(batches).toEqual([
       [[], 's!k:2'],
-      [['s!k:3', 's!k:4'], null],
+      [['s!k:3', 's!k:4'], 's!k:4'],
+      [[], null],
     ]);
   });
 });

@@ -1072,8 +1072,12 @@ app's slots:
   `walkPattern` does: a skip scan that places each key against the
   pattern's fields and seeks past the keys that cannot match, after
   stepping up to 16 keys toward the target, since a SQLite seek costs
-  about as much as 16 steps.  It reads one key past the batch to tell
-  whether more follow, and decodes only the batch's values.  Over a
+  about as much as 16 steps.  It walks no further than the batch, and
+  decodes only the batch's values: a full batch's `next` is its last
+  key, and whether more follow is the next batch's answer, empty with a
+  null `next` when none do, so a batch depends on no key it did not
+  hand out, and a grantor that stops at a full batch is re-run by no
+  write past it.  Over a
   write buffer, the walk merges in the buffer's keys that the pattern
   picks out (Log and edits).  The skeleton's conformance fixture
   (`typespec/tests/fixtures/scan-conformance.json`) runs against it

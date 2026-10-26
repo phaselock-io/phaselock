@@ -253,7 +253,7 @@ static JSValue native_delete_slice(JSContext *ctx, JSValueConst this_val, int ar
 }
 
 /* one scan batch as it is collected: the entries the walk visits up to the batch's limit, and
-   whether one more follows */
+   whether it filled */
 typedef struct batch_ctx {
     JSContext *ctx;
     jsrt *js;
@@ -261,18 +261,13 @@ typedef struct batch_ctx {
     size_t limit;
     JSValue entries;
     size_t n;
-    bool more;
+    bool full;
     char *last; // the batch's last key
     size_t last_n;
 } batch_ctx;
 
-/* take a key into the batch with its value's bytes, or note that more follow a full batch */
+/* take a key into the batch with its value's bytes, stopping the walk once the batch is full */
 static int batch_take(batch_ctx *b, const char *key, size_t n, const uint8_t *val, size_t len) {
-    if (b->n == b->limit) {
-        b->more = true;
-        return 0;
-    }
-
     // the key's value, decoded under the batch's type
     JSValue v = JS_UNDEFINED;
     if (b->type >= 0) {
@@ -290,7 +285,9 @@ static int batch_take(batch_ctx *b, const char *key, size_t n, const uint8_t *va
     memcpy(b->last, key, n);
     b->last[n] = 0;
     b->last_n = n;
-    return 1;
+    if (b->n < b->limit) return 1;
+    b->full = true;
+    return 0;
 }
 
 /* a store key the walk visits, with the cursor on it, into the batch */
@@ -385,7 +382,7 @@ static int merged_walk(jsrt *js, const pattern *p, bool reverse, const char *aft
         return -1;
     }
     const wentry *e;
-    while (!b->more && (e = merge_peek(&m))) {
+    while (!b->full && (e = merge_peek(&m))) {
         if (merge_take(&m, e) < 0) return -1;
     }
     return 0;
@@ -393,9 +390,10 @@ static int merged_walk(jsrt *js, const pattern *p, bool reverse, const char *aft
 
 /* One batch of a walk of the keys a pattern picks out, the skeleton's ReadScan answered with
    {entries, next}: the keys from just past after, with their values decoded under the type the
-   request names, or keys only for a type of false.  It reads one key past the batch to tell
-   whether more follow.  A call with a write buffer walks the buffer merged with the store.  While
-   the grantor runs, the batch's span is its read-set. */
+   request names, or keys only for a type of false.  It walks no further than the batch: next is
+   the last key of a full batch, and whether more follow is the next batch's answer, so the batch
+   depends on no key it does not hand out.  A call with a write buffer walks the buffer merged with
+   the store.  While the grantor runs, the batch's span is its read-set. */
 static JSValue native_scan(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     jsrt *js = rt_of(ctx);
     JSValueConst req = argv[0];
@@ -447,8 +445,7 @@ static JSValue native_scan(JSContext *ctx, JSValueConst this_val, int argc, JSVa
     }
     b.limit = limit >= (double)SIZE_MAX ? SIZE_MAX : (size_t)limit;
 
-    // walk one key past the batch, to tell whether more follow, through the write buffer when the
-    // call has one
+    // walk the batch, through the write buffer when the call has one
     b.entries = JS_NewArray(ctx);
     int rc;
     if (js->wb && !wbuf_empty(js->wb)) {
@@ -468,9 +465,9 @@ static JSValue native_scan(JSContext *ctx, JSValueConst this_val, int argc, JSVa
     // the batch, and what it walked for the grantor's read-set
     JSValue out = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, out, "entries", b.entries);
-    JS_SetPropertyStr(ctx, out, "next", b.more ? JS_NewStringLen(ctx, b.last, b.last_n) : JS_NULL);
+    JS_SetPropertyStr(ctx, out, "next", b.full ? JS_NewStringLen(ctx, b.last, b.last_n) : JS_NULL);
     if (js->track_spans) {
-        const char *to = b.more ? b.last : NULL;
+        const char *to = b.full ? b.last : NULL;
         span_list_push(js->track_spans, p, reverse, after, after_n, to, b.last_n);
     } else {
         pattern_free(p);

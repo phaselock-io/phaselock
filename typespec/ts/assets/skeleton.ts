@@ -676,8 +676,10 @@ export type ScanRequest = {
   values: false | { type: string; rep: Rep };
 };
 
-/** one batch; a keys-only scan carries undefined values; next is the batch's last key when more
-    follow, to pass as `after`, and null when the walk is done */
+/** One batch; a keys-only scan carries undefined values.  next is the last key of a full batch, to
+    pass as `after`, and null for a short one, which ends the walk.  A full batch says nothing of
+    what follows it: whether the walk holds more is the next batch's answer, empty and null when it
+    holds none, so a scan's reader depends on no key it was not handed. */
 export type StoreScan = { entries: [string, unknown][]; next: string | null };
 
 /** every entry a scan picks out, batch by batch */
@@ -1434,19 +1436,18 @@ class InMemTxn implements WTxn {
     }
     if (!(req.limit >= 1)) throw new RangeError("a scan's limit is at least 1");
 
-    // walk one key past a batch, to tell whether more follow
+    // walk up to a batch's worth of keys, and no further
     const keys: string[] = [];
     const cursor = this.#cursor(c.head, req.reverse === true);
-    walkPattern(c, cursor, req, STEP_BUDGET, (k) => keys.push(k) <= req.limit);
+    walkPattern(c, cursor, req, STEP_BUDGET, (k) => keys.push(k) < req.limit);
 
     // the batch, its values copied or converted out; a value that fails to decode is left out
-    const page = keys.slice(0, req.limit);
     const entries: [string, unknown][] = [];
-    for (const k of page) {
+    for (const k of keys) {
       const value = v ? this.#out(k, v.type, v.rep) : undefined;
       if (!v || value !== undefined) entries.push([k, value]);
     }
-    return { entries, next: keys.length > req.limit ? page[page.length - 1] : null };
+    return { entries, next: keys.length === req.limit ? keys[keys.length - 1] : null };
   }
 
   // a cursor over the live keys: the stored ones no update shadows, merged with the updates' live
@@ -1581,7 +1582,7 @@ class OverlayTxn implements WTxn {
   scan(req: ScanRequest): StoreScan {
     const result = this.#base.scan(req);
 
-    // the stretch this batch covers: up to its last key when more follow, else to the walk's end
+    // the stretch this batch covers: up to its last key when it is full, else to the walk's end
     const span: ScanSpan = {
       pattern: compilePattern(req.pattern),
       reverse: req.reverse === true,
@@ -1604,10 +1605,10 @@ class OverlayTxn implements WTxn {
     if (req.reverse) keys.reverse();
     const page: StoreScan = {
       entries: keys.slice(0, req.limit).map((k) => [k, merged.get(k)]),
-      next: keys.length > req.limit ? keys[req.limit - 1] : null,
+      next: keys.length >= req.limit ? keys[req.limit - 1] : null,
     };
 
-    // the base has more batches behind this span, so the walk resumes past it even if the merge fit
+    // the base's batch was full, so the walk resumes past it even if the merge was short
     if (page.next === null && result.next !== null) page.next = result.next;
     return page;
   }

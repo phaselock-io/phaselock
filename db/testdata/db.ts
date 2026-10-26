@@ -21,7 +21,7 @@ declare const crypto: { randomUUID(): string };
 
 /* The users the tests sign in as without creating an account first.  root is an admin, and r1 is
    audited: its every grant run changes its view, so a test sees each run as a view frame. */
-const TEST_USERS = ['root', 'p1', 'r1', 'requester', 'raw-requester', 'flaky'];
+const TEST_USERS = ['root', 'p1', 'r1', 'requester', 'raw-requester', 'flaky', 'peeker', 'peeker2'];
 const ROOT = 'root';
 const AUDITED = 'r1';
 // a user whose grant writes, which a grantor, reading only, may not
@@ -34,6 +34,9 @@ const FLAKY = 'flaky';
    read-only context, so only the database's own check refuses them. */
 const RAW_WRITER = 'raw-requester';
 const RAW_LOOKUP = 'raw-lookup';
+// principals whose grant branches on a one-row raw scan's next without following it, two so that
+// one's registration holds a grant while the other's is run afresh
+const PEEKERS = ['peeker', 'peeker2'];
 let writeTxn: WriteTxn | undefined;
 
 // whether the principal is root or an account flagged admin
@@ -318,6 +321,15 @@ const bundle = defineTestDB<TestPlugins>({
   deciders,
   grant: (txn, principal) => {
     if (principal.user === null) return ['book!'];
+    if (PEEKERS.includes(principal.user)) {
+      // a full batch's next says only that the batch filled: p1 is granted while any patron is
+      const { next } = readTxn!.scan({
+        pattern: { slice: { family: 'patron', params: [null] }, name: 'patron', local: [] },
+        type: false,
+        limit: 1,
+      });
+      return next === null ? ['book!'] : ['book!', 'patron:p1!'];
+    }
     if (principal.user === WRITER) {
       // the grantor's txn offers no writes, so only a cast reaches them
       (txn as unknown as TestDBTxn).set.messages('p1', ['from grant']);

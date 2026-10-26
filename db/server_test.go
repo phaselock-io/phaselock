@@ -781,6 +781,37 @@ func TestViewAndWants(t *testing.T) {
 	s3.quiet()
 }
 
+// a grant a connection holds always matches a fresh run of the grantor: a grantor that branches on
+// a scan's next depends on what the scan handed it, and a full batch hands it nothing past its
+// last key, so a write past that key changes neither
+func TestAGrantThatBranchesOnAScansNextStaysWhatAFreshRunAnswers(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "add-patron", "id", "p2", "name", "Bob"))
+	peeker := h.token("peeker")
+	s := h.connect(peeker, -1)
+	s.live()
+	if !slices.Contains(strs(s.first[3]), "patron:p1") {
+		t.Fatalf("expected p1 granted, got %v", s.first)
+	}
+
+	// p2, past the one-row batch, goes; the held grant is what a fresh run, under another principal
+	// of the same grant, answers
+	h.accept(admin, mut("c3", "remove-patron", "id", "p2"))
+	fresh := h.connect(h.token("peeker2"), -1)
+	if got, want := fresh.header.Get("PhaseLock-View"), s.header.Get("PhaseLock-View"); got != want {
+		t.Fatalf("a fresh run answers %v, the held view is %v", fresh.first, s.first)
+	}
+	s.quiet()
+
+	// p1, inside the batch, goes too, and the grant follows
+	h.accept(admin, mut("c4", "remove-patron", "id", "p1"))
+	if f := s.nextTagged("view"); slices.Contains(strs(f[3]), "patron:p1") {
+		t.Fatalf("expected p1 revoked, got %v", f)
+	}
+}
+
 func TestGrantInvalidation(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
