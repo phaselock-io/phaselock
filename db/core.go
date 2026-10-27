@@ -50,6 +50,7 @@ type principal struct {
 	anonymous bool
 	user      string
 	gen       int64 // -1 skips the generation check
+	exp       int64 // when the token expires, in Unix seconds; 0 for the anonymous principal
 }
 
 // item is one edit of the log: its wire encoding, the slice it edits, and the position of its
@@ -76,6 +77,11 @@ type result struct {
 	// outcomes before it, and hash what lookup answers now, nil for none
 	bounce bool
 	hash   *string
+	// an account: the generation lookup answers for user's token, -1 for no account, or, in a
+	// change, that the core has forgotten it
+	user       string
+	generation int64
+	forgotten  bool
 }
 
 // verdict is a mutation's proof as checked: whether it carries one, and if so whether it passed
@@ -90,7 +96,8 @@ const (
 	proofPassed = C.PLDB_PROOF_PASSED
 	proofFailed = C.PLDB_PROOF_FAILED
 
-	// how many times a call may bounce before the writer takes a changed hash for lookup's bug
+	// how many times a call may bounce before the writer rejects it, and a login may read
+	// credentials that changed before it takes them for lookup's bug
 	maxBounces = C.PLDB_MAX_BOUNCES
 )
 
@@ -103,13 +110,15 @@ const (
 	rArm      = C.PLDB_R_ARM
 	rTick     = C.PLDB_R_TICK
 	rKey      = C.PLDB_R_KEY
+	rAccount  = C.PLDB_R_ACCOUNT
 )
 
 func bytesReader(b []byte) *bytes.Reader { return bytes.NewReader(b) }
 
-// openCore opens the core with a page cache of cacheMiB for each SQLite connection; on an empty
-// log, its bootstrap may read the env variables named
-func openCore(dir, bundle string, env []string, cacheMiB int) (*core, error) {
+// openCore opens the core with a page cache of cacheMiB for each SQLite connection, keeping a
+// principal's registration for ttl once it is unused; on an empty log, its bootstrap may read the
+// env variables named
+func openCore(dir, bundle string, env []string, cacheMiB int, ttl time.Duration) (*core, error) {
 	cdir, cbundle := C.CString(dir), C.CString(bundle)
 	defer C.free(unsafe.Pointer(cdir))
 	defer C.free(unsafe.Pointer(cbundle))
@@ -120,7 +129,8 @@ func openCore(dir, bundle string, env []string, cacheMiB int) (*core, error) {
 	chost := C.CString(hostJS)
 	defer C.free(unsafe.Pointer(chost))
 	rc := C.pldb_open(cdir, chost, C.size_t(len(hostJS)), cbundle, C.pldb_go_hasher(), cenv, C.int(len(env)),
-		C.int(cacheMiB), &db, (*C.char)(unsafe.Pointer(&errbuf[0])), C.size_t(len(errbuf)))
+		C.int(cacheMiB), C.int64_t(ttl.Milliseconds()), &db, (*C.char)(unsafe.Pointer(&errbuf[0])),
+		C.size_t(len(errbuf)))
 	if rc != 0 {
 		return nil, errors.New(cstr(errbuf))
 	}
@@ -223,6 +233,13 @@ func (c *core) unregister(conn uint64) {
 func (c *core) lookup(reqid uint64, ident []byte) {
 	ptr, l := cbytes(ident)
 	C.pldb_lookup(c.db, C.uint64_t(reqid), ptr, l)
+}
+
+// account asks what lookup answers for a user's token as of the request's turn
+func (c *core) account(reqid uint64, user string) {
+	cuser := C.CString(user)
+	defer C.free(unsafe.Pointer(cuser))
+	C.pldb_account(c.db, C.uint64_t(reqid), cuser)
 }
 
 // cronEntry is one entry of a cron install, as the bundle names it.
@@ -333,6 +350,11 @@ func (c *core) pop() result {
 		out.errmsg = C.GoString(r.errmsg)
 	}
 	out.bounce = r.bounce != 0
+	if r.user != nil {
+		out.user = C.GoString(r.user)
+	}
+	out.generation = int64(r.generation)
+	out.forgotten = r.forgotten != 0
 	if r.hash != nil {
 		h := C.GoString(r.hash)
 		out.hash = &h
@@ -445,6 +467,15 @@ func (c *core) readEdits(selector string, from, to uint64, reverse bool, limit i
 	}
 	defer C.pldb_items_free(items, n)
 	return goItems(items, n), nil
+}
+
+// head is the log's last position
+func (c *core) head() (uint64, error) {
+	var position C.uint64_t
+	if C.pldb_head(c.db, &position) != 0 {
+		return 0, errors.New("reading the log's head failed")
+	}
+	return uint64(position), nil
 }
 
 func (c *core) snapshot(selector string) ([]byte, uint64, error) {

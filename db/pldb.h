@@ -17,6 +17,7 @@ enum {
     PLDB_R_ARM = 5,     /* reqid, marks: every cron entry's mark, in entry order */
     PLDB_R_TICK = 6,    /* reqid; status 500 with errmsg when the tick's hook failed */
     PLDB_R_KEY = 7,     /* reqid: a token key and its sweep are durable */
+    PLDB_R_ACCOUNT = 8, /* user: a user's account changed (below); or reqid: pldb_account's answer */
 };
 
 /* One edit as the wire sees it: data is the edit's msgpack array, its envelope and its payload's
@@ -45,6 +46,12 @@ typedef struct pldb_result {
     size_t len;
     char **selectors; /* what the grantor allows, sorted and unique */
     size_t nselectors;
+    /* An account: the generation lookup answers for user's token, -1 for no account, and in
+       pldb_account's answer the password hash, in hash.  A change that names a user carries
+       forgotten instead when the core no longer keeps an answer for the user. */
+    char *user;
+    int64_t generation;
+    int forgotten;
     int64_t *marks;
     size_t nmarks;
     char *errmsg;
@@ -66,10 +73,11 @@ typedef int (*pldb_hash_fn)(uintptr_t arg, const char *pw, size_t pwlen, char *o
 
 /* host is the JS host's source, host.js, which the Go layer embeds; env names the variables the
    bundle's bootstrap may read; on an empty log, open runs it.  cache_mib is the page cache of
-   each SQLite connection, the writer's and the reader's, in MiB. */
+   each SQLite connection, the writer's and the reader's, in MiB.  ttl_ms is how long a
+   principal's registration is kept once it has no connection and has gone unused. */
 int pldb_open(const char *dir, const char *host, size_t hostlen, const char *bundle,
-              pldb_hash_fn hasher, const char *const *env, int nenv, int cache_mib, pldb **out,
-              char *err, size_t errlen);
+              pldb_hash_fn hasher, const char *const *env, int nenv, int cache_mib,
+              int64_t ttl_ms, pldb **out, char *err, size_t errlen);
 void pldb_close(pldb *db);
 /* the id of this log instance; positions mean nothing across epochs */
 const char *pldb_epoch(pldb *db);
@@ -88,7 +96,7 @@ typedef struct pldb_verdict {
 } pldb_verdict;
 
 /* The writer bounces a call at most this many times; past it, a proven mutation whose
-   credentials changed again is rejected as a bug in lookup. */
+   credentials changed again is rejected. */
 #define PLDB_MAX_BOUNCES 3
 
 /* Requests; answered through pldb_pop.  user NULL is anonymous; gen < 0 skips
@@ -102,6 +110,18 @@ int pldb_submit(pldb *db, uint64_t reqid, const char *user, int64_t gen, const u
 int pldb_register(pldb *db, uint64_t reqid, uint64_t conn, const char *user, int64_t gen);
 int pldb_unregister(pldb *db, uint64_t conn);
 int pldb_lookup(pldb *db, uint64_t reqid, const uint8_t *ident, size_t len);
+/* what lookup answers for a user's token as of its turn, answered as a PLDB_R_ACCOUNT */
+int pldb_account(pldb *db, uint64_t reqid, const char *user);
+
+/* The core keeps one registration per principal: what the grantor allows it, and for a user,
+   what lookup answers for its token, each with what it read.  The writer brings each up to date
+   when it uses it, running it again only when a write before it in the batch touched what it
+   read, so every check in a mutation's turn sees the state the mutation does.  After each batch,
+   a grant or account the batch touched is run again for a registration with connections, and
+   otherwise forgotten until it is next used; then each connection whose grant changed gets a
+   PLDB_R_VIEW, and a PLDB_R_ACCOUNT names each user whose generation changed or that the core
+   forgot, all ahead of the batch's commit.  A registration with no connections is dropped once
+   it has gone unused for the TTL. */
 
 /* Cron.  The bundle's cron entries are read when the database opens: every entry of every cron
    install, in install and entry order, which db owns.  An entry's mark is the last of its slots
@@ -179,6 +199,8 @@ int pldb_read_edits(pldb *db, const char *selector, uint64_t from, uint64_t to, 
                     size_t limit, pldb_item **items, size_t *n);
 void pldb_items_free(pldb_item *items, size_t n);
 int pldb_snapshot(pldb *db, const char *selector, uint8_t **out, size_t *len, uint64_t *position);
+/* the log's last position */
+int pldb_head(pldb *db, uint64_t *position);
 void pldb_free(void *p);
 
 /* Test only: the scan conformance test's hold on the pattern walk (scantest.c).  It opens the

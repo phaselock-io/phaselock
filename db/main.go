@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -31,6 +32,8 @@ func main() {
 		"the page cache of each of the database's SQLite connections, in MiB")
 	maxStreamBacklog := flag.Int("max-stream-backlog", 2048,
 		"the most commits and view changes a /stream connection may have queued and unsent before it is dropped")
+	principalTTL := flag.Duration("principal-ttl", time.Minute,
+		"how long a principal's grant and account are kept once it has no connection and has gone unused")
 	var bootstrapEnv []string
 	flag.Func("bootstrap-env", "an environment variable the bundle's bootstrap may read (repeatable)", func(name string) error {
 		bootstrapEnv = append(bootstrapEnv, name)
@@ -62,7 +65,8 @@ func main() {
 
 	srv, err := Open(ctx, Options{DataDir: *data, Bundle: *bundle, DevAuth: *devAuth, BootstrapEnv: bootstrapEnv,
 		ClientIPHeader: *clientIPHeader, MaxMutations: *maxMutations, MaxAnonymousMutations: *maxAnonymousMutations,
-		PathPrefix: *pathPrefix, SqliteCacheSize: *sqliteCacheSize, MaxStreamBacklog: *maxStreamBacklog})
+		PathPrefix: *pathPrefix, SqliteCacheSize: *sqliteCacheSize, MaxStreamBacklog: *maxStreamBacklog,
+		PrincipalTTL: *principalTTL})
 	if err != nil {
 		log.Fatal(err)
 	}

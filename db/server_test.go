@@ -2350,6 +2350,185 @@ func TestARegistrationInTheBatchThatRevokesASliceNeverGetsItsEdits(t *testing.T)
 	s.quiet()
 }
 
+// permissions ///////////////////////////////////////////////////////////////
+
+// a revocation ends the token's connections ahead of the edits of its batch, and Go refuses the
+// token from then on without a trip to the writer
+func TestARevocationEndsTheTokensConnections(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "ann", "name", "Ann"))
+	tok := h.signUp("ann", "hunter2")
+	s := h.connect(tok, -1)
+	s.live()
+
+	h.together(
+		func() { h.accept(admin, mut("c2", "revoke-sessions", "user", "ann")) },
+		func() { h.accept(admin, mut("c3", "rename-patron", "id", "ann", "name", "Anne")) },
+	)
+	if f := s.nextTagged("end"); asInt(f[1]) != endRevoked || f[2] != "token revoked" {
+		t.Fatalf("expected the revocation's end, got %v", f)
+	}
+
+	// the writer takes no request while the token is refused
+	h.srv.core.holdBatches(true)
+	status, _ := h.mutationsStatus(tok, mut("c4", "rename-patron", "id", "ann", "name", "x"))
+	queued := h.srv.core.queued()
+	h.srv.core.holdBatches(false)
+	if status != 401 || queued != 0 {
+		t.Fatalf("a revoked token: status %d, %d queued", status, queued)
+	}
+
+	// a fresh sign-in carries the new generation
+	h.accept(h.signIn("ann", "hunter2"), mut("c5", "rename-patron", "id", "ann", "name", "Ann"))
+}
+
+// a revocation applies to the mutations after it in its own batch
+func TestARevocationStopsTheMutationsAfterItInItsBatch(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "ann", "name", "Ann"))
+	tok := h.signUp("ann", "hunter2")
+
+	// the writer holds ann's account from her first mutation, so the revocation must reach it
+	h.accept(tok, mut("c2", "rename-patron", "id", "ann", "name", "Anne"))
+	var status int
+	h.together(
+		func() { h.accept(admin, mut("c3", "revoke-sessions", "user", "ann")) },
+		func() { status, _ = h.mutationsStatus(tok, mut("c4", "rename-patron", "id", "ann", "name", "x")) },
+	)
+	if status != 401 {
+		t.Fatalf("a token revoked earlier in the batch: %d", status)
+	}
+}
+
+// a grant applies to the expectations after it in its own batch
+func TestAGrantCoversTheExpectationsAfterItInItsBatch(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, mut("c3", "create-account", "user", "p1", "password", "hunter2"))
+	ann := h.token("p1")
+
+	// the writer holds ann's grant from her first expectation, so the grant must reach it
+	if o := h.expecting(ann, mut("c4", "rename-patron", "id", "p1", "name", "y"),
+		map[string]any{"patron:p2": 99}); o.kind != "reject" {
+		t.Fatalf("an expectation outside the grant: %+v", o)
+	}
+	var o outcome
+	h.together(
+		func() { h.accept(admin, mut("c5", "grant-view", "user", "p1", "prefix", "patron:p2!")) },
+		func() {
+			o = h.expecting(ann, mut("c6", "rename-patron", "id", "p1", "name", "x"),
+				map[string]any{"patron:p2": 99})
+		},
+	)
+	if o.kind != "conflict" {
+		t.Fatalf("an expectation the batch's grant covers: %+v", o)
+	}
+}
+
+// a connection ends shortly before its token expires, while its client can still refresh it
+func TestAStreamEndsBeforeItsTokenExpires(t *testing.T) {
+	c := &clock{t: time.Now()}
+	h := startWith(t, t.Context(), Options{now: c.now})
+	tok := h.token("p1")
+	_, claims := tokenParts(t, tok)
+	c.set(time.Unix(asInt(claims["exp"]), 0).Add(-expiryLead - 300*time.Millisecond))
+
+	s := h.connect(tok, -1)
+	s.live()
+	if f := s.nextTagged("end"); asInt(f[1]) != endRevoked || f[2] != "token expiring" {
+		t.Fatalf("expected the expiry's end, got %v", f)
+	}
+	if status, _, out := h.do("POST", "/auth/token", tok, mpEncode(map[string]any{"kind": "refresh"})); status != 200 {
+		t.Fatalf("refreshing the token after the end: %d %s", status, out)
+	}
+}
+
+// /snapshot and /edits check the grant as of what they read, so a revocation that lands after the
+// request registers and before the read hides the selector
+func TestASnapshotOrEditsReadAfterARevocationIsRefused(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+	h.accept(admin, mut("c2", "add-patron", "id", "p2", "name", "Bob"))
+	h.accept(admin, mut("c3", "create-account", "user", "p1", "password", "hunter2"))
+	ann := h.token("p1")
+	reads := []string{"/snapshot/patron:p2", "/edits/patron:p2"}
+
+	// lands a mutation once, as an admin, when the next read is about to run
+	beforeTheRead := func(m mutation) {
+		var once sync.Once
+		h.srv.beforeRead = func() {
+			once.Do(func() {
+				req, _ := http.NewRequest("POST", h.web.URL+"/mutations", bytes.NewReader(m.encode(nil)))
+				req.Header.Set("Authorization", "Bearer "+admin)
+				if resp, err := http.DefaultClient.Do(req); err == nil {
+					resp.Body.Close()
+				}
+			})
+		}
+	}
+
+	// each read lands between a grant and its revocation
+	for i, path := range reads {
+		h.accept(admin, mut(fmt.Sprintf("g%d", i), "grant-view", "user", "p1", "prefix", "patron:p2!"))
+		if status, _, out := h.do("GET", path, ann, nil); status != 200 {
+			t.Fatalf("%s while granted: %d %s", path, status, out)
+		}
+		beforeTheRead(mut(fmt.Sprintf("r%d", i), "revoke-view", "user", "p1", "prefix", "patron:p2!"))
+		if status, _, out := h.do("GET", path, ann, nil); status != 403 {
+			t.Fatalf("%s revoked before the read: %d %s", path, status, out)
+		}
+	}
+
+	// a token revoked before the read is refused
+	beforeTheRead(mut("rs", "revoke-sessions", "user", "p1"))
+	if status, _, out := h.do("GET", "/snapshot/patron:p1", ann, nil); status != 401 {
+		t.Fatalf("a snapshot whose token was revoked before the read: %d %s", status, out)
+	}
+}
+
+// a principal's registration outlives its last connection for the TTL, so a reconnect is answered
+// from it, and past the TTL the grant runs again
+func TestARegistrationOutlivesItsConnectionsForTheTTL(t *testing.T) {
+	for _, ttl := range []time.Duration{time.Minute, time.Millisecond} {
+		h := startWith(t, t.Context(), Options{PrincipalTTL: ttl})
+		admin := h.admin()
+		r1 := h.token("r1")
+
+		// the audited user's every grant run changes its view
+		s := h.connect(r1, -1)
+		s.live()
+		view := s.header.Get("PhaseLock-View")
+		s.close()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			h.srv.mu.Lock()
+			n := len(h.srv.conns)
+			h.srv.mu.Unlock()
+			if n == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the connection never closed")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(10 * time.Millisecond)
+		h.accept(admin, mut("c1", "add-book", "id", "b1", "title", "Dune"))
+
+		s = h.connectView(r1, -1, view)
+		same := s.header.Get("PhaseLock-View") == view
+		s.close()
+		if same != (ttl == time.Minute) {
+			t.Fatalf("under a TTL of %v, the reconnect's view was the same: %v", ttl, same)
+		}
+	}
+}
+
 func TestSliceByteCounters(t *testing.T) {
 	h := start(t)
 	admin := h.admin()
@@ -3166,15 +3345,57 @@ func TestALoginIsCheckedAgainWhenTheCredentialsChange(t *testing.T) {
 func TestALookupThatChangesOnEveryReadIsABug(t *testing.T) {
 	h := start(t)
 
-	// the writer bounces the call a few times, then rejects it as lookup's bug, in full in dev
+	// the core reads lookup once for the state it holds, so a proof is checked against that one
+	// answer, which no password matches
 	o := h.mutations(h.token("flaky"), mut("c1", "authenticated-mutation", "user", "flaky", "check", proof("x")))[0]
-	if o.kind != "reject" || !strings.Contains(o.reason, "different passwordHash on each of 5 reads") {
+	if o.kind != "reject" || o.reason != "invalid credentials" {
 		t.Fatalf("a proof against a flaky lookup: %+v", o)
 	}
 
-	// a login gives up the same way
+	// a login reads lookup again after its check, and gives up after a few answers that differ
 	if status := login(h, "flaky", "x"); status != 500 {
 		t.Fatalf("a login against a flaky lookup: %d", status)
+	}
+}
+
+// a proof whose sender's credentials change before every one of its turns is rejected once the
+// call has bounced as often as it may
+func TestAProofWhoseCredentialsKeepChangingIsRejected(t *testing.T) {
+	h := start(t)
+	tok := h.signUp("ann", "hunter2")
+	admin := h.admin()
+
+	// every check of the proof is followed by a change of the password
+	var changes atomic.Int32
+	errs := make(chan error, 8)
+	h.srv.proved = func() {
+		n := changes.Add(1)
+		body := mut(fmt.Sprintf("hook-%d", n), "set-password", "user", "ann", "password",
+			fmt.Sprintf("pw%d", n)).encode(nil)
+		req, _ := http.NewRequest("POST", h.web.URL+"/mutations", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+admin)
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				err = fmt.Errorf("set-password: %d", resp.StatusCode)
+			}
+		}
+		if err != nil {
+			errs <- err
+		}
+	}
+	o := h.mutations(tok, mut("c1", "authenticated-mutation", "user", "ann", "check", proof("hunter2")))[0]
+	if o.kind != "reject" || o.reason != "the sender's credentials changed 4 times while its proof was checked" {
+		t.Fatalf("a proof whose credentials keep changing: %+v", o)
+	}
+	if n := changes.Load(); n != 4 {
+		t.Fatalf("the proof was checked %d times", n)
+	}
+	select {
+	case err := <-errs:
+		t.Fatal(err)
+	default:
 	}
 }
 

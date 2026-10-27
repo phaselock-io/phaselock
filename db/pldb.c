@@ -1,4 +1,4 @@
-/* The core: request and result queues, the txn loop, grant registrations, and the reader-side
+/* The core: request and result queues, the txn loop, registrations, and the reader-side
    calls. */
 
 #include <ctype.h>
@@ -9,7 +9,16 @@
 #include "internal.h"
 #include "sha256.h"
 
-enum { REQ_SUBMIT = 1, REQ_REGISTER, REQ_UNREGISTER, REQ_LOOKUP, REQ_ARM, REQ_TICK, REQ_KEY };
+enum {
+    REQ_SUBMIT = 1,
+    REQ_REGISTER,
+    REQ_UNREGISTER,
+    REQ_LOOKUP,
+    REQ_ACCOUNT,
+    REQ_ARM,
+    REQ_TICK,
+    REQ_KEY
+};
 
 /* a formatted string, malloc'd */
 static char *strf(const char *fmt, ...) {
@@ -44,19 +53,7 @@ typedef struct req {
     struct req *next;
 } req;
 
-/* one registered grant, shared by every connection with the same principal */
-typedef struct reg {
-    char *canon;
-    char *user;
-    strlist selectors;
-    char hash[17]; /* of selectors, so a change to the set is one comparison */
-    strlist rkeys;   /* the keys the grantor got */
-    span_list spans; /* what each of the grantor's scan batches walked */
-    uint64_t *conns;
-    size_t nconns, capconns;
-    char *failure; /* what its connections are answered with when the grantor failed, or NULL */
-    struct reg *next;
-} reg;
+typedef struct reg reg;
 
 struct pldb {
     char *dir;
@@ -81,7 +78,9 @@ struct pldb {
     pthread_t thread;
     bool started;
     uint64_t position;
+    uint64_t batches; /* the batches run, the last one's id */
     reg *regs;
+    int64_t ttl_ms;
     wbuf wb; /* the write buffer of the mutation running */
 
     pldb_cron_entry *cron;
@@ -194,6 +193,7 @@ void pldb_result_free(pldb_result *r) {
     free(r->marks);
     free(r->errmsg);
     free(r->hash);
+    free(r->user);
     free(r);
 }
 
@@ -277,6 +277,12 @@ int pldb_lookup(pldb *db, uint64_t reqid, const uint8_t *ident, size_t len) {
     return 0;
 }
 
+int pldb_account(pldb *db, uint64_t reqid, const char *user) {
+    if (!user) return -1;
+    enqueue(db, req_new(REQ_ACCOUNT, reqid, user, -1));
+    return 0;
+}
+
 size_t pldb_cron_entries(pldb *db, const pldb_cron_entry **out) {
     *out = db->cron;
     return db->ncron;
@@ -312,7 +318,90 @@ int pldb_cron_tick(pldb *db, uint64_t reqid, size_t i, int64_t slot) {
     return 0;
 }
 
-// grant registrations //////////////////////////////////////////////////////
+// registrations ////////////////////////////////////////////////////////////
+
+/* What a cached read-only call read, the keys it got and the stretch each of its scan batches
+   walked, and how far into a batch's writes it has seen, so that a test against the batch's writes
+   takes only those made after it ran.  A call last run in an earlier batch has seen every write
+   before this batch, since every batch ends by settling the calls its writes touched. */
+typedef struct reads {
+    strlist keys;
+    span_list spans;
+    uint64_t batch;
+    size_t written, deleted;
+} reads;
+
+/* One principal's registration, shared by every connection with the principal and kept for the
+   TTL once the last one closes: what the grantor allows it and, for a user, what lookup answers
+   for its token, each current while its flag is set.  Each keeps what the connections or Go were
+   last told of it, so a change made in a batch reaches them once, at the batch's end. */
+struct reg {
+    char *canon;
+    char *user;
+
+    // the grant
+    bool granted;
+    strlist selectors;
+    char hash[17]; /* of selectors, so a change to the set is one comparison */
+    char *failure; /* what its connections are answered with when the grantor failed, or NULL */
+    reads greads;
+    char sent[17]; /* the hash its connections were last sent, and whether it was a failure */
+    bool sent_failure;
+
+    // the account
+    bool looked;
+    int64_t generation; /* -1 for no account */
+    char *password_hash;
+    char *lookup_failure; /* what a proof is rejected with when lookup failed, or NULL */
+    reads areads;
+    bool told; /* whether Go holds a generation for the user, and which */
+    int64_t told_generation;
+
+    uint64_t *conns;
+    size_t nconns, capconns;
+    int64_t used; /* when it was last used or left by its last connection, in Unix ms */
+    struct reg *next;
+};
+
+/* The registrations a batch takes, each answered once the batch has re-run the grantors its
+   writes touched, so a connection registered in the batch that changes its grant gets the view
+   as of the batch's end, in one answer: an answer built at the registration would carry the view
+   from before the batch's writes, and a re-run's answer for the same connection would race it. */
+typedef struct reg_replies {
+    reg **g;
+    pldb_result **r;
+    size_t n, cap;
+} reg_replies;
+
+/* one group commit as it runs: the edits it commits, the keys it writes and the prefixes it
+   clears, in order, and the registrations it takes */
+typedef struct batch {
+    uint64_t id;
+    int64_t servertime;
+    items commit;
+    strlist written;
+    strlist deleted;
+    reg_replies replies;
+} batch;
+
+/* results in order, pushed once the batch commits */
+typedef struct results {
+    pldb_result *head, *tail;
+} results;
+
+static void results_add(results *l, pldb_result *r) {
+    if (l->tail) l->tail->next = r;
+    else l->head = r;
+    l->tail = r;
+}
+
+static void results_push_all(pldb *db, results *l) {
+    while (l->head) {
+        pldb_result *r = l->head;
+        l->head = r->next;
+        results_push(db, r);
+    }
+}
 
 static char *canon_principal(const char *user) {
     return user ? strf("u:%s", user) : xstrdup("anon");
@@ -334,19 +423,78 @@ static void view_hash(const strlist *selectors, char out[17]) {
 
 static bool normalize_bundle_selector(char *selector);
 
+// start recording what a call reads
+static void reads_begin(pldb *db, reads *r) {
+    strlist_clear(&r->keys);
+    span_list_clear(&r->spans);
+    db->js.track_rkeys = &r->keys;
+    db->js.track_spans = &r->spans;
+}
+
+// stop recording, the call having seen every write the batch has made so far
+static void reads_end(pldb *db, reads *r, const batch *b) {
+    db->js.track_rkeys = NULL;
+    db->js.track_spans = NULL;
+    r->batch = b->id;
+    r->written = b->written.n;
+    r->deleted = b->deleted.n;
+}
+
+static void reads_clear(reads *r) {
+    strlist_clear(&r->keys);
+    span_list_clear(&r->spans);
+}
+
+static void reads_free(reads *r) {
+    strlist_free(&r->keys);
+    span_list_free(&r->spans);
+}
+
+static bool has_prefix(const char *s, const char *prefix) {
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+/* Whether the batch's writes since a call ran touched what it read: a written key it got or one
+   inside a stretch a scan batch walked, or a deleted prefix holding a key it got or one that could
+   lie inside such a stretch.  A spurious re-run costs only time, so a deleted prefix dirties
+   whenever it may. */
+static bool reads_touched(const reads *r, const batch *b) {
+    size_t from_written = r->batch == b->id ? r->written : 0;
+    size_t from_deleted = r->batch == b->id ? r->deleted : 0;
+
+    // the written keys
+    for (size_t i = from_written; i < b->written.n; i++) {
+        const char *k = b->written.v[i];
+        if (strlist_has(&r->keys, k)) return true;
+        size_t n = strlen(k);
+        for (size_t j = 0; j < r->spans.n; j++) {
+            if (span_covers(&r->spans.v[j], k, n)) return true;
+        }
+    }
+
+    // the deleted prefixes
+    for (size_t i = from_deleted; i < b->deleted.n; i++) {
+        const char *p = b->deleted.v[i];
+        for (size_t j = 0; j < r->keys.n; j++) {
+            if (has_prefix(r->keys.v[j], p)) return true;
+        }
+        size_t n = strlen(p);
+        for (size_t j = 0; j < r->spans.n; j++) {
+            if (span_may_hold(&r->spans.v[j], p, n)) return true;
+        }
+    }
+    return false;
+}
+
 /* Run the grantor for the registration, replacing its selectors and read-set.  A grantor that
    throws or returns a malformed selector is a bug, and the registration fails closed: it grants
    nothing, and every connection of it is answered with the failure. */
-static int reg_evaluate(pldb *db, reg *g) {
+static void grant_run(pldb *db, const batch *b, reg *g) {
     JSValue principal = js_principal(&db->js, g->user);
     strlist_clear(&g->selectors);
-    strlist_clear(&g->rkeys);
-    span_list_clear(&g->spans);
-    db->js.track_rkeys = &g->rkeys;
-    db->js.track_spans = &g->spans;
+    reads_begin(db, &g->greads);
     int rc = js_grant(&db->js, principal, &g->selectors);
-    db->js.track_rkeys = NULL;
-    db->js.track_spans = NULL;
+    reads_end(db, &g->greads, b);
     JS_FreeValue(db->js.ctx, principal);
 
     // every selector in wire form, or the first failure
@@ -363,7 +511,38 @@ static int reg_evaluate(pldb *db, reg *g) {
         strlist_clear(&g->selectors);
     }
     view_hash(&g->selectors, g->hash);
-    return g->failure ? -1 : 0;
+    g->granted = true;
+}
+
+static void grant_forget(reg *g) {
+    g->granted = false;
+    strlist_clear(&g->selectors);
+    free(g->failure);
+    g->failure = NULL;
+    reads_clear(&g->greads);
+}
+
+/* Run lookup for the user's token, replacing the account and its read-set.  A lookup that throws
+   is a bug, and the account fails closed: it is no account, so the user's tokens are refused. */
+static void account_run(pldb *db, const batch *b, reg *g) {
+    JSValue principal = js_principal(&db->js, g->user);
+    free(g->password_hash);
+    free(g->lookup_failure);
+    g->password_hash = g->lookup_failure = NULL;
+    reads_begin(db, &g->areads);
+    int rc = js_account(&db->js, principal, &g->generation, &g->password_hash);
+    reads_end(db, &g->areads, b);
+    JS_FreeValue(db->js.ctx, principal);
+    if (rc) g->lookup_failure = bug_reason(db, NULL, strf("lookup failed: %s", db->js.err));
+    g->looked = true;
+}
+
+static void account_forget(reg *g) {
+    g->looked = false;
+    free(g->password_hash);
+    free(g->lookup_failure);
+    g->password_hash = g->lookup_failure = NULL;
+    reads_clear(&g->areads);
 }
 
 static reg *reg_find(pldb *db, const char *canon) {
@@ -376,10 +555,12 @@ static void reg_free(reg *g) {
     free(g->canon);
     free(g->user);
     strlist_free(&g->selectors);
-    strlist_free(&g->rkeys);
-    span_list_free(&g->spans);
-    free(g->conns);
     free(g->failure);
+    reads_free(&g->greads);
+    free(g->password_hash);
+    free(g->lookup_failure);
+    reads_free(&g->areads);
+    free(g->conns);
     free(g);
 }
 
@@ -390,6 +571,38 @@ static void reg_attach(reg *g, uint64_t conn) {
         if (!g->conns) die("out of memory");
     }
     g->conns[g->nconns++] = conn;
+}
+
+// the principal's registration, made when it has none, used now
+static reg *reg_of(pldb *db, const batch *b, const char *user) {
+    char *canon = canon_principal(user);
+    reg *g = reg_find(db, canon);
+    if (g) {
+        free(canon);
+    } else {
+        g = xmalloc(sizeof *g);
+        memset(g, 0, sizeof *g);
+        g->canon = canon;
+        g->user = user ? xstrdup(user) : NULL;
+        g->next = db->regs;
+        db->regs = g;
+    }
+    g->used = b->servertime;
+    return g;
+}
+
+// the principal's registration, its grant current as of this point in the batch
+static reg *reg_grant(pldb *db, const batch *b, const char *user) {
+    reg *g = reg_of(db, b, user);
+    if (!g->granted || reads_touched(&g->greads, b)) grant_run(db, b, g);
+    return g;
+}
+
+// the user's registration, its account current as of this point in the batch
+static reg *reg_account(pldb *db, const batch *b, const char *user) {
+    reg *g = reg_of(db, b, user);
+    if (!g->looked || reads_touched(&g->areads, b)) account_run(db, b, g);
+    return g;
 }
 
 /* A selector in wire form is an exact one, a slice name, or a prefix one: "chat:*" or
@@ -454,16 +667,6 @@ static pldb_result *view_result(const reg *g, uint64_t conn, uint64_t position) 
     return r;
 }
 
-/* The registrations a batch takes, each answered once the batch has re-run the grantors its
-   writes touched, so a connection registered in the batch that changes its grant gets the view
-   as of the batch's end, in one answer: an answer built at the registration would carry the view
-   from before the batch's writes, and a re-run's answer for the same connection would race it. */
-typedef struct reg_replies {
-    reg **g;
-    pldb_result **r;
-    size_t n, cap;
-} reg_replies;
-
 static void reg_replies_push(reg_replies *rr, reg *g, pldb_result *r) {
     if (rr->n == rr->cap) {
         rr->cap = rr->cap ? rr->cap * 2 : 4;
@@ -485,23 +688,16 @@ static bool reg_replies_has(const reg_replies *rr, uint64_t conn) {
 }
 
 /* the stale-token check: -1 stale, 0 ok */
-static int check_generation(pldb *db, const char *user, int64_t gen) {
+static int check_generation(pldb *db, const batch *b, const char *user, int64_t gen) {
     if (!user || gen < 0) return 0;
-    JSValue principal = js_principal(&db->js, user);
-    int64_t g = js_generation(&db->js, principal);
-    JS_FreeValue(db->js.ctx, principal);
-    if (g == -2) {
-        fprintf(stderr, "pldb: generation lookup failed: %s\n", db->js.err);
-        return -1;
-    }
-    /* a token speaks only for an existing account at its current generation */
-    if (g == -1) return -1;
-    return g == gen ? 0 : -1;
+
+    // a token speaks only for an existing account at its current generation
+    return reg_account(db, b, user)->generation == gen ? 0 : -1;
 }
 
-static void handle_register(pldb *db, req *q, reg_replies *replies, pldb_result **after_tail) {
+static void handle_register(pldb *db, batch *b, req *q, pldb_result **after_tail) {
     pldb_result *r;
-    if (check_generation(db, q->user, q->gen)) {
+    if (check_generation(db, b, q->user, q->gen)) {
         r = result_new(PLDB_R_VIEW);
         r->status = 401;
         r->conn = q->conn;
@@ -510,115 +706,118 @@ static void handle_register(pldb *db, req *q, reg_replies *replies, pldb_result 
         *after_tail = r;
         return;
     }
-    char *canon = canon_principal(q->user);
-    reg *g = reg_find(db, canon);
-    if (!g) {
-        g = xmalloc(sizeof *g);
-        memset(g, 0, sizeof *g);
-        g->canon = canon;
-        g->user = q->user ? xstrdup(q->user) : NULL;
-        reg_evaluate(db, g);
-        g->next = db->regs;
-        db->regs = g;
-    } else {
-        free(canon);
-    }
+    reg *g = reg_grant(db, b, q->user);
     reg_attach(g, q->conn);
 
     // the reply goes out with the batch's other answers, its view filled at the batch's end
     r = result_new(PLDB_R_VIEW);
     r->conn = q->conn;
     r->reqid = q->reqid;
-    reg_replies_push(replies, g, r);
+    reg_replies_push(&b->replies, g, r);
     (*after_tail)->next = r;
     *after_tail = r;
 }
 
-static void handle_unregister(pldb *db, req *q) {
+// the TTL of a registration its last connection leaves runs from now
+static void handle_unregister(pldb *db, const batch *b, req *q) {
+    for (reg *g = db->regs; g; g = g->next) {
+        for (size_t i = 0; i < g->nconns; i++) {
+            if (g->conns[i] != q->conn) continue;
+            g->conns[i] = g->conns[--g->nconns];
+            if (g->nconns == 0) g->used = b->servertime;
+            return;
+        }
+    }
+}
+
+// what lookup answers for the user's token as of the request's turn
+static void handle_account(pldb *db, const batch *b, req *q, pldb_result **after_tail) {
+    pldb_result *r = result_new(PLDB_R_ACCOUNT);
+    r->reqid = q->reqid;
+    reg *g = reg_account(db, b, q->user);
+    if (g->lookup_failure) {
+        r->status = 500;
+        r->errmsg = xstrdup(g->lookup_failure);
+    } else {
+        r->user = xstrdup(q->user);
+        r->generation = g->generation;
+        r->hash = g->password_hash ? xstrdup(g->password_hash) : NULL;
+    }
+    (*after_tail)->next = r;
+    *after_tail = r;
+}
+
+// an account result telling Go the user's generation, or to forget it
+static pldb_result *account_result(const reg *g, bool forgotten) {
+    pldb_result *r = result_new(PLDB_R_ACCOUNT);
+    r->user = xstrdup(g->user);
+    r->generation = g->generation;
+    r->forgotten = forgotten;
+    return r;
+}
+
+/* Bring every registration to the batch's end.  A grant or account the batch's writes touched
+   since it last ran is run again for a registration with connections, which hear of a change
+   ahead of the batch's edits, and is otherwise forgotten until it is next used.  Then each
+   connection whose grant changed since it was last sent one gets a view result, but the ones
+   registered in the batch, whose replies answer them; and Go gets an account result for each user
+   whose generation changed since it was last told one, or that the core forgot. */
+static void settle(pldb *db, batch *b, results *accounts, results *views) {
+    for (reg *g = db->regs; g; g = g->next) {
+        // the grant
+        if (g->granted && reads_touched(&g->greads, b)) {
+            if (g->nconns) grant_run(db, b, g);
+            else grant_forget(g);
+        }
+
+        // the connections, when it changed
+        bool failed = g->failure != NULL;
+        if (g->granted && (strcmp(g->hash, g->sent) != 0 || failed != g->sent_failure)) {
+            /* the whole set goes out on every change, and a failure; the server cuts a set down to
+               each connection's wants and decides whether that view changed */
+            for (size_t i = 0; i < g->nconns; i++) {
+                if (reg_replies_has(&b->replies, g->conns[i])) continue;
+                results_add(views, view_result(g, g->conns[i], db->position));
+            }
+            memcpy(g->sent, g->hash, sizeof g->sent);
+            g->sent_failure = failed;
+        }
+
+        // the account
+        if (!g->user) continue;
+        if (g->looked && reads_touched(&g->areads, b)) {
+            if (g->nconns) account_run(db, b, g);
+            else account_forget(g);
+        }
+
+        // Go's generation, when it is no longer the core's
+        if (g->looked && (!g->told || g->told_generation != g->generation)) {
+            results_add(accounts, account_result(g, false));
+            g->told = true;
+            g->told_generation = g->generation;
+        } else if (!g->looked && g->told) {
+            results_add(accounts, account_result(g, true));
+            g->told = false;
+        }
+    }
+}
+
+// drop every registration without connections that has gone unused for the TTL
+static void expire(pldb *db, int64_t now, results *accounts) {
     reg **link = &db->regs;
     while (*link) {
         reg *g = *link;
-        for (size_t i = 0; i < g->nconns; i++) {
-            if (g->conns[i] == q->conn) {
-                g->conns[i] = g->conns[--g->nconns];
-                break;
-            }
-        }
-        if (g->nconns == 0) {
-            *link = g->next;
-            reg_free(g);
-        } else {
+        if (g->nconns || now - g->used < db->ttl_ms) {
             link = &g->next;
+            continue;
         }
-    }
-}
-
-static bool has_prefix(const char *s, const char *prefix) {
-    return strncmp(s, prefix, strlen(prefix)) == 0;
-}
-
-/* Whether a batch's writes touched what a registration's grantor read: a written key it got or
-   one inside a stretch a scan batch walked, or a deleted prefix holding a key it got or one that
-   could lie inside such a stretch.  A spurious re-run costs only time, so a deleted prefix
-   dirties whenever it may. */
-static bool reads_touched(const reg *g, const strlist *written, const strlist *deleted) {
-    // the written keys
-    for (size_t i = 0; i < written->n; i++) {
-        const char *k = written->v[i];
-        if (strlist_has(&g->rkeys, k)) return true;
-        size_t n = strlen(k);
-        for (size_t j = 0; j < g->spans.n; j++) {
-            if (span_covers(&g->spans.v[j], k, n)) return true;
-        }
-    }
-
-    // the deleted prefixes
-    for (size_t i = 0; i < deleted->n; i++) {
-        const char *p = deleted->v[i];
-        for (size_t j = 0; j < g->rkeys.n; j++) {
-            if (has_prefix(g->rkeys.v[j], p)) return true;
-        }
-        size_t n = strlen(p);
-        for (size_t j = 0; j < g->spans.n; j++) {
-            if (span_may_hold(&g->spans.v[j], p, n)) return true;
-        }
-    }
-    return false;
-}
-
-/* after a batch's writes: re-run every grantor whose read-set was touched, and emit a view result
-   to every connection of a registration whose selectors changed */
-static void invalidate_views(pldb *db, const strlist *written, const strlist *deleted,
-                             const reg_replies *replies, pldb_result **head, pldb_result **tail) {
-    for (reg *g = db->regs; g; g = g->next) {
-        if (!reads_touched(g, written, deleted)) continue;
-        char old_hash[17];
-        memcpy(old_hash, g->hash, sizeof old_hash);
-        reg_evaluate(db, g);
-        /* the whole set goes out on every change, and a failure always;
-           the server cuts a set down to each connection's wants and
-           decides whether that view changed */
-        if (g->failure || strcmp(old_hash, g->hash) != 0) {
-            for (size_t i = 0; i < g->nconns; i++) {
-                if (reg_replies_has(replies, g->conns[i])) continue;
-                pldb_result *r = view_result(g, g->conns[i], db->position);
-                if (*tail) (*tail)->next = r;
-                else *head = r;
-                *tail = r;
-            }
-        }
+        if (g->told) results_add(accounts, account_result(g, true));
+        *link = g->next;
+        reg_free(g);
     }
 }
 
 // the write path ///////////////////////////////////////////////////////////
-
-typedef struct batch {
-    int64_t servertime;
-    items commit;
-    strlist written;
-    strlist deleted;
-    reg_replies replies;
-} batch;
 
 /* the most slices one mutation's expectations may name */
 #define EXPECT_MAX 1024
@@ -649,24 +848,17 @@ static bool view_covers(const strlist *view, const char *slice) {
    covers when the mutation's turn comes; naming another rejects the mutation, whether or not the
    slice exists.  Writes the reject, or a conflict outcome listing each mismatched slice's actual
    seq, and returns true when either is written. */
-static bool check_expect(pldb *db, mpack_writer_t *w, const uint8_t *id,
-                         const mpack_node_t *expect, JSValueConst principal) {
+static bool check_expect(pldb *db, const batch *b, mpack_writer_t *w,
+                         const mpack_node_t *expect, const char *user) {
     if (!expect) return false;
     size_t n = mpack_node_map_count(*expect);
     if (n > EXPECT_MAX) die("prepared expect: %zu slices", n);
     if (n == 0) return false;
 
     // what the sender may see; a grantor that fails grants nothing
-    strlist view = {0};
-    int rc = js_grant(&db->js, principal, &view);
-    for (size_t i = 0; rc == 0 && i < view.n; i++) {
-        if (!normalize_bundle_selector(view.v[i])) rc = -1;
-    }
-    if (rc) {
-        strlist_free(&view);
-        char *reason = bug_reason(db, id, strf("grant failed: %s", db->js.err));
-        write_reason(w, "reject", reason);
-        free(reason);
+    reg *g = reg_grant(db, b, user);
+    if (g->failure) {
+        write_reason(w, "reject", g->failure);
         return true;
     }
 
@@ -678,13 +870,12 @@ static bool check_expect(pldb *db, mpack_writer_t *w, const uint8_t *id,
         name.len = 0;
         buf_append(&name, mpack_node_str(k), mpack_node_strlen(k));
         buf_append(&name, "", 1);
-        if (view_covers(&view, (const char *)name.p)) continue;
+        if (view_covers(&g->selectors, (const char *)name.p)) continue;
         char *reason = strf("expect: %s is not a slice the sender may see", (char *)name.p);
         write_reason(w, "reject", reason);
         free(reason);
         hidden = true;
     }
-    strlist_free(&view);
     if (hidden) {
         buf_free(&name);
         return true;
@@ -922,9 +1113,9 @@ static void write_ok(mpack_writer_t *w, uint64_t position) {
    the mutation's edits when it carries the mutation out.  A reject, a conflict, or a throw
    discards the buffer, leaving nothing in the log or the store. */
 static void decide(pldb *db, batch *b, mpack_writer_t *w, const uint8_t *id, JSValueConst data,
-                   const mpack_node_t *expect, JSValueConst principal) {
+                   const mpack_node_t *expect, const char *user, JSValueConst principal) {
     // the client's expectations of its slices
-    if (check_expect(db, w, id, expect, principal)) return;
+    if (check_expect(db, b, w, expect, user)) return;
 
     // the decider, writing into the buffer
     char *reason = NULL;
@@ -950,28 +1141,30 @@ enum { PROOF_HOLDS, PROOF_DECIDED, PROOF_BOUNCED };
    rejection written into w when it failed against the same hash, or lookup failed; and
    PROOF_BOUNCED with the hash lookup answers in *bounce when the hash changed after the proof
    was checked, so that the proof is checked again against it.  A call that has bounced
-   PLDB_MAX_BOUNCES times is decided instead, since a hash that changes on every read is lookup's
-   bug. */
-static int check_proof(pldb *db, mpack_writer_t *w, const uint8_t *id, const pldb_verdict *v,
-                       int attempt, JSValueConst principal, char **bounce) {
-    char *now = NULL;
-    if (js_password_hash(&db->js, principal, &now)) {
-        char *reason = bug_reason(db, id, strf("lookup error: %s", db->js.err));
-        write_reason(w, "reject", reason);
-        free(reason);
-        return PROOF_DECIDED;
+   PLDB_MAX_BOUNCES times is rejected instead, since its sender's credentials keep changing under
+   it. */
+static int check_proof(pldb *db, const batch *b, mpack_writer_t *w, const pldb_verdict *v,
+                       int attempt, const char *user, char **bounce) {
+    // the hash, none for the anonymous principal
+    const char *now = NULL;
+    if (user) {
+        reg *g = reg_account(db, b, user);
+        if (g->lookup_failure) {
+            write_reason(w, "reject", g->lookup_failure);
+            return PROOF_DECIDED;
+        }
+        now = g->password_hash;
     }
 
     // has the hash changed since the proof was checked?
     bool same = now && v->hash ? strcmp(now, v->hash) == 0 : now == v->hash;
     if (!same && attempt < PLDB_MAX_BOUNCES) {
-        *bounce = now;
+        *bounce = now ? xstrdup(now) : NULL;
         return PROOF_BOUNCED;
     }
-    free(now);
     if (!same) {
-        char *reason = bug_reason(db, id, strf("lookup answered a different passwordHash on each "
-                                               "of %d reads", PLDB_MAX_BOUNCES + 2));
+        char *reason = strf("the sender's credentials changed %d times while its proof was checked",
+                            PLDB_MAX_BOUNCES + 1);
         write_reason(w, "reject", reason);
         free(reason);
         return PROOF_DECIDED;
@@ -994,8 +1187,8 @@ static int check_proof(pldb *db, mpack_writer_t *w, const uint8_t *id, const pld
    which decides nothing and writes no outcome, with what lookup answers in *bounce. */
 static bool run_mutation(pldb *db, batch *b, mpack_writer_t *w, const char *series, uint64_t n,
                          const uint8_t *id, JSValueConst data, const mpack_node_t *expect,
-                         JSValueConst principal, const pldb_verdict *v, int attempt,
-                         char **bounce) {
+                         const char *user, JSValueConst principal, const pldb_verdict *v,
+                         int attempt, char **bounce) {
     // the dedup check
     if (series) {
         uint64_t hwm = 0;
@@ -1009,10 +1202,10 @@ static bool run_mutation(pldb *db, batch *b, mpack_writer_t *w, const char *seri
 
     // the proof, then the mutation
     int proof = v && v->state != PLDB_PROOF_NONE
-                    ? check_proof(db, w, id, v, attempt, principal, bounce)
+                    ? check_proof(db, b, w, v, attempt, user, bounce)
                     : PROOF_HOLDS;
     if (proof == PROOF_BOUNCED) return true;
-    if (proof == PROOF_HOLDS) decide(db, b, w, id, data, expect, principal);
+    if (proof == PROOF_HOLDS) decide(db, b, w, id, data, expect, user, principal);
 
     // the decision moves the mark
     if (series && store_series_mark(db->w, series, n, b->servertime))
@@ -1025,7 +1218,7 @@ static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) 
     r->reqid = q->reqid;
     (*after_tail)->next = r;
     *after_tail = r;
-    if (check_generation(db, q->user, q->gen)) {
+    if (check_generation(db, b, q->user, q->gen)) {
         r->status = 401;
         return;
     }
@@ -1075,7 +1268,7 @@ static void handle_submit(pldb *db, batch *b, req *q, pldb_result **after_tail) 
         } else {
             const pldb_verdict *v = k < q->nverdicts ? &q->verdicts[k] : NULL;
             r->bounce = run_mutation(db, b, &w, key, n, id, datav, expects ? &expect : NULL,
-                                     principal, v, q->attempt, &r->hash);
+                                     q->user, principal, v, q->attempt, &r->hash);
         }
         free(key);
         JS_FreeValue(ctx, datav);
@@ -1175,9 +1368,11 @@ static void handle_key(pldb *db, req *q, pldb_result **after_tail) {
 
 static void run_batch(pldb *db, req *head) {
     batch b = {0};
+    b.id = ++db->batches;
     b.servertime = now_ms();
     if (store_exec(db->w, "BEGIN IMMEDIATE")) die("begin: %s", store_err(db->w));
 
+    // each request in its turn, its answer queued behind the batch's commit
     pldb_result after_head = {0};
     pldb_result *after_tail = &after_head;
     for (req *q = head; q; q = q->next) {
@@ -1186,13 +1381,16 @@ static void run_batch(pldb *db, req *head) {
             handle_submit(db, &b, q, &after_tail);
             break;
         case REQ_REGISTER:
-            handle_register(db, q, &b.replies, &after_tail);
+            handle_register(db, &b, q, &after_tail);
             break;
         case REQ_UNREGISTER:
-            handle_unregister(db, q);
+            handle_unregister(db, &b, q);
             break;
         case REQ_LOOKUP:
             handle_lookup(db, q, &after_tail);
+            break;
+        case REQ_ACCOUNT:
+            handle_account(db, &b, q, &after_tail);
             break;
         case REQ_ARM:
             handle_arm(db, &b, q, &after_tail);
@@ -1205,20 +1403,23 @@ static void run_batch(pldb *db, req *head) {
             break;
         }
     }
-    pldb_result *views = NULL, *views_tail = NULL;
-    invalidate_views(db, &b.written, &b.deleted, &b.replies, &views, &views_tail);
+
+    // the registrations as the batch leaves them
+    results accounts = {0}, views = {0};
+    settle(db, &b, &accounts, &views);
 
     // each registration's reply, with its view as the batch leaves it
     for (size_t i = 0; i < b.replies.n; i++) view_fill(b.replies.r[i], b.replies.g[i]);
     free(b.replies.g);
     free(b.replies.r);
+
+    // then the registrations gone unused, and the commit
+    expire(db, b.servertime, &accounts);
     if (store_exec(db->w, "COMMIT")) die("commit: %s", store_err(db->w));
 
-    while (views) {
-        pldb_result *r = views;
-        views = r->next;
-        results_push(db, r);
-    }
+    // the changes to accounts and views, ahead of the edits they apply to
+    results_push_all(db, &accounts);
+    results_push_all(db, &views);
     if (b.commit.n) {
         pldb_result *r = result_new(PLDB_R_COMMIT);
         r->position = db->position;
@@ -1384,11 +1585,12 @@ static int load_cron(pldb *db, char *err, size_t errlen) {
 }
 
 int pldb_open(const char *dir, const char *host, size_t hostlen, const char *bundle,
-              pldb_hash_fn hasher, const char *const *env, int nenv, int cache_mib, pldb **out,
-              char *err, size_t errlen) {
+              pldb_hash_fn hasher, const char *const *env, int nenv, int cache_mib,
+              int64_t ttl_ms, pldb **out, char *err, size_t errlen) {
     pldb *db = xmalloc(sizeof *db);
     memset(db, 0, sizeof *db);
     db->dir = xstrdup(dir);
+    db->ttl_ms = ttl_ms;
     db->hasher = hasher;
     pthread_mutex_init(&db->rmu, NULL);
     pthread_mutex_init(&db->qmu, NULL);
@@ -1473,6 +1675,13 @@ void pldb_close(pldb *db) {
 }
 
 const char *pldb_epoch(pldb *db) { return db->epoch; }
+
+int pldb_head(pldb *db, uint64_t *position) {
+    pthread_mutex_lock(&db->rmu);
+    int rc = store_max_position(db->r, position);
+    pthread_mutex_unlock(&db->rmu);
+    return rc ? -1 : 0;
+}
 
 // reader side //////////////////////////////////////////////////////////////
 

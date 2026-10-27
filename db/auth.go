@@ -113,7 +113,9 @@ func (s *Server) verify(token string) (*claims, error) {
 	return &c, nil
 }
 
-// principalOf resolves the Authorization header; no header is anonymous.
+// principalOf resolves the Authorization header; no header is anonymous.  A token whose generation
+// is not the one the core last published for its user is refused here, without a trip to the
+// writer, which checks every other token.
 func (s *Server) principalOf(r *http.Request) (principal, error) {
 	h := r.Header.Get("Authorization")
 	if h == "" {
@@ -127,8 +129,16 @@ func (s *Server) principalOf(r *http.Request) (principal, error) {
 	if err != nil {
 		return principal{}, err
 	}
-	return principal{user: c.Sub, gen: c.Gen}, nil
+	s.mu.Lock()
+	gen, known := s.generations[c.Sub]
+	s.mu.Unlock()
+	if known && gen != c.Gen {
+		return principal{}, errRevoked
+	}
+	return principal{user: c.Sub, gen: c.Gen, exp: c.Exp}, nil
 }
+
+var errRevoked = errors.New("token revoked")
 
 func hashPassword(pw string) string {
 	salt := make([]byte, 16)
@@ -274,11 +284,11 @@ func (s *Server) passwordHashOf(p principal) (*string, error) {
 	if p.anonymous {
 		return nil, nil
 	}
-	a, err := s.lookup(map[string]any{"kind": "token", "user": p.user})
-	if err != nil || a == nil {
-		return nil, err
+	r := s.request(func(reqid uint64) { s.core.account(reqid, p.user) })
+	if r.status != 0 {
+		return nil, errors.New(r.errmsg)
 	}
-	return a.passwordHash, nil
+	return r.hash, nil
 }
 
 // prove checks each mutation's proofs, the passwords prepare set aside, against hash, and answers

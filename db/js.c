@@ -890,24 +890,25 @@ int js_lookup(jsrt *js, const uint8_t *ident, size_t len, buf *out) {
     return rc;
 }
 
-int64_t js_generation(jsrt *js, JSValueConst principal) {
-    JSValue r = call_reading(js, "generation", "lookup", 1, &principal);
-    if (JS_IsException(r)) return -2;
-    int64_t g = -1;
-    JS_ToInt64(js->ctx, &g, r);
-    JS_FreeValue(js->ctx, r);
-    return g;
-}
-
-int js_password_hash(jsrt *js, JSValueConst principal, char **out) {
-    *out = NULL;
-    JSValue r = call_reading(js, "passwordHash", "lookup", 1, &principal);
+int js_account(jsrt *js, JSValueConst principal, int64_t *generation, char **hash) {
+    JSContext *ctx = js->ctx;
+    *generation = -1;
+    *hash = NULL;
+    JSValue r = call_reading(js, "account", "lookup", 1, &principal);
     if (JS_IsException(r)) return -1;
-    if (JS_IsString(r)) {
-        const char *s = JS_ToCString(js->ctx, r);
-        if (s) *out = xstrdup(s);
-        JS_FreeCString(js->ctx, s);
+    if (JS_IsNull(r)) return 0;
+
+    // the generation, and the hash, which host.js has checked is a string or null
+    JSValue g = JS_GetPropertyStr(ctx, r, "generation");
+    JS_ToInt64(ctx, generation, g);
+    JS_FreeValue(ctx, g);
+    JSValue h = JS_GetPropertyStr(ctx, r, "passwordHash");
+    if (JS_IsString(h)) {
+        const char *s = JS_ToCString(ctx, h);
+        if (s) *hash = xstrdup(s);
+        JS_FreeCString(ctx, s);
     }
-    JS_FreeValue(js->ctx, r);
+    JS_FreeValue(ctx, h);
+    JS_FreeValue(ctx, r);
     return 0;
 }

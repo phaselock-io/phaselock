@@ -91,12 +91,12 @@ plan above take precedence over it.
   default: at SQLite's own 2 MiB, a large group commit spills pages to
   the WAL before it commits and reads them back.
 - Threads in C: the txn loop (owns QuickJS, SQLite writer connection,
-  grant registrations); a results pop thread on the Go side that
+  registrations); a results pop thread on the Go side that
   blocks in one cgo call; a reader thread with its own SQLite
   connection for history reads, edit reads, and snapshot cuts.
   Handler goroutines enqueue mutations directly; no dedicated push
-  thread.  Mutation outcomes, view changes, and lookup replies all
-  come back through the single results queue.
+  thread.  Mutation outcomes, view and account changes, and lookup
+  replies all come back through the single results queue.
 - The bundle is one JS file assigning `globalThis.__bundle` (see Bundle
   contract): the app's `db.ts` calling the generated `define{Database}`,
   bundled with the generated module.
@@ -336,8 +336,8 @@ Every frame is an array whose first element is a tag.
   outside the stream without confusing the two.  It is never sent as
   an HTTP status.  600: the grantor failed when a commit re-ran it;
   601: the connection's backlog overflowed; 602: a history read
-  failed.  A client ends the connection on a code it does not know as
-  on any other.
+  failed; 603: a commit revoked the token, or it is about to expire.  A client ends the connection on a
+  code it does not know as on any other.
 - `since=N` replays history from N+1, then sends `live` with the last
   position the replay reached; nothing after `live` repeats a position
   at or below it.  `since=-1` means bootstrap: history from the view's
@@ -531,7 +531,7 @@ Every frame is an array whose first element is a tag.
       epoch against its connection's, and a resuming client checks the
       position against the one it is mid-download of; the tail read
       can be issued from the header alone.  The grant must cover the
-      whole selector.
+      whole selector, as of the cut (Registrations).
 
     GET /edits/<selector>[?after=W][&before=X][&reverse=true][&max=N]
       → edits frames for the selector with W < position < X, one per
@@ -539,7 +539,8 @@ Every frame is an array whose first element is a tag.
         1000) and the rest of the last one's mutation, or fewer when
         the range runs out; header PhaseLock-Scanned.  No after is the
         start of the log, no before is the head.  The grant must cover
-        the whole selector, as for a snapshot.
+        the whole selector, as of the log's head once the edits are
+        read.
 
 - A snapshot response is the blob inline or a pointer to it in a blob
   store: v0 answers inline, and a deployment backed by a blob store
@@ -858,7 +859,16 @@ Atomicity:
   `kid`; a token naming any other algorithm is refused.  Refresh is
   re-issue.  The token's `gen` is compared to the account's generation
   on connection open and on every mutation; a mismatch is rejected, so
-  a generation bump logs out everywhere.
+  a generation bump logs out everywhere.  An open connection whose
+  generation a commit moves ends with `["end", 603, "token revoked"]`
+  ahead of that commit's edits, and one ends a minute before its token
+  expires with `["end", 603, "token expiring"]`, so its client
+  reconnects with the token refreshed.
+- Go keeps each user's generation as the core last published it, for
+  every user the core holds an account for (Registrations),
+  and refuses a token that does not match it at once, before the
+  writer sees the request.  A user the core holds no account for goes
+  to the writer, whose check is the authority.
 - A private key lives only in the memory of the process that signs
   with it.  The first signature after startup mints one, and so does
   the first signature once the current key has signed for a day, so
@@ -885,11 +895,10 @@ Atomicity:
   so a login is decided against the credentials it ends with.
   Credentials still changing after a third re-check are `lookup`
   answering differently for the same state, a bug, which fails the
-  login with 500.  The generation check calls `lookup` with
-  `{kind: "token", user}`; refresh calls it with `{kind: "refresh",
-  user}`; a null result means no account and fails like a moved
-  generation, since a token speaks only for an existing account, dev
-  tokens included.
+  login with 500.  The generation check reads the user's account
+  (Registrations); refresh calls `lookup` with `{kind: "refresh",
+  user}`.  No account fails like a moved generation, since a token
+  speaks only for an existing account, dev tokens included.
 - A mutation's `NewPassword` fields, which the registry marks, are
   hashed in the handler's cgo call, before the decider runs.  The
   decider and the log see only the hash.  Password-bearing mutations
@@ -901,16 +910,15 @@ Atomicity:
   not know stops it at startup: the bundle needs a newer database.
 - A `MutationAuth` proof of kind `password` proves the sender's own
   password.  Intake writes `{kind: "password"}` in its place and sets
-  the password aside; Go asks `lookup` with `{kind: "token", user}`
-  for the sender and checks the request's proofs against its
-  `passwordHash` on the pool, within the client's budget, as a login
-  does.  The anonymous principal and an account without a hash fail.
+  the password aside; Go asks the core for the sender's account and
+  checks the request's proofs against its `passwordHash` on the pool,
+  within the client's budget, as a login does.  The anonymous principal and an account without a hash fail.
   Each mutation's verdict, with the hash it was checked against,
   travels to the writer beside the mutation and never reaches the log.
 - The writer checks a proven mutation after the dedup check and before
   `expect` and the decider, so a failed proof never learns a slice's
   seq, and a resend of a mutation that landed is answered by dedup
-  however its proof checks now.  It calls `lookup` again in the
+  however its proof checks now.  It reads the account again in the
   mutation's turn: when the hash is unchanged the verdict stands, and
   a failed one is rejected as "invalid credentials", a decision like
   any other.  When the hash changed, the writer bounces the call: it
@@ -919,8 +927,7 @@ Atomicity:
   budget and waiting for room on the pool, then submits the rest of
   the call again.  The call's mutations are still decided once each
   and in order, and a call may prove a password its earlier mutation
-  set.  A fourth change in a row is `lookup`'s bug, and rejects the
-  mutation as one.  Every submit runs the generation check, so a
+  set.  A fourth change in a row rejects the mutation.  Every submit runs the generation check, so a
   token revoked partway through a call is refused with 401, as a lost
   reply is, and a resend dedups the mutations already decided.
 - Every argon2id hash, at login and at intake, runs on a fixed pool of
@@ -950,6 +957,36 @@ Atomicity:
   load, such as one replaced halfway, leaves the last one that loaded
   in place.  A pair that does not load at startup stops the server
   before it opens anything.
+
+### Registrations
+
+- The core keeps one registration per principal: what the grantor
+  allows it and, for a user, its account, what `lookup` answers for
+  `{kind: "token", user}`, a generation and a password hash.  Each is
+  kept with what it read (Bundle contract), and every check reads it:
+  a connection's view, an expectation's grant, a request's generation,
+  and a proof's hash.
+- The writer brings each up to date where it uses it.  Each remembers
+  how far into its batch's writes it ran, and runs again only when a
+  write since then touched what it read, so every check in a
+  mutation's turn sees the state the mutation does: a revocation
+  refuses the next request in its own batch, and a grant covers the
+  next expectation.
+- At a batch's end, a grant or account the batch touched is run again
+  for a registration with connections, and otherwise forgotten until
+  its next use.  Each connection whose grant changed gets a view
+  frame, and Go gets each user's new generation, or word that the core
+  no longer holds it, all ahead of the batch's commit, so a connection
+  is cut down or ended before the edits of the batch that did it.
+- A registration with no connections is kept for `--principal-ttl`, a
+  minute by default, from its last use or its last connection's close,
+  and dropped by the first batch after.
+- `/snapshot` and `/edits` register for the length of the request.
+  After the read, the request waits until the dispatcher has published
+  the position the read saw, the cut's or, for `/edits`, the log's
+  head after the read, then checks the token and the grant, so a
+  revocation that lands while the request runs refuses it with 401 or
+  403.
 
 ### Bootstrap
 
@@ -1043,10 +1080,10 @@ app's slots:
 
 - `data` is the mutation's data; `principal` is `{user}` with `user`
   null for anonymous; `ident` is `{kind: "password", identity}` at
-  login and the `token`/`refresh` shapes above otherwise.  The `token`
-  shape also answers for a `MutationAuth` proof, and the writer reads
-  its `passwordHash` again in the mutation's turn, so its answer
-  should change only when the account's credentials do.
+  login and the `token`/`refresh` shapes above otherwise.  A
+  registration holds the `token` shape's answer and runs it again only
+  when a write touches what it read (Registrations), so the answer
+  must follow from the state it reads.
 - The bundle's contexts are built once, when it is defined, and
   `host.js` binds them once, when the bundle loads, to one transaction
   object whose calls reach whichever call into the bundle is running:
@@ -1104,8 +1141,8 @@ app's slots:
   picks out (Log and edits).  The skeleton's conformance fixture
   (`typespec/tests/fixtures/scan-conformance.json`) runs against it
   in `scan_test.go`.
-- The grantor is registered per distinct `principal` and re-run when
-  a commit touches what it read: the keys it got, and for each scan
+- A registration's grantor and `token` lookup are run again when a
+  write touches what they read: the keys they got, and for each scan
   batch, the stretch of keys the walk covered, the skeleton's
   `ScanSpan` (its pattern, its direction, from just past the batch's
   `after` to its `next` or the walk's end).  A written key touches a

@@ -269,10 +269,9 @@ int js_tick(jsrt *js, wbuf *wb, const char *install, const char *entry, int64_t 
             int64_t now);
 int js_grant(jsrt *js, JSValueConst principal, strlist *out);
 int js_lookup(jsrt *js, const uint8_t *ident, size_t len, buf *out);
-int64_t js_generation(jsrt *js, JSValueConst principal);
-/* the password hash lookup answers for the principal's token, malloc'd into out, or NULL for
-   none; -1 when lookup threw */
-int js_password_hash(jsrt *js, JSValueConst principal, char **out);
+/* What lookup answers for the principal's token: its generation, -1 for no account, and its
+   password hash, malloc'd into hash, or NULL for none; -1 when lookup threw. */
+int js_account(jsrt *js, JSValueConst principal, int64_t *generation, char **hash);
 
 /* names.c: slice names, the selectors a grantor returns, and the characters of a key */
 /* whether a string is a slice name: a family, then optionally ':' and its parameters' values

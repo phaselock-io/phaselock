@@ -71,19 +71,16 @@ globalThis.__host = (function () {
       const r = bundle().lookup(ident);
       return r == null ? null : r;
     },
-    generation(principal) {
+    // what lookup answers for a principal's token: its generation and password hash, or null for
+    // no account
+    account(principal) {
       const r = bundle().lookup({ kind: 'token', user: principal.user });
-      return r == null ? -1 : (r.generation ?? 0);
-    },
-    // the password hash lookup answers for a principal's token, or null for none
-    passwordHash(principal) {
-      if (principal.user === null) return null;
-      const r = bundle().lookup({ kind: 'token', user: principal.user });
-      if (r == null || r.passwordHash == null) return null;
-      if (typeof r.passwordHash !== 'string') {
+      if (r == null) return null;
+      const passwordHash = r.passwordHash ?? null;
+      if (passwordHash !== null && typeof passwordHash !== 'string') {
         throw new Error('lookup answered a passwordHash that is not a string');
       }
-      return r.passwordHash;
+      return { generation: r.generation ?? 0, passwordHash };
     },
   };
 })();

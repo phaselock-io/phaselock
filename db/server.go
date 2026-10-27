@@ -56,6 +56,9 @@ type Options struct {
 	// the most commits and view changes a /stream connection may have queued and unsent before it
 	// is dropped (default 2048)
 	MaxStreamBacklog int
+	// how long a principal's grant and account are kept once it has no connection and has gone
+	// unused (default a minute)
+	PrincipalTTL time.Duration
 
 	// tests only: the clock tokens and their keys are minted and checked by, time.Now when nil
 	now func() time.Time
@@ -67,6 +70,8 @@ type Options struct {
 	beforePush      func(position uint64)
 	beforeStreaming func()
 	beforeForward   func()
+	// tests only: called by /snapshot and /edits once the principal is registered, before the read
+	beforeRead func()
 }
 
 type Server struct {
@@ -95,9 +100,17 @@ type Server struct {
 	conns    map[uint64]*conn
 	nextReq  atomic.Uint64
 	nextConn atomic.Uint64
-	// the last commit's position, published under mu once the commit's frames are queued
-	position atomic.Uint64
-	done     chan struct{}
+	// the last commit's position, published under mu once the commit's frames are queued, which
+	// broadcasts published; and whether the dispatcher has stopped, which broadcasts it too
+	position  atomic.Uint64
+	published *sync.Cond
+	stopped   bool
+	done      chan struct{}
+	/* Each user's generation as the core last published it, for the users it keeps an account
+	   for, and each user's connections whose tokens a change of the generation revokes, by user.
+	   Both under mu. */
+	generations map[string]int64
+	byUser      map[string]map[*conn]struct{}
 	// the interval between a connection's heartbeat vouches
 	heartbeat time.Duration
 
@@ -112,6 +125,7 @@ type Server struct {
 	beforePush      func(position uint64)
 	beforeStreaming func()
 	beforeForward   func()
+	beforeRead      func()
 }
 
 // conn is one connection.  Its view is what the grantor allows cut down to what it wants, and its
@@ -135,6 +149,14 @@ type conn struct {
 	overflowed, shutdown bool
 	// signaled, without blocking, when a frame is queued or the connection ends
 	wake chan struct{}
+	// its principal's user, and its token's generation and expiry in Unix seconds; a connection
+	// whose token no longer speaks for its account is revoked
+	user    string
+	gen     int64
+	exp     int64
+	revoked bool
+	// what the grantor's failure answers the connection with, "" while it grants
+	failure string
 }
 
 // frame is one queued frame: a commit whose edits the connection's view covers some of, or a
@@ -182,12 +204,16 @@ const (
 	endGrantorFailed = 600 // the grantor failed when a commit re-ran it
 	endOverflow      = 601 // the connection's backlog overflowed
 	endReadFailed    = 602 // a history read failed
+	endRevoked       = 603 // the token was revoked, or is about to expire
 )
 
 const (
 	heartbeat = 15 * time.Second
-	maxBody   = 16 << 20
-	coldBatch = 1000
+	// how long before its token expires a connection ends, so that its client reconnects with the
+	// token refreshed
+	expiryLead = time.Minute
+	maxBody    = 16 << 20
+	coldBatch  = 1000
 )
 
 // editsPage is the default and maximum number of edits one /edits response asks for.
@@ -216,8 +242,19 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 	if err := os.MkdirAll(o.DataDir, 0o755); err != nil {
 		return nil, err
 	}
-	c, err := openCore(o.DataDir, o.Bundle, o.BootstrapEnv, cacheMiB)
+	ttl := o.PrincipalTTL
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	c, err := openCore(o.DataDir, o.Bundle, o.BootstrapEnv, cacheMiB, ttl)
 	if err != nil {
+		return nil, err
+	}
+
+	// the log's head, the position the dispatcher has published until its first commit
+	head, err := c.head()
+	if err != nil {
+		c.close()
 		return nil, err
 	}
 
@@ -287,6 +324,8 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 		epoch:                 c.epoch(),
 		pending:               map[uint64]chan result{},
 		conns:                 map[uint64]*conn{},
+		generations:           map[string]int64{},
+		byUser:                map[string]map[*conn]struct{}{},
 		done:                  make(chan struct{}),
 		heartbeat:             cmp.Or(o.heartbeat, heartbeat),
 		cron:                  entries,
@@ -294,7 +333,10 @@ func Open(ctx context.Context, o Options) (*Server, error) {
 		beforePush:            o.beforePush,
 		beforeStreaming:       o.beforeStreaming,
 		beforeForward:         o.beforeForward,
+		beforeRead:            o.beforeRead,
 	}
+	s.published = sync.NewCond(&s.mu)
+	s.position.Store(head)
 	go s.dispatch()
 
 	// arm every new entry at the current minute, then tick every entry from its mark
@@ -410,10 +452,18 @@ func (s *Server) dispatch() {
 					wake(c)
 				}
 			}
+			s.stopped = true
+			s.published.Broadcast()
 			s.mu.Unlock()
 			return
 		case rOutcome, rLookup, rArm, rTick, rKey:
 			s.reply(r)
+		case rAccount:
+			if r.reqid != 0 {
+				s.reply(r)
+			} else {
+				s.account(r)
+			}
 		case rView:
 			s.mu.Lock()
 			c := s.conns[r.conn]
@@ -424,8 +474,10 @@ func (s *Server) dispatch() {
 				changed := token != c.token
 				c.selectors = view
 				c.token = token
+				c.failure = ""
 				if r.reqid != 0 {
-					if !c.ephemeral {
+					// a connection the batch that registered it revoked never starts
+					if !c.ephemeral && !c.revoked {
 						c.active = true
 					}
 				} else if c.active && changed {
@@ -434,11 +486,15 @@ func (s *Server) dispatch() {
 					s.queue(c, frame{view: &viewChange{pos: s.position.Load(), token: token,
 						selectors: view}})
 				}
-			} else if c != nil && r.reqid == 0 && c.active {
-				// the grantor failed when a commit re-ran it, so the connection ends
-				end := mpEncode([]any{"end", endGrantorFailed, r.errmsg})
-				s.queue(c, frame{view: &viewChange{end: end}})
-				c.active = false
+			} else if c != nil {
+				// the grantor failed, so the connection is answered with the failure, and one it
+				// failed under when a commit re-ran it ends
+				c.failure = r.errmsg
+				if r.reqid == 0 && c.active {
+					end := mpEncode([]any{"end", endGrantorFailed, r.errmsg})
+					s.queue(c, frame{view: &viewChange{end: end}})
+					c.active = false
+				}
 			}
 			s.mu.Unlock()
 			if r.reqid != 0 {
@@ -466,9 +522,42 @@ func (s *Server) dispatch() {
 			   then written every frame at or below it, and one that switches to streaming gets
 			   each commit from exactly one of its hot catchup and its queue. */
 			s.position.Store(r.position)
+			s.published.Broadcast()
 			s.mu.Unlock()
 		}
 	}
+}
+
+// account takes the core's change to a user's account, ahead of the edits of the batch that made
+// it: Go's copy of the generation, which refuses a stale token at once, and the end of every
+// connection whose token no longer speaks for the account.
+func (s *Server) account(r result) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r.forgotten {
+		delete(s.generations, r.user)
+		return
+	}
+	s.generations[r.user] = r.generation
+	for c := range s.byUser[r.user] {
+		if c.gen == r.generation || c.revoked {
+			continue
+		}
+		c.revoked = true
+		s.queue(c, frame{view: &viewChange{end: mpEncode([]any{"end", endRevoked, "token revoked"})}})
+		c.active = false
+	}
+}
+
+// settled waits until the dispatcher has published a position, by which every change to a grant
+// or an account up to it has reached the connections; false when the server stops first.
+func (s *Server) settled(position uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for s.position.Load() < position && !s.stopped {
+		s.published.Wait()
+	}
+	return s.position.Load() >= position
 }
 
 func (s *Server) reply(r result) {
@@ -678,9 +767,18 @@ func (s *Server) view(p principal, wants []string, ephemeral bool) (*conn, resul
 		wants:     wants,
 		ephemeral: ephemeral,
 		wake:      make(chan struct{}, 1),
+		user:      p.user,
+		gen:       p.gen,
+		exp:       p.exp,
 	}
 	s.mu.Lock()
 	s.conns[c.id] = c
+	if !p.anonymous && p.gen >= 0 {
+		if s.byUser[p.user] == nil {
+			s.byUser[p.user] = map[*conn]struct{}{}
+		}
+		s.byUser[p.user][c] = struct{}{}
+	}
 	s.mu.Unlock()
 	r := s.request(func(reqid uint64) { s.core.register(reqid, c.id, p) })
 	if r.status != 0 {
@@ -688,20 +786,57 @@ func (s *Server) view(p principal, wants []string, ephemeral bool) (*conn, resul
 		return c, r
 	}
 
-	// the dispatcher computed the view before it replied
+	// the dispatcher computed the view before it replied, and revoked a connection whose batch
+	// revoked its token
 	s.mu.Lock()
 	r.selectors = c.selectors
 	r.token = c.token
+	revoked := c.revoked
 	s.mu.Unlock()
+	if revoked {
+		s.drop(c)
+		return c, result{status: http.StatusUnauthorized}
+	}
 	return c, r
 }
 
 func (s *Server) drop(c *conn) {
 	s.mu.Lock()
 	delete(s.conns, c.id)
+	if conns := s.byUser[c.user]; conns != nil {
+		delete(conns, c)
+		if len(conns) == 0 {
+			delete(s.byUser, c.user)
+		}
+	}
 	c.active = false
 	s.mu.Unlock()
 	s.core.unregister(c.id)
+}
+
+// visible answers whether an ephemeral connection's view still covers a selector once the
+// dispatcher has published position, the last its read saw, by which every change to its
+// principal's grant or account up to it has reached the connection; otherwise it answers the
+// client with why not.
+func (s *Server) visible(w http.ResponseWriter, c *conn, selector string, position uint64) bool {
+	if !s.settled(position) {
+		http.Error(w, errClosed.Error(), http.StatusServiceUnavailable)
+		return false
+	}
+	s.mu.Lock()
+	revoked, failure, selectors := c.revoked, c.failure, c.selectors
+	s.mu.Unlock()
+	switch {
+	case revoked:
+		http.Error(w, errRevoked.Error(), http.StatusUnauthorized)
+	case failure != "":
+		http.Error(w, failure, http.StatusInternalServerError)
+	case !covers(selectors, selector):
+		http.Error(w, "selector not visible", http.StatusForbidden)
+	default:
+		return true
+	}
+	return false
 }
 
 // refuse answers a request the core did not carry out: a stale token, the server shutting
@@ -796,7 +931,17 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// writes a queued view frame at the cursor, or the end frame a failed grantor queues
+	// the token's expiry, shortly before which the connection ends
+	var expired <-chan time.Time
+	if p.exp != 0 {
+		timer := time.NewTimer(time.Unix(p.exp, 0).Add(-expiryLead).Sub(s.now()))
+		defer timer.Stop()
+		expired = timer.C
+	}
+	endExpired := mpEncode([]any{"end", endRevoked, "token expiring"})
+
+	// writes a queued view frame at the cursor, or an end frame a failed grantor or a revocation
+	// queues
 	writeView := func(v *viewChange) bool {
 		if v.end != nil {
 			write(v.end)
@@ -876,6 +1021,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// cold catchup: unbuffered, as long as it takes, with the view frames queued meanwhile, the only
 	// frames queued before the switch to streaming
 	for {
+		select {
+		case <-expired:
+			write(endExpired)
+			return
+		default:
+		}
 		if !forward(take()) {
 			return
 		}
@@ -949,6 +1100,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if !write(mpEncode([]any{"vouch", cursor})) {
 				return
 			}
+		case <-expired:
+			write(endExpired)
+			return
 		case <-r.Context().Done():
 			return
 		}
@@ -1076,6 +1230,9 @@ func (s *Server) decide(ctx context.Context, p principal, pc *prepared, verdicts
 		if err != nil {
 			return nil, result{status: http.StatusServiceUnavailable, errmsg: err.Error()}
 		}
+		if s.proved != nil {
+			s.proved()
+		}
 		copy(verdicts[first:], again)
 	}
 }
@@ -1105,14 +1262,22 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		refuse(w, view)
 		return
 	}
-	s.drop(c)
+	defer s.drop(c)
 	if !covers(view.selectors, selector) {
 		http.Error(w, "selector not visible", http.StatusForbidden)
 		return
 	}
+
+	// the cut, then the grant as of it, so that a revocation that lands before the cut hides it
+	if s.beforeRead != nil {
+		s.beforeRead()
+	}
 	blob, position, err := s.core.snapshot(selector)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !s.visible(w, c, selector, position) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -1192,14 +1357,27 @@ func (s *Server) handleEdits(w http.ResponseWriter, r *http.Request) {
 		refuse(w, view)
 		return
 	}
-	s.drop(c)
+	defer s.drop(c)
 	if !covers(view.selectors, selector) {
 		http.Error(w, "selector not visible", http.StatusForbidden)
 		return
 	}
+
+	// the edits, then the grant as of the head read after them, which bounds every edit read
+	if s.beforeRead != nil {
+		s.beforeRead()
+	}
 	items, err := s.core.readEdits(selector, after, before, reverse, limit)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	head, err := s.core.head()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !s.visible(w, c, selector, head) {
 		return
 	}
 	mutations := groupPositions(items)
