@@ -36,6 +36,27 @@ void strlist_clear(strlist *l);
 void strlist_free(strlist *l);
 void strlist_sort(strlist *l);
 
+/* A table of owned strings in the order they were added, with a hash over the distinct ones that
+   names each string's last add.  A put adds a string once, so the table is a set; an add appends
+   every time, and strtab_last tells the adds that are the last of their string, so a walk over a
+   stretch of the table can take each string once. */
+typedef struct strtab {
+    char **v;
+    size_t n, cap;
+    size_t *slots; /* open addressing over v: the index of a string's last add plus one, 0 empty */
+    size_t nslots;
+} strtab;
+/* append s, answering its index */
+size_t strtab_add(strtab *t, const char *s);
+/* add s unless the table holds it */
+void strtab_put(strtab *t, const char *s);
+/* the index of s's last add, or -1 */
+long strtab_find(const strtab *t, const char *s);
+/* whether entry i is the last add of its string */
+bool strtab_last(const strtab *t, size_t i);
+void strtab_clear(strtab *t);
+void strtab_free(strtab *t);
+
 char *xstrdup(const char *s);
 void *xmalloc(size_t n);
 void die(const char *fmt, ...);
@@ -241,7 +262,7 @@ typedef struct jsrt {
        that only reads runs, which a write fails, naming slot */
     wbuf *wb;
     const char *slot;
-    strlist *track_rkeys;
+    strtab *track_rkeys;
     span_list *track_spans;
     size_t scan_budget; /* the keys a scan steps through before it seeks */
     bool dev;           /* the bundle's DEV: its errors go to clients in full */
@@ -273,12 +294,17 @@ int js_lookup(jsrt *js, const uint8_t *ident, size_t len, buf *out);
    password hash, malloc'd into hash, or NULL for none; -1 when lookup threw. */
 int js_account(jsrt *js, JSValueConst principal, int64_t *generation, char **hash);
 
-/* names.c: slice names, the selectors a grantor returns, and the characters of a key */
+/* names.c: slice names, the selectors a grantor returns, and the characters of a key.  A store
+   key holds at most KEY_MAX bytes, the most an LMDB key holds by default, and a slice name at
+   most SLICE_MAX, one less, the shortest key under it being "<slice>!". */
+#define KEY_MAX 511
+#define SLICE_MAX (KEY_MAX - 1)
 /* whether a string is a slice name: a family, then optionally ':' and its parameters' values
-   separated by ',' */
+   separated by ',', SLICE_MAX bytes at most */
 bool slice_name_ok(const char *name);
 /* whether a prefix selector's text before its star ("chat:", "chat:acme,") is a family and ':',
-   then whole leading values, each followed by ',' */
+   then whole leading values, each followed by ',', and shorter than SLICE_MAX bytes, since a slice
+   name it covers is longer */
 bool selector_prefix_ok(const char *prefix);
 /* whether a key, as its C string, holds no control character and no lone surrogate */
 bool key_chars_ok(const char *key);

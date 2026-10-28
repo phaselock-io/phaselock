@@ -219,6 +219,10 @@ const (
 // editsPage is the default and maximum number of edits one /edits response asks for.
 const editsPage = 1000
 
+// sliceMax is the most bytes a slice name holds, the core's SLICE_MAX: one less than the 511 an
+// LMDB key holds by default, since the shortest key under a slice is "<slice>!".
+const sliceMax = 510
+
 // Open starts a server that lives until ctx ends or Close is called.  Its handler's requests
 // should run under BaseContext, so that they end with it.
 func Open(ctx context.Context, o Options) (*Server, error) {
@@ -624,10 +628,14 @@ func matches(name, selector string) bool {
 // URL carries unencoded.  A prefix selector is a family and ':', or a
 // family, ':', and whole leading values each followed by ',', then '*'.  The
 // core checks a grantor's selectors, and the slice names a write or an
-// expectation gives, by the same rules.
+// expectation gives, by the same rules.  A slice name holds at most sliceMax
+// bytes, and a prefix selector covers names longer than its text.
 func validSelector(selector string) bool {
 	if selector == "*" {
 		return true
+	}
+	if len(selector) > sliceMax {
+		return false
 	}
 
 	// a prefix selector's values are all leading ones, followed by their separator
@@ -773,7 +781,7 @@ func (s *Server) view(p principal, wants []string, ephemeral bool) (*conn, resul
 	}
 	s.mu.Lock()
 	s.conns[c.id] = c
-	if !p.anonymous && p.gen >= 0 {
+	if !p.anonymous {
 		if s.byUser[p.user] == nil {
 			s.byUser[p.user] = map[*conn]struct{}{}
 		}

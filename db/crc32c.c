@@ -116,3 +116,63 @@ static int cmpstr(const void *a, const void *b) {
 void strlist_sort(strlist *l) {
     if (l->n > 1) qsort(l->v, l->n, sizeof(char *), cmpstr);
 }
+
+// the hash's slot for s: the one naming its last add, or the empty one where it would go
+static size_t strtab_slot(const strtab *t, const char *s) {
+    size_t mask = t->nslots - 1;
+    uint64_t h = pl_fnv1a(s, strlen(s), 14695981039346656037ull);
+    for (size_t i = h & mask;; i = (i + 1) & mask) {
+        size_t at = t->slots[i];
+        if (at == 0 || strcmp(t->v[at - 1], s) == 0) return i;
+    }
+}
+
+// rebuild the hash over the entries, at a size that keeps it at most half full
+static void strtab_rehash(strtab *t) {
+    size_t want = 16;
+    while (want < 2 * (t->n + 1)) want *= 2;
+    if (want != t->nslots) {
+        free(t->slots);
+        t->slots = xmalloc(want * sizeof *t->slots);
+        t->nslots = want;
+    }
+    memset(t->slots, 0, t->nslots * sizeof *t->slots);
+    for (size_t i = 0; i < t->n; i++) t->slots[strtab_slot(t, t->v[i])] = i + 1;
+}
+
+size_t strtab_add(strtab *t, const char *s) {
+    if (t->nslots < 2 * (t->n + 1)) strtab_rehash(t);
+    if (t->n == t->cap) {
+        t->cap = t->cap ? t->cap * 2 : 16;
+        t->v = realloc(t->v, t->cap * sizeof *t->v);
+        if (!t->v) die("out of memory");
+    }
+    t->v[t->n] = xstrdup(s);
+    t->slots[strtab_slot(t, s)] = ++t->n;
+    return t->n - 1;
+}
+
+void strtab_put(strtab *t, const char *s) {
+    if (strtab_find(t, s) < 0) strtab_add(t, s);
+}
+
+long strtab_find(const strtab *t, const char *s) {
+    if (t->n == 0) return -1;
+    size_t at = t->slots[strtab_slot(t, s)];
+    return at ? (long)at - 1 : -1;
+}
+
+bool strtab_last(const strtab *t, size_t i) { return strtab_find(t, t->v[i]) == (long)i; }
+
+void strtab_clear(strtab *t) {
+    for (size_t i = 0; i < t->n; i++) free(t->v[i]);
+    t->n = 0;
+    if (t->nslots) memset(t->slots, 0, t->nslots * sizeof *t->slots);
+}
+
+void strtab_free(strtab *t) {
+    strtab_clear(t);
+    free(t->v);
+    free(t->slots);
+    memset(t, 0, sizeof *t);
+}

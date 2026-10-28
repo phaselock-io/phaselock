@@ -36,6 +36,16 @@ globalThis.__host = (function () {
 
   const bundle = () => globalThis.__bundle;
 
+  // an account's generation, 0 when absent; anything but a non-negative safe integer is lookup's
+  // bug, since a token's generation is compared for equality alone
+  const generationOf = (r) => {
+    const generation = r.generation ?? 0;
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new Error('lookup answered a generation that is not a non-negative safe integer');
+    }
+    return generation;
+  };
+
   return {
     // bind the bundle's contexts to the transaction, once, after the bundle is evaluated
     load() {
@@ -69,7 +79,9 @@ globalThis.__host = (function () {
     grant: (principal) => bundle().grant(principal),
     lookup(ident) {
       const r = bundle().lookup(ident);
-      return r == null ? null : r;
+      if (r == null) return null;
+      generationOf(r);
+      return r;
     },
     // what lookup answers for a principal's token: its generation and password hash, or null for
     // no account
@@ -80,7 +92,7 @@ globalThis.__host = (function () {
       if (passwordHash !== null && typeof passwordHash !== 'string') {
         throw new Error('lookup answered a passwordHash that is not a string');
       }
-      return { generation: r.generation ?? 0, passwordHash };
+      return { generation: generationOf(r), passwordHash };
     },
   };
 })();

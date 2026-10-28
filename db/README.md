@@ -158,10 +158,11 @@ plan above take precedence over it.
   stack, under the mutation's id.  A dev bundle answers the client
   with the whole error too.  Stacks are mapped through the bundle's
   source map when it carries one.
-- The write gate: a key written holds no control character or lone
-  surrogate, and its slice, the text before its first `!`, is a slice
-  name (Store keys), so a key with no `!`, or an engine-reserved key
-  beginning with `!`, is refused.  A slice deleted is a slice name.
+- The write gate: a key written holds at most 511 bytes, no control
+  character, and no lone surrogate, and its slice, the text before its
+  first `!`, is a slice name (Store keys), so a key with no `!`, or an
+  engine-reserved key beginning with `!`, is refused.  A slice deleted
+  is a slice name.
   The gate checks syntax alone, so a well-formed name in a family no
   slice type declares, or with the wrong number of parameters, lands.
   The local key is the app's: one that no key template names lands as
@@ -238,8 +239,11 @@ plan above take precedence over it.
   database checks a slice name by this syntax alone: a family, a
   non-empty run of `A-Z a-z 0-9 _ -`, then optionally `:` and values
   separated by `,`, each non-empty, each but the last a run of the
-  family's characters, and the last free to hold `.` and `~` too.  The
-  family templates stay in the model's generated code.  Each
+  family's characters, and the last free to hold `.` and `~` too, in
+  510 bytes at most.  A store key holds at most 511, the most an LMDB
+  key holds by default, so 510 is the longest slice name any key can
+  be under, `<slice>!`.  The family templates stay in the model's
+  generated code.  Each
   separator after a parameter (`,` and `!`) sorts below every
   character the parameter may hold, so a scan of a family visits its
   slices, and a scan of a key template its keys, in the order of their
@@ -483,8 +487,9 @@ Every frame is an array whose first element is a tag.
         time, from the whole request in hand to its answer
       → 400 when the body is not a sequence of [S, n, id, data,
         expect?] values with S a string and n an integer, or both nil,
-        and id 16 bytes of bin; nothing can be answered for such a
-        body, mutation by mutation
+        and id 16 bytes of bin, or when a mutation holds more than
+        2^20 values; nothing can be answered for such a body,
+        mutation by mutation
       → 413 when the body carries more mutations than the request's
         limit, refused before any is checked, with the limit in a
         PhaseLock-Max-Mutations header
@@ -859,7 +864,10 @@ Atomicity:
   `kid`; a token naming any other algorithm is refused.  Refresh is
   re-issue.  The token's `gen` is compared to the account's generation
   on connection open and on every mutation; a mismatch is rejected, so
-  a generation bump logs out everywhere.  An open connection whose
+  a generation bump logs out everywhere.  A generation is a
+  non-negative safe integer, 0 when lookup answers none; any other is
+  lookup's bug and fails the lookup, and a token carrying a negative
+  `gen` is malformed.  An open connection whose
   generation a commit moves ends with `["end", 603, "token revoked"]`
   ahead of that commit's edits, and one ends a minute before its token
   expires with `["end", 603, "token expiring"]`, so its client

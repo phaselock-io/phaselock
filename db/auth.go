@@ -110,6 +110,11 @@ func (s *Server) verify(token string) (*claims, error) {
 	if c.Exp < s.now().Unix() {
 		return nil, errors.New("token expired")
 	}
+
+	// the server mints only the non-negative generations lookup answers
+	if c.Gen < 0 {
+		return nil, errors.New("malformed token")
+	}
 	return &c, nil
 }
 

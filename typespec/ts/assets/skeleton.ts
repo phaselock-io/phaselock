@@ -1929,12 +1929,40 @@ function* named(
    everything before its first `!`.  Keys sort in code-point order, and each separator after a
    parameter sorts below every character that parameter may hold: `,` below a segment's, and `!`
    below a slice name's.  So a walk of a family visits its slices in the order of their
-   parameters, `gen` before `gen-2`, and a walk of a key template its keys likewise. */
+   parameters, `gen` before `gen-2`, and a walk of a key template its keys likewise.
+
+   A store key holds at most KEY_MAX bytes of UTF-8, the most an LMDB key holds by default, so a
+   slice name holds at most SLICE_MAX, one less, the shortest key under it being `{slice}!`.  The
+   database refuses a write past either, and so does an Engine's prediction. */
 
 const SEGMENT = '[A-Za-z0-9_-]+';
 const SLICE_REST = '[A-Za-z0-9_.~-]+';
 const SEGMENT_RE = new RegExp(`^${SEGMENT}$`);
 const SLICE_REST_RE = new RegExp(`^${SLICE_REST}$`);
+
+/** the most bytes of UTF-8 a store key holds */
+export const KEY_MAX = 511;
+/** the most bytes of UTF-8 a slice name holds */
+export const SLICE_MAX = KEY_MAX - 1;
+
+// the length of a string's UTF-8, a lone surrogate taking three bytes
+function utf8Length(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    const pair = c >= 0xd800 && c <= 0xdbff && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00;
+    n += c < 0x80 ? 1 : c < 0x800 ? 2 : pair ? 4 : 3;
+    if (pair) i++;
+  }
+  return n;
+}
+
+// throws for a key past KEY_MAX bytes, or a slice name past SLICE_MAX
+function checkLength(what: 'key' | 'slice name', s: string): void {
+  const max = what === 'key' ? KEY_MAX : SLICE_MAX;
+  const n = utf8Length(s);
+  if (n > max) throw new Error(`${what} ${s.slice(0, 64)}... is ${n} bytes, over ${max}`);
+}
 
 /** A template parameter's value, other than a terminal one, checked.  A generated accessor passes
     each of its parameters through this or $asSliceRest before building a key; no template
@@ -2078,8 +2106,10 @@ export type LookupIdent =
   | { kind: 'refresh'; user: string }
   | { kind: 'token'; user: string };
 
-/** an existing account: its user, the generation every token of it must carry, and the stored
-    password hash a sign-in or a password proof verifies against */
+/** An existing account: its user, the generation every token of it must carry, and the stored
+    password hash a sign-in or a password proof verifies against.  The generation is a
+    non-negative safe integer, 0 when absent, and an account's tokens stop verifying when it
+    changes; any other generation is a bug that fails the lookup. */
 export type LookupResult = {
   user: string;
   generation?: number;
@@ -4791,7 +4821,8 @@ export class Engine<QX, PX, M, N = never> {
   }
 
   /* One mutation's prediction, written onto the overlay's scratch layer through a WriteTxn.
-     Deleting a slice deletes its keys in the overlay. */
+     Deleting a slice deletes its keys in the overlay.  A write past the length of a key or a slice
+     name throws, as the decider's would. */
   #predictIn(txn: WTxn, predictor: Predictor<PX, M>, mutation: M): void {
     // the predictor's transaction: its reads are its own to change
     const wtx: WriteTxn = {
@@ -4802,12 +4833,15 @@ export class Engine<QX, PX, M, N = never> {
         return txn.scan({ ...req, values });
       },
       set(key, type, value) {
+        checkLength('key', key);
         txn.set(key, type, JS, value);
       },
       del(key) {
+        checkLength('key', key);
         txn.del(key);
       },
       deleteSlice(slice) {
+        checkLength('slice name', slice);
         txn.delPrefix(`${slice}!`);
       },
     };

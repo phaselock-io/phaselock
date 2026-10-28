@@ -179,20 +179,17 @@ int store_exec(store *s, const char *sql) {
     return 0;
 }
 
-/* the exclusive upper bound of the key range sharing prefix; false if the
-   prefix is empty (unbounded) */
-static bool prefix_bound(const char *prefix, char *bound, size_t cap) {
+/* the exclusive upper bound of the key range sharing prefix, its last byte incremented past any
+   trailing 0xFF bytes, malloc'd; NULL when no text lies above them all, as for the empty prefix */
+static char *prefix_bound(const char *prefix) {
     size_t n = strlen(prefix);
-    if (n == 0 || n + 1 > cap) return false;
-    memcpy(bound, prefix, n + 1);
-    while (n > 0) {
-        if ((unsigned char)bound[n - 1] != 0xFF) {
-            bound[n - 1]++;
-            return true;
-        }
-        bound[--n] = 0;
-    }
-    return false;
+    while (n > 0 && (unsigned char)prefix[n - 1] == 0xFF) n--;
+    if (n == 0) return NULL;
+    char *bound = xmalloc(n + 1);
+    memcpy(bound, prefix, n);
+    bound[n - 1]++;
+    bound[n] = 0;
+    return bound;
 }
 
 static int step_done(store *s, sqlite3_stmt *st, const char *what) {
@@ -259,12 +256,13 @@ int store_del(store *s, const char *key) {
 }
 
 int store_scan(store *s, const char *prefix, store_kv_fn fn, void *arg) {
-    char bound[1024];
+    char *bound = prefix_bound(prefix);
     sqlite3_stmt *st;
-    if (prefix_bound(prefix, bound, sizeof bound)) {
+    if (bound) {
         st = s->scan;
         sqlite3_bind_text(st, 1, prefix, -1, SQLITE_STATIC);
         sqlite3_bind_text(st, 2, bound, -1, SQLITE_TRANSIENT);
+        free(bound);
     } else {
         st = s->scan_all;
     }
@@ -337,10 +335,11 @@ void store_cursor_end(store *s) {
 }
 
 int store_del_prefix(store *s, const char *prefix) {
-    char bound[1024];
-    if (!prefix_bound(prefix, bound, sizeof bound)) return store_exec(s, "DELETE FROM kv");
+    char *bound = prefix_bound(prefix);
+    if (!bound) return store_exec(s, "DELETE FROM kv");
     sqlite3_bind_text(s->del_prefix, 1, prefix, -1, SQLITE_STATIC);
     sqlite3_bind_text(s->del_prefix, 2, bound, -1, SQLITE_TRANSIENT);
+    free(bound);
     if (step_done(s, s->del_prefix, "del_prefix")) return -1;
     size_t n = strlen(prefix);
     if (n > 1 && prefix[n - 1] == '!') {
@@ -395,13 +394,13 @@ int store_read_slice(store *s, const char *slice, uint64_t from, uint64_t to, bo
 int store_read_prefix(store *s, const char *prefix, uint64_t from, uint64_t to, bool reverse,
                       store_log_fn fn, void *arg) {
     sqlite3_stmt *st = reverse ? s->read_prefix_desc : s->read_prefix_asc;
-    char bound[1024];
     /* slice names are ASCII, so DEL bounds the empty prefix */
-    if (!prefix_bound(prefix, bound, sizeof bound)) strcpy(bound, "\x7f");
+    char *bound = prefix_bound(prefix);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)from);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)to);
     sqlite3_bind_text(st, 3, prefix, -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 4, bound, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, bound ? bound : "\x7f", -1, SQLITE_TRANSIENT);
+    free(bound);
     return log_rows(s, st, fn, arg, "read_prefix");
 }
 
@@ -547,12 +546,13 @@ int store_slice_stats(store *s, const char *name, uint64_t *seq, uint64_t *pos,
 }
 
 int store_slices_under(store *s, const char *prefix, store_slice_fn fn, void *arg) {
-    char bound[1024];
+    char *bound = prefix_bound(prefix);
     sqlite3_stmt *st;
-    if (prefix_bound(prefix, bound, sizeof bound)) {
+    if (bound) {
         st = s->live_slices;
         sqlite3_bind_text(st, 1, prefix, -1, SQLITE_STATIC);
         sqlite3_bind_text(st, 2, bound, -1, SQLITE_TRANSIENT);
+        free(bound);
     } else {
         st = s->live_slices_all;
     }

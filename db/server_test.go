@@ -1183,6 +1183,39 @@ func TestTheWriteGateChecksSliceNamesBySyntax(t *testing.T) {
 	}
 }
 
+func TestKeysAndSliceNamesHoldAtMostAnLMDBKey(t *testing.T) {
+	h := start(t)
+	admin := h.admin()
+	h.accept(admin, mut("c1", "add-patron", "id", "p1", "name", "Ann"))
+
+	// a slice name of 510 bytes holds its shortest key, of 511, which lands
+	slice := "nope:" + strings.Repeat("a", 505)
+	h.accept(admin, mut("c2", "notify", "patron", "p1", "reasons", []any{"set " + slice + "!"}))
+	if got := strs(h.snapshot(admin, slice).records[slice+"!"]); strings.Join(got, ",") != "set "+slice+"!" {
+		t.Fatalf("the key of 511 bytes: %v", got)
+	}
+
+	// a key of 512 bytes fails its write
+	o := h.mutations(admin, mut("c3", "notify", "patron", "p1", "reasons", []any{"set " + slice + "!k"}))[0]
+	if o.kind != "reject" || !strings.Contains(o.reason, "is 512 bytes, over 511") {
+		t.Fatalf("writing a key of 512 bytes: %+v", o)
+	}
+
+	// and a slice name of 511 fails its deletion
+	long := slice + "a"
+	o = h.mutations(admin, mut("c4", "notify", "patron", "p1", "reasons", []any{"delete " + long}))[0]
+	if o.kind != "reject" || !strings.Contains(o.reason, long[:200]+" is not a slice name") {
+		t.Fatalf("deleting a slice name of 511 bytes: %+v", o)
+	}
+
+	// a selector naming one is malformed wherever a client gives one
+	for _, path := range []string{"/snapshot/" + long, "/edits/" + long, "/stream?since=0&want=" + long} {
+		if status, _, _ := h.do("GET", path, admin, nil); status != http.StatusBadRequest {
+			t.Fatalf("GET %.20s... with a selector of 511 bytes: %d", path, status)
+		}
+	}
+}
+
 // snapshot blob parsing per the README ///////////////////////////////////
 
 type blob struct {
@@ -2756,6 +2789,21 @@ func TestMutationLimits(t *testing.T) {
 		t.Fatalf("a mutation of a refused request: %+v", o)
 	}
 
+	// a mutation of 2^20 values at most is checked, and one of more refuses its request: an
+	// unnumbered mutation, its id, and data an array of nils, five values besides the nils
+	nils := func(n int) []byte {
+		b := append([]byte{0x94, 0xc0, 0xc0, 0xc4, 16}, make([]byte, 16)...)
+		b = binary.BigEndian.AppendUint32(append(b, 0xdd), uint32(n))
+		return append(b, bytes.Repeat([]byte{0xc0}, n)...)
+	}
+	if status, _, out := h.do("POST", "/mutations", admin, nils(1<<20-5)); status != 200 {
+		t.Fatalf("a mutation of 2^20 values: %d %s", status, out)
+	}
+	status, _, out := h.do("POST", "/mutations", admin, nils(1<<20-4))
+	if status != 400 || !strings.Contains(string(out), "holds more than 1048576 values") {
+		t.Fatalf("a mutation of 2^20 + 1 values: %d %s", status, out)
+	}
+
 	// limits of the server's own
 	h = startWith(t, t.Context(), Options{MaxMutations: 4, MaxAnonymousMutations: 2})
 	if status, limit := post(h, h.admin(), books("e", 5)); status != 413 || limit != "4" {
@@ -3687,6 +3735,33 @@ func TestDevSignInIsAnExistingAccount(t *testing.T) {
 	}
 }
 
+func TestAGenerationIsANonNegativeSafeInteger(t *testing.T) {
+	h := start(t)
+
+	// a lookup answering any other generation fails, so its account signs in nowhere
+	for _, user := range []string{"negative", "fractional"} {
+		if status, _ := devSignIn(h, map[string]any{"identity": user}); status != 500 {
+			t.Fatalf("dev sign-in as %s: %d", user, status)
+		}
+		token, _, err := h.srv.mint(user, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status, _ := h.mutationsStatus(token, mut("c1", "add-book", "id", "b1", "title", "Dune")); status != 401 {
+			t.Fatalf("mutations as %s: %d", user, status)
+		}
+	}
+
+	// and a token carrying a negative generation is malformed, whatever its account
+	token, _, err := h.srv.mint("p1", -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := h.mutationsStatus(token, mut("c2", "add-book", "id", "b2", "title", "Dune")); status != 401 {
+		t.Fatalf("mutations with a negative generation: %d", status)
+	}
+}
+
 func TestATokenForNoAccountIsRefusedEverywhere(t *testing.T) {
 	h := start(t)
 	ghost, _, err := h.srv.mint("ghost", 0)
@@ -3804,6 +3879,11 @@ func TestValidSelector(t *testing.T) {
 		"patron:p/1":        false,
 		"patron:p 1":        false,
 		"patron:p%2F1":      false,
+		// a slice name of 510 bytes, the most there is, and one longer
+		"nope:" + strings.Repeat("a", 505):        true,
+		"nope:" + strings.Repeat("a", 506):        false,
+		"nope:" + strings.Repeat("a", 503) + ",*": true,
+		"nope:" + strings.Repeat("a", 504) + ",*": false,
 	} {
 		if got := validSelector(selector); got != want {
 			t.Errorf("validSelector(%q) = %v, want %v", selector, got, want)

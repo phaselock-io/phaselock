@@ -2,6 +2,8 @@
 
 import { describe, expect, test } from 'vitest';
 
+import { KEY_MAX } from '../../../ts/assets/skeleton.ts';
+
 import {
   type Blob,
   bootstrap,
@@ -75,6 +77,22 @@ describe('predictions', () => {
     await settle();
     expect(p1.values.at(-1)).toEqual({ count: 2, fields: { a: 1, c: 1 } });
     expect(p2.values.at(-1)).toEqual({ count: 1, fields: {} });
+  });
+
+  test('a prediction writing a key past KEY_MAX bytes throws, as its decider would', async () => {
+    // each mutation writes one log entry of patron:p2 at a key padded to the length it names
+    const padded: Predictor = (txn, mutation) => {
+      const m = mutation as { length: number; field: string };
+      const key = 'patron:p2!log:~'.padEnd(m.length, 'x');
+      txn.set(key, 'state', { id: 'p2', type: 'set', field: m.field, value: 1 });
+    };
+    const r = rig({ predictor: padded });
+    await bootstrap(r, ['patron:*'], { 'patron:*': patrons });
+    const p2 = watch(r, 'patron:p2');
+    r.engine.sendMutation({ length: KEY_MAX, field: 'a' });
+    r.engine.sendMutation({ length: KEY_MAX + 1, field: 'b' });
+    await settle();
+    expect(p2.values.at(-1)).toEqual({ count: 1, fields: { a: 1 } });
   });
 
   test("a predicted deletion drops the slice's keys from the overlay only", async () => {

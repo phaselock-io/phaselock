@@ -321,11 +321,12 @@ int pldb_cron_tick(pldb *db, uint64_t reqid, size_t i, int64_t slot) {
 // registrations ////////////////////////////////////////////////////////////
 
 /* What a cached read-only call read, the keys it got and the stretch each of its scan batches
-   walked, and how far into a batch's writes it has seen, so that a test against the batch's writes
-   takes only those made after it ran.  A call last run in an earlier batch has seen every write
-   before this batch, since every batch ends by settling the calls its writes touched. */
+   walked, and how far into a batch's writes it has seen: those before it last ran, and those a
+   check since found not to touch it, so a check takes only the writes after that.  A call last
+   run in an earlier batch has seen every write before this batch, since every batch ends by
+   settling the calls its writes touched. */
 typedef struct reads {
-    strlist keys;
+    strtab keys; /* each key got, once */
     span_list spans;
     uint64_t batch;
     size_t written, deleted;
@@ -379,7 +380,7 @@ typedef struct batch {
     uint64_t id;
     int64_t servertime;
     items commit;
-    strlist written;
+    strtab written; /* the key of each write, in order */
     strlist deleted;
     reg_replies replies;
 } batch;
@@ -425,7 +426,7 @@ static bool normalize_bundle_selector(char *selector);
 
 // start recording what a call reads
 static void reads_begin(pldb *db, reads *r) {
-    strlist_clear(&r->keys);
+    strtab_clear(&r->keys);
     span_list_clear(&r->spans);
     db->js.track_rkeys = &r->keys;
     db->js.track_spans = &r->spans;
@@ -441,12 +442,12 @@ static void reads_end(pldb *db, reads *r, const batch *b) {
 }
 
 static void reads_clear(reads *r) {
-    strlist_clear(&r->keys);
+    strtab_clear(&r->keys);
     span_list_clear(&r->spans);
 }
 
 static void reads_free(reads *r) {
-    strlist_free(&r->keys);
+    strtab_free(&r->keys);
     span_list_free(&r->spans);
 }
 
@@ -454,18 +455,15 @@ static bool has_prefix(const char *s, const char *prefix) {
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
-/* Whether the batch's writes since a call ran touched what it read: a written key it got or one
-   inside a stretch a scan batch walked, or a deleted prefix holding a key it got or one that could
-   lie inside such a stretch.  A spurious re-run costs only time, so a deleted prefix dirties
-   whenever it may. */
-static bool reads_touched(const reads *r, const batch *b) {
-    size_t from_written = r->batch == b->id ? r->written : 0;
-    size_t from_deleted = r->batch == b->id ? r->deleted : 0;
-
-    // the written keys
+/* whether the batch's writes from the given ones on touched what a call read: a written key it
+   got or one inside a stretch a scan batch walked, or a deleted prefix holding a key it got or one
+   that could lie inside such a stretch */
+static bool writes_touch(const reads *r, const batch *b, size_t from_written, size_t from_deleted) {
+    // the written keys, each once, at its last write
     for (size_t i = from_written; i < b->written.n; i++) {
+        if (!strtab_last(&b->written, i)) continue;
         const char *k = b->written.v[i];
-        if (strlist_has(&r->keys, k)) return true;
+        if (strtab_find(&r->keys, k) >= 0) return true;
         size_t n = strlen(k);
         for (size_t j = 0; j < r->spans.n; j++) {
             if (span_covers(&r->spans.v[j], k, n)) return true;
@@ -483,6 +481,20 @@ static bool reads_touched(const reads *r, const batch *b) {
             if (span_may_hold(&r->spans.v[j], p, n)) return true;
         }
     }
+    return false;
+}
+
+/* Whether the batch's writes the call has not seen touched what it read.  A spurious re-run costs
+   only time, so a deleted prefix dirties whenever it may. */
+static bool reads_touched(reads *r, const batch *b) {
+    size_t from_written = r->batch == b->id ? r->written : 0;
+    size_t from_deleted = r->batch == b->id ? r->deleted : 0;
+    if (writes_touch(r, b, from_written, from_deleted)) return true;
+
+    // the writes checked are seen, so the next check takes only the ones after them
+    r->batch = b->id;
+    r->written = b->written.n;
+    r->deleted = b->deleted.n;
     return false;
 }
 
@@ -614,11 +626,13 @@ static bool is_prefix_selector(const char *selector) {
     return n > 2 && selector[n - 1] == '*' && (selector[n - 2] == ':' || selector[n - 2] == ',');
 }
 
-static void selector_prefix(const char *selector, char *out, size_t cap) {
-    size_t n = strlen(selector) - 1; /* drop the star */
-    if (n + 1 > cap) n = cap - 1;
+/* a prefix selector's text before its star, malloc'd */
+static char *selector_prefix(const char *selector) {
+    size_t n = strlen(selector) - 1;
+    char *out = xmalloc(n + 1);
     memcpy(out, selector, n);
     out[n] = 0;
+    return out;
 }
 
 /* The grantor returns selectors with a terminator on every entry: a prefix selector ("chat:*",
@@ -689,7 +703,7 @@ static bool reg_replies_has(const reg_replies *rr, uint64_t conn) {
 
 /* the stale-token check: -1 stale, 0 ok */
 static int check_generation(pldb *db, const batch *b, const char *user, int64_t gen) {
-    if (!user || gen < 0) return 0;
+    if (!user) return 0;
 
     // a token speaks only for an existing account at its current generation
     return reg_account(db, b, user)->generation == gen ? 0 : -1;
@@ -1064,7 +1078,7 @@ static void commit_slice(pldb *db, batch *b, const uint8_t *id, const wbuf *wb, 
         if (!e->val && life == EDIT_BIRTH) continue;
         int rc = e->val ? store_set(db->w, e->key, e->val, e->len) : store_del(db->w, e->key);
         if (rc) die("apply %s: %s", e->key, store_err(db->w));
-        strlist_push(&b->written, e->key);
+        strtab_add(&b->written, e->key);
     }
 
     // the edit, appended to the log at the slice's next seq and queued for the live connections
@@ -1435,7 +1449,7 @@ static void run_batch(pldb *db, req *head) {
         results_push(db, r);
         r = next;
     }
-    strlist_free(&b.written);
+    strtab_free(&b.written);
     strlist_free(&b.deleted);
     while (head) {
         req *next = head->next;
@@ -1541,7 +1555,7 @@ static int run_bootstrap(pldb *db, char *err, size_t errlen) {
 
     // nothing is subscribed yet, so the commit's items go nowhere
     pldb_items_free(b.commit.v, b.commit.n);
-    strlist_free(&b.written);
+    strtab_free(&b.written);
     strlist_free(&b.deleted);
     return 0;
 }
@@ -1762,13 +1776,12 @@ int pldb_read_log(pldb *db, uint64_t from, uint64_t to, pldb_item **items, size_
 int pldb_read_edits(pldb *db, const char *selector, uint64_t from, uint64_t to, int reverse,
                     size_t limit, pldb_item **items, size_t *n) {
     read_ctx rc = {.limit = limit ? limit : 1};
-    char prefix[1024];
-    if (is_prefix_selector(selector)) selector_prefix(selector, prefix, sizeof prefix);
+    char *prefix = is_prefix_selector(selector) ? selector_prefix(selector) : NULL;
     pthread_mutex_lock(&db->rmu);
-    int r = is_prefix_selector(selector)
-                ? store_read_prefix(db->r, prefix, from, to, reverse != 0, read_cb, &rc)
-                : store_read_slice(db->r, selector, from, to, reverse != 0, read_cb, &rc);
+    int r = prefix ? store_read_prefix(db->r, prefix, from, to, reverse != 0, read_cb, &rc)
+                   : store_read_slice(db->r, selector, from, to, reverse != 0, read_cb, &rc);
     pthread_mutex_unlock(&db->rmu);
+    free(prefix);
     if (r) {
         pldb_items_free(rc.it.v, rc.it.n);
         return -1;
@@ -1849,9 +1862,8 @@ static int snap_slice_cb(void *arg, const char *name, uint64_t seq, uint64_t pos
 }
 
 int pldb_snapshot(pldb *db, const char *selector, uint8_t **out, size_t *len, uint64_t *position) {
-    char prefix[1024];
-    if (is_prefix_selector(selector)) selector_prefix(selector, prefix, sizeof prefix);
-    else snprintf(prefix, sizeof prefix, "%s!", selector);
+    // the keys' prefix: a prefix selector's text before its star, or an exact one's slice and '!'
+    char *prefix = is_prefix_selector(selector) ? selector_prefix(selector) : strf("%s!", selector);
 
     snap_ctx sc = {0};
     uint64_t seq = 0, pos = 0, edit_bytes = 0, state_bytes = 0;
@@ -1896,6 +1908,7 @@ int pldb_snapshot(pldb *db, const char *selector, uint8_t **out, size_t *len, ui
     }
     store_exec(db->r, "COMMIT");
     pthread_mutex_unlock(&db->rmu);
+    free(prefix);
     if (rc) {
         mpack_writer_destroy(&w);
         free(hdr);
@@ -1950,6 +1963,9 @@ static char *reasonf(const char *fmt, ...) {
 
 /* the longest series id a mutation may carry, in bytes */
 #define SERIES_MAX 64
+
+/* the most values one mutation's msgpack may hold, which bounds the memory of its parse */
+#define MUTATION_MAX_NODES (1 << 20)
 
 /* whether a msgpack integer is a mutation number: from 1 to 2^53 - 1, so that every client's
    numbers are exact */
@@ -2197,8 +2213,14 @@ int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, size_
     // refusing the whole request when any is not one, since nothing can be answered for it
     size_t ncmds = 0;
     mpack_tree_init_data(&tree, (const char *)body, len);
+    mpack_tree_set_limits(&tree, SIZE_MAX, MUTATION_MAX_NODES);
     for (size_t consumed = 0; consumed < len; ncmds++) {
         mpack_tree_parse(&tree);
+        if (mpack_tree_error(&tree) == mpack_error_too_big) {
+            snprintf(err, errlen, "a mutation holds more than %d values", MUTATION_MAX_NODES);
+            mpack_tree_destroy(&tree);
+            return -1;
+        }
         if (mpack_tree_error(&tree) != mpack_ok) {
             snprintf(err, errlen, "malformed msgpack");
             mpack_tree_destroy(&tree);
@@ -2227,6 +2249,7 @@ int pldb_prepare(pldb *db, uintptr_t arg, const uint8_t *body, size_t len, size_
     proof_list proofs = {0};
     int refused = 0;
     mpack_tree_init_data(&tree, (const char *)body, len);
+    mpack_tree_set_limits(&tree, SIZE_MAX, MUTATION_MAX_NODES);
     for (size_t i = 0; i < ncmds && !refused; i++) {
         mpack_tree_parse(&tree);
         out->offsets[i] = prepared.len;

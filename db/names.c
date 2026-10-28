@@ -27,6 +27,8 @@ static const char *segment_end(const char *s) {
 }
 
 bool slice_name_ok(const char *name) {
+    if (strlen(name) > SLICE_MAX) return false;
+
     // the family, then its parameters or the end
     const char *p = segment_end(name);
     if (!p || (*p && *p != ':')) return false;
@@ -43,6 +45,8 @@ bool slice_name_ok(const char *name) {
 }
 
 bool selector_prefix_ok(const char *prefix) {
+    if (strlen(prefix) >= SLICE_MAX) return false;
+
     // the family and its ':'
     const char *p = segment_end(prefix);
     if (!p || *p != ':') return false;

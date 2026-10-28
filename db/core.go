@@ -49,7 +49,7 @@ type core struct {
 type principal struct {
 	anonymous bool
 	user      string
-	gen       int64 // -1 skips the generation check
+	gen       int64 // the token's generation; -1 for the anonymous principal, which has none
 	exp       int64 // when the token expires, in Unix seconds; 0 for the anonymous principal
 }
 

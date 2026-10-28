@@ -28,6 +28,8 @@ const AUDITED = 'r1';
 const WRITER = 'requester';
 // a user whose lookup answers a different password hash on every read, which is lookup's bug
 const FLAKY = 'flaky';
+// users whose lookup answers a generation that is not a non-negative safe integer, lookup's bug
+const MISCOUNTED: Record<string, number> = { negative: -1, fractional: 1.5 };
 
 /* A user whose grant, and an identity whose lookup, write through the raw transaction plugins are
    bound to, which the wrapper at the end of this file holds.  Those writes pass the bundle's
@@ -356,6 +358,7 @@ const bundle = defineTestDB<TestPlugins>({
       return { user: a.user, generation: a.generation, passwordHash: a.hash };
     }
     if (user === FLAKY) return { user, generation: 0, passwordHash: crypto.randomUUID() };
+    if (user in MISCOUNTED) return { user, generation: MISCOUNTED[user] };
     // the tests' standing users, who need no account in the log
     return TEST_USERS.includes(user) ? { user, generation: 0 } : null;
   },

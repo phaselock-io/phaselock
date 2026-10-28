@@ -99,8 +99,8 @@ typedef struct pldb_verdict {
    credentials changed again is rejected. */
 #define PLDB_MAX_BOUNCES 3
 
-/* Requests; answered through pldb_pop.  user NULL is anonymous; gen < 0 skips
-   the generation check.  A submit's body is mutations pldb_prepare prepared, with one verdict
+/* Requests; answered through pldb_pop.  user NULL is anonymous, and any other user's token
+   must carry gen, the generation lookup answers for its account.  A submit's body is mutations pldb_prepare prepared, with one verdict
    per mutation, or none when nverdicts is 0, and attempt the number of times the call has
    bounced.  The writer checks a proven mutation against what lookup answers when its turn comes:
    when the hash differs from its verdict's, it stops the call there and answers a bounce, and

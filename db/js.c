@@ -117,7 +117,7 @@ static JSValue native_get(JSContext *ctx, JSValueConst this_val, int argc, JSVal
         free(key);
         return JS_EXCEPTION;
     }
-    if (js->track_rkeys) strlist_push(js->track_rkeys, key);
+    if (js->track_rkeys) strtab_put(js->track_rkeys, key);
 
     // the write buffer's answer, if it has one
     const uint8_t *bval;
@@ -157,20 +157,25 @@ static bool writing(JSContext *ctx, jsrt *js) {
    where the C string stops. */
 static bool slice_writable(JSContext *ctx, const char *slice, bool nul) {
     if (!nul && slice_name_ok(slice)) return true;
-    JS_ThrowTypeError(ctx, "%s is not a slice name", slice);
+    JS_ThrowTypeError(ctx, "%.200s is not a slice name", slice);
     return false;
 }
 
-/* Whether key may be written: it holds no control character or lone surrogate, and its slice, the
-   text before its first '!', is a slice name; throws when not.  nul says the key holds U+0000
-   where the C string stops. */
+/* Whether key may be written: it holds KEY_MAX bytes at most, no control character, and no lone
+   surrogate, and its slice, the text before its first '!', is a slice name; throws when not.  nul
+   says the key holds U+0000 where the C string stops. */
 static bool key_writable(JSContext *ctx, const char *key, bool nul) {
     if (nul) {
         JS_ThrowTypeError(ctx, "a key beginning %s holds U+0000", key);
         return false;
     }
+    size_t n = strlen(key);
+    if (n > KEY_MAX) {
+        JS_ThrowTypeError(ctx, "key %.64s... is %zu bytes, over %d", key, n, KEY_MAX);
+        return false;
+    }
     if (!key_chars_ok(key)) {
-        JS_ThrowTypeError(ctx, "key %s holds a control character or a lone surrogate", key);
+        JS_ThrowTypeError(ctx, "key %.200s holds a control character or a lone surrogate", key);
         return false;
     }
 
@@ -185,7 +190,7 @@ static bool key_writable(JSContext *ctx, const char *key, bool nul) {
         free(slice);
     }
     if (ok) return true;
-    JS_ThrowTypeError(ctx, "key %s has no slice name before its first '!'", key);
+    JS_ThrowTypeError(ctx, "key %.200s has no slice name before its first '!'", key);
     return false;
 }
 
@@ -839,9 +844,9 @@ int js_cron_entries(jsrt *js, strlist *out) {
     if (JS_IsException(r)) return -1;
     JSValue lenv = JS_GetPropertyStr(ctx, r, "length");
     int64_t n = 0;
-    JS_ToInt64(ctx, &n, lenv);
+    int rc = JS_ToInt64(ctx, &n, lenv) ? -1 : 0;
     JS_FreeValue(ctx, lenv);
-    int rc = 0;
+    if (rc) capture_exception(js);
     for (int64_t i = 0; i < n && rc == 0; i++) {
         JSValue entry = JS_GetPropertyUint32(ctx, r, (uint32_t)i);
         rc = strings_of(js, entry, out);
@@ -898,10 +903,17 @@ int js_account(jsrt *js, JSValueConst principal, int64_t *generation, char **has
     if (JS_IsException(r)) return -1;
     if (JS_IsNull(r)) return 0;
 
-    // the generation, and the hash, which host.js has checked is a string or null
+    // the generation, which host.js has checked is a non-negative safe integer, and the hash,
+    // which it has checked is a string or null
     JSValue g = JS_GetPropertyStr(ctx, r, "generation");
-    JS_ToInt64(ctx, generation, g);
+    int rc = JS_ToInt64(ctx, generation, g);
     JS_FreeValue(ctx, g);
+    if (rc) {
+        capture_exception(js);
+        *generation = -1;
+        JS_FreeValue(ctx, r);
+        return -1;
+    }
     JSValue h = JS_GetPropertyStr(ctx, r, "passwordHash");
     if (JS_IsString(h)) {
         const char *s = JS_ToCString(ctx, h);
