@@ -81,9 +81,10 @@ client/ts/        @phaselock/client: the JS host's transport over HTTP
                   registry.
 plugins/          @phaselock/plugins: the plugins we ship, as a
                   database's bundle installs them; cron so far.
-db/               The v0 database: a C core (QuickJS, SQLite, the
-                  conversion kernel) under a Go HTTP layer.  See
-                  db/README.md.
+db/               The v0 database: one Rust crate (QuickJS, SQLite,
+                  the conversion kernel, the HTTP layer), a library
+                  and the binary over it, with its feature tests in
+                  db/tests/.  See db/README.md.
 agents/           The "phaselock" agent plugin; canonical skill at
                   agents/skills/phaselock/.
 .claude-plugin/   marketplace.json cataloging the plugin.
@@ -128,12 +129,12 @@ TypeSpec tooling (`cd typespec`):
   `dist/`, which only publishing uses
 - `pnpm test` — regenerate fixtures, run the vitest suite
 
-Database (`cd db`; Go 1.25+ and a C compiler):
+Database (`cd db`; a Rust toolchain and a C compiler):
 
-- `make` — build `db/phaselockdb` (plain `go build` with
-  `CGO_CFLAGS_ALLOW=-fwrapv`; no other build steps)
-- `make test` — rebuild the test bundle, run the Go tests
-- `make check` — the core's own C, warnings as errors
+- `make` — build `db/target/release/phaselockdb` (plain
+  `cargo build --release`; build.rs compiles the vendored QuickJS)
+- `make test` — rebuild the test bundle, run the unit tests and the
+  feature tests in `db/tests/`
 
 Examples (`cd examples/todo-basic` or `library`):
 
@@ -166,11 +167,11 @@ An example's `pnpm gen` regenerates every time it runs, so after work on
 - The generic query hook, `useLocalQuery.ts`, is library-quality.
 - Wrap new documentation files at 80 columns.
 - Vendored third-party code lives under a `vendor/` directory
-  (`db/third_party/` in the database's Go module, where Go reserves
-  `vendor/`), each file headed with its origin, version, commit, any
-  modification, SPDX id, and full license text (see
-  `client/ts/src/vendor/`), and gets an entry in the root `NOTICE`,
-  mirrored in the `NOTICE` of any package that ships it.
+  (`db/third_party/` in the database's crate, since `vendor/` is where
+  `cargo vendor` writes crates), each file headed with its origin,
+  version, commit, any modification, SPDX id, and full license text
+  (see `client/ts/src/vendor/`), and gets an entry in the root
+  `NOTICE`, mirrored in the `NOTICE` of any package that ships it.
 - If a result contradicts your model of the system, stop and ask rather
   than iterating on guesses; this codebase has few but sharp invariants,
   and the user usually spots the mismatch immediately.

@@ -5,10 +5,10 @@ import type { DbMarker, DbTypes, Plugin, PluginInstall } from './plugin.js';
     is due. */
 export type Tick = { name: string; slot: Date; now: Date };
 
-/** A cron entry: its spec, a robfig/cron standard spec of five fields or a descriptor, in UTC
-    unless it starts with `CRON_TZ=`; and its hook, which carries out each tick by writing through
-    the database's txn, as a decider does.  A hook must not throw: a throw is a bug, which
-    discards the tick's writes. */
+/** A cron entry: its spec, a standard cron spec of five fields or a descriptor such as `@daily`
+    or `@every 15m`, in UTC unless it starts with `CRON_TZ=`; and its hook, which carries out
+    each tick by writing through the database's txn, as a decider does.  A hook must not throw: a
+    throw is a bug, which discards the tick's writes. */
 export type CronEntry<DB extends DbTypes> = {
   spec: string;
   hook(txn: DB['txn'], tick: Tick): void;

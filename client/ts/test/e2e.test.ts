@@ -1,4 +1,4 @@
-// Drives the HTTP transport against the v0 server.  Skipped unless db/phaselockdb has been built.
+// Drives the HTTP transport against the v0 server.  Skipped unless `make -C db` has built it.
 
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -28,7 +28,7 @@ function mut(name: string, n: number, data: unknown): Mutation<Uint8Array> {
   const id = `00000000-0000-0000-0000-${name.padStart(12, '0')}`;
   return { id, series: 'e2e', n, data: encode(data) };
 }
-const binary = join(db, 'phaselockdb');
+const binary = join(db, 'target', 'release', 'phaselockdb');
 
 describe.skipIf(!existsSync(binary))('against phaselockdb', () => {
   let proc: ChildProcess;

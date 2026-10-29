@@ -7,11 +7,11 @@ the (planned) real DB, to power demos and full-stack development.
 
 The real db will have the following shape:
 
-- it will be a CGO project: a Go HTTP wrapper around a C db core.
-- the C core will use QuickJS, LDMB, a custom edit log and dedup index
-- connections are received in Go, and JWT checked
-- mutations are received in Go and passed byte-wise to the C core
-- the C core will batch up incoming writes into transaction batches
+- it will be a pure Rust project: an HTTP layer over a db core, one binary.
+- the core will use QuickJS, LMDB, a custom edit log and dedup index
+- connections are received by the HTTP layer, and JWT checked
+- mutations are received by the HTTP layer and passed byte-wise to the core
+- the core will batch up incoming writes into transaction batches
 - for each batch:
   - lmdb write txn is opened
   - for each txn:
@@ -27,7 +27,7 @@ The real db will have the following shape:
 The reasons to use QuickJS (vs V8 or Node.js) are:
   - its performance and simplicity
   - its sandboxing abilities
-  - raw IO and serde work can be done in C
+  - raw IO and serde work can be done in Rust
   - optimistic parallelism is possible in the JS hot loop
 
 Additional features will include:
@@ -45,11 +45,11 @@ This is gonna be _really_ cool.
 But time is short, so we're shipping a vibe-coded version of that just to power
 demos:
 
-- it will be a CGO project: a Go HTTP wrapper around a C core.
-- the C core will use QuickJS, and SQLite for log, kv store, and dedup index
-- connections are received in Go, and JWT checked
-- mutations are received in Go and passed byte-wise to the C core
-- the C core will batch up incoming writes into transaction batches
+- it is one Rust binary: an HTTP layer over a core
+- the core uses QuickJS, and SQLite for log, kv store, and dedup index
+- connections are received by the HTTP layer, and JWT checked
+- mutations are checked as they arrive and passed byte-wise to the core
+- the core batches up incoming writes into transaction batches
 - for each batch:
   - sql txn is opened
   - for each txn:
@@ -79,60 +79,78 @@ plan above take precedence over it.
 
 ### Shape
 
-- Go HTTP layer over a C core, joined by cgo.  Go never decodes
-  msgpack on the data path: mutations go to C as the bytes the client
-  sent, edits come out of C as their encoded wire arrays, and Go
-  writes only container headers around them.  The auth endpoints are
-  Go-owned and decode their own small request bodies.
-- SQLite for everything in C: the log, the KV store, the series
-  table, the slices table.  One write transaction per group commit,
+- One Rust binary: an HTTP layer over a core.  The HTTP layer never
+  decodes an edit: mutations go to the writer as the bytes the check
+  wrote, edits come out of the writer as their encoded wire arrays,
+  each shared by every connection it goes to, and a connection writes
+  only container headers around them.  The auth endpoints decode
+  their own small request bodies.
+- SQLite for everything: the log, the KV store, the series table, the
+  slices table.  One write transaction per group commit,
   WAL mode, synchronous=FULL.  Each connection, the writer's and the
   reader's, has a page cache of `--sqlite-cache-size` MiB, 64 by
   default: at SQLite's own 2 MiB, a large group commit spills pages to
   the WAL before it commits and reads them back.
-- Threads in C: the txn loop (owns QuickJS, SQLite writer connection,
-  registrations); a results pop thread on the Go side that
-  blocks in one cgo call; a reader thread with its own SQLite
-  connection for history reads, edit reads, and snapshot cuts.
-  Handler goroutines enqueue mutations directly; no dedicated push
-  thread.  Mutation outcomes, view and account changes, and lookup
-  replies all come back through the single results queue.
+- Threads:
+  - The tokio runtime runs the HTTP layer on hyper, HTTP/1.1 and,
+    over TLS, HTTP/2: the request handlers, the dispatcher, each
+    stream's writer, and the cron scheduler.
+  - The writer thread, the txn loop, owns the QuickJS runtime, which
+    it creates and which never leaves it, the SQLite writer
+    connection, the registrations, and the cron entries.  It takes
+    every request queued as one batch, one `BEGIN IMMEDIATE` ...
+    `COMMIT`.
+  - The reader thread owns a second SQLite connection and serves
+    history reads, edit reads, snapshot cuts, the head, and the token
+    keys, one job at a time, each cut in one read transaction.
+  - tokio's blocking pool runs the argon2id hashes, bounded by the
+    hash pool (Auth).
+- Channels: requests reach the writer through one queue under a lock,
+  so a batch takes the whole queue at once.  Mutation outcomes, view
+  and account changes, commits, and every other reply come back to
+  the dispatcher on one results channel, in the order the writer
+  makes them: accounts and views, then the commit, then the batch's
+  replies; the dispatcher routes each reply to its request.  A
+  stream's frames go from its writer to hyper through a bounded
+  channel of 32 chunks, so a client that stops reading stops its
+  writer.  Published positions travel on a watch channel, which a
+  read that waits for them waits on.
 - The bundle is one JS file assigning `globalThis.__bundle` (see Bundle
   contract): the app's `db.ts` calling the generated `define{Database}`,
   bundled with the generated module.
-- Every typed value crosses through the conversion kernel (`walk.c`):
-  a source, either msgpack parsed by mpack's node API or a
-  tokenization of a QuickJS value, a walk over the registry the
-  bundle carries, and a sink that builds JS values, writes msgpack
-  with mpack, or discards.  C builds rich values straight from
-  msgpack and walks the JS heap straight to msgpack, and it checks
-  every mutation on the handler's thread before anything else happens
-  to it.  The registry is compiled once at open from the bundle's
-  schema, `{nodes, ids, mutations}`; every read and write of the
-  store names one of its identities, the value's type.  mpack writes
-  the output; untyped values, the outcomes and `lookup`'s traffic,
-  still go through `mpjs.c`.
-- One context for the process, made in `main` from SIGINT and SIGTERM:
-  every request runs under it (`http.Server.BaseContext`), so an open
-  connection ends the moment it does.  Shutdown then waits for
-  handlers to return, a cgo call or a hash in progress finishing
-  first, stops the hash workers, and closes the core, which commits
-  the batch in hand.  The core outlives every handler, since a
-  handler reaching a closed core would be a use-after-free in C.
+- Every typed value crosses through the conversion kernel
+  (`src/walk.rs`): a source, either a msgpack tree that borrows the
+  bytes it was parsed from or a tokenization of a QuickJS value, a
+  walk over the registry the bundle carries, and a sink that builds
+  JS values, writes msgpack, or discards.  The kernel builds rich
+  values straight from msgpack and walks the JS heap straight to
+  msgpack, and it checks every mutation on its request's task before
+  anything else happens to it.  The registry is compiled once at open
+  from the bundle's schema, `{nodes, ids, mutations}`; every read and
+  write of the store names one of its identities, the value's type.
+  Untyped values, `lookup`'s traffic, go through `src/js/mpjs.rs`.
+- A call into the bundle is interrupted after 30 seconds, bootstrap
+  excepted, and the bundle's heap is capped at 4 GiB; either failure
+  is the call's bug.
+- One lifetime for the process, ended by SIGINT or SIGTERM: every
+  request selects on it, so an open connection ends the moment it
+  does.  Shutdown then waits up to ten seconds for connections to
+  close, stops the hash pool once the hashes in progress finish, and
+  closes the core, which commits the batch in hand.
 
 ### Log and edits
 
 - The mutation is the atom.  A POST may carry several mutations; each
   is checked, decided, committed, and acked independently and in
-  order.  Group commit batches mutations per fsync.  The check runs in
-  the handler's cgo call, against the mutations union of the registry
+  order.  Group commit batches mutations per fsync.  The check runs on
+  the request's task, against the mutations union of the registry
   and rejecting fields the model does not name, so a malformed
   mutation is answered there and never reaches dedup, `expect`, or
   the writer; the fields the database prepares for the decider (a
   `NewPassword`'s hash) are collected by the check and replaced when
   the checked mutation is written out for the writer thread.
 - The decider runs over a read-write transaction whose writes go to a
-  write buffer (`buffer.c`), never to the store.  The buffer holds
+  write buffer (`src/buffer.rs`), never to the store.  The buffer holds
   each key written once, with its last value's msgpack bytes in store
   format, or a deletion, and each slice deleted, with whether its
   history goes too; deleting a slice drops the buffer's keys under
@@ -366,7 +384,7 @@ Every frame is an array whose first element is a tag.
   skips the new view's edits in those commits.  A snapshot cut fresh,
   past them, hides the gap, and one cut earlier, from a cache, leaves
   a slice born there missing until its next edit
-  (`TestALiveViewFramesPositionPassesCommitsTheOldViewCouldNotSee`).
+  (`views::a_live_view_frames_position_passes_commits_the_old_view_could_not_see`).
   A grantor runs once per group commit, after all of it, so a view
   changes only at a batch's end, and every edit in the batch that
   changed it is filtered by the new view: a client may briefly show a
@@ -450,8 +468,8 @@ Every frame is an array whose first element is a tag.
   built at the registration, from before the batch's writes, would race
   the re-run grantor's answer and could leave the connection streaming
   under the old view while the core counts it current
-  (`TestARegistrationInTheBatchThatGrantsItASliceGetsTheSlice`,
-  `TestARegistrationInTheBatchThatRevokesASliceNeverGetsItsEdits`).
+  (`views::a_registration_in_the_batch_that_grants_it_a_slice_gets_the_slice`,
+  `views::a_registration_in_the_batch_that_revokes_a_slice_never_gets_its_edits`).
   History
   from `since` is replayed under the current view, so a client's held
   set at its checkpoint plus the replay is complete whatever happened
@@ -488,8 +506,8 @@ Every frame is an array whose first element is a tag.
       → 400 when the body is not a sequence of [S, n, id, data,
         expect?] values with S a string and n an integer, or both nil,
         and id 16 bytes of bin, or when a mutation holds more than
-        2^20 values; nothing can be answered for such a body,
-        mutation by mutation
+        2^20 values or nests more than 2048 deep; nothing can be
+        answered for such a body, mutation by mutation
       → 413 when the body carries more mutations than the request's
         limit, refused before any is checked, with the limit in a
         PhaseLock-Max-Mutations header
@@ -688,8 +706,8 @@ at a seq when its base has the slice's state through that seq, and *parks*
 an edit when it keeps it unapplied for the land.  The base is *frozen*
 while any backfill is in flight.  The conformance suite,
 `typespec/tests/src/engine/conformance/`, checks each rule in a group named
-for it; the database's own halves are checked by `server_test.go`, under
-the tests these rules name.
+for it; the database's own halves are checked by the feature tests the
+rules name, `file::test` for a test of `tests/file.rs`.
 
 Chaining:
 
@@ -730,7 +748,7 @@ Lifecycle:
   seq: its next birth starts it from empty, and its next normal edit is a
   missed birth (P3).  A death of a slice the client does not hold costs no
   backfill.  The database makes no edit for a delete of a slice that is
-  not live (`TestDeletingANonLiveSliceIsNoEdit`).
+  not live (`edits::deleting_a_slice_that_is_not_live_is_no_edit`).
 
 View:
 
@@ -741,7 +759,7 @@ View:
   latest view does not cover, no state, held seq, or parked edit.  The
   same holds at boot for whatever the build's wants do not cover.  The
   database sends a view frame ahead of the edits of the group commit that
-  caused it (`TestAViewFrameLeadsTheEditsItGrantsIntoStreaming`), and a
+  caused it (`views::a_view_frame_leads_the_edits_it_grants_into_streaming`), and a
   view changes only at a group commit's end, so a frame may briefly show
   a slice before the data that grants it.
 - P9.  A view frame backfills exactly the selectors it newly grants: a
@@ -751,7 +769,7 @@ View:
   slice the frozen base still holds.  Each new backfill tails through the
   frame's position (`until` is the position plus one), the last position
   the connection sent under the previous view
-  (`TestAStaleTokensViewFrameIsAtTheSincePresented`).  The view is
+  (`views::a_stale_tokens_view_frame_is_at_the_since_presented`).  The view is
   persisted when its frame arrives, and every connect presents the latest
   view's token.
 
@@ -761,7 +779,7 @@ Bootstrap:
   Once it has read the bootstrap's view frame at V, its cursor is V, so a
   reconnect presents `since` V; the frame's backfills cover every position
   at or below V and the connection every position above it
-  (`TestBootstrapDeliversEverythingAboveTheViewPosition`).  An edit at V
+  (`stream::a_bootstrap_delivers_everything_above_the_view_position`).  An edit at V
   that both deliver applies once.
 
 Cursor:
@@ -771,7 +789,7 @@ Cursor:
   back, commits with the frame that moved it, and is the `since` of every
   connect.  The database sends a vouch or a live frame at N only after
   every edit at or below N that the connection may see
-  (`TestAVouchNeverOvertakesAnEditItCovers`).
+  (`stream::a_vouch_never_overtakes_an_edit_it_covers`).
 - P12.  The cursor never skips an edit: every edit at or below it of a
   slice the view covers is applied, parked, or below the `until` of an
   in-flight backfill covering its slice, across reconnects and restarts,
@@ -800,7 +818,7 @@ Backfills:
   one transaction applies every blob (P5), every parked run (P4), and
   the latest view's drops (P8), clears every backfill record, header,
   parked page, and parked edit, and applies the base through the cursor
-  (`TestASnapshotsVisibleIsTheLastChangeUnderItsSelector`).
+  (`reads::visible_is_the_last_change_under_the_selector`).
 - P17.  A backfill whose snapshot starts over reads its tail again: after
   a `stale` outcome, from the later of the new snapshot's position and
   where its parked tail reached, since what it parked stays; after a
@@ -847,7 +865,7 @@ Atomicity:
   mutation's edits to the slices a client holds whole or not at all
   (P3, P16).
 - P23.  A tail page never splits the edits of one mutation
-  (`TestAnEditsPageNeverSplitsAMutation`); the client parks each delivery
+  (`reads::an_edits_page_never_splits_a_mutation`); the client parks each delivery
   in one transaction and resumes a tail after the highest position it
   parked, so a resumed tail never skips part of a mutation.
 
@@ -872,7 +890,8 @@ Atomicity:
   ahead of that commit's edits, and one ends a minute before its token
   expires with `["end", 603, "token expiring"]`, so its client
   reconnects with the token refreshed.
-- Go keeps each user's generation as the core last published it, for
+- The server keeps each user's generation as the core last published
+  it, for
   every user the core holds an account for (Registrations),
   and refuses a token that does not match it at once, before the
   writer sees the request.  A user the core holds no account for goes
@@ -882,8 +901,8 @@ Atomicity:
   the first signature once the current key has signed for a day, so
   every restart is a rotation and an idle server mints nothing.  A
   key's public half is committed to the store's token key table, in a
-  writer batch, before anything it signed leaves the process; Go
-  reads the table once, at startup, and verifies a token by the
+  writer batch, before anything it signed leaves the process; the
+  server reads the table once, at startup, and verifies a token by the
   stored key its `kid` names, so tokens outlive their process.
 - A key stops signing when its successor is minted, or, for the
   newest key of a past process, by this process's start.  Minting a
@@ -892,12 +911,13 @@ Atomicity:
   signed has expired.  The grace covers a clock stepped back between a
   key's last signature and its successor's minting, as restoring a VM
   snapshot can.
-- Login and refresh call the bundle's `lookup` on the txn thread; Go
-  verifies the password against its `passwordHash` (argon2id, in a
-  PHC string) and mints the token.  A login naming no account runs a
-  dummy verification, one argon2id hash at the current parameters, so
-  it answers no faster than a wrong password.  Go never reads the
-  store.  After the check Go calls `lookup` again, and when the
+- Login and refresh call the bundle's `lookup` on the txn thread; the
+  HTTP layer verifies the password against its `passwordHash`
+  (argon2id, in a PHC string) and mints the token.  A login naming no
+  account runs a dummy verification, one argon2id hash at the current
+  parameters, so it answers no faster than a wrong password.  The HTTP
+  layer never reads the store.  After the check it calls `lookup`
+  again, and when the
   account's user or `passwordHash` changed meanwhile, checks the
   password again against the new answer, outside the client's budget,
   so a login is decided against the credentials it ends with.
@@ -908,7 +928,7 @@ Atomicity:
   user}`.  No account fails like a moved generation, since a token
   speaks only for an existing account, dev tokens included.
 - A mutation's `NewPassword` fields, which the registry marks, are
-  hashed in the handler's cgo call, before the decider runs.  The
+  hashed by the mutation check, before the decider runs.  The
   decider and the log see only the hash.  Password-bearing mutations
   are `@online` in the model, so the generated client API never puts
   them in the outbox.  The other prepared kinds (CaptchaToken,
@@ -918,10 +938,11 @@ Atomicity:
   not know stops it at startup: the bundle needs a newer database.
 - A `MutationAuth` proof of kind `password` proves the sender's own
   password.  Intake writes `{kind: "password"}` in its place and sets
-  the password aside; Go asks the core for the sender's account and
-  checks the request's proofs against its `passwordHash` on the pool,
-  within the client's budget, as a login does.  The anonymous principal and an account without a hash fail.
-  Each mutation's verdict, with the hash it was checked against,
+  the password aside; the HTTP layer asks the core for the sender's
+  account and checks the request's proofs against its `passwordHash`
+  on the pool, within the client's budget, as a login does.  The
+  anonymous principal and an account without a hash fail.  Each
+  mutation's verdict, with the hash it was checked against,
   travels to the writer beside the mutation and never reaches the log.
 - The writer checks a proven mutation after the dedup check and before
   `expect` and the decider, so a failed proof never learns a slice's
@@ -930,21 +951,22 @@ Atomicity:
   mutation's turn: when the hash is unchanged the verdict stands, and
   a failed one is rejected as "invalid credentials", a decision like
   any other.  When the hash changed, the writer bounces the call: it
-  stops at the mutation and answers the outcomes before it, and Go
-  checks every remaining proof against the new hash, outside the
+  stops at the mutation and answers the outcomes before it, and the
+  HTTP layer checks every remaining proof against the new hash, outside the
   budget and waiting for room on the pool, then submits the rest of
   the call again.  The call's mutations are still decided once each
   and in order, and a call may prove a password its earlier mutation
-  set.  A fourth change in a row rejects the mutation.  Every submit runs the generation check, so a
-  token revoked partway through a call is refused with 401, as a lost
-  reply is, and a resend dedups the mutations already decided.
+  set.  A fourth change in a row rejects the mutation.  Every submit
+  runs the generation check, so a token revoked partway through a call
+  is refused with 401, as a lost reply is, and a resend dedups the
+  mutations already decided.
 - Every argon2id hash, at login and at intake, runs on a fixed pool of
-  workers (`HashWorkers`, default `GOMAXPROCS`) behind a queue of twice
-  that, so hashing's memory stays at the pool's size times one hash's.
+  workers, one per available CPU, behind a queue of twice that, so
+  hashing's memory stays at the pool's size times one hash's.
   A full queue answers 503 at once, and a queued hash whose client has
   left is skipped.  Each client, by the address it connects from, has a
-  budget of hashes, a token bucket (`AuthBurst` 10, refilled at
-  `AuthRate` 1 per second); past it, a login answers 429.  A mutation
+  budget of hashes, a token bucket of 10, refilled at 1 per second;
+  past it, a login answers 429.  A mutation
   request whose hash is refused, by a full pool or a spent budget, is
   refused whole with the same status, so its ids are still free to
   retry; refusing one mutation would be a final rejection.
@@ -983,7 +1005,8 @@ Atomicity:
 - At a batch's end, a grant or account the batch touched is run again
   for a registration with connections, and otherwise forgotten until
   its next use.  Each connection whose grant changed gets a view
-  frame, and Go gets each user's new generation, or word that the core
+  frame, and the server gets each user's new generation, or word that
+  the core
   no longer holds it, all ahead of the batch's commit, so a connection
   is cut down or ended before the edits of the batch that did it.
 - A registration with no connections is kept for `--principal-ttl`, a
@@ -1037,11 +1060,14 @@ Atomicity:
 - Cron is the built-in plugin of `@phaselock/plugins` (`plugins/`).
   When the core opens, it finds every install of kind `cron` in the
   bundle's `plugins` and reads each entry's name and spec from its
-  config; an entry's name is 1 to 64 bytes of `[A-Za-z0-9_-]`.  Go
-  parses every spec with robfig/cron's `ParseStandard`, in UTC unless
-  it starts with `CRON_TZ=` or `TZ=`, and rounds an `@every` up to a
-  whole minute, with a notice in the log.  A name or spec that fails
-  stops startup.
+  config; an entry's name is 1 to 64 bytes of `[A-Za-z0-9_-]`.  A spec
+  is a standard cron spec: five fields (minute, hour, day of month,
+  month, day of week) with ranges, steps, lists, and names, or one of
+  `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily`,
+  `@midnight`, `@hourly`, and `@every <duration>`, in UTC unless it
+  starts with `CRON_TZ=` or `TZ=` naming a zone.  An `@every` is
+  rounded up to a whole minute, with a notice in the log.  A name or
+  spec that fails stops startup.
 - An entry's mark, the last of its slots decided, is its row in the
   series table, under the key `$cron:<install>,<entry>` as it is,
   with `hwm` the slot in Unix seconds.  A client's key is hex, so the
@@ -1050,7 +1076,7 @@ Atomicity:
   every entry without a row the current minute as its mark, so a new
   or renamed entry first fires at its first slot after that, and
   answers every entry's mark.
-- The scheduler (`cron.go`) wakes at the earliest next slot, or
+- The scheduler (`src/cron.rs`) wakes at the earliest next slot, or
   after a minute at most, and fires each entry's latest slot at or
   before the wall clock's now, and only that one, so downtime fires
   each entry once.  The mark becomes the slot, never the time it
@@ -1135,20 +1161,22 @@ app's slots:
   not fit its type fails the call.  A scan names one type too, or
   `false` for keys only, so a scan with values picks out one key
   template's keys.
-- A scan walks the kv table in C (`scan.c`) the way the skeleton's
+- A scan walks the kv table (`src/scan.rs`) the way the skeleton's
   `walkPattern` does: a skip scan that places each key against the
   pattern's fields and seeks past the keys that cannot match, after
   stepping up to 16 keys toward the target, since a SQLite seek costs
-  about as much as 16 steps.  It walks no further than the batch, and
-  decodes only the batch's values: a full batch's `next` is its last
-  key, and whether more follow is the next batch's answer, empty with a
-  null `next` when none do, so a batch depends on no key it did not
-  hand out, and a grantor that stops at a full batch is re-run by no
-  write past it.  Over a
-  write buffer, the walk merges in the buffer's keys that the pattern
-  picks out (Log and edits).  The skeleton's conformance fixture
-  (`typespec/tests/fixtures/scan-conformance.json`) runs against it
-  in `scan_test.go`.
+  about as much as 16 steps.  The kv cursor reads ahead, a batch of rows
+  per query, 17 at a seek and doubling up to 256 as the walk goes on, so
+  a step past a batch is one more query.  It walks no further than the
+  batch, and decodes only the batch's values: a full batch's `next` is
+  its last key, and whether more follow is the next batch's answer,
+  empty with a null `next` when none do, so a batch depends on no key it
+  did not hand out, and a grantor that stops at a full batch is re-run
+  by no write past it.  Over a write buffer, the walk merges in the
+  buffer's keys that the pattern picks out (Log and edits).  The
+  skeleton's conformance fixture
+  (`typespec/tests/fixtures/scan-conformance.json`) runs against it in
+  `tests/scan_test.go`.
 - A registration's grantor and `token` lookup are run again when a
   write touches what they read: the keys they got, and for each scan
   batch, the stretch of keys the walk covered, the skeleton's
@@ -1164,63 +1192,71 @@ app's slots:
 
 ### Layout and build
 
-The database is one Go module, `phaselock.io/phaselockdb`, rooted at
-`db/`, and one package: cgo compiles a package's C only from its own
-directory, and calls C only in its own package, so the C core and the
-Go layer sit side by side.
+The database is one Rust crate, `phaselockdb`, rooted at `db/`: a
+library, and the binary over it.
 
-    db/*.c, *.h   the C core: pldb.c txn loop, queues, the mutation
-                  check, and the commit of edits, buffer.c a
-                  mutation's write buffer, store.c SQLite, scan.c key
-                  patterns and their walk, walk.c the conversion
-                  kernel, names.c the syntax of slice names, prefix
-                  selectors, and keys, mpjs.c untyped msgpack<->JS,
-                  js.c QuickJS host and the merging scan, host.js the
-                  JS glue (embedded by Go), os.c the calls that differ
-                  by platform, scantest.c the scan conformance test's
-                  hold on the walk
-    db/*.go       the Go layer: core.go cgo binding and build flags,
-                  server.go HTTP, auth.go tokens and passwords, keys.go
-                  token keys, cron.go the cron scheduler, mp.go
-                  msgpack codec, server_test.go feature tests,
-                  plugins_test.go plugins and cron ticks, cron_test.go
-                  the scheduler, scan_test.go the scans, scantest.go
-                  their test-only binding
-    db/internal/  one Go package per vendored C library, so the
-                  build cache keeps its object code across edits to
-                  the core: lib_*.c wraps each vendored C file,
-                  setting the defines its own build passes
-    db/third_party/
-                  QuickJS, SQLite's amalgamation, MPack, and SHA-256,
-                  each file headed with its origin and license;
-                  update.py vendors a new QuickJS or SQLite and
-                  regenerates its wrappers and NOTICE entry
-    db/testdata/  the test bundle: model.tsp and db.ts, generated into
-                  bundle.js (dev, with an inline source map) and
-                  bundle.prod.js by the TypeScript emitter and esbuild,
-                  with @phaselock/plugins from plugins/
+    src/lib.rs        the library the binary and the feature tests share
+    src/main.rs       the binary: flags, TLS, and signals
+    src/listen.rs     serving a listener's connections
+    src/server.rs     routes, the dispatcher, connections and their
+                      backlogs, /stream, /mutations, /snapshot, /edits
+    src/auth.rs       JWTs, principals, client naming, proofs,
+                      /auth/token
+    src/keys.rs       the token keys: rotation and sweeping
+    src/hash.rs       argon2id, the bounded hash pool, the per-client
+                      budget
+    src/cron.rs       cron specs and the scheduler
+    src/tlscert.rs    the certificate pair, reloaded when its files
+                      change
+    src/hooks.rs      tests only: the points a test holds the server at
+    src/core/         the core: mod.rs its handle, request queue, and
+                      results; writer.rs the writer thread, its group
+                      commits, registrations, dedup, proofs,
+                      expectations, and the commit of edits;
+                      prepare.rs the mutation check; reader.rs the
+                      reader thread
+    src/walk.rs       the conversion kernel
+    src/scan.rs       key patterns, their skip-scan walk, and spans
+    src/buffer.rs     a mutation's write buffer
+    src/store.rs      SQLite: kv, log, series, token keys, slices
+    src/js/           the QuickJS host (mod.rs), the QuickJS C API
+                      (ffi.rs), and untyped msgpack<->JS (mpjs.rs)
+    src/mp.rs         msgpack: a borrowing parser and a writer of the
+                      smallest encodings
+    src/names.rs      slice names, selectors, the characters of a key
+    host.js           the JS glue, embedded in the binary
+    build.rs          compiles the vendored QuickJS
+    third_party/      QuickJS, each file headed with its origin and
+                      license; update.py vendors a new one and rewrites
+                      its NOTICE entry
+    tests/            the feature tests, a file per area, over the harness
+                      in tests/common/
+    testdata/         the test bundle: model.tsp and db.ts, generated
+                      into bundle.js (dev, with an inline source map)
+                      and bundle.prod.js by the TypeScript emitter and
+                      esbuild, with @phaselock/plugins from plugins/
 
-Building needs only Go 1.25 or newer and a C compiler: GCC or Clang on
-Linux and macOS, MinGW-w64 on Windows, which is the only toolchain
-cgo supports there.  QuickJS needs `-fwrapv`, which is outside cgo's
-default flag allowlist, so a build sets `CGO_CFLAGS_ALLOW=-fwrapv`;
-the makefile does.  The Go side depends on `golang.org/x/crypto` for
-argon2id and `github.com/robfig/cron/v3` for cron specs.  The tests
-need pnpm: `make -C db test` rebuilds the test bundle on every run,
-from the emitter's and `plugins/`'s sources.  cgo compiles C without
-warnings, so `make -C db check` compiles the core's own C with them,
-as errors.
+Building needs a Rust toolchain with edition 2024 and a C compiler:
+build.rs compiles upstream QuickJS, not the quickjs-ng fork, with
+`-fwrapv`, which QuickJS relies on.  `src/js/ffi.rs` declares the
+QuickJS C API by hand and writes out the header's inline functions,
+the refcounting and value construction, over the 64-bit `JSValue`, a
+payload word and a tag word; vendoring a QuickJS that changes the
+value's layout means changing them too.  Every other dependency is a
+crate: tokio, hyper, and rustls for HTTP and TLS, rusqlite with its
+bundled SQLite, ed25519-dalek, argon2, and chrono-tz.  Both profiles
+build with `panic = "abort"`, so no panic unwinds across the FFI.
 
-    CGO_CFLAGS_ALLOW=-fwrapv go install phaselock.io/phaselockdb@latest
-    make -C db          build db/phaselockdb
-    make -C db test     build the test bundle, run the Go tests
-    make -C db check    the core's C, warnings as errors
-    ./db/phaselockdb --bundle db/testdata/bundle.js --dev-auth
+The tests need pnpm: `make -C db test` rebuilds the test bundle from the
+emitter's and `plugins/`'s sources and runs the unit tests and the feature
+tests in `tests/`, a file per area of the database over a shared harness
+in `tests/common/`.  A feature test runs its server in the test's own
+process, serving a loopback port as the binary serves its listener, so it speaks
+HTTP to it as a client does and reaches its core and its hooks directly.
+The hooks, `src/hooks.rs`, are points a test holds the server at: each is
+an async function the server awaits there when a test has set one, and
+none is set otherwise.
 
-`go install` resolves `phaselock.io/phaselockdb` through a `go-import`
-page on phaselock.io naming this repository's `db` directory, so the
-module's versions are the repository's `db/v*` tags.
-
-Reader-side calls (history, edit reads, snapshot) share one SQLite reader
-connection behind a mutex rather than a dedicated thread; each runs in
-its own read transaction so a cut is consistent with its position.
+    make -C db          build db/target/release/phaselockdb
+    make -C db test     build the test bundle, run the unit and feature tests
+    ./db/target/release/phaselockdb --bundle db/testdata/bundle.js --dev-auth

@@ -34,7 +34,7 @@ function okAt(r: Rig, position: number): void {
 /** the id of the last mutation sent */
 const lastId = (r: Rig): string => r.server.sends.at(-1)![0].id;
 
-// the database's half is server_test.go's TestAVouchNeverOvertakesAnEditItCovers
+// the database's half is db/tests/stream.rs's a_vouch_never_overtakes_an_edit_it_covers
 describe('P11: the cursor is the highest position received, and every connect presents it', () => {
   test('P11: edits, vouches, and live frames move the cursor forward only, and the next connect presents it', async () => {
     const r = await held();

@@ -1,5 +1,6 @@
-phaselockdb
+target/
 data/
+tests/
 testdata/node_modules/
 testdata/bundle.js
 testdata/bundle.prod.js

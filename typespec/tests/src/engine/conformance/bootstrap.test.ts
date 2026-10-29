@@ -7,7 +7,7 @@ import { checkpoint, ev, keys, log, rig, seq, settle, state, watch } from '../ha
 import { patrons, record, restart, set } from './common.ts';
 
 /* Also: boot.test.ts 'a missing !view means bootstrap: since -1, view null'.  The database's half
-   is server_test.go's TestBootstrapDeliversEverythingAboveTheViewPosition. */
+   is db/tests/stream.rs's a_bootstrap_delivers_everything_above_the_view_position. */
 describe("P10: a bootstrap's backfills cover the view's position and below, its connection above", () => {
   test("P10: once a bootstrap's view frame at V is processed, the cursor is V, and a reconnect resumes from it", async () => {
     const r = rig();

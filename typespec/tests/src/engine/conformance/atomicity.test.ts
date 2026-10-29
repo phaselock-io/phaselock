@@ -77,7 +77,7 @@ describe('P22: queries see a frame whole or not at all', () => {
 });
 
 /* Also: crash.test.ts 'a store left mid-backfill boots with the record...'.  The database's half is
-   server_test.go's TestAnEditsPageNeverSplitsAMutation. */
+   db/tests/reads.rs's an_edits_page_never_splits_a_mutation. */
 describe('P23: a tail is parked and resumed by whole mutations', () => {
   test('P23: a tail in several deliveries parks each, and the land waits for its end', async () => {
     const r = rig();

@@ -18,7 +18,7 @@ import {
 
 import { held, named, one, patrons, record, resumed, view } from './common.ts';
 
-// the database's half is server_test.go's TestAViewFrameLeadsTheEditsItGrantsIntoStreaming
+// the database's half is db/tests/views.rs's a_view_frame_leads_the_edits_it_grants_into_streaming
 describe('P8: a view cancels what it does not cover at once, and drops it from the base unfrozen or at the land', () => {
   test('P8: unfrozen, a revoke drops the slices it no longer covers at once', async () => {
     const r = await held();

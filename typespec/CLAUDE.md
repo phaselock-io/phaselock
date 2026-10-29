@@ -71,7 +71,7 @@ layout, build commands, and the test suite.
   identities a Registry answers for and its mutations union (`{engine}Schema`,
   `{database}Schema`, each `{ nodes, ids, mutations }`).  A host converts by walking it, reading
   and writing, checked against the schema both ways: `client/ts`'s `buildRegistry` in JS,
-  `db/walk.c` in C.  A new type kind is a new node kind, handled in every walker.
+  `db/src/walk.rs` in Rust.  A new type kind is a new node kind, handled in every walker.
 - **`skeleton.ts` has no library dependencies.**  It is pure logic: every codec, transport, and
   store with outside dependencies comes from the host (`client/ts`, `db/`), reaching the
   Engine through the `Registry`, `Transport`, and `Store` interfaces.  A session is opaque here:
@@ -248,6 +248,6 @@ layout, build commands, and the test suite.
 - A union of one member lowers to that member, so a one-member mutations union collides by name
   with its only member (`duplicate-name`); name the model itself as the mutations argument.
 - An intake type's vocabulary name is its kind in the schema, and the database matches kinds by
-  name (`INTAKE_KINDS` in `db/walk.c`), so renaming an intake type changes the database too.
+  name (`INTAKE_KINDS` in `db/src/walk.rs`), so renaming an intake type changes the database too.
 - An interface extending several vocabulary instantiations, or extending a slice or engine
   interface directly, is not handled (only the first direct instance is read).

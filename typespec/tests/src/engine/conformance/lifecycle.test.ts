@@ -39,7 +39,7 @@ describe('P6: a birth clears its slice, then applies its writes', () => {
   });
 });
 
-// the database's half is server_test.go's TestDeletingANonLiveSliceIsNoEdit
+// the database's half is db/tests/edits.rs's deleting_a_slice_that_is_not_live_is_no_edit
 describe('P7: a death clears its slice, and the client forgets it', () => {
   test('P7: after a death, a normal edit of the slice is a missed birth, and a rebirth starts it from empty', async () => {
     const r = await held();
