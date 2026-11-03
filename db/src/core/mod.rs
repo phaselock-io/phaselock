@@ -16,6 +16,7 @@
 
 mod prepare;
 mod reader;
+mod readsets;
 mod writer;
 
 use std::collections::VecDeque;
@@ -182,6 +183,8 @@ pub struct Config {
     pub call_limit: std::time::Duration,
     /// what bootstrap's hashPassword hashes with
     pub hash: crate::js::HashFn,
+    /// tests only: whether every batch ends by checking the registrations against their maps
+    pub check_registrations: bool,
 }
 
 struct Queue {
@@ -230,6 +233,7 @@ impl Core {
             ttl_ms: c.ttl_ms,
             call_limit: c.call_limit,
             hash: c.hash,
+            check: c.check_registrations,
             shared: shared.clone(),
             results: tx.clone(),
         };

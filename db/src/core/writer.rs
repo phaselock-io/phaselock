@@ -2,7 +2,7 @@
 //! queued as one group commit, keeps the registrations, and commits each mutation's write buffer
 //! as its edits.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -10,14 +10,14 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
+use super::readsets::{Cached, Call, ReadIndex, ReadSet};
 use super::{
     CronEntry, ID_LEN, Item, Kind, MAX_BOUNCES, Proof, Req, Res, Shared, Submit, Verdict, now_ms,
 };
 use crate::buffer::Touched;
-use crate::js::{self, Host, Reads};
+use crate::js::{self, Host};
 use crate::mp::{self, Node};
 use crate::names;
-use crate::scan::Span;
 use crate::store::Store;
 use crate::walk::Schema;
 
@@ -41,77 +41,12 @@ pub(super) struct Opening {
     pub ttl_ms: i64,
     pub call_limit: std::time::Duration,
     pub hash: js::HashFn,
+    pub check: bool,
     pub shared: Arc<Shared>,
     pub results: mpsc::UnboundedSender<Res>,
 }
 
 type Opened = Result<(Arc<Schema>, Vec<CronEntry>), String>;
-
-/// What a cached read-only call read, and how far into a batch's writes it has seen, so that a
-/// test against the batch's writes takes only those made after it ran.  A call last run in an
-/// earlier batch has seen every write before this batch, since every batch ends by settling the
-/// calls its writes touched.
-#[derive(Default)]
-struct ReadSet {
-    keys: HashSet<Vec<u8>>,
-    spans: Vec<Span>,
-    batch: u64,
-    written: usize,
-    deleted: usize,
-}
-
-impl ReadSet {
-    fn of(reads: Reads, b: &Batch) -> ReadSet {
-        ReadSet {
-            keys: reads.keys,
-            spans: reads.spans,
-            batch: b.id,
-            written: b.written.len(),
-            deleted: b.deleted.len(),
-        }
-    }
-
-    /* Whether the batch's writes the call has not seen touched what it read.  A spurious re-run
-    costs only time, so a deleted prefix dirties whenever it may. */
-    fn touched(&mut self, b: &Batch) -> bool {
-        let (from_written, from_deleted) =
-            if self.batch == b.id { (self.written, self.deleted) } else { (0, 0) };
-        if self.writes_touch(b, from_written, from_deleted) {
-            return true;
-        }
-
-        // the writes checked are seen, so the next check takes only the ones after them
-        self.batch = b.id;
-        self.written = b.written.len();
-        self.deleted = b.deleted.len();
-        false
-    }
-
-    /* Whether the batch's writes from the given ones on touched what the call read: a written key
-    it got or one inside a stretch a scan batch walked, or a deleted prefix holding a key it got
-    or one that could lie inside such a stretch. */
-    fn writes_touch(&self, b: &Batch, from_written: usize, from_deleted: usize) -> bool {
-        // the written keys, each once, at its last write
-        for (i, k) in b.written.iter().enumerate().skip(from_written) {
-            if b.last_write[k] != i {
-                continue;
-            }
-            if self.keys.contains(k) || self.spans.iter().any(|s| s.covers(k)) {
-                return true;
-            }
-        }
-
-        // the deleted prefixes
-        for p in &b.deleted[from_deleted..] {
-            if self.keys.iter().any(|k| k.starts_with(p))
-                || self.spans.iter().any(|s| s.may_hold(p))
-            {
-                return true;
-            }
-        }
-        false
-    }
-}
 
 /* One principal's registration, shared by every connection with the principal and kept for the
 TTL once the last one closes: what the grantor allows it and, for a user, what lookup answers
@@ -142,19 +77,16 @@ struct Reg {
     told_generation: i64,
 
     conns: Vec<u64>,
-    used: i64, // when it was last used or left by its last connection, in Unix ms
+    used: i64,    // when it was last used or left by its last connection, in Unix ms
+    visited: u64, // the last batch whose settle visits it
 }
 
-/// one group commit as it runs: the edits it commits, the keys it writes and the prefixes it
-/// clears, in order, and the registrations it answers once it ends
+/// one group commit as it runs: the edits it commits, and the registrations it answers once it
+/// ends
 struct Batch {
     id: u64,
     servertime: i64,
     commit: Vec<Item>,
-    written: Vec<Vec<u8>>,
-    // {key written: the index of its last write in written}
-    last_write: HashMap<Vec<u8>, usize>,
-    deleted: Vec<Vec<u8>>,
     // (registration, index of its reply among the batch's answers)
     replies: Vec<(usize, usize)>,
     // the answers, pushed once the batch commits
@@ -167,18 +99,9 @@ impl Batch {
             id,
             servertime: now_ms(),
             commit: Vec::new(),
-            written: Vec::new(),
-            last_write: HashMap::new(),
-            deleted: Vec::new(),
             replies: Vec::new(),
             after: Vec::new(),
         }
-    }
-
-    // records a key the batch writes
-    fn write(&mut self, key: &[u8]) {
-        self.last_write.insert(key.to_vec(), self.written.len());
-        self.written.push(key.to_vec());
     }
 }
 
@@ -189,11 +112,37 @@ struct Writer {
     results: mpsc::UnboundedSender<Res>,
     position: u64,
     batches: u64,
-    // newest last; walked newest first
-    regs: Vec<Reg>,
+
+    // the registrations by id, None for a free one: an id is its registration's while it lives
+    regs: Vec<Option<Reg>>,
+    free: Vec<usize>,
+    // {principal, in canonical form: its registration}
+    by_principal: HashMap<String, usize>,
+    // {connection: its principal's registration}
+    by_conn: HashMap<u64, usize>,
+    // what the registrations' cached calls read
+    index: ReadIndex,
+    // the registrations the batch's settle visits, each one once: those a write dirtied and those
+    // whose call ran
+    visits: Vec<usize>,
+    // the calls a write touched, reused write to write
+    hits: Vec<Call>,
+    // tests only: whether every batch ends by checking the registrations against their maps,
+    // dying when they disagree
+    check: bool,
     ttl_ms: i64,
     cron: Vec<CronEntry>,
     cron_keys: Vec<String>, // each entry's series key, $cron:<install>,<entry>
+}
+
+// a call's read-set while the call is clean, for the index's lookups
+fn clean(regs: &[Option<Reg>], c: Call) -> Option<&ReadSet> {
+    let g = regs[c.reg].as_ref()?;
+    let r = match c.what {
+        Cached::Grant => &g.greads,
+        Cached::Account => &g.areads,
+    };
+    (!r.dirty).then_some(r)
 }
 
 fn die(what: &str, e: String) -> ! {
@@ -299,6 +248,13 @@ fn open(o: Opening) -> Result<Writer, String> {
         position,
         batches: 0,
         regs: Vec::new(),
+        free: Vec::new(),
+        by_principal: HashMap::new(),
+        by_conn: HashMap::new(),
+        index: ReadIndex::default(),
+        visits: Vec::new(),
+        hits: Vec::new(),
+        check: o.check,
         ttl_ms: o.ttl_ms,
         cron: Vec::new(),
         cron_keys: Vec::new(),
@@ -340,14 +296,80 @@ impl Writer {
 
     // registrations //////////////////////////////////////////////////////////
 
+    fn reg(&self, i: usize) -> &Reg {
+        self.regs[i].as_ref().expect("a live registration")
+    }
+
+    fn reg_mut(&mut self, i: usize) -> &mut Reg {
+        self.regs[i].as_mut().expect("a live registration")
+    }
+
+    // lists the registration for the batch's settle, once
+    fn visit(&mut self, b: &Batch, i: usize) {
+        if self.reg(i).visited == b.id {
+            return;
+        }
+        self.reg_mut(i).visited = b.id;
+        self.visits.push(i);
+    }
+
+    // a call's read-set, and its registration's flag that the call holds an answer
+    fn read_set(&mut self, c: Call) -> &mut ReadSet {
+        let g = self.reg_mut(c.reg);
+        match c.what {
+            Cached::Grant => &mut g.greads,
+            Cached::Account => &mut g.areads,
+        }
+    }
+
+    // replaces a call's read-set in the index, the one it held dropped
+    fn relink(&mut self, c: Call, next: ReadSet) {
+        let old = std::mem::replace(self.read_set(c), next);
+        self.index.unlink(c, &old);
+        let next = std::mem::take(self.read_set(c));
+        self.index.link(c, &next);
+        *self.read_set(c) = next;
+    }
+
+    // dirties each call in hits, listing its registration for the batch's settle
+    fn dirty(&mut self, b: &Batch, hits: &mut Vec<Call>) {
+        for c in hits.drain(..) {
+            let r = self.read_set(c);
+            if r.dirty {
+                continue;
+            }
+            r.dirty = true;
+            self.visit(b, c.reg);
+        }
+    }
+
+    // dirties every call a written key touched
+    fn written(&mut self, b: &Batch, key: &[u8]) {
+        let mut hits = std::mem::take(&mut self.hits);
+        let regs = &self.regs;
+        self.index.written(key, |c| clean(regs, c), &mut hits);
+        self.dirty(b, &mut hits);
+        self.hits = hits;
+    }
+
+    // dirties every call a cleared slice, its prefix "<slice>!", touched
+    fn cleared(&mut self, b: &Batch, prefix: &[u8]) {
+        let mut hits = std::mem::take(&mut self.hits);
+        let regs = &self.regs;
+        self.index.cleared(prefix, |c| clean(regs, c), &mut hits);
+        self.dirty(b, &mut hits);
+        self.hits = hits;
+    }
+
     /* Runs the grantor for the registration, replacing its selectors and read-set.  A grantor
     that throws or returns a malformed selector is a bug, and the registration fails closed: it
     grants nothing, and every connection of it is answered with the failure. */
     fn grant_run(&mut self, b: &Batch, i: usize) {
-        let p = self.host.principal(self.regs[i].user.as_deref());
+        let p = self.host.principal(self.reg(i).user.as_deref());
         let (r, reads) = self.host.recording(|h| h.grant(p.v));
         drop(p);
-        self.regs[i].greads = ReadSet::of(reads, b);
+        self.relink(Call { reg: i, what: Cached::Grant }, ReadSet::of(reads));
+        self.visit(b, i);
 
         // every selector in wire form, or the first failure
         let (selectors, msg) = match r {
@@ -368,68 +390,78 @@ impl Writer {
             }
         };
         let failure = msg.map(|m| self.bug_reason(None, m));
-        let g = &mut self.regs[i];
+        let g = self.reg_mut(i);
         g.selectors = if failure.is_some() { Vec::new() } else { selectors };
         g.failure = failure;
         g.hash = view_hash(&g.selectors);
         g.granted = true;
     }
 
-    fn grant_forget(g: &mut Reg) {
+    fn grant_forget(&mut self, i: usize) {
+        self.relink(Call { reg: i, what: Cached::Grant }, ReadSet::default());
+        let g = self.reg_mut(i);
         g.granted = false;
         g.selectors.clear();
         g.failure = None;
-        g.greads = ReadSet::default();
     }
 
     /* Runs lookup for the user's token, replacing the account and its read-set.  A lookup that
     throws is a bug, and the account fails closed: it is no account, so the user's tokens are
     refused. */
     fn account_run(&mut self, b: &Batch, i: usize) {
-        let p = self.host.principal(self.regs[i].user.as_deref());
+        let p = self.host.principal(self.reg(i).user.as_deref());
         let (r, reads) = self.host.recording(|h| h.account(p.v));
         drop(p);
-        self.regs[i].areads = ReadSet::of(reads, b);
+        self.relink(Call { reg: i, what: Cached::Account }, ReadSet::of(reads));
+        self.visit(b, i);
         let (generation, hash, failure) = match r {
             Ok((g, h)) => (g, h, None),
             Err(e) => (-1, None, Some(self.bug_reason(None, format!("lookup failed: {e}")))),
         };
-        let g = &mut self.regs[i];
+        let g = self.reg_mut(i);
         g.generation = generation;
         g.password_hash = hash;
         g.lookup_failure = failure;
         g.looked = true;
     }
 
-    fn account_forget(g: &mut Reg) {
+    fn account_forget(&mut self, i: usize) {
+        self.relink(Call { reg: i, what: Cached::Account }, ReadSet::default());
+        let g = self.reg_mut(i);
         g.looked = false;
         g.password_hash = None;
         g.lookup_failure = None;
-        g.areads = ReadSet::default();
     }
 
     // the principal's registration, made when it has none, used now
     fn reg_of(&mut self, b: &Batch, user: Option<&str>) -> usize {
         let c = canon(user);
-        let i = match self.regs.iter().position(|g| g.canon == c) {
-            Some(i) => i,
+        let i = match self.by_principal.get(&c) {
+            Some(&i) => i,
             None => {
-                self.regs.push(Reg {
-                    canon: c,
-                    user: user.map(String::from),
-                    ..Default::default()
-                });
-                self.regs.len() - 1
+                let g =
+                    Reg { canon: c.clone(), user: user.map(String::from), ..Default::default() };
+                let i = match self.free.pop() {
+                    Some(i) => i,
+                    None => {
+                        self.regs.push(None);
+                        self.regs.len() - 1
+                    }
+                };
+                self.regs[i] = Some(g);
+                self.by_principal.insert(c, i);
+                i
             }
         };
-        self.regs[i].used = b.servertime;
+        self.reg_mut(i).used = b.servertime;
         i
     }
 
     // the principal's registration, its grant current as of this point in the batch
     fn reg_grant(&mut self, b: &Batch, user: Option<&str>) -> usize {
         let i = self.reg_of(b, user);
-        if !self.regs[i].granted || self.regs[i].greads.touched(b) {
+        let g = self.reg(i);
+        if !g.granted || g.greads.dirty {
             self.grant_run(b, i);
         }
         i
@@ -438,7 +470,8 @@ impl Writer {
     // the user's registration, its account current as of this point in the batch
     fn reg_account(&mut self, b: &Batch, user: &str) -> usize {
         let i = self.reg_of(b, Some(user));
-        if !self.regs[i].looked || self.regs[i].areads.touched(b) {
+        let g = self.reg(i);
+        if !g.looked || g.areads.dirty {
             self.account_run(b, i);
         }
         i
@@ -449,7 +482,7 @@ impl Writer {
         match user {
             Some(u) => {
                 let i = self.reg_account(b, u);
-                self.regs[i].generation == generation
+                self.reg(i).generation == generation
             }
             None => true,
         }
@@ -481,7 +514,8 @@ impl Writer {
             return;
         }
         let i = self.reg_grant(b, user.as_deref());
-        self.regs[i].conns.push(conn);
+        self.reg_mut(i).conns.push(conn);
+        self.by_conn.insert(conn, i);
 
         // the reply goes out with the batch's other answers, its view filled at the batch's end
         b.replies.push((i, b.after.len()));
@@ -490,21 +524,20 @@ impl Writer {
 
     // the TTL of a registration its last connection leaves runs from now
     fn handle_unregister(&mut self, b: &Batch, conn: u64) {
-        for g in &mut self.regs {
-            if let Some(at) = g.conns.iter().position(|&c| c == conn) {
-                g.conns.swap_remove(at);
-                if g.conns.is_empty() {
-                    g.used = b.servertime;
-                }
-                return;
-            }
+        let Some(i) = self.by_conn.remove(&conn) else { return };
+        let g = self.reg_mut(i);
+        if let Some(at) = g.conns.iter().position(|&c| c == conn) {
+            g.conns.swap_remove(at);
+        }
+        if g.conns.is_empty() {
+            g.used = b.servertime;
         }
     }
 
     // what lookup answers for the user's token as of the request's turn
     fn handle_account(&mut self, b: &mut Batch, reqid: u64, user: String) {
         let i = self.reg_account(b, &user);
-        let g = &self.regs[i];
+        let g = self.reg(i);
         let mut r = Res { kind: Kind::Account, reqid, ..Default::default() };
         match &g.lookup_failure {
             Some(f) => {
@@ -531,27 +564,30 @@ impl Writer {
         }
     }
 
-    /* Brings every registration to the batch's end.  A grant or account the batch's writes
-    touched since it last ran is run again for a registration with connections, which hear of a
+    /* Brings every registration the batch visits to the batch's end: each one a write dirtied,
+    and each one whose call ran, since no other one's grant or account changed.  A grant or
+    account a write dirtied is run again for a registration with connections, which hear of a
     change ahead of the batch's edits, and is otherwise forgotten until it is next used.  Then
     each connection whose grant changed since it was last sent one gets a view result, but the
     ones registered in the batch, whose replies answer them; and the server gets an account
     result for each user whose generation changed since it was last told one, or that the core
     forgot. */
     fn settle(&mut self, b: &Batch, accounts: &mut Vec<Res>, views: &mut Vec<Res>) {
-        for i in (0..self.regs.len()).rev() {
+        let mut visits = std::mem::take(&mut self.visits);
+        for &i in &visits {
             // the grant
-            if self.regs[i].granted && self.regs[i].greads.touched(b) {
-                if !self.regs[i].conns.is_empty() {
+            let g = self.reg(i);
+            if g.granted && g.greads.dirty {
+                if !g.conns.is_empty() {
                     self.grant_run(b, i);
                 } else {
-                    Self::grant_forget(&mut self.regs[i]);
+                    self.grant_forget(i);
                 }
             }
 
             // the connections, when it changed
             let position = self.position;
-            let g = &mut self.regs[i];
+            let g = self.reg_mut(i);
             let failed = g.failure.is_some();
             if g.granted && (g.hash != g.sent || failed != g.sent_failure) {
                 /* the whole set goes out on every change, and a failure; the server cuts a set
@@ -572,16 +608,16 @@ impl Writer {
             if g.user.is_none() {
                 continue;
             }
-            if g.looked && g.areads.touched(b) {
+            if g.looked && g.areads.dirty {
                 if !g.conns.is_empty() {
                     self.account_run(b, i);
                 } else {
-                    Self::account_forget(g);
+                    self.account_forget(i);
                 }
             }
 
             // the server's generation, when it is no longer the core's
-            let g = &mut self.regs[i];
+            let g = self.reg_mut(i);
             if g.looked && (!g.told || g.told_generation != g.generation) {
                 accounts.push(Self::account_result(g, false));
                 g.told = true;
@@ -591,20 +627,58 @@ impl Writer {
                 g.told = false;
             }
         }
+        visits.clear();
+        self.visits = visits;
     }
 
     // drops every registration without connections that has gone unused for the TTL
     fn expire(&mut self, now: i64, accounts: &mut Vec<Res>) {
-        let ttl = self.ttl_ms;
-        self.regs.retain(|g| {
-            if !g.conns.is_empty() || now - g.used < ttl {
-                return true;
+        for i in 0..self.regs.len() {
+            let Some(g) = &self.regs[i] else { continue };
+            if !g.conns.is_empty() || now - g.used < self.ttl_ms {
+                continue;
             }
             if g.told {
                 accounts.push(Self::account_result(g, true));
             }
-            false
-        });
+            self.relink(Call { reg: i, what: Cached::Grant }, ReadSet::default());
+            self.relink(Call { reg: i, what: Cached::Account }, ReadSet::default());
+            let g = self.regs[i].take().expect("a live registration");
+            self.by_principal.remove(&g.canon);
+            self.free.push(i);
+        }
+    }
+
+    /* Tests only: whether the registrations, their maps, and the read-set index agree as a batch
+    leaves them, and where they do not: each live registration is its principal's and each of
+    its connections', the index holds exactly what the calls holding an answer read, and settle
+    left no call dirty. */
+    fn check_registrations(&self) -> Result<(), String> {
+        let ensure = |ok: bool, what: &dyn Fn() -> String| if ok { Ok(()) } else { Err(what()) };
+        let mut index = ReadIndex::default();
+        let (mut live, mut conns) = (0, 0);
+        for (i, g) in self.regs.iter().enumerate() {
+            let Some(g) = g else { continue };
+            live += 1;
+            conns += g.conns.len();
+            let c = &g.canon;
+            ensure(self.by_principal.get(c) == Some(&i), &|| format!("{c} is not mapped to {i}"))?;
+            for k in &g.conns {
+                ensure(self.by_conn.get(k) == Some(&i), &|| format!("connection {k} of {c}"))?;
+            }
+            ensure(!g.greads.dirty && !g.areads.dirty, &|| format!("{c} left dirty"))?;
+            let unread = |r: &ReadSet| r.keys.is_empty() && r.spans.is_empty();
+            ensure(g.granted || unread(&g.greads), &|| format!("{c}'s forgotten grant read"))?;
+            ensure(g.looked || unread(&g.areads), &|| format!("{c}'s forgotten account read"))?;
+            index.link(Call { reg: i, what: Cached::Grant }, &g.greads);
+            index.link(Call { reg: i, what: Cached::Account }, &g.areads);
+        }
+        ensure(self.by_principal.len() == live, &|| {
+            "a principal mapped to no registration".into()
+        })?;
+        ensure(self.by_conn.len() == conns, &|| "a connection mapped to no registration".into())?;
+        ensure(index == self.index, &|| "the index differs from the registrations' reads".into())?;
+        ensure(self.visits.is_empty(), &|| "visits left for the next batch".into())
     }
 
     // the write path ///////////////////////////////////////////////////////////
@@ -628,7 +702,7 @@ impl Writer {
 
         // what the sender may see; a grantor that fails grants nothing
         let i = self.reg_grant(b, user);
-        let g = &self.regs[i];
+        let g = self.reg(i);
         if let Some(f) = &g.failure {
             write_reason(w, "reject", f);
             return true;
@@ -698,7 +772,7 @@ impl Writer {
 
         // the slice's row: a birth revives it, a death ends it, and an erasure drops its edits
         // before this one
-        let st = &self.store;
+        let st = Rc::clone(&self.store);
         if life == Life::Birth {
             st.slice_birth(&name, pos).unwrap_or_else(|e| die("slice_birth", e));
         }
@@ -715,7 +789,7 @@ impl Writer {
             let mut prefix = t.name.to_vec();
             prefix.push(b'!');
             st.del_prefix(&prefix).unwrap_or_else(|e| die("del_prefix", e));
-            b.deleted.push(prefix);
+            self.cleared(b, &prefix);
         }
         if life != Life::Death {
             for &(k, v) in &t.entries {
@@ -725,7 +799,7 @@ impl Writer {
                     None => st.del(k),
                 }
                 .unwrap_or_else(|e| die("apply", e));
-                b.write(k);
+                self.written(b, k);
             }
         }
 
@@ -807,7 +881,7 @@ impl Writer {
         let mut now = None;
         if let Some(u) = user {
             let i = self.reg_account(b, u);
-            let g = &self.regs[i];
+            let g = self.reg(i);
             if let Some(f) = &g.lookup_failure {
                 write_reason(w, "reject", f);
                 return ProofCheck::Decided;
@@ -1068,11 +1142,16 @@ impl Writer {
 
         // each registration's reply, with its view as the batch leaves it
         for &(i, at) in &b.replies {
-            Self::view_fill(&mut b.after[at], &self.regs[i]);
+            Self::view_fill(&mut b.after[at], self.reg(i));
         }
 
         // then the registrations gone unused, and the commit
         self.expire(b.servertime, &mut accounts);
+        if self.check
+            && let Err(e) = self.check_registrations()
+        {
+            die("the registrations", e);
+        }
         self.store.exec("COMMIT").unwrap_or_else(|e| die("commit", e));
 
         // the changes to accounts and views, ahead of the edits they apply to
@@ -1204,66 +1283,4 @@ fn encode_edit(
 /// nothing the database stores lets its reader send under a live series
 pub fn series_key(series: &[u8]) -> String {
     Sha256::digest(series).iter().map(|b| format!("{b:02x}")).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // a read-set of keys, as a call that ran at the batch's current writes leaves it
-    fn read(keys: &[&str], b: &Batch) -> ReadSet {
-        let keys = keys.iter().map(|k| k.as_bytes().to_vec()).collect();
-        ReadSet::of(Reads { keys, spans: Vec::new() }, b)
-    }
-
-    #[test]
-    fn a_check_takes_only_the_writes_after_the_last_one() {
-        let mut b = Batch::new(1);
-        let mut r = read(&["a!x"], &b);
-
-        // a write the call did not read is no touch, and the check moves past it
-        b.write(b"a!y");
-        assert!(!r.touched(&b));
-        assert_eq!(r.written, 1, "the check's sync point");
-
-        // a write of a key it got is
-        b.write(b"a!x");
-        assert!(r.touched(&b));
-    }
-
-    #[test]
-    fn a_key_the_call_saw_written_again_touches_it() {
-        let mut b = Batch::new(1);
-        b.write(b"a!x");
-        let mut r = read(&["a!x"], &b);
-        assert!(!r.touched(&b), "the write the call ran after");
-
-        // the same key written again, its last write past what the call saw
-        b.write(b"a!x");
-        assert!(r.touched(&b));
-    }
-
-    #[test]
-    fn a_later_batch_checks_every_write() {
-        let mut b = Batch::new(1);
-        let mut r = read(&["a!x"], &b);
-        b.write(b"a!x");
-        b.write(b"a!y");
-
-        // a call last run in an earlier batch has seen none of this batch's writes
-        let mut next = Batch::new(2);
-        next.write(b"a!x");
-        assert!(r.touched(&next));
-        assert!(r.touched(&b), "a failed check leaves the sync point where it was");
-    }
-
-    #[test]
-    fn a_cleared_slice_touches_a_key_under_it() {
-        let mut b = Batch::new(1);
-        let mut r = read(&["a!x"], &b);
-        b.deleted.push(b"b!".to_vec());
-        assert!(!r.touched(&b));
-        b.deleted.push(b"a!".to_vec());
-        assert!(r.touched(&b));
-    }
 }

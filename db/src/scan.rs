@@ -490,7 +490,28 @@ pub fn push_span(
     l.push(Span { pattern, reverse, from: from.map(|f| f.to_vec()), to: to.map(|t| t.to_vec()) });
 }
 
+/// tests only: a span of the keys starting with head, over the stretch from just past from to to
+#[cfg(test)]
+pub(crate) fn test_span(head: &str, from: Option<Vec<u8>>, to: Option<Vec<u8>>) -> Span {
+    let pattern = Pattern { head: head.as_bytes().to_vec(), fields: Vec::new(), named: false };
+    Span { pattern, reverse: false, from, to }
+}
+
 impl Span {
+    /// The longest text every key the span covers starts with: its pattern's head, or what both
+    /// ends of its stretch share when that is longer, since every key between two texts starts
+    /// with what they share.
+    pub fn prefix(&self) -> &[u8] {
+        let head = &self.pattern.head;
+        if let (Some(f), Some(t)) = (&self.from, &self.to) {
+            let n = f.iter().zip(t).take_while(|(a, b)| a == b).count();
+            if n > head.len() {
+                return &f[..n];
+            }
+        }
+        head
+    }
+
     /// whether a key written lies inside what the scan batch read
     pub fn covers(&self, key: &[u8]) -> bool {
         if let Some(from) = &self.from {

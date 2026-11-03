@@ -187,6 +187,7 @@ async fn run(f: Flags, certs: Option<Arc<tlscert::CertFiles>>) -> i32 {
         principal_ttl: f.principal_ttl,
         heartbeat: Duration::ZERO,
         call_limit: Duration::ZERO,
+        check_registrations: false,
         clock: None,
     };
     let srv = match Server::open(o).await {

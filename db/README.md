@@ -1034,19 +1034,32 @@ Atomicity:
   kept with what it read (Bundle contract), and every check reads it:
   a connection's view, an expectation's grant, a request's generation,
   and a proof's hash.
-- The writer brings each up to date where it uses it.  Each remembers
-  how far into its batch's writes it ran, and runs again only when a
-  write since then touched what it read, so every check in a
-  mutation's turn sees the state the mutation does: a revocation
-  refuses the next request in its own batch, and a grant covers the
-  next expectation.
-- At a batch's end, a grant or account the batch touched is run again
-  for a registration with connections, and otherwise forgotten until
-  its next use.  Each connection whose grant changed gets a view
-  frame, and the server gets each user's new generation, or word that
-  the core
-  no longer holds it, all ahead of the batch's commit, so a connection
-  is cut down or ended before the edits of the batch that did it.
+- The writer brings each up to date where it uses it.  A write marks
+  each grant and account it touched dirty as its mutation's edits
+  commit, and a check runs the grantor or `lookup` again only for a
+  dirty one, so every check in a mutation's turn sees the state the
+  mutation does: a revocation refuses the next request in its own
+  batch, and a grant covers the next expectation.
+- What the grants and accounts read is indexed
+  (`src/core/readsets.rs`), so a write looks only at what could cover
+  it: each key read, by the key and by its slice, and each scan span
+  under the longest prefix of a slice name that ends at a separator
+  and that every key the span covers starts with: `""` for a scan of
+  every slice, `fam:` for an unbounded family scan, `fam:p1,` for one
+  bounded within its first parameter, `slice!` for one slice.  A
+  written key looks in the buckets of its own such prefixes, and a
+  cleared slice in those of `<slice>!`.  An answer's entries change
+  only when it runs again, is forgotten, or expires, never during a
+  write's lookup.  The registrations are found by principal and by
+  connection through maps, so no request walks them all.
+- At a batch's end, settle visits only the registrations the batch
+  dirtied or ran a grantor or `lookup` for, since no other one
+  changed.  A dirty grant or account is run again for a registration
+  with connections, and otherwise forgotten until its next use.  Each
+  connection whose grant changed gets a view frame, and the server
+  gets each user's new generation, or word that the core no longer
+  holds it, all ahead of the batch's commit, so a connection is cut
+  down or ended before the edits of the batch that did it.
 - A registration with no connections is kept for `--principal-ttl`, a
   minute by default, from its last use or its last connection's close,
   and dropped by the first batch after.
@@ -1203,10 +1216,10 @@ app's slots:
   `walkPattern` does: a skip scan that places each key against the
   pattern's fields and seeks past the keys that cannot match, after
   stepping up to 16 keys toward the target, since a SQLite seek costs
-  about as much as 16 steps.  The kv cursor reads ahead, a batch of rows
-  per query, 17 at a seek and doubling up to 256 as the walk goes on, so
-  a step past a batch is one more query.  It walks no further than the
-  batch, and decodes only the batch's values: a full batch's `next` is
+  about as much as 16 steps.  The kv cursor steps one SQLite statement
+  in place, one of six prepared per connection, and reads a key or
+  value from SQLite's row without copying it.  It walks no further than
+  the batch, and decodes only the batch's values: a full batch's `next` is
   its last key, and whether more follow is the next batch's answer,
   empty with a null `next` when none do, so a batch depends on no key it
   did not hand out, and a grantor that stops at a full batch is re-run
@@ -1214,9 +1227,9 @@ app's slots:
   buffer's keys that the pattern picks out (Log and edits).  The
   skeleton's conformance fixture
   (`typespec/tests/fixtures/scan-conformance.json`) runs against it in
-  `tests/scan_test.go`.
-- A registration's grantor and `token` lookup are run again when a
-  write touches what they read: the keys they got, and for each scan
+  `tests/scan.rs`.
+- A registration's grant and account are dirtied when a write
+  touches what they read: the keys they got, and for each scan
   batch, the stretch of keys the walk covered, the skeleton's
   `ScanSpan` (its pattern, its direction, from just past the batch's
   `after` to its `next` or the walk's end).  A written key touches a
@@ -1226,7 +1239,8 @@ app's slots:
   hold a key the span covers: the prefix and the pattern's head agree,
   one starting with the other, and the prefix's keys overlap the
   span's stretch.  A spurious re-run costs only time, so that test
-  errs toward re-running.
+  errs toward re-running.  Tests run every server with a check after
+  each batch that the registrations, their maps, and the index agree.
 
 ### Layout and build
 
@@ -1252,8 +1266,9 @@ library, and the binary over it.
                       results; writer.rs the writer thread, its group
                       commits, registrations, dedup, proofs,
                       expectations, and the commit of edits;
-                      prepare.rs the mutation check; reader.rs the
-                      reader thread
+                      readsets.rs the index of what registrations
+                      read; prepare.rs the mutation check; reader.rs
+                      the reader thread
     src/walk.rs       the conversion kernel
     src/scan.rs       key patterns, their skip-scan walk, and spans
     src/buffer.rs     a mutation's write buffer

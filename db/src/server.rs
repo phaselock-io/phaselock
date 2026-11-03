@@ -61,6 +61,9 @@ pub struct Options {
     pub heartbeat: Duration,
     /// how long one call into the bundle may run before it is interrupted, 30 seconds when zero
     pub call_limit: Duration,
+    /// tests only: whether every batch ends by checking the registrations against their maps
+    /// and read-set index, aborting when they disagree
+    pub check_registrations: bool,
     /// the clock tokens and their keys are minted and checked by, the system's when None
     pub clock: Option<Clock>,
 }
@@ -553,6 +556,7 @@ impl Server {
             ttl_ms: ttl.as_millis() as i64,
             call_limit: if o.call_limit.is_zero() { js::CALL_LIMIT } else { o.call_limit },
             hash: bootstrap_hash,
+            check_registrations: o.check_registrations,
         };
         let (c, results) = tokio::task::spawn_blocking(move || Core::open(cfg))
             .await

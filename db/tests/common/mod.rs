@@ -58,14 +58,15 @@ pub fn testdata(name: &str) -> String {
 }
 
 /// The options a test's server opens with unless it changes them: a data directory of its own,
-/// the dev test bundle, dev auth, an attempt budget no test of other features runs out of, and
-/// the routes at the root.
+/// the dev test bundle, dev auth, an attempt budget no test of other features runs out of, the
+/// routes at the root, and the registrations checked after every batch.
 pub fn options(dir: &Path) -> Options {
     Options {
         data_dir: dir.display().to_string(),
         bundle: testdata("bundle.js"),
         dev_auth: true,
         auth_burst: 1000,
+        check_registrations: true,
         ..Default::default()
     }
 }
