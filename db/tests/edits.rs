@@ -5,6 +5,7 @@ mod common;
 
 use common::*;
 use phaselockdb::mp::Writer;
+use std::time::Duration;
 
 /// a slice's edits, all of them
 async fn slice_edits(h: &Harness, token: &str, slice: &str) -> Vec<Edit> {
@@ -460,6 +461,24 @@ async fn a_slice_name_fills_its_template() {
         "an unmapped stack: {}",
         outs[0].reason
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decider_past_its_deadline_reports_where_it_was() {
+    let h = start_with(|o| o.call_limit = Duration::from_millis(200)).await;
+    let admin = h.admin().await;
+
+    // the interrupted call's error carries its stack, mapped through the bundle's source map
+    let o = h.mutations(&admin, &[mutation!("c1", "spin")]).await.remove(0);
+    assert!(o.kind == "reject" && o.reason.contains("interrupted"), "the spin: {o:?}");
+    assert!(
+        o.reason.contains("(db.ts:") && !o.reason.contains("bundle.js:"),
+        "an unmapped stack: {}",
+        o.reason
+    );
+
+    // and the writer goes on
+    h.accept(&admin, mutation!("c2", "add-patron", "id" => "p1", "name" => "Ann")).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -679,6 +679,11 @@ pub trait Sink {
     fn bool(&mut self, b: bool) -> Result<(), &'static str>;
     fn null(&mut self) -> Result<(), &'static str>;
     fn date(&mut self, ms: f64) -> Result<(), &'static str>;
+
+    /// a value the caller writes in later, which only a sink that keeps holes takes
+    fn hole(&mut self) -> Result<(), &'static str> {
+        Err("a hole in a value that keeps none")
+    }
 }
 
 /// the sink of a check, which discards every event
@@ -912,14 +917,15 @@ enum V<'a> {
 }
 
 /// One field the database prepares for the decider, met by a check: its kind, its key, and its
-/// value.  The caller decides the result to write in its place: a string, or a
-/// MutationAuthResult's kind, written as {kind}.
+/// value.  The caller decides the result to write in its place: a string, a MutationAuthResult's
+/// kind, written as {kind}, or a hole the sink marks, for a string the caller fills in later.
 pub struct Intake<'a> {
     pub kind: &'static str,
     pub key: Vec<u8>,
     pub node: &'a Node<'a>,
     pub result: Option<String>,
     pub result_kind: Option<&'static str>,
+    pub hole: bool,
 }
 
 struct Walk<'a, 's> {
@@ -930,6 +936,8 @@ struct Walk<'a, 's> {
     depth: usize,
     path: Vec<u8>,
     seglens: Vec<usize>,
+    // the field slots of the structs the walk is inside, innermost last
+    slots: Vec<Option<V<'a>>>,
     // the prepared fields of the top-level value: collected by a check, written by a write
     intakes: Option<&'s mut Vec<Intake<'a>>>,
     results: Option<&'s [Intake<'a>]>,
@@ -940,6 +948,76 @@ struct Walk<'a, 's> {
 }
 
 static EMPTY_TB: TokBuf = TokBuf { toks: Vec::new(), arena: Vec::new() };
+
+/// the elements of an array a walk reads, in order, read in place
+enum Elems<'a> {
+    Mp(std::slice::Iter<'a, Node<'a>>),
+    Tok { tb: &'a TokBuf, at: usize, left: usize },
+}
+
+impl<'a> Iterator for Elems<'a> {
+    type Item = V<'a>;
+
+    fn next(&mut self) -> Option<V<'a>> {
+        match self {
+            Elems::Mp(it) => it.next().map(V::Mp),
+            Elems::Tok { tb, at, left } => {
+                if *left == 0 {
+                    return None;
+                }
+                *left -= 1;
+                let v = V::Tok(*at);
+                *at = tb.skip(*at);
+                Some(v)
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = match self {
+            Elems::Mp(it) => it.len(),
+            Elems::Tok { left, .. } => *left,
+        };
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for Elems<'_> {}
+
+/// the entries of a map a walk reads, in order, each key None when it is not a string
+enum Entries<'a> {
+    Mp(std::slice::Iter<'a, (Node<'a>, Node<'a>)>),
+    Tok { tb: &'a TokBuf, at: usize, left: usize },
+}
+
+impl<'a> Iterator for Entries<'a> {
+    type Item = (Option<&'a [u8]>, V<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Entries::Mp(it) => it.next().map(|(k, v)| (k.as_str(), V::Mp(v))),
+            Entries::Tok { tb, at, left } => {
+                if *left == 0 {
+                    return None;
+                }
+                *left -= 1;
+                let e = (Some(tb.span(&tb.toks[*at])), V::Tok(*at + 1));
+                *at = tb.skip(*at + 1);
+                Some(e)
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = match self {
+            Entries::Mp(it) => it.len(),
+            Entries::Tok { left, .. } => *left,
+        };
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for Entries<'_> {}
 
 impl<'a> Walk<'a, '_> {
     fn failed(&self) -> bool {
@@ -953,25 +1031,33 @@ impl<'a> Walk<'a, '_> {
         self.err = Some(format!("${}: {}", String::from_utf8_lossy(&self.path), msg.as_ref()));
     }
 
-    fn path_push(&mut self, seg: &[u8]) {
-        let mut n = seg.len().min(127);
+    // pushes a path segment, the bytes of head and then tail: at most 127 of them, and none once
+    // the path is long or deep
+    fn path_push(&mut self, head: &[u8], tail: &[u8]) {
+        let mut n = (head.len() + tail.len()).min(127);
         if self.path.len() + n > 1024 || self.seglens.len() > MAX_DEPTH {
             n = 0;
         }
-        self.path.extend_from_slice(&seg[..n]);
+        let h = head.len().min(n);
+        self.path.extend_from_slice(&head[..h]);
+        self.path.extend_from_slice(&tail[..n - h]);
         self.seglens.push(n);
     }
 
     fn path_index(&mut self, i: usize) {
-        self.path_push(format!("[{i}]").as_bytes());
+        use std::io::Write;
+        let mut seg = [0u8; 24];
+        let n = {
+            let mut w = &mut seg[..];
+            let _ = write!(w, "[{i}]");
+            24 - w.len()
+        };
+        self.path_push(&seg[..n], b"");
     }
 
     fn path_key(&mut self, k: &[u8], cap: bool) {
         let k = if cap && k.len() > 100 { &k[..100] } else { k };
-        let mut seg = Vec::with_capacity(k.len() + 1);
-        seg.push(b'.');
-        seg.extend_from_slice(k);
-        self.path_push(&seg);
+        self.path_push(b".", k);
     }
 
     fn path_pop(&mut self) {
@@ -1111,43 +1197,30 @@ impl<'a> Walk<'a, '_> {
         }
     }
 
-    fn elems(&self, v: V<'a>) -> Vec<V<'a>> {
+    // an array's elements; none for any other value
+    fn elems(&self, v: V<'a>) -> Elems<'a> {
         match v {
-            V::Mp(Node::Array(a)) => a.iter().map(V::Mp).collect(),
-            V::Tok(i) => {
-                let tb = self.tb;
-                let mut out = Vec::with_capacity(tb.toks[i].num as usize);
-                let mut at = i + 1;
-                for _ in 0..tb.toks[i].num {
-                    out.push(V::Tok(at));
-                    at = tb.skip(at);
-                }
-                out
+            V::Mp(Node::Array(a)) => Elems::Mp(a.iter()),
+            V::Tok(i) if self.tb.toks[i].kind == Kind::Arr => {
+                Elems::Tok { tb: self.tb, at: i + 1, left: self.tb.toks[i].num as usize }
             }
-            _ => Vec::new(),
+            _ => Elems::Mp([].iter()),
         }
     }
 
-    // a map's entries, each key None when it is not a string
-    fn entries(&self, v: V<'a>) -> Vec<(Option<&'a [u8]>, V<'a>)> {
+    // a map's entries; none for any other value
+    fn entries(&self, v: V<'a>) -> Entries<'a> {
         match v {
-            V::Mp(Node::Map(m)) => m.iter().map(|(k, val)| (k.as_str(), V::Mp(val))).collect(),
-            V::Tok(i) => {
-                let tb = self.tb;
-                let mut out = Vec::with_capacity(tb.toks[i].num as usize);
-                let mut at = i + 1;
-                for _ in 0..tb.toks[i].num {
-                    out.push((Some(tb.span(&tb.toks[at])), V::Tok(at + 1)));
-                    at = tb.skip(at + 1);
-                }
-                out
+            V::Mp(Node::Map(m)) => Entries::Mp(m.iter()),
+            V::Tok(i) if self.tb.toks[i].kind == Kind::Obj => {
+                Entries::Tok { tb: self.tb, at: i + 1, left: self.tb.toks[i].num as usize }
             }
-            _ => Vec::new(),
+            _ => Entries::Mp([].iter()),
         }
     }
 
     fn find_field(&self, obj: V<'a>, key: &[u8]) -> Option<V<'a>> {
-        self.entries(obj).into_iter().find(|(k, _)| *k == Some(key)).map(|(_, v)| v)
+        self.entries(obj).find(|(k, _)| *k == Some(key)).map(|(_, v)| v)
     }
 
     fn jsontype(&self, v: V<'a>) -> Jt {
@@ -1203,7 +1276,7 @@ impl<'a> Walk<'a, '_> {
                 // a time a Date cannot hold, an invalid Date's NaN among them, has no timestamp
                 match self.date(v) {
                     None => return self.fail("malformed timestamp"),
-                    Some(ms) if !(ms.abs() <= DATE_MAX_MS) => {
+                    Some(ms) if ms.is_nan() || ms.abs() > DATE_MAX_MS => {
                         return self.fail("a timestamp outside the range of a Date");
                     }
                     Some(ms) => self.sink.date(ms),
@@ -1279,9 +1352,24 @@ impl<'a> Walk<'a, '_> {
         }
         let top = std::mem::replace(&mut self.top, false);
 
+        // the struct's slots, one per declared field, above those of the structs it lies in
+        let base = self.slots.len();
+        self.slots.resize(base + fields.len(), None);
+        self.struct_fields(fields, disc, v, top, base);
+        self.slots.truncate(base);
+    }
+
+    // walks a struct's fields with its slots from base
+    fn struct_fields(
+        &mut self,
+        fields: &'a [Field],
+        disc: Option<usize>,
+        v: V<'a>,
+        top: bool,
+        base: usize,
+    ) {
         // find each declared field's value, and judge the rest
         let nf = fields.len();
-        let mut slots: Vec<Option<V<'a>>> = vec![None; nf];
         let mut present = 0;
         for (k, fv) in self.entries(v) {
             if self.failed() {
@@ -1300,13 +1388,13 @@ impl<'a> Walk<'a, '_> {
                         self.path_pop();
                     }
                 }
-                Some(i) if slots[i].is_some() => {
+                Some(i) if self.slots[base + i].is_some() => {
                     self.path_key(k, false);
                     self.fail("repeated field");
                     self.path_pop();
                 }
                 Some(i) => {
-                    slots[i] = Some(fv);
+                    self.slots[base + i] = Some(fv);
                     present += 1;
                 }
             }
@@ -1317,7 +1405,7 @@ impl<'a> Walk<'a, '_> {
 
         // every required field is present
         for (i, f) in fields.iter().enumerate() {
-            if slots[i].is_none() && !f.optional {
+            if self.slots[base + i].is_none() && !f.optional {
                 self.path_key(&f.key, false);
                 self.fail("missing required field");
                 self.path_pop();
@@ -1334,7 +1422,7 @@ impl<'a> Walk<'a, '_> {
                 break;
             }
             let f = &fields[i];
-            let Some(fv) = slots[i] else { continue };
+            let Some(fv) = self.slots[base + i] else { continue };
             self.path_key(&f.key, false);
             let r = self.sink.key(&f.key);
             self.sink(r);
@@ -1348,12 +1436,19 @@ impl<'a> Walk<'a, '_> {
                         node,
                         result: None,
                         result_kind: None,
+                        hole: false,
                     });
                 }
-                let (res, res_kind) = match self.result_for(&f.key) {
-                    Some(r) => (r.result.clone(), r.result_kind),
-                    None => (None, None),
+                let (res, res_kind, hole) = match self.result_for(&f.key) {
+                    Some(r) => (r.result.clone(), r.result_kind, r.hole),
+                    None => (None, None, false),
                 };
+                if hole {
+                    let r = self.sink.hole();
+                    self.sink(r);
+                    self.path_pop();
+                    continue;
+                }
                 if let Some(res) = res {
                     let r = self.sink.str(res.as_bytes());
                     self.sink(r);
@@ -1511,7 +1606,7 @@ impl<'a> Walk<'a, '_> {
             }
             Sol::Index(i, sub) => {
                 let elem = if self.kind(subj) == Kind::Arr {
-                    self.elems(subj).get(*i as usize).copied()
+                    self.elems(subj).nth(*i as usize)
                 } else {
                     None
                 };
@@ -1654,6 +1749,7 @@ fn walk<'a, 's>(
         depth: 0,
         path: Vec::new(),
         seglens: Vec::new(),
+        slots: Vec::new(),
         intakes: None,
         results: None,
         prepared: false,
@@ -1687,7 +1783,7 @@ pub fn write<'a>(
     ty: Option<u32>,
     strict: bool,
     il: Option<&[Intake<'a>]>,
-    out: &mut mp::Writer,
+    out: &mut dyn Sink,
 ) -> Result<(), String> {
     let mut w = walk(sc, &EMPTY_TB, out, strict);
     w.results = il;

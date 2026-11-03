@@ -32,9 +32,11 @@ const maxOperation = 32 * 1024 * 1024;
 const SET = 0x00;
 const END = 0xff;
 // a send that fails for a reason that may not recur is tried again this many times, waiting
-// this long before the first retry and twice as long before each one after
+// this long before the first retry and twice as long before each one after, unless the database
+// names its own wait, which is held to the longest
 const sendRetries = 3;
 const sendRetryDelay = 100;
+const maxRetryDelay = 30_000;
 // a session is refreshed once it has lived this share of its lifetime
 const refreshAfter = 0.5;
 
@@ -139,8 +141,9 @@ export class HTTPTransport implements Transport {
       outcomes in order, in as many requests as the database's limit on mutations per request
       calls for, one after another.  A request of numbered mutations that fails for a reason that
       may not recur is tried again a few times under the same ids, which the database's dedup
-      makes safe; a request with an unnumbered mutation is tried once.  A 4xx stands at once, and
-      a refused session ends, and the post rejects with an AuthError. */
+      makes safe; a request with an unnumbered mutation is tried again only when the database
+      refused it before deciding any of it.  Any other 4xx stands at once, and a refused session
+      ends, and the post rejects with an AuthError. */
   async post(
     mutations: Mutation<Uint8Array>[],
     session: Session | null = null,
@@ -153,9 +156,8 @@ export class HTTPTransport implements Transport {
         try {
           return await postMutations(this.#url, authorization(session), request);
         } catch (e: unknown) {
-          const clientError = e instanceof StatusError && e.status >= 400 && e.status < 500;
-          if (!numbered || clientError || attempt === sendRetries) throw refusal(e, session);
-          await sleep(sendRetryDelay * 2 ** attempt, new AbortController().signal);
+          if (attempt === sendRetries || !retryable(e, numbered)) throw refusal(e, session);
+          await sleep(retryDelay(e, attempt), new AbortController().signal);
         }
       }
     });
@@ -652,9 +654,9 @@ class HTTPConnection implements Connection {
 
   /* One call, as the requests the database's limit calls for, each with its retries.  A retry
      repeats the request under the same ids, which the database's dedup makes safe: a mutation the
-     first attempt committed answers dup.  A 4xx answer is the client's own doing and stands at
-     once; so does any failure once the stream has ended or the connection was aborted, since the
-     next connection resends. */
+     first attempt committed answers dup.  A 4xx answer but a 429 is the client's own doing and
+     stands at once; so does any failure once the stream has ended or the connection was aborted,
+     since the next connection resends. */
   async #post(mutations: Mutation<Uint8Array>[]): Promise<MutationResult[]> {
     await this.#ready();
     return inRequests(mutations, this.#limits, this.#session === null, async (request) => {
@@ -662,11 +664,15 @@ class HTTPConnection implements Connection {
         try {
           return await postMutations(this.#url, this.#headers(), request, this.#signal);
         } catch (e: unknown) {
-          const clientError = e instanceof StatusError && e.status >= 400 && e.status < 500;
-          if (attempt === sendRetries || clientError || this.#ended || this.#signal.aborted) {
+          if (
+            attempt === sendRetries ||
+            !retryable(e, true) ||
+            this.#ended ||
+            this.#signal.aborted
+          ) {
             throw e;
           }
-          await sleep(sendRetryDelay * 2 ** attempt, this.#signal);
+          await sleep(retryDelay(e, attempt), this.#signal);
           if (this.#ended) throw e;
         }
       }
@@ -719,13 +725,36 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-/** a /mutations response whose status answers no mutation */
+/** A /mutations response whose status answers no mutation: safe when the database refused the
+    request before deciding any of it, and retryAfter the wait it names in milliseconds, NaN for
+    none. */
 class StatusError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  safe: boolean;
+  retryAfter: number;
+  constructor(status: number, message: string, safe = false, retryAfter = NaN) {
     super(message);
     this.status = status;
+    this.safe = safe;
+    this.retryAfter = retryAfter;
   }
+}
+
+/* Whether a failed send may go again.  A 429, and a 503 the database marks safe to retry, refused
+   the request before any of it was decided, so it may go again whatever it holds; any other
+   failure but a 4xx may have applied some of it, so it goes again only when every mutation is
+   numbered, since the database's dedup answers a resent one it applied. */
+function retryable(e: unknown, numbered: boolean): boolean {
+  if (!(e instanceof StatusError)) return numbered;
+  if (e.status === 429 || e.safe) return true;
+  return numbered && (e.status < 400 || e.status >= 500);
+}
+
+// how long to wait before a send's next attempt: the wait the database names, or the backoff's
+function retryDelay(e: unknown, attempt: number): number {
+  const named = e instanceof StatusError ? e.retryAfter : NaN;
+  if (Number.isFinite(named) && named >= 0) return Math.min(named, maxRetryDelay);
+  return sendRetryDelay * 2 ** attempt;
 }
 
 /** a 413: the request carried more mutations than the database takes in one, max */
@@ -803,7 +832,8 @@ async function postMutations(
     if (resp.status === 413 && Number.isSafeInteger(max) && max > 0) {
       throw new TooManyMutations(max, message);
     }
-    throw new StatusError(resp.status, message);
+    const safe = resp.headers.get('PhaseLock-Safe-To-Retry') === 'true';
+    throw new StatusError(resp.status, message, safe, headerInt(resp, 'Retry-After') * 1000);
   }
   const outcomes = decodeAny(new Uint8Array(await resp.arrayBuffer())) as unknown[][];
   return outcomes.map((o): MutationResult => {

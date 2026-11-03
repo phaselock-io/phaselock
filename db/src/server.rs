@@ -16,21 +16,25 @@ use hyper::body::{Frame as BodyFrame, Incoming, SizeHint};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use crate::core::unix_ms;
-use crate::core::{self, Core, Item, Kind, PrepareError, Prepared, Req, Res, Verdict};
+use crate::core::{self, Core, Item, Kind, PrepareError, Prepared, Req, Res, Submit, Verdict};
 use crate::cron::{self, Scheduler};
-use crate::hash::{HashError, HashPool, Limiter};
+use crate::hash::{HashError, Hasher, Limiter, Local, Wait};
 use crate::hooks::Hooks;
+use crate::js;
 use crate::keys::Keyring;
 use crate::mp::{self, Val};
 use crate::names::{self, covers};
+use crate::pool::{Pool, PoolError};
 
 #[derive(Default)]
 pub struct Options {
     pub data_dir: String,
     pub bundle: String,
     pub dev_auth: bool,
-    /// password hashing: the workers, each holding one argon2id hash's memory while it runs, and
-    /// each client's budget of hashes, a burst regained at a rate per second
+    /// password hashing: the hasher, the server's own pool of hash_workers when None, each worker
+    /// holding one argon2id hash's memory while it runs; and each client's budget of hashes, a
+    /// burst regained at a rate per second
+    pub hasher: Option<Arc<dyn Hasher>>,
     pub hash_workers: usize,
     pub auth_burst: usize,
     pub auth_rate: f64,
@@ -55,6 +59,8 @@ pub struct Options {
     pub principal_ttl: Duration,
     /// the interval between a connection's heartbeat vouches
     pub heartbeat: Duration,
+    /// how long one call into the bundle may run before it is interrupted, 30 seconds when zero
+    pub call_limit: Duration,
     /// the clock tokens and their keys are minted and checked by, the system's when None
     pub clock: Option<Clock>,
 }
@@ -75,6 +81,17 @@ pub const HEARTBEAT: Duration = Duration::from_secs(15);
 // token refreshed
 const EXPIRY_LEAD_MS: i64 = 60_000;
 const MAX_BODY: usize = 16 << 20;
+// the largest mutation body checked on the task that took it; a larger one is checked on the
+// check pool, since its check runs long enough to hold up the tasks behind it
+const CHECK_INLINE: usize = 16 << 10;
+// the default number of hash workers is one per core, up to this many
+const HASH_WORKERS_MAX: usize = 16;
+/* The header on a refusal made before any mutation reached the writer, so a client may send the
+request again whether or not its mutations are numbered.  A 429 never carries it: every 429 the
+server answers is such a refusal. */
+pub const SAFE_TO_RETRY: &str = "phaselock-safe-to-retry";
+// the seconds a 503 or 429 asks the client to wait before it tries again
+const RETRY_AFTER: &str = "1";
 const COLD_BATCH: u64 = 1000;
 /// the default and maximum number of edits one /edits response asks for
 const EDITS_PAGE: usize = 1000;
@@ -128,6 +145,16 @@ pub fn http_error(status: u16, msg: &str) -> Resp {
     let h = r.headers_mut();
     h.insert("content-type", HeaderValue::from_static("text/plain; charset=utf-8"));
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    if status == 503 || status == 429 {
+        h.insert("retry-after", HeaderValue::from_static(RETRY_AFTER));
+    }
+    r
+}
+
+/// answers a request the server sheds before any mutation of it reaches the writer
+pub fn shed(msg: &str) -> Resp {
+    let mut r = http_error(503, msg);
+    r.headers_mut().insert(SAFE_TO_RETRY, HeaderValue::from_static("true"));
     r
 }
 
@@ -323,9 +350,12 @@ pub struct Server {
     pub clock: Clock,
     pub dev_auth: bool,
     pub epoch: String,
-    pub hashes: HashPool,
-    pub hash_workers: usize,
+    pub hasher: Arc<dyn Hasher>,
+    // the hasher the server made, which it stops when it closes
+    local_hasher: Option<Arc<Local>>,
     pub limit: Limiter,
+    // the checks of large mutation bodies
+    checks: Pool,
     pub client_ip_header: String,
     max_mutations: usize,
     max_anonymous_mutations: usize,
@@ -499,12 +529,30 @@ impl Server {
         let cache = check_cache_size(o.sqlite_cache_size)?;
         let ttl = if o.principal_ttl.is_zero() { Duration::from_secs(60) } else { o.principal_ttl };
 
+        // the hasher, which bootstrap hashes through too, waiting on the writer thread
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let (hasher, local_hasher): (Arc<dyn Hasher>, _) = match o.hasher {
+            Some(h) => (h, None),
+            None => {
+                let workers =
+                    if o.hash_workers == 0 { cores.min(HASH_WORKERS_MAX) } else { o.hash_workers };
+                let l = Arc::new(Local::new(workers, 2 * workers));
+                (l.clone(), Some(l))
+            }
+        };
+        let bootstrap_hash: js::HashFn = {
+            let (h, rt) = (hasher.clone(), tokio::runtime::Handle::current());
+            Box::new(move |pw| rt.block_on(h.hash(pw.to_string(), Wait::Queue)).ok())
+        };
+
         let cfg = core::Config {
             dir: o.data_dir.clone(),
             bundle: o.bundle.clone(),
             env: o.bootstrap_env.clone(),
             cache_mib: cache,
             ttl_ms: ttl.as_millis() as i64,
+            call_limit: if o.call_limit.is_zero() { js::CALL_LIMIT } else { o.call_limit },
+            hash: bootstrap_hash,
         };
         let (c, results) = tokio::task::spawn_blocking(move || Core::open(cfg))
             .await
@@ -542,11 +590,6 @@ impl Server {
             }
         }
 
-        let workers = if o.hash_workers == 0 {
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
-        } else {
-            o.hash_workers
-        };
         let burst = if o.auth_burst == 0 { 10 } else { o.auth_burst };
         let rate = if o.auth_rate <= 0.0 { 1.0 } else { o.auth_rate };
         let max_mutations = if o.max_mutations == 0 { 128 } else { o.max_mutations };
@@ -558,9 +601,10 @@ impl Server {
             clock,
             dev_auth: o.dev_auth,
             epoch: c.epoch.clone(),
-            hashes: HashPool::new(workers, 2 * workers),
-            hash_workers: workers,
+            hasher,
+            local_hasher,
             limit: Limiter::new(rate, burst),
+            checks: Pool::new("pldb-check", cores, 2 * cores),
             client_ip_header: o.client_ip_header,
             max_mutations,
             max_anonymous_mutations: max_anonymous.min(max_mutations),
@@ -603,7 +647,7 @@ impl Server {
         let task = tokio::spawn(async move {
             tokio::select! {
                 _ = sched.run(crate::core::now_ms, |i, slot| srv.clone().fire_cron(i, slot)) => {}
-                _ = crate::hash::until(&mut done) => {}
+                _ = crate::pool::until(&mut done) => {}
             }
         });
         *s.cron_task.lock().unwrap() = Some(task);
@@ -649,7 +693,10 @@ impl Server {
         if let Some(t) = cron {
             let _ = t.await;
         }
-        self.hashes.stop(self.hash_workers).await;
+        if let Some(h) = &self.local_hasher {
+            h.stop().await;
+        }
+        self.checks.stop().await;
         let core = &self.core;
         tokio::task::block_in_place(|| core.close());
         let d = self.dispatcher.lock().unwrap().take();
@@ -936,23 +983,24 @@ impl Server {
         self.mu.lock().unwrap().conns.len()
     }
 
-    /// Whether an ephemeral connection's view still covers a selector once the dispatcher has
+    /// Why an ephemeral connection's view no longer covers a selector once the dispatcher has
     /// published position, the last its read saw, by which every change to its principal's grant
-    /// or account up to it has reached the connection; otherwise the answer that says why not.
-    async fn visible(&self, id: u64, selector: &str, position: u64) -> Result<(), Resp> {
+    /// or account up to it has reached the connection: the answer that says so, None while the
+    /// view covers it.
+    async fn not_visible(&self, id: u64, selector: &str, position: u64) -> Option<Resp> {
         if !self.settled(position).await {
-            return Err(http_error(503, ERR_CLOSED));
+            return Some(http_error(503, ERR_CLOSED));
         }
         let sh = self.mu.lock().unwrap();
-        let Some(c) = sh.conns.get(&id) else { return Err(http_error(503, ERR_CLOSED)) };
+        let Some(c) = sh.conns.get(&id) else { return Some(http_error(503, ERR_CLOSED)) };
         if c.revoked {
-            Err(http_error(401, ERR_REVOKED))
+            Some(http_error(401, ERR_REVOKED))
         } else if !c.failure.is_empty() {
-            Err(http_error(500, &c.failure))
+            Some(http_error(500, &c.failure))
         } else if !covers(&c.selectors, selector) {
-            Err(http_error(403, "selector not visible"))
+            Some(http_error(403, "selector not visible"))
         } else {
-            Ok(())
+            None
         }
     }
 
@@ -1039,7 +1087,7 @@ impl Server {
         let closed = out.tx.clone();
         tokio::select! {
             _ = s.stream_frames(guard.id, p, since, view, presented, out) => {}
-            _ = crate::hash::until(&mut done) => {}
+            _ = crate::pool::until(&mut done) => {}
             _ = closed.closed() => {}
         }
         drop(guard);
@@ -1308,13 +1356,19 @@ impl Server {
         let client = self.client_of(&r);
         let limit = if p.anonymous { self.max_anonymous_mutations } else { self.max_mutations };
         let schema = self.core.schema.clone();
-        let pc = core::prepare(&schema, &body, limit, |pw| {
-            let s = self.clone();
-            let client = client.clone();
-            async move { s.hash_for(&client, pw).await }
-        })
-        .await;
-        let pc = match pc {
+
+        // the check: on this task for a small body, and on the check pool for a large one, which
+        // sheds the request when the pool's queue is full
+        let pc = if body.len() <= CHECK_INLINE {
+            core::prepare(&schema, &body, limit)
+        } else {
+            match self.checks.try_run(move || core::prepare(&schema, &body, limit)).await {
+                Ok(pc) => pc,
+                Err(PoolError::Busy) => return shed("the database is busy checking mutations"),
+                Err(PoolError::Closed) => return shed(ERR_CLOSED),
+            }
+        };
+        let mut pc = match pc {
             Ok(pc) => pc,
             Err(PrepareError::TooMany) => {
                 // the limit this request was held to, which the client splits its mutations under
@@ -1325,10 +1379,20 @@ impl Server {
                 set(resp.headers_mut(), "phaselock-max-mutations", limit.to_string());
                 return resp;
             }
-            Err(PrepareError::Busy) => return hash_failed(HashError::Busy),
-            Err(PrepareError::Limited) => return hash_failed(HashError::Limited),
             Err(PrepareError::Malformed(e)) => return http_error(400, &e),
         };
+
+        // each NewPassword's hash, within the client's budget, written into its hole
+        if !pc.passwords.is_empty() {
+            let mut hashes = Vec::with_capacity(pc.passwords.len());
+            for pw in std::mem::take(&mut pc.passwords) {
+                match self.hash_for(&client, pw).await {
+                    Ok(h) => hashes.push(h),
+                    Err(e) => return hash_failed(e),
+                }
+            }
+            pc.fill(&hashes);
+        }
 
         // each proof against the sender's credentials, within the client's budget
         let mut verdicts = Vec::new();
@@ -1383,7 +1447,7 @@ impl Server {
         p: &Principal,
         pc: &Prepared,
         mut verdicts: Vec<Verdict>,
-    ) -> Result<Vec<Vec<u8>>, Res> {
+    ) -> Result<Vec<Vec<u8>>, Box<Res>> {
         let mut outcomes = Vec::new();
         let mut first = 0;
         let mut attempt = 0;
@@ -1394,22 +1458,19 @@ impl Server {
             let user = p.user_opt();
             let generation = p.generation;
             let res = self
-                .request(|reqid| Req::Submit {
-                    reqid,
-                    user,
-                    generation,
-                    body,
-                    verdicts: vs,
-                    attempt,
+                .request(|reqid| {
+                    Req::Submit(Submit { reqid, user, generation, body, verdicts: vs, attempt })
                 })
                 .await;
             if res.status != 0 {
-                return Err(res);
+                return Err(Box::new(res));
             }
-            let outs = split_array(&res.buf).ok_or_else(|| Res {
-                status: 500,
-                errmsg: "malformed outcomes".into(),
-                ..Default::default()
+            let outs = split_array(&res.buf).ok_or_else(|| {
+                Box::new(Res {
+                    status: 500,
+                    errmsg: "malformed outcomes".into(),
+                    ..Default::default()
+                })
             })?;
             let n = outs.len();
             outcomes.extend(outs);
@@ -1420,10 +1481,12 @@ impl Server {
             // the mutation after the outcomes bounced: check its proofs, and every later one,
             // again
             first += n;
-            let again =
-                self.prove("", res.hash.clone(), &pc.proofs[first..], false).await.map_err(
-                    |e| Res { status: 503, errmsg: e.message().into(), ..Default::default() },
-                )?;
+            let again = self
+                .prove("", res.hash.clone(), &pc.proofs[first..], false)
+                .await
+                .map_err(|e| {
+                    Box::new(Res { status: 503, errmsg: e.message().into(), ..Default::default() })
+                })?;
             self.proved().await;
             for (i, v) in again.into_iter().enumerate() {
                 verdicts[first + i] = v;
@@ -1469,7 +1532,7 @@ impl Server {
             Ok(b) => b,
             Err(e) => return http_error(500, &e),
         };
-        if let Err(resp) = self.visible(guard.id, &selector, position).await {
+        if let Some(resp) = self.not_visible(guard.id, &selector, position).await {
             return resp;
         }
         let mut resp = Response::new(Body::Full(Some(Bytes::from(blob))));
@@ -1546,7 +1609,7 @@ impl Server {
             Ok(h) => h,
             Err(e) => return http_error(500, &e),
         };
-        if let Err(resp) = self.visible(guard.id, &selector, head).await {
+        if let Some(resp) = self.not_visible(guard.id, &selector, head).await {
             return resp;
         }
         let mut scanned = if reverse || to_head { after } else { before };
@@ -1570,29 +1633,33 @@ impl Server {
 
 /// the encoded values of a msgpack array, each its own bytes
 fn split_array(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
-    let (node, _) = mp::parse(buf).ok()?;
-    let n = node.array()?.len();
-    // the header's length: 1, 3, or 5 bytes
-    let mut at = match buf[0] {
-        0x90..=0x9f => 1,
-        0xdc => 3,
-        _ => 5,
+    // the header: its length, and where the elements start
+    let be = |b: &[u8]| b.iter().fold(0usize, |n, &c| n << 8 | c as usize);
+    let (n, mut at) = match *buf.first()? {
+        h @ 0x90..=0x9f => ((h & 0x0f) as usize, 1),
+        0xdc => (be(buf.get(1..3)?), 3),
+        0xdd => (be(buf.get(1..5)?), 5),
+        _ => return None,
     };
-    let mut out = Vec::with_capacity(n);
+
+    // each element, parsed once to find its end
+    let mut out = Vec::with_capacity(n.min(buf.len()));
     for _ in 0..n {
-        let (_, used) = mp::parse(&buf[at..]).ok()?;
+        let (_, used) = mp::parse(buf.get(at..)?).ok()?;
         out.push(buf[at..at + used].to_vec());
         at += used;
     }
     Some(out)
 }
 
-/// answers a request whose password hashing did not run: the client's budget is spent, the pool
-/// is full, or the server is going away
+/* Answers a request whose password hashing did not run: the client's budget is spent, the
+hasher is full, or the server is going away.  Hashing runs before any mutation of a request
+reaches the writer, so the request may be sent again; and no other refusal answers 429, so a
+client may resend any request a 429 answers. */
 pub fn hash_failed(e: HashError) -> Resp {
     match e {
         HashError::Limited => http_error(429, e.message()),
-        _ => http_error(503, e.message()),
+        _ => shed(e.message()),
     }
 }
 

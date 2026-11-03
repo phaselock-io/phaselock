@@ -45,6 +45,7 @@ fn conformance_store(budget: Option<usize>) -> (ConformanceStore, Vec<Case>) {
         store,
         env_names: Vec::new(),
         hasher: Box::new(|pw| Some(phaselockdb::hash::hash_password(pw))),
+        call_limit: phaselockdb::js::CALL_LIMIT,
     };
     let host = Host::open(&testdata("bundle.js"), o).unwrap_or_else(|e| panic!("the host: {e}"));
     host.bind_thread();

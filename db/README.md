@@ -103,8 +103,12 @@ plan above take precedence over it.
   - The reader thread owns a second SQLite connection and serves
     history reads, edit reads, snapshot cuts, the head, and the token
     keys, one job at a time, each cut in one read transaction.
-  - tokio's blocking pool runs the argon2id hashes, bounded by the
-    hash pool (Auth).
+  - Two pools of worker threads run the CPU-heavy work a request
+    waits on: the hash pool runs the argon2id hashes (Auth), and the
+    check pool checks large mutation bodies (Log and edits).  Their
+    threads run at nice 10, so the kernel preempts a long hash or
+    check whenever the writer, the dispatcher, or a connection needs
+    a core.
 - Channels: requests reach the writer through one queue under a lock,
   so a batch takes the whole queue at once.  Mutation outcomes, view
   and account changes, commits, and every other reply come back to
@@ -124,31 +128,39 @@ plan above take precedence over it.
   walk over the registry the bundle carries, and a sink that builds
   JS values, writes msgpack, or discards.  The kernel builds rich
   values straight from msgpack and walks the JS heap straight to
-  msgpack, and it checks every mutation on its request's task before
-  anything else happens to it.  The registry is compiled once at open
+  msgpack, and it checks every mutation before anything else happens
+  to it.  The registry is compiled once at open
   from the bundle's schema, `{nodes, ids, mutations}`; every read and
   write of the store names one of its identities, the value's type.
   Untyped values, `lookup`'s traffic, go through `src/js/mpjs.rs`.
 - A call into the bundle is interrupted after 30 seconds, bootstrap
   excepted, and the bundle's heap is capped at 4 GiB; either failure
-  is the call's bug.
+  is the call's bug.  Formatting a failed call's error, its stack
+  mapped through the bundle's source map, has 100 ms of its own, so
+  an interrupted call still reports where it was.
 - One lifetime for the process, ended by SIGINT or SIGTERM: every
   request selects on it, so an open connection ends the moment it
   does.  Shutdown then waits up to ten seconds for connections to
-  close, stops the hash pool once the hashes in progress finish, and
-  closes the core, which commits the batch in hand.
+  close, stops the hash and check pools once the work in progress
+  finishes, and closes the core, which commits the batch in hand.
 
 ### Log and edits
 
 - The mutation is the atom.  A POST may carry several mutations; each
   is checked, decided, committed, and acked independently and in
-  order.  Group commit batches mutations per fsync.  The check runs on
-  the request's task, against the mutations union of the registry
-  and rejecting fields the model does not name, so a malformed
-  mutation is answered there and never reaches dedup, `expect`, or
-  the writer; the fields the database prepares for the decider (a
-  `NewPassword`'s hash) are collected by the check and replaced when
-  the checked mutation is written out for the writer thread.
+  order.  Group commit batches mutations per fsync.  The check runs
+  against the mutations union of the registry, rejecting fields the
+  model does not name, so a malformed mutation is answered there and
+  never reaches dedup, `expect`, or the writer.  The fields the
+  database prepares for the decider are collected by the check and
+  replaced when the checked mutation is written out for the writer
+  thread; a `NewPassword` is written as a hole, which its hash fills
+  once the check is done, so the check waits on nothing.
+- A body of up to 16 KiB is checked on the request's task, which
+  takes tens of microseconds; a larger one is checked on the check
+  pool, one worker per core behind a queue of twice that, since its
+  check can run long enough to hold up the tasks behind it.  A full
+  queue sheds the request (Wire protocol).
 - The decider runs over a read-write transaction whose writes go to a
   write buffer (`src/buffer.rs`), never to the store.  The buffer holds
   each key written once, with its last value's msgpack bytes in store
@@ -511,6 +523,19 @@ Every frame is an array whose first element is a tag.
       → 413 when the body carries more mutations than the request's
         limit, refused before any is checked, with the limit in a
         PhaseLock-Max-Mutations header
+      → 429 when a hash the request needs finds the client's budget
+        spent (Auth)
+      → 503 when the server sheds the request or is shutting down
+
+- A refusal made before any mutation of the request reached the
+  writer may be sent again whether or not its mutations are
+  numbered: every 429, and a 503 with `PhaseLock-Safe-To-Retry:
+  true`, which the server sends when its check pool or hasher is full
+  or stopping.  Any other 503 may follow decisions it did not answer,
+  so only a request of numbered mutations is resent after one, as
+  dedup makes safe.  Every 503 and 429 names a wait in `Retry-After`.
+  No 429 carries the header, since every one is such a refusal, and
+  the server never answers 429 after the writer has a mutation.
 
 - Series, numbers, and the outcomes are under Mutation dedup.
 - A request carries at most 128 mutations, and one without a session
@@ -960,16 +985,29 @@ Atomicity:
   runs the generation check, so a token revoked partway through a call
   is refused with 401, as a lost reply is, and a resend dedups the
   mutations already decided.
-- Every argon2id hash, at login and at intake, runs on a fixed pool of
-  workers, one per available CPU, behind a queue of twice that, so
-  hashing's memory stays at the pool's size times one hash's.
-  A full queue answers 503 at once, and a queued hash whose client has
-  left is skipped.  Each client, by the address it connects from, has a
-  budget of hashes, a token bucket of 10, refilled at 1 per second;
-  past it, a login answers 429.  A mutation
+- New hashes are argon2id at RFC 9106's second recommended
+  parameters: 64 MiB, 3 passes, 4 lanes, which the build computes one
+  after another, at about the cost of one lane.  A PHC string carries
+  its parameters, so a hash made at others still verifies.
+- Every hash and verification, at login, at intake, and in
+  bootstrap, goes through a hasher, which the server answers from its
+  own hash pool: one worker per available CPU up to 16, behind a
+  queue of twice that, so hashing's memory stays at the pool's size
+  times one hash's, 1 GiB at most.  A full queue answers 503 at once, and a queued hash
+  whose client has left is skipped.  Each client, by the address it
+  connects from, has a budget of hashes, a token bucket of 10,
+  refilled at 1 per second; past it, a login answers 429.  A mutation
   request whose hash is refused, by a full pool or a spent budget, is
   refused whole with the same status, so its ids are still free to
   retry; refusing one mutation would be a final rejection.
+- The hasher is an interface (`Hasher`, in `src/hash.rs`) for a
+  shared hosted tier, where many small databases share one machine.
+  There each database hands its hashes to one hasher the machine
+  runs outside its processes, over a Unix socket, so a database's
+  memory stays small and hashing's memory is paid once per machine.
+  Its calls are async and hold no thread while they wait.  A
+  standalone server has no use for another hasher; an embedding hands
+  one in through `Options::hasher`.
 - An IPv6 client is budgeted by its /64, since a single host is
   commonly given a whole /64.  Behind a proxy, `--client-ip-header
   <name>` takes each client's address from a header the proxy sets to
@@ -1029,9 +1067,9 @@ Atomicity:
   seed of demo data is one commit.
 - `txn` is the context a decider writes through.  `ctx` has two
   calls.  `hashPassword(plain)` returns the same salted argon2id hash
-  intake produces, made at once, since bootstrap runs before anything
-  is served; it is the only producer of a password hash besides
-  intake.  `env(name)` reads only the environment variables the
+  intake produces, from the server's hasher, which the writer thread
+  waits on, since bootstrap runs before anything is served; it is the
+  only producer of a password hash besides intake.  `env(name)` reads only the environment variables the
   operator names with `--bootstrap-env NAME` (repeatable), and any
   other reads as the empty string, so a production seed carries no
   secret in its source.
@@ -1203,8 +1241,9 @@ library, and the binary over it.
     src/auth.rs       JWTs, principals, client naming, proofs,
                       /auth/token
     src/keys.rs       the token keys: rotation and sweeping
-    src/hash.rs       argon2id, the bounded hash pool, the per-client
-                      budget
+    src/hash.rs       argon2id, the hasher and the server's own hash
+                      pool, the per-client budget
+    src/pool.rs       the worker pools for hashes and large checks
     src/cron.rs       cron specs and the scheduler
     src/tlscert.rs    the certificate pair, reloaded when its files
                       change

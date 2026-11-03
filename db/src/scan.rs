@@ -20,7 +20,8 @@ pub const SCAN_STEP_BUDGET: usize = 16;
 struct Field {
     literal: bool,
     lit: Vec<u8>,
-    whole: bool, // the literal is a whole local key
+    lit_bound: Vec<u8>, // the exclusive upper bound of the keys starting with the literal
+    whole: bool,        // the literal is a whole local key
     lo: Option<Vec<u8>>,
     hi: Option<Vec<u8>>,
     lo_open: bool,
@@ -216,7 +217,13 @@ impl Pattern {
         if n > 0 {
             tname.push(b':');
         }
-        p.fields.push(Field { literal: true, lit: tname, whole: n == 0, ..Default::default() });
+        p.fields.push(Field {
+            literal: true,
+            lit_bound: prefix_bound(&tname).unwrap_or_default(),
+            lit: tname,
+            whole: n == 0,
+            ..Default::default()
+        });
         p.named = true;
         p.value_fields(ctx, local.v, n, b',', 0)?;
         Ok(p)
@@ -236,47 +243,59 @@ impl Pattern {
 // placing a key //////////////////////////////////////////////////////////////
 
 /// where a key stands against a pattern, for a walk one way: a match, a key to step past, the end
-/// of the walk, or the target of a seek to the next key that may match
-enum Place {
+/// of the walk, or a seek to the next key that may match
+enum Place<'p> {
     Match,
     Step,
     Done,
-    Seek(Vec<u8>, bool),
+    Seek(Target<'p>),
 }
 
-fn seek_to(key: &[u8], at: usize, tail: &[u8], strict: bool) -> Place {
-    let mut t = key[..at].to_vec();
-    t.extend_from_slice(tail);
-    Place::Seek(t, strict)
+/// A seek's target: the key's first at bytes, then tail, then extra when it is set.  The tail is
+/// text the pattern holds, so placing a key builds nothing.
+struct Target<'p> {
+    at: usize,
+    tail: &'p [u8],
+    extra: Option<u8>,
+    strict: bool,
+}
+
+impl Target<'_> {
+    // writes the target for the key it was placed from into buf
+    fn write(&self, key: &[u8], buf: &mut Vec<u8>) {
+        buf.clear();
+        buf.extend_from_slice(&key[..self.at]);
+        buf.extend_from_slice(self.tail);
+        buf.extend(self.extra);
+    }
+}
+
+fn seek_to(at: usize, tail: &[u8], extra: Option<u8>, strict: bool) -> Place<'_> {
+    Place::Seek(Target { at, tail, extra, strict })
+}
+
+// past every key holding the value of the nearest varying field before the one placed, given
+// as the end of its text and its separator
+fn skip_back<'p>(back: Option<(usize, u8)>, reverse: bool) -> Place<'p> {
+    match back {
+        None => Place::Done,
+        Some((end, _)) if reverse => seek_to(end + 1, b"", None, true),
+        Some((end, sep)) => seek_to(end, b"", Some(sep.wrapping_add(1)), false),
+    }
 }
 
 impl Pattern {
-    // past every key holding the value of the nearest varying field before field i
-    fn skip_back(&self, i: usize, ends: &[usize], key: &[u8], reverse: bool) -> Place {
-        for j in (0..i).rev() {
-            let f = &self.fields[j];
-            if f.literal || f.single {
-                continue;
-            }
-            if reverse {
-                return seek_to(key, ends[j] + 1, b"", true);
-            }
-            return seek_to(key, ends[j], &[f.sep.wrapping_add(1)], false);
-        }
-        Place::Done
-    }
-
     /* Places a key the way a skip scan does: the skeleton's placeKey.  The first field outside its
     match decides: a field short of its match seeks to where the match begins, and a field past
     it seeks past every key holding the value of the nearest field before it that admits more
     than one, or ends the walk when no such field does.  Seek targets are in walk order. */
-    fn place(&self, key: &[u8], reverse: bool) -> Place {
+    fn place<'p>(&'p self, key: &[u8], reverse: bool) -> Place<'p> {
         if !key.starts_with(&self.head) {
             return Place::Done;
         }
-        let mut ends = vec![0usize; self.fields.len()];
+        let mut back = None;
         let mut pos = self.head.len();
-        for (i, f) in self.fields.iter().enumerate() {
+        for f in &self.fields {
             // a literal: the template's keys start with it, or are it when it is a whole local key
             if f.literal {
                 let rest = &key[pos..];
@@ -286,18 +305,17 @@ impl Pattern {
                 }
                 if rest.cmp(&f.lit[..]) == Ordering::Less {
                     if reverse {
-                        return self.skip_back(i, &ends, key, reverse);
+                        return skip_back(back, reverse);
                     }
-                    return seek_to(key, pos, &f.lit, false);
+                    return seek_to(pos, &f.lit, None, false);
                 }
                 if !reverse {
-                    return self.skip_back(i, &ends, key, reverse);
+                    return skip_back(back, reverse);
                 }
                 if f.whole {
-                    return seek_to(key, pos, &f.lit, false);
+                    return seek_to(pos, &f.lit, None, false);
                 }
-                let end = prefix_bound(&f.lit).unwrap_or_default();
-                return seek_to(key, pos, &end, true);
+                return seek_to(pos, &f.lit_bound, None, true);
             }
 
             // a value field: its text runs to its separator, or to the end for the last field
@@ -316,17 +334,15 @@ impl Pattern {
                 let d = v.cmp(lo);
                 if d == Ordering::Less || (d == Ordering::Equal && f.lo_open) {
                     if reverse {
-                        return self.skip_back(i, &ends, key, reverse);
+                        return skip_back(back, reverse);
                     }
                     if !f.lo_open {
-                        return seek_to(key, pos, lo, false);
+                        return seek_to(pos, lo, None, false);
                     }
                     if f.sep == 0 {
-                        return seek_to(key, pos, lo, true);
+                        return seek_to(pos, lo, None, true);
                     }
-                    let mut t = lo.clone();
-                    t.push(f.sep + 1);
-                    return seek_to(key, pos, &t, false);
+                    return seek_to(pos, lo, Some(f.sep + 1), false);
                 }
             }
 
@@ -335,17 +351,15 @@ impl Pattern {
                 let d = v.cmp(hi);
                 if d == Ordering::Greater || (d == Ordering::Equal && f.hi_open) {
                     if !reverse {
-                        return self.skip_back(i, &ends, key, reverse);
+                        return skip_back(back, reverse);
                     }
                     if f.hi_open {
-                        return seek_to(key, pos, hi, true);
+                        return seek_to(pos, hi, None, true);
                     }
                     if f.sep == 0 {
-                        return seek_to(key, pos, hi, false);
+                        return seek_to(pos, hi, None, false);
                     }
-                    let mut t = hi.clone();
-                    t.push(f.sep + 1);
-                    return seek_to(key, pos, &t, true);
+                    return seek_to(pos, hi, Some(f.sep + 1), true);
                 }
             }
 
@@ -353,7 +367,9 @@ impl Pattern {
             if short {
                 return Place::Step;
             }
-            ends[i] = end;
+            if !f.single {
+                back = Some((end, f.sep));
+            }
             pos = end + (f.sep != 0) as usize;
         }
         Place::Match
@@ -396,9 +412,9 @@ pub fn walk(
             cur.seek(true, end.as_deref(), end.is_some())?
         }
     };
+    let mut target = Vec::new();
     while at {
-        let place = p.place(cur.key(), reverse);
-        let (target, strict) = match place {
+        let strict = match p.place(cur.key(), reverse) {
             Place::Done => break,
             Place::Match => {
                 match visit(cur.key(), cur.value()) {
@@ -413,7 +429,10 @@ pub fn walk(
                 at = cur.step()?;
                 continue;
             }
-            Place::Seek(t, s) => (t, s),
+            Place::Seek(t) => {
+                t.write(cur.key(), &mut target);
+                t.strict
+            }
         };
 
         // a target behind the key comes from a bound holding characters its parameter cannot,

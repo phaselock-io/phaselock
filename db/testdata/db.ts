@@ -315,6 +315,11 @@ const deciders: TestDBDeciders<TestPlugins> = {
       messages.push('own');
     });
   },
+  spin: () => {
+    for (;;) {
+      // until the deadline interrupts it
+    }
+  },
 };
 
 // the bundle //

@@ -574,6 +574,32 @@ async fn a_new_password_reaches_the_decider_hashed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn new_passwords_in_a_large_request_are_hashed_into_place() {
+    let h = start().await;
+    let admin = h.admin().await;
+
+    /* A request large enough to be checked off the request's task, with a password ahead of a
+    long title, a rejected one, and another behind them: each hash goes into its own mutation,
+    and the mutations after each hash still decode. */
+    let title = "t".repeat(20 << 10);
+    let muts = [
+        mutation!("c1", "create-account", "user" => "ann", "password" => "pw-ann"),
+        mutation!("c2", "add-book", "id" => "b1", "title" => &title),
+        mutation!("c3", "create-account", "user" => "cat", "password" => 42),
+        mutation!("c4", "create-account", "user" => "bob", "password" => "pw-bob"),
+        mutation!("c5", "add-book", "id" => "b2", "title" => "Emma"),
+    ];
+    let got = h.mutations(&admin, &muts).await;
+    let kinds: Vec<&str> = got.iter().map(|o| o.kind.as_str()).collect();
+    assert_eq!(kinds, ["ok", "ok", "reject", "ok", "ok"], "outcomes: {got:?}");
+    assert_eq!(h.login("ann", "pw-ann").await, 200, "ann's password");
+    assert_eq!(h.login("bob", "pw-bob").await, 200, "bob's password");
+    let records = h.snapshot(&admin, "book").await.records;
+    assert!(records["book!book:b1"]["title"] == title.as_str(), "the long title");
+    assert!(records["book!book:b2"]["title"] == "Emma", "the title after the second hash");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_value_no_type_accepts_is_rejected_by_name() {
     let h = start().await;
     let admin = h.admin().await;

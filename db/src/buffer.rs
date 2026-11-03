@@ -23,6 +23,9 @@ pub fn slice_of(key: &[u8]) -> Option<&[u8]> {
     key.iter().position(|&c| c == b'!').map(|i| &key[..i])
 }
 
+/// a walk of the buffer's entries: each key, and its value or None for a deletion
+pub type Range<'a> = Box<dyn Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a>;
+
 impl WriteBuffer {
     /// writes key's value, or deletes key for None
     pub fn put(&mut self, key: &[u8], val: Option<&[u8]>) {
@@ -66,11 +69,7 @@ impl WriteBuffer {
     }
 
     /// the entries in key order from just past after, or from the first; forward or reverse
-    pub fn range<'a>(
-        &'a self,
-        after: Option<&[u8]>,
-        reverse: bool,
-    ) -> Box<dyn Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a> {
+    pub fn range<'a>(&'a self, after: Option<&[u8]>, reverse: bool) -> Range<'a> {
         let map = |(k, v): (&'a Vec<u8>, &'a Option<Vec<u8>>)| (k.as_slice(), v.as_deref());
         match (after, reverse) {
             (None, false) => Box::new(self.entries.iter().map(map)),

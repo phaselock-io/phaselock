@@ -1,21 +1,24 @@
-//! Password hashing: argon2id runs on a fixed pool of workers behind a bounded queue, so its
-//! memory stays at the pool's size times one hash's, and a per-client token bucket in front of the
-//! pool keeps one client from filling the queue.  Hashes are PHC strings, which carry the
-//! parameters they were made with.
+//! Password hashing: argon2id, behind the Hasher interface the server hashes and verifies
+//! through, and a per-client token bucket in front of it that keeps one client from filling its
+//! queue.  Hashes are PHC strings, which carry the parameters they were made with, so a hash made
+//! at other parameters still verifies.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
-// the argon2id parameters new hashes are made with
-const ARGON_TIME: u32 = 2;
-const ARGON_MEMORY: u32 = 19 * 1024;
-const ARGON_THREADS: u32 = 1;
+use crate::pool::{Pool, PoolError};
+
+// the argon2id parameters new hashes are made with: RFC 9106's second recommended option, 64 MiB
+// over 3 passes in 4 lanes, which this build computes one after another
+const ARGON_TIME: u32 = 3;
+const ARGON_MEMORY: u32 = 64 * 1024;
+const ARGON_LANES: u32 = 4;
 const ARGON_KEY_LEN: usize = 32;
 
 // PHC strings use the standard alphabet with no padding
@@ -23,11 +26,11 @@ const PHC64: base64::engine::GeneralPurpose = base64::engine::general_purpose::S
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashError {
-    /// the queue is full
+    /// the hasher's queue is full
     Busy,
     /// the client's budget is spent
     Limited,
-    /// the pool has stopped
+    /// the hasher has stopped
     Closed,
 }
 
@@ -38,6 +41,91 @@ impl HashError {
             HashError::Limited => "too many password attempts; slow down",
             HashError::Closed => "the server is shutting down",
         }
+    }
+}
+
+impl From<PoolError> for HashError {
+    fn from(e: PoolError) -> HashError {
+        match e {
+            PoolError::Busy => HashError::Busy,
+            PoolError::Closed => HashError::Closed,
+        }
+    }
+}
+
+/// a hasher's answer
+pub type Answer<'a, T> = Pin<Box<dyn Future<Output = Result<T, HashError>> + Send + 'a>>;
+
+/// how a request waits for its turn at the hasher
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    /// refused with Busy when the hasher's queue is full
+    Refuse,
+    /// waiting for room in the queue: for a check whose call may already have decided mutations,
+    /// and for bootstrap's hashes, which no client waits on
+    Queue,
+}
+
+/** What the server hashes and verifies passwords through.  Each call is async: a hasher may
+answer from a pool of threads or from a service across a socket, and the request waits without
+holding a thread either way.  A call whose future is dropped is abandoned.
+
+The server hashes on its own pool, Local, unless the embedding hands it another.  The interface
+exists for a shared hosted tier, where many small databases run on one machine: each database
+hands its hashes to one hasher the machine shares, outside its process, so the database's memory
+stays small and the memory of hashing is paid once per machine instead of once per database.  A
+standalone server has no use for another hasher. */
+pub trait Hasher: Send + Sync {
+    /// a PHC string of the password, at the hasher's parameters
+    fn hash(&self, password: String, wait: Wait) -> Answer<'_, String>;
+
+    /// Whether the password is the one stored hashes.  With no stored hash, spends what a
+    /// verification spends and answers false, so a login naming no account answers no faster
+    /// than a wrong password.
+    fn verify(&self, stored: Option<String>, password: String, wait: Wait) -> Answer<'_, bool>;
+
+    /// stops taking calls, and waits until the calls in hand finish
+    fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+/// The hasher of a standalone server: argon2id on a fixed pool of workers behind a bounded
+/// queue, so its memory stays at the pool's size times one hash's.
+pub struct Local {
+    pool: Pool,
+}
+
+impl Local {
+    pub fn new(workers: usize, queue: usize) -> Local {
+        Local { pool: Pool::new("pldb-hash", workers, queue) }
+    }
+}
+
+impl Hasher for Local {
+    fn hash(&self, password: String, wait: Wait) -> Answer<'_, String> {
+        Box::pin(async move {
+            let hash = move || hash_password(&password);
+            Ok(match wait {
+                Wait::Refuse => self.pool.try_run(hash).await?,
+                Wait::Queue => self.pool.queue_run(hash).await?,
+            })
+        })
+    }
+
+    fn verify(&self, stored: Option<String>, password: String, wait: Wait) -> Answer<'_, bool> {
+        Box::pin(async move {
+            let check = move || match stored {
+                Some(h) => verify_password(&h, &password),
+                None => dummy_verify(&password),
+            };
+            Ok(match wait {
+                Wait::Refuse => self.pool.try_run(check).await?,
+                Wait::Queue => self.pool.queue_run(check).await?,
+            })
+        })
+    }
+
+    fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.pool.stop())
     }
 }
 
@@ -53,10 +141,10 @@ fn argon(pw: &[u8], salt: &[u8], t: u32, m: u32, p: u32, len: usize) -> Option<V
 pub fn hash_password(pw: &str) -> String {
     let mut salt = [0u8; 16];
     getrandom::fill(&mut salt).expect("random bytes");
-    let key = argon(pw.as_bytes(), &salt, ARGON_TIME, ARGON_MEMORY, ARGON_THREADS, ARGON_KEY_LEN)
+    let key = argon(pw.as_bytes(), &salt, ARGON_TIME, ARGON_MEMORY, ARGON_LANES, ARGON_KEY_LEN)
         .expect("argon2id at fixed parameters");
     format!(
-        "$argon2id$v=19$m={ARGON_MEMORY},t={ARGON_TIME},p={ARGON_THREADS}${}${}",
+        "$argon2id$v=19$m={ARGON_MEMORY},t={ARGON_TIME},p={ARGON_LANES}${}${}",
         PHC64.encode(salt),
         PHC64.encode(key)
     )
@@ -67,7 +155,7 @@ pub fn hash_password(pw: &str) -> String {
 pub fn dummy_verify(pw: &str) -> bool {
     let mut salt = [0u8; 16];
     getrandom::fill(&mut salt).expect("random bytes");
-    argon(pw.as_bytes(), &salt, ARGON_TIME, ARGON_MEMORY, ARGON_THREADS, ARGON_KEY_LEN);
+    argon(pw.as_bytes(), &salt, ARGON_TIME, ARGON_MEMORY, ARGON_LANES, ARGON_KEY_LEN);
     false
 }
 
@@ -104,87 +192,6 @@ pub fn verify_password(hash: &str, pw: &str) -> bool {
         return false;
     };
     subtle::ConstantTimeEq::ct_eq(key.as_slice(), want.as_slice()).into()
-}
-
-/// waits until a flag is set
-pub async fn until(rx: &mut watch::Receiver<bool>) {
-    let _ = rx.wait_for(|s| *s).await;
-}
-
-/// A pool of hash workers: workers run at once, and a job waits for one in a queue of bounded
-/// length, leaving the queue when a worker takes it.  A job whose client has left before a worker
-/// reaches it is skipped, since its future is dropped.  When the pool stops, the workers finish
-/// the jobs in hand and take no more.
-pub struct HashPool {
-    workers: Arc<Semaphore>,
-    queue: Arc<Semaphore>,
-    stopped: watch::Sender<bool>,
-}
-
-impl HashPool {
-    pub fn new(workers: usize, queue: usize) -> HashPool {
-        HashPool {
-            workers: Arc::new(Semaphore::new(workers)),
-            queue: Arc::new(Semaphore::new(queue)),
-            stopped: watch::channel(false).0,
-        }
-    }
-
-    // runs a job holding its place in the queue on a worker once one is free
-    async fn run<T: Send + 'static>(
-        &self,
-        place: OwnedSemaphorePermit,
-        f: impl FnOnce() -> T + Send + 'static,
-    ) -> Result<T, HashError> {
-        let mut stopped = self.stopped.subscribe();
-        tokio::select! {
-            w = self.workers.clone().acquire_owned() => {
-                let w = w.map_err(|_| HashError::Closed)?;
-                drop(place);
-                let r = tokio::task::spawn_blocking(move || {
-                    let r = f();
-                    drop(w);
-                    r
-                });
-                r.await.map_err(|_| HashError::Closed)
-            }
-            _ = until(&mut stopped) => Err(HashError::Closed),
-        }
-    }
-
-    /// runs f on a worker and waits for it: Busy when the queue is full
-    pub async fn try_run<T: Send + 'static>(
-        &self,
-        f: impl FnOnce() -> T + Send + 'static,
-    ) -> Result<T, HashError> {
-        if *self.stopped.borrow() {
-            return Err(HashError::Closed);
-        }
-        let Ok(place) = self.queue.clone().try_acquire_owned() else { return Err(HashError::Busy) };
-        self.run(place, f).await
-    }
-
-    /// runs f on a worker and waits for it, as try_run does, but waits for room in the queue
-    pub async fn queue_run<T: Send + 'static>(
-        &self,
-        f: impl FnOnce() -> T + Send + 'static,
-    ) -> Result<T, HashError> {
-        if *self.stopped.borrow() {
-            return Err(HashError::Closed);
-        }
-        let mut stopped = self.stopped.subscribe();
-        let place = tokio::select! {
-            s = self.queue.clone().acquire_owned() => s.map_err(|_| HashError::Closed)?,
-            _ = until(&mut stopped) => return Err(HashError::Closed),
-        };
-        self.run(place, f).await
-    }
-
-    /// stops taking jobs, then waits until the jobs in hand finish
-    pub async fn stop(&self, workers: usize) {
-        self.stopped.send_replace(true);
-        let _ = self.workers.acquire_many(workers as u32).await;
-    }
 }
 
 /// A token bucket per client: each holds up to burst tokens and regains rate per second, and an
@@ -240,102 +247,13 @@ impl Limiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
 
-    // a job that holds its worker until released, reporting when it starts
-    fn holding() -> (impl FnOnce() + Send + 'static, mpsc::Receiver<()>, mpsc::Sender<()>) {
-        let (started_tx, started) = mpsc::channel();
-        let (release, release_rx) = mpsc::channel::<()>();
-        let run = move || {
-            started_tx.send(()).unwrap();
-            let _ = release_rx.recv();
-        };
-        (run, started, release)
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_pool_bounds_its_queue() {
-        let p = Arc::new(HashPool::new(1, 1));
-        let (run, started, release) = holding();
-
-        // the worker takes the first job and the queue holds the second; the third is refused
-        let first = tokio::spawn({
-            let p = p.clone();
-            async move { p.try_run(run).await }
-        });
-        tokio::task::spawn_blocking(move || started.recv().unwrap()).await.unwrap();
-        let second = tokio::spawn({
-            let p = p.clone();
-            async move { p.try_run(|| ()).await }
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(p.try_run(|| ()).await, Err(HashError::Busy));
-
-        // once the worker is free both queued jobs finish
-        release.send(()).unwrap();
-        assert!(first.await.unwrap().is_ok());
-        assert!(second.await.unwrap().is_ok());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_pool_skips_the_jobs_of_clients_that_left() {
-        let p = Arc::new(HashPool::new(1, 4));
-        let (run, started, release) = holding();
-        let busy = tokio::spawn({
-            let p = p.clone();
-            async move { p.try_run(run).await }
-        });
-        tokio::task::spawn_blocking(move || started.recv().unwrap()).await.unwrap();
-
-        // a job queued behind the busy worker whose client then leaves
-        let ran = Arc::new(AtomicBool::new(false));
-        let waiting = tokio::spawn({
-            let (p, ran) = (p.clone(), ran.clone());
-            async move { p.try_run(move || ran.store(true, Ordering::SeqCst)).await }
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        waiting.abort();
-        assert!(waiting.await.unwrap_err().is_cancelled());
-
-        // the worker skips its job
-        release.send(()).unwrap();
-        busy.await.unwrap().unwrap();
-        p.try_run(|| ()).await.unwrap();
-        assert!(!ran.load(Ordering::SeqCst), "the job of a client that left was run");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_pool_stops() {
-        let p = Arc::new(HashPool::new(1, 4));
-        let (run, started, release) = holding();
-        let running = tokio::spawn({
-            let p = p.clone();
-            async move { p.try_run(run).await }
-        });
-        tokio::task::spawn_blocking(move || started.recv().unwrap()).await.unwrap();
-
-        // a queued job, and then shutdown
-        let ran = Arc::new(AtomicBool::new(false));
-        let queued = tokio::spawn({
-            let (p, ran) = (p.clone(), ran.clone());
-            async move { p.try_run(move || ran.store(true, Ordering::SeqCst)).await }
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let stopping = tokio::spawn({
-            let p = p.clone();
-            async move { p.stop(1).await }
-        });
-
-        // the queued job's client is answered at once, and its job never runs
-        assert_eq!(queued.await.unwrap(), Err(HashError::Closed));
-
-        // the hash in progress finishes, and then the workers are gone
-        release.send(()).unwrap();
-        running.await.unwrap().unwrap();
-        stopping.await.unwrap();
-        assert!(!ran.load(Ordering::SeqCst), "a queued job ran after shutdown");
-        assert_eq!(p.try_run(|| ()).await, Err(HashError::Closed));
+    #[test]
+    fn a_hash_verifies_and_carries_its_parameters() {
+        let h = hash_password("hunter2");
+        assert!(h.starts_with("$argon2id$v=19$m=65536,t=3,p=4$"), "{h}");
+        assert!(verify_password(&h, "hunter2"));
+        assert!(!verify_password(&h, "hunter3"));
     }
 
     #[test]

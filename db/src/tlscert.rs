@@ -21,8 +21,8 @@ type Stamp = [(u64, u128); 2];
 
 struct State {
     cert: Arc<CertifiedKey>,
-    loaded: Stamp,         // the files as the certificate in hand was loaded from them
-    failed: Option<Stamp>, // the files as the last load that failed found them, logged once
+    loaded: Stamp,          // the files as the certificate in hand was loaded from them
+    failed: Option<String>, // why the files last failed to load, logged once while it lasts
     checked: Instant,
 }
 
@@ -100,6 +100,7 @@ impl CertFiles {
         if let Ok(s) = &stamp
             && *s == st.loaded
         {
+            st.failed = None;
             return st.cert.clone();
         }
         let err = match &stamp {
@@ -107,6 +108,7 @@ impl CertFiles {
                 Ok(c) => {
                     st.cert = c;
                     st.loaded = *s;
+                    st.failed = None;
                     eprintln!("tls: loaded a new certificate from {}", self.cert_file);
                     return st.cert.clone();
                 }
@@ -115,15 +117,22 @@ impl CertFiles {
             Err(e) => e.clone(),
         };
 
-        // the files are missing or do not load, so the certificate in hand stays; each state of
-        // the files is logged once
-        let s = stamp.ok();
-        if s != st.failed || s.is_none() {
-            st.failed = s;
-            eprintln!("tls: keeping the current certificate: {err}");
+        // the files are missing or do not load, so the certificate in hand stays
+        if let Some(e) = newly_failed(&mut st, err) {
+            eprintln!("tls: keeping the current certificate: {e}");
         }
         st.cert.clone()
     }
+}
+
+// a failure to log, None when it is the one already logged, which it stays until the files load
+// or return to the certificate in hand
+fn newly_failed(st: &mut State, err: String) -> Option<String> {
+    if st.failed.as_ref() == Some(&err) {
+        return None;
+    }
+    st.failed = Some(err.clone());
+    Some(err)
 }
 
 impl ResolvesServerCert for CertFiles {
@@ -230,6 +239,29 @@ mod tests {
         std::fs::rename(&next, &link).unwrap();
         due(&c);
         assert_eq!(served(&c), two, "after the swap");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failure_is_logged_once_while_it_lasts() {
+        let dir = temp("failure");
+        let (cert, key, one) = write_pair(&dir.join("live"), 1);
+        let c = CertFiles::load(&cert, &key).unwrap();
+
+        // missing files fail every check, but only the first one logs
+        std::fs::remove_file(&cert).unwrap();
+        due(&c);
+        assert_eq!(served(&c), one, "the certificate in hand stays");
+        let failed = c.state.lock().unwrap().failed.clone();
+        assert!(failed.as_deref().is_some_and(|f| f.contains("stat")), "{failed:?}");
+        assert_eq!(newly_failed(&mut c.state.lock().unwrap(), failed.clone().unwrap()), None);
+
+        // another failure logs, and a load clears the one in hand
+        assert!(newly_failed(&mut c.state.lock().unwrap(), "another".into()).is_some());
+        let (_, _, two) = write_pair(&dir.join("live"), 2);
+        due(&c);
+        assert_eq!(served(&c), two, "the files that load again");
+        assert_eq!(c.state.lock().unwrap().failed, None, "a load clears the failure");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

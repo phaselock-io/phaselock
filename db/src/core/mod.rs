@@ -25,7 +25,7 @@ use std::thread::JoinHandle;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-pub use prepare::{HashRefusal, PrepareError, Prepared, prepare};
+pub use prepare::{PrepareError, Prepared, prepare};
 pub use reader::Reader;
 
 use crate::walk::Schema;
@@ -62,19 +62,21 @@ pub enum Proof {
     Failed,
 }
 
+/// mutations `prepare` prepared, with one verdict per mutation or none, and the number of times
+/// the call has bounced
+pub struct Submit {
+    pub reqid: u64,
+    pub user: Option<String>,
+    pub generation: i64,
+    pub body: Vec<u8>,
+    pub verdicts: Vec<Verdict>,
+    pub attempt: i32,
+}
+
 /// A request to the writer.  A user of None is anonymous, and any other user's token must carry
 /// the generation lookup answers for its account.
 pub enum Req {
-    /// mutations `prepare` prepared, with one verdict per mutation or none, and the number of
-    /// times the call has bounced
-    Submit {
-        reqid: u64,
-        user: Option<String>,
-        generation: i64,
-        body: Vec<u8>,
-        verdicts: Vec<Verdict>,
-        attempt: i32,
-    },
+    Submit(Submit),
     Register {
         reqid: u64,
         conn: u64,
@@ -177,6 +179,9 @@ pub struct Config {
     pub env: Vec<String>,
     pub cache_mib: i64,
     pub ttl_ms: i64,
+    pub call_limit: std::time::Duration,
+    /// what bootstrap's hashPassword hashes with
+    pub hash: crate::js::HashFn,
 }
 
 struct Queue {
@@ -223,6 +228,8 @@ impl Core {
             env: c.env,
             cache_mib: c.cache_mib,
             ttl_ms: c.ttl_ms,
+            call_limit: c.call_limit,
+            hash: c.hash,
             shared: shared.clone(),
             results: tx.clone(),
         };

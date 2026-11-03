@@ -1,8 +1,7 @@
-//! The check of a request's mutations, on the caller's task: every mutation is checked against
-//! the bundle's registry, and the fields the database prepares for the decider are prepared,
-//! before anything reaches the writer.
-
-use std::future::Future;
+//! The check of a request's mutations: every mutation is checked against the bundle's registry,
+//! and the fields the database prepares for the decider are prepared, before anything reaches the
+//! writer.  The check is plain CPU work over the body, so the caller decides where it runs; it
+//! waits on nothing, and each password it needs hashed is left as a hole the caller fills.
 
 use super::ID_LEN;
 use super::writer::{EXPECT_MAX, series_key};
@@ -19,12 +18,53 @@ const MUTATION_MAX_NODES: usize = 1 << 20;
 /// A request as the check prepared it: body holds the mutations that passed, in order, each
 /// series replaced by its key in the series table; reasons has one entry per mutation of the
 /// request, None for one that passed and why it was rejected otherwise; offsets has each passing
-/// mutation's start in body, and proofs the password of each MutationAuth proof it carries.
+/// mutation's start in body, and proofs the password of each MutationAuth proof it carries.  Each
+/// NewPassword of a passing mutation is a hole in body, with its password in passwords, until fill
+/// writes the hashes in.
 pub struct Prepared {
     pub body: Vec<u8>,
     pub reasons: Vec<Option<String>>,
     pub offsets: Vec<usize>,
     pub proofs: Vec<Vec<String>>,
+    pub passwords: Vec<String>,
+    // each hole, in order, as the passing mutation it lies in and its place in body
+    holes: Vec<(usize, usize)>,
+}
+
+impl Prepared {
+    /// Writes each of hashes, the hashes of passwords in its order, into its hole, moving the
+    /// mutations after it to make room.
+    pub fn fill(&mut self, hashes: &[String]) {
+        assert_eq!(hashes.len(), self.holes.len(), "a hash for every hole");
+        if hashes.is_empty() {
+            return;
+        }
+
+        // the body with each hash in its hole, and the room each mutation's holes took
+        let mut body =
+            Vec::with_capacity(self.body.len() + hashes.iter().map(|h| h.len() + 5).sum::<usize>());
+        let mut grew = vec![0; self.offsets.len()];
+        let mut at = 0;
+        for (&(m, pos), h) in self.holes.iter().zip(hashes) {
+            body.extend_from_slice(&self.body[at..pos]);
+            let before = body.len();
+            let mut w = mp::Writer::new();
+            w.str(h.as_bytes());
+            body.extend_from_slice(&w.buf);
+            grew[m] += body.len() - before;
+            at = pos;
+        }
+        body.extend_from_slice(&self.body[at..]);
+
+        // each mutation starts later by the room every mutation before it took
+        let mut shift = 0;
+        for (o, g) in self.offsets.iter_mut().zip(grew) {
+            *o += shift;
+            shift += g;
+        }
+        self.body = body;
+        self.holes.clear();
+    }
 }
 
 pub enum PrepareError {
@@ -32,15 +72,52 @@ pub enum PrepareError {
     Malformed(String),
     /// the request carries more mutations than its limit, refused before any is checked
     TooMany,
-    /// a hash was refused: the pool is full, or the client's budget is spent
-    Busy,
-    Limited,
 }
 
-/// a hash function's refusal of this request's hashing, which refuses the whole request
-pub enum HashRefusal {
-    Busy,
-    Limited,
+// a writer that keeps the place of each hole the walk leaves
+struct HoleWriter {
+    w: mp::Writer,
+    holes: Vec<usize>,
+}
+
+impl walk::Sink for HoleWriter {
+    fn begin_obj(&mut self, n: usize) -> Result<(), &'static str> {
+        self.w.begin_obj(n)
+    }
+    fn key(&mut self, k: &[u8]) -> Result<(), &'static str> {
+        walk::Sink::key(&mut self.w, k)
+    }
+    fn end_obj(&mut self) -> Result<(), &'static str> {
+        self.w.end_obj()
+    }
+    fn begin_arr(&mut self, n: usize) -> Result<(), &'static str> {
+        self.w.begin_arr(n)
+    }
+    fn end_arr(&mut self) -> Result<(), &'static str> {
+        self.w.end_arr()
+    }
+    fn str(&mut self, s: &[u8]) -> Result<(), &'static str> {
+        walk::Sink::str(&mut self.w, s)
+    }
+    fn int(&mut self, i: i64) -> Result<(), &'static str> {
+        walk::Sink::int(&mut self.w, i)
+    }
+    fn float(&mut self, f: f64) -> Result<(), &'static str> {
+        self.w.float(f)
+    }
+    fn bool(&mut self, b: bool) -> Result<(), &'static str> {
+        walk::Sink::bool(&mut self.w, b)
+    }
+    fn null(&mut self) -> Result<(), &'static str> {
+        self.w.null()
+    }
+    fn date(&mut self, ms: f64) -> Result<(), &'static str> {
+        self.w.date(ms)
+    }
+    fn hole(&mut self) -> Result<(), &'static str> {
+        self.holes.push(self.w.buf.len());
+        Ok(())
+    }
 }
 
 // whether an integer is a mutation number: from 1 to 2^53 - 1, so that every client's numbers
@@ -123,47 +200,39 @@ fn expect_reason(e: &Node<'_>) -> Option<String> {
         .map(|w| format!("expect: {} is named twice", shown(w[0])))
 }
 
-enum Outcome {
-    Passed,
-    Rejected(String),
-    Refused(PrepareError),
+// one mutation as the check prepared it: its encoding, its proofs' passwords, and each password
+// to hash with the place of its hole in the encoding
+struct PreparedMutation {
+    buf: Vec<u8>,
+    proofs: Vec<String>,
+    passwords: Vec<String>,
+    holes: Vec<usize>,
 }
 
-/// Checks one mutation's data and prepares its fields: a NewPassword is hashed, and a password
-/// MutationAuth is replaced by its result and its password set aside in proofs; any other kind
-/// cannot be verified yet.  Writes the prepared [key, n, id, data, expect?] to out, its series
-/// replaced by its key.
-async fn prepare_mutation<F, Fut>(
-    sc: &Schema,
-    c: &Node<'_>,
-    out: &mut Vec<u8>,
-    proofs: &mut Vec<String>,
-    hash: &mut F,
-) -> Outcome
-where
-    F: FnMut(String) -> Fut,
-    Fut: Future<Output = Result<String, HashRefusal>>,
-{
+/// Checks one mutation's data and prepares its fields: a NewPassword is left as a hole with its
+/// password set aside to hash, and a password MutationAuth is replaced by its result and its
+/// password set aside in proofs; any other kind cannot be verified yet.  Answers the prepared
+/// [key, n, id, data, expect?], its series replaced by its key, or why the mutation is rejected.
+fn prepare_mutation(sc: &Schema, c: &Node<'_>) -> Result<PreparedMutation, String> {
     let Some(mutations) = sc.mutations() else {
-        return Outcome::Rejected("this database takes no mutations".into());
+        return Err("this database takes no mutations".into());
     };
     let items = c.array().unwrap();
     let data = &items[3];
     let mut il: Vec<Intake<'_>> = Vec::new();
-    if let Err(why) = walk::check(sc, data, mutations, true, Some(&mut il)) {
-        return Outcome::Rejected(why);
-    }
+    walk::check(sc, data, mutations, true, Some(&mut il))?;
     if items.len() > 4
         && let Some(r) = expect_reason(&items[4])
     {
-        return Outcome::Rejected(r);
+        return Err(r);
     }
 
-    // each proof, whose password the caller checks, before any hash is spent on the mutation
+    // each proof, whose password the caller checks
+    let mut proofs = Vec::new();
     for i in il.iter_mut().filter(|i| i.kind == "MutationAuth") {
         let kind = i.node.get("kind").and_then(|k| k.as_str()).unwrap_or(b"");
         if kind != b"password" {
-            return Outcome::Rejected(format!(
+            return Err(format!(
                 "{} proofs are not supported by this database yet",
                 String::from_utf8_lossy(kind)
             ));
@@ -173,20 +242,14 @@ where
         i.result_kind = Some("password");
     }
 
-    // each other prepared field's result
+    // each other prepared field: a hole for its hash, which the caller makes
+    let mut passwords = Vec::new();
     for i in il.iter_mut().filter(|i| i.kind != "MutationAuth") {
         if i.kind != "NewPassword" {
-            return Outcome::Rejected(format!(
-                "{} fields are not supported by this database yet",
-                i.kind
-            ));
+            return Err(format!("{} fields are not supported by this database yet", i.kind));
         }
-        let pw = String::from_utf8_lossy(i.node.as_str().unwrap_or(b"")).into_owned();
-        match hash(pw).await {
-            Ok(h) => i.result = Some(h),
-            Err(HashRefusal::Busy) => return Outcome::Refused(PrepareError::Busy),
-            Err(HashRefusal::Limited) => return Outcome::Refused(PrepareError::Limited),
-        }
+        passwords.push(String::from_utf8_lossy(i.node.as_str().unwrap_or(b"")).into_owned());
+        i.hole = true;
     }
 
     // the mutation as checked, its prepared fields replaced
@@ -206,9 +269,9 @@ where
     if let Node::Bin(id) = items[2] {
         w.bin(id);
     }
-    if let Err(why) = walk::write(sc, data, Some(mutations), true, Some(&il), &mut w) {
-        return Outcome::Rejected(why);
-    }
+    let mut hw = HoleWriter { w, holes: Vec::new() };
+    walk::write(sc, data, Some(mutations), true, Some(&il), &mut hw)?;
+    let HoleWriter { mut w, holes } = hw;
     if len > 4 {
         let m = items[4].map().unwrap_or(&[]);
         w.map(m.len());
@@ -217,23 +280,13 @@ where
             w.uint(v.as_u64().unwrap_or(0));
         }
     }
-    out.extend_from_slice(&w.buf);
-    Outcome::Passed
+    Ok(PreparedMutation { buf: w.into_vec(), proofs, passwords, holes })
 }
 
-/// Checks and prepares a request of at most max mutations, hashing each NewPassword with hash.
-/// A refused hash refuses the whole request, so the client can retry it later under the same
-/// series and numbers.
-pub async fn prepare<F, Fut>(
-    sc: &Schema,
-    body: &[u8],
-    max: usize,
-    mut hash: F,
-) -> Result<Prepared, PrepareError>
-where
-    F: FnMut(String) -> Fut,
-    Fut: Future<Output = Result<String, HashRefusal>>,
-{
+/// Checks and prepares a request of at most max mutations.  Hashing a NewPassword is the
+/// caller's, after the check, and a refused hash refuses the whole request, so the client can
+/// retry it later under the same series and numbers.
+pub fn prepare(sc: &Schema, body: &[u8], max: usize) -> Result<Prepared, PrepareError> {
     // the request is a sequence of at most max [S, n, id, data, expect?] values: parse them,
     // refusing the whole request when any is not one, since nothing can be answered for it
     let mut nodes = Vec::new();
@@ -260,23 +313,29 @@ where
         nodes.push(n);
     }
 
-    // check and prepare each mutation; a mutation that does not pass carries no proofs
-    let mut p =
-        Prepared { body: Vec::new(), reasons: Vec::new(), offsets: Vec::new(), proofs: Vec::new() };
+    // check and prepare each mutation; a mutation that does not pass carries no proofs and leaves
+    // no holes
+    let mut p = Prepared {
+        body: Vec::new(),
+        reasons: Vec::new(),
+        offsets: Vec::new(),
+        proofs: Vec::new(),
+        passwords: Vec::new(),
+        holes: Vec::new(),
+    };
     for n in &nodes {
-        let start = p.body.len();
-        let mut proofs = Vec::new();
-        match prepare_mutation(sc, n, &mut p.body, &mut proofs, &mut hash).await {
-            Outcome::Passed => {
+        match prepare_mutation(sc, n) {
+            Ok(m) => {
+                let start = p.body.len();
+                let index = p.offsets.len();
+                p.holes.extend(m.holes.iter().map(|h| (index, start + h)));
+                p.passwords.extend(m.passwords);
+                p.body.extend_from_slice(&m.buf);
                 p.reasons.push(None);
                 p.offsets.push(start);
-                p.proofs.push(proofs);
+                p.proofs.push(m.proofs);
             }
-            Outcome::Rejected(r) => {
-                p.body.truncate(start);
-                p.reasons.push(Some(r));
-            }
-            Outcome::Refused(e) => return Err(e),
+            Err(r) => p.reasons.push(Some(r)),
         }
     }
     Ok(p)

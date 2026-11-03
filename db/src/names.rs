@@ -33,15 +33,16 @@ pub fn slice_name_ok(name: &[u8]) -> bool {
         return false;
     }
     let Some(rest) = rest else { return true };
-    let values: Vec<&[u8]> = rest.split(|&c| c == b',').collect();
-    let last = values.len() - 1;
-    values.iter().enumerate().all(|(i, v)| {
-        if i < last {
-            segment(v)
-        } else {
-            !v.is_empty() && v.iter().all(|&c| segment_char(c) || c == b'.' || c == b'~')
-        }
-    })
+
+    // every value but the last a segment, and the last one non-empty, which may also hold . and ~
+    let (leading, last) = match rest.iter().rposition(|&c| c == b',') {
+        Some(i) => (Some(&rest[..i]), &rest[i + 1..]),
+        None => (None, rest),
+    };
+    if leading.is_some_and(|l| !l.split(|&c| c == b',').all(segment)) {
+        return false;
+    }
+    !last.is_empty() && last.iter().all(|&c| segment_char(c) || c == b'.' || c == b'~')
 }
 
 /// whether a prefix selector's text before its star ("chat:", "chat:acme,") is a family and ':',

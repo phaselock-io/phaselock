@@ -371,8 +371,10 @@ async fn intake_hashing_is_rate_limited_per_client() {
     /* a request whose hash finds the budget spent is refused whole, so it can be retried later
     under the same ids */
     let m = mutation!("c2", "create-account", "user" => "bob", "password" => "pw");
-    let (status, _) = h.mutations_status("", &[m]).await;
-    assert_eq!(status, 429, "a hash past the budget: {status}, want 429");
+    let r = h.req("POST", "/mutations", "", Some(m.encode(None))).await;
+    assert_eq!(r.status, 429, "a hash past the budget: {}, want 429", r.status);
+    assert!(!r.header("retry-after").is_empty(), "a 429 names how long to wait");
+    assert_eq!(r.header("phaselock-safe-to-retry"), "", "a 429 carries no safe-to-retry header");
 
     // mutations that hash nothing are not limited
     let admin = h.admin().await;

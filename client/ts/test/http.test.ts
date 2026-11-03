@@ -391,6 +391,14 @@ describe('sendMutations', () => {
     expect(stub.requests.length).toBe(requests);
   });
 
+  test('a 429 is retried', async () => {
+    failures = 1;
+    failStatus = 429;
+    expect((await send('a'))[0]).toEqual({ kind: 'ok', position: 2 });
+    expect(seen).toEqual(['a', 'a']);
+    expect(ends()).toEqual([]);
+  });
+
   test('a 4xx is not retried', async () => {
     failures = Infinity;
     failStatus = 400;
@@ -609,12 +617,14 @@ describe('HTTPTransport', () => {
     expect(stub.requests).toEqual([]);
   });
 
-  // a /mutations that fails with each status in turn, then answers every mutation ok
-  function flaky(...statuses: number[]): void {
+  // a /mutations that fails with each status in turn, each with its headers when it is a pair,
+  // then answers every mutation ok
+  function flaky(...statuses: (number | [number, Record<string, string>])[]): void {
     stub.routes.set('/mutations', (_req, body, res) => {
-      const status = statuses.shift();
-      if (status !== undefined) {
-        res.writeHead(status);
+      const next = statuses.shift();
+      if (next !== undefined) {
+        const [status, headers] = typeof next === 'number' ? [next, {}] : next;
+        res.writeHead(status, headers);
         res.end('no');
         return;
       }
@@ -639,6 +649,15 @@ describe('HTTPTransport', () => {
     const mutation = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
     await expect(new HTTPTransport(stub.url).post([mutation])).rejects.toThrow('mutations: 503');
     expect(stub.requests.length).toBe(1);
+  });
+
+  test('an unnumbered post refused before any of it was decided is retried', async () => {
+    flaky([503, { 'PhaseLock-Safe-To-Retry': 'true', 'Retry-After': '0' }], [429, {}]);
+    const mutation = { id: uuidOf('c1'), series: null, n: null, data: encode({}) };
+    expect(await new HTTPTransport(stub.url).post([mutation])).toEqual([
+      { kind: 'ok', position: 7 },
+    ]);
+    expect(stub.requests.length).toBe(3);
   });
 
   test('a 4xx stands at once, numbered or not', async () => {

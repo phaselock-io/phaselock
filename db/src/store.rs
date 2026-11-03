@@ -2,10 +2,12 @@
 //! table live in one database file.  Keys and slice names are TEXT compared bytewise, bound from
 //! their bytes as they are.
 
-use std::collections::VecDeque;
+use std::cell::{RefCell, RefMut};
+use std::ffi::{CStr, c_int};
+use std::ptr::{self, NonNull};
 
 use rusqlite::types::{ToSqlOutput, ValueRef};
-use rusqlite::{Connection, OptionalExtension, ToSql, params};
+use rusqlite::{Connection, OptionalExtension, ToSql, ffi, params};
 
 const SCHEMA: &str = "
     PRAGMA synchronous=FULL;
@@ -86,6 +88,8 @@ pub struct TokenKeyRow {
 
 /// One SQLite connection, the writer's or the reader's.
 pub struct Store {
+    // ahead of conn, so that the statements are finalized before the connection closes
+    seeks: RefCell<Seeks>,
     conn: Connection,
 }
 
@@ -107,7 +111,8 @@ impl Store {
             conn.execute_batch(&format!("PRAGMA cache_size=-{};", cache_mib * 1024))
                 .map_err(|e| err("cache_size", e))?;
         }
-        Ok(Store { conn })
+        let seeks = Seeks::prepare(&conn)?;
+        Ok(Store { seeks: RefCell::new(seeks), conn })
     }
 
     pub fn exec(&self, sql: &str) -> Result<()> {
@@ -507,91 +512,175 @@ impl Store {
             .map_err(|e| err("live_slice", e))
     }
 
-    pub fn cursor(&self, want_values: bool) -> Cursor<'_> {
-        Cursor {
-            store: self,
-            want_values,
-            reverse: false,
-            buf: VecDeque::new(),
-            more: false,
-            batch: CURSOR_FIRST_BATCH,
+    /// a kv cursor, of which the store has one at a time
+    pub fn cursor(&self, want_values: bool) -> Result<Cursor<'_>> {
+        let seeks = self.seeks.try_borrow_mut().map_err(|_| "cursor: one is already open")?;
+        Ok(Cursor { seeks, want_values, at: None })
+    }
+}
+
+/// A prepared statement the store finalizes when it closes.
+struct Stmt(NonNull<ffi::sqlite3_stmt>);
+
+// a statement moves between threads with the connection that owns it, and is used by one at a time
+unsafe impl Send for Stmt {}
+
+impl Stmt {
+    fn prepare(conn: &Connection, sql: &CStr) -> Result<Stmt> {
+        let mut st = ptr::null_mut();
+        unsafe {
+            let db = conn.handle();
+            let rc = ffi::sqlite3_prepare_v3(
+                db,
+                sql.as_ptr(),
+                -1,
+                ffi::SQLITE_PREPARE_PERSISTENT,
+                &mut st,
+                ptr::null_mut(),
+            );
+            match NonNull::new(st) {
+                Some(st) if rc == ffi::SQLITE_OK => Ok(Stmt(st)),
+                _ => Err(format!("cursor: {}", errmsg(db))),
+            }
         }
     }
 }
 
-// a cursor fetches rows in batches, the first small, since a scan batch often stops early
-const CURSOR_FIRST_BATCH: usize = 17;
-const CURSOR_MAX_BATCH: usize = 256;
+impl Drop for Stmt {
+    fn drop(&mut self) {
+        unsafe { ffi::sqlite3_finalize(self.0.as_ptr()) };
+    }
+}
+
+unsafe fn errmsg(db: *mut ffi::sqlite3) -> String {
+    unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db)) }.to_string_lossy().into_owned()
+}
+
+// the kv cursor's statements, one per direction and bound, each re-bound per seek
+const FIRST: usize = 0;
+const LAST: usize = 1;
+const GE: usize = 2;
+const GT: usize = 3;
+const LE: usize = 4;
+const LT: usize = 5;
+
+struct Seeks([Stmt; 6]);
+
+impl Seeks {
+    fn prepare(conn: &Connection) -> Result<Seeks> {
+        let p = |sql| Stmt::prepare(conn, sql);
+        Ok(Seeks([
+            p(c"SELECT key, value FROM kv ORDER BY key")?,
+            p(c"SELECT key, value FROM kv ORDER BY key DESC")?,
+            p(c"SELECT key, value FROM kv WHERE key >= ?1 ORDER BY key")?,
+            p(c"SELECT key, value FROM kv WHERE key > ?1 ORDER BY key")?,
+            p(c"SELECT key, value FROM kv WHERE key <= ?1 ORDER BY key DESC")?,
+            p(c"SELECT key, value FROM kv WHERE key < ?1 ORDER BY key DESC")?,
+        ]))
+    }
+}
 
 /// The kv cursor walks the kv table's keys one way.  A seek forward moves to the first key at or
 /// after target, strictly after it when strict, and one in reverse to the last key at or before
 /// it; no target moves to the first or last key of all.  A step moves one key on in the seek's
-/// direction.  Each answers true at a key and false past the end of the walk.  The cursor reads
-/// ahead in batches of rows, so the key and value at the cursor are its own copies.
+/// direction.  Each answers true at a key and false past the end of the walk.  The key and value
+/// at the cursor are SQLite's own row, read in place, so they last until the cursor moves.
 pub struct Cursor<'s> {
-    store: &'s Store,
+    seeks: RefMut<'s, Seeks>,
     want_values: bool,
-    reverse: bool,
-    buf: VecDeque<(Vec<u8>, Vec<u8>)>,
-    // whether rows lie past the buffered ones
-    more: bool,
-    batch: usize,
+    // the statement positioned at the cursor's key, None past the end of the walk
+    at: Option<usize>,
 }
 
 impl Cursor<'_> {
-    fn fetch(&mut self, from: Option<&[u8]>, strict: bool) -> Result<()> {
-        let (op, order) = match (self.reverse, strict) {
-            (false, false) => (">=", "ASC"),
-            (false, true) => (">", "ASC"),
-            (true, false) => ("<=", "DESC"),
-            (true, true) => ("<", "DESC"),
-        };
-        let cols = if self.want_values { "key, value" } else { "key, x''" };
-        let sql = match from {
-            Some(_) => {
-                format!("SELECT {cols} FROM kv WHERE key {op} ?1 ORDER BY key {order} LIMIT ?2")
+    fn stmt(&self, i: usize) -> *mut ffi::sqlite3_stmt {
+        self.seeks.0[i].0.as_ptr()
+    }
+
+    // returns the statement the cursor is on to its start, which ends its read of the table
+    fn end(&mut self) {
+        if let Some(i) = self.at.take() {
+            unsafe {
+                ffi::sqlite3_reset(self.stmt(i));
+                ffi::sqlite3_clear_bindings(self.stmt(i));
             }
-            None => format!("SELECT {cols} FROM kv ORDER BY key {order} LIMIT ?1"),
-        };
-        let mut st = self.store.conn.prepare_cached(&sql).map_err(|e| err("cursor", e))?;
-        let n = self.batch as i64;
-        let mut rows = match from {
-            Some(t) => st.query(params![T(t), n]),
-            None => st.query(params![n]),
         }
-        .map_err(|e| err("cursor", e))?;
-        self.buf.clear();
-        while let Some(r) = rows.next().map_err(|e| err("cursor", e))? {
-            self.buf.push_back((
-                bytes(r, 0).map_err(|e| err("cursor", e))?,
-                bytes(r, 1).map_err(|e| err("cursor", e))?,
-            ));
+    }
+
+    // steps the cursor's statement onto its next row, ending the walk past the last
+    fn land(&mut self) -> Result<bool> {
+        let Some(i) = self.at else { return Ok(false) };
+        let st = self.stmt(i);
+        let rc = unsafe { ffi::sqlite3_step(st) };
+        if rc == ffi::SQLITE_ROW {
+            return Ok(true);
         }
-        self.more = self.buf.len() == self.batch;
-        self.batch = (self.batch * 2).min(CURSOR_MAX_BATCH);
-        Ok(())
+        let msg = (rc != ffi::SQLITE_DONE).then(|| unsafe { errmsg(ffi::sqlite3_db_handle(st)) });
+        self.end();
+        match msg {
+            Some(m) => Err(format!("cursor: {m}")),
+            None => Ok(false),
+        }
     }
 
     pub fn seek(&mut self, reverse: bool, target: Option<&[u8]>, strict: bool) -> Result<bool> {
-        self.reverse = reverse;
-        self.batch = CURSOR_FIRST_BATCH;
-        self.fetch(target, strict)?;
-        Ok(!self.buf.is_empty())
+        self.end();
+        let i = match (target, reverse, strict) {
+            (None, false, _) => FIRST,
+            (None, true, _) => LAST,
+            (Some(_), false, false) => GE,
+            (Some(_), false, true) => GT,
+            (Some(_), true, false) => LE,
+            (Some(_), true, true) => LT,
+        };
+
+        // the target is copied, since the caller may rewrite it while the statement runs
+        if let Some(t) = target {
+            let rc = unsafe {
+                ffi::sqlite3_bind_text(
+                    self.stmt(i),
+                    1,
+                    t.as_ptr().cast(),
+                    t.len() as c_int,
+                    ffi::SQLITE_TRANSIENT(),
+                )
+            };
+            if rc != ffi::SQLITE_OK {
+                let db = unsafe { ffi::sqlite3_db_handle(self.stmt(i)) };
+                return Err(format!("cursor: {}", unsafe { errmsg(db) }));
+            }
+        }
+        self.at = Some(i);
+        self.land()
     }
 
     pub fn step(&mut self) -> Result<bool> {
-        let Some((last, _)) = self.buf.pop_front() else { return Ok(false) };
-        if self.buf.is_empty() && self.more {
-            self.fetch(Some(&last), true)?;
+        self.land()
+    }
+
+    // a column of the row at the cursor, as SQLite holds it
+    fn column(&self, col: c_int) -> &[u8] {
+        let Some(i) = self.at else { return &[] };
+        let st = self.stmt(i);
+        unsafe {
+            let p = ffi::sqlite3_column_blob(st, col);
+            let n = ffi::sqlite3_column_bytes(st, col);
+            if p.is_null() { &[] } else { std::slice::from_raw_parts(p.cast(), n as usize) }
         }
-        Ok(!self.buf.is_empty())
     }
 
     pub fn key(&self) -> &[u8] {
-        &self.buf[0].0
+        self.column(0)
     }
 
+    /// the value at the cursor, empty when the cursor was opened for keys only
     pub fn value(&self) -> &[u8] {
-        &self.buf[0].1
+        if self.want_values { self.column(1) } else { &[] }
+    }
+}
+
+impl Drop for Cursor<'_> {
+    fn drop(&mut self) {
+        self.end();
     }
 }

@@ -10,7 +10,9 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-use super::{CronEntry, ID_LEN, Item, Kind, MAX_BOUNCES, Proof, Req, Res, Shared, Verdict, now_ms};
+use super::{
+    CronEntry, ID_LEN, Item, Kind, MAX_BOUNCES, Proof, Req, Res, Shared, Submit, Verdict, now_ms,
+};
 use crate::buffer::Touched;
 use crate::js::{self, Host, Reads};
 use crate::mp::{self, Node};
@@ -37,6 +39,8 @@ pub(super) struct Opening {
     pub env: Vec<String>,
     pub cache_mib: i64,
     pub ttl_ms: i64,
+    pub call_limit: std::time::Duration,
+    pub hash: js::HashFn,
     pub shared: Arc<Shared>,
     pub results: mpsc::UnboundedSender<Res>,
 }
@@ -261,7 +265,7 @@ enum ProofCheck {
 }
 
 pub(super) fn run(o: Opening, ready: std::sync::mpsc::Sender<Opened>) {
-    let mut w = match open(&o) {
+    let mut w = match open(o) {
         Ok(w) => w,
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -274,7 +278,7 @@ pub(super) fn run(o: Opening, ready: std::sync::mpsc::Sender<Opened>) {
 }
 
 /// opens the writer's store and host, and runs bootstrap on an empty log
-fn open(o: &Opening) -> Result<Writer, String> {
+fn open(o: Opening) -> Result<Writer, String> {
     let store = Rc::new(Store::open(&o.path, true, o.cache_mib)?);
     let position = store.max_position()?;
     let host = Host::open(
@@ -282,7 +286,8 @@ fn open(o: &Opening) -> Result<Writer, String> {
         js::Options {
             store: store.clone(),
             env_names: o.env.clone(),
-            hasher: Box::new(|pw| Some(crate::auth::hash_password(pw))),
+            hasher: o.hash,
+            call_limit: o.call_limit,
         },
     )?;
     host.bind_thread();
@@ -880,16 +885,8 @@ impl Writer {
         None
     }
 
-    fn handle_submit(
-        &mut self,
-        b: &mut Batch,
-        reqid: u64,
-        user: Option<String>,
-        generation: i64,
-        body: Vec<u8>,
-        verdicts: Vec<Verdict>,
-        attempt: i32,
-    ) {
+    fn handle_submit(&mut self, b: &mut Batch, s: Submit) {
+        let Submit { reqid, user, generation, body, verdicts, attempt } = s;
         let mut r = Res { kind: Kind::Outcome, reqid, ..Default::default() };
         if !self.generation_ok(b, user.as_deref(), generation) {
             r.status = 401;
@@ -1050,9 +1047,7 @@ impl Writer {
         // each request in its turn, its answer queued behind the batch's commit
         for q in reqs {
             match q {
-                Req::Submit { reqid, user, generation, body, verdicts, attempt } => {
-                    self.handle_submit(&mut b, reqid, user, generation, body, verdicts, attempt)
-                }
+                Req::Submit(s) => self.handle_submit(&mut b, s),
                 Req::Register { reqid, conn, user, generation } => {
                     self.handle_register(&mut b, reqid, conn, user, generation)
                 }

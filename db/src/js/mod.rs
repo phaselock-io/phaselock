@@ -33,8 +33,15 @@ const ENV_SHIM: &str = concat!(
     "}"
 );
 
-/// how long one call into the bundle may run before it is interrupted; bootstrap has no limit
-const CALL_LIMIT: Duration = Duration::from_secs(30);
+/// how long one call into the bundle may run before it is interrupted unless the host is given
+/// another; bootstrap has no limit
+pub const CALL_LIMIT: Duration = Duration::from_secs(30);
+
+/// what bootstrap's hashPassword hashes with: the password's PHC string, None when it fails
+pub type HashFn = Box<dyn Fn(&str) -> Option<String> + Send>;
+
+/// how long mapping an error's stack through the source map may run
+const MAP_STACK_LIMIT: Duration = Duration::from_millis(100);
 
 /// the most memory the bundle's heap may hold
 const MEMORY_LIMIT: usize = 4 << 30;
@@ -157,7 +164,7 @@ pub struct State {
     pub track: RefCell<Option<Reads>>,
     scan_budget: Cell<usize>,
     env_names: Vec<String>,
-    hasher: Box<dyn Fn(&str) -> Option<String>>,
+    hasher: HashFn,
     deadline: Cell<Option<Instant>>,
 }
 
@@ -172,6 +179,7 @@ pub struct Host {
     bundle_file: String,
     source_map: JSValue,
     map_stack: JSValue,
+    call_limit: Duration,
 }
 
 unsafe fn state<'a>(ctx: *mut JSContext) -> &'a State {
@@ -471,7 +479,7 @@ unsafe extern "C" fn native_scan(
     if unsafe { JS_ToFloat64(ctx, &mut limit, lv.v) } != 0 {
         return JS_EXCEPTION;
     }
-    if !(limit >= 1.0) {
+    if limit.is_nan() || limit < 1.0 {
         return throw_range(ctx, "a scan's limit is at least 1");
     }
     let limit = if limit >= usize::MAX as f64 { usize::MAX } else { limit as usize };
@@ -479,7 +487,13 @@ unsafe extern "C" fn native_scan(
     // walk the batch, through the write buffer when the call has one
     let entries = unsafe { JS_NewArray(ctx) };
     let mut b = Batch { ctx, st, ty, limit, entries, n: 0, full: false, last: Vec::new() };
-    let mut cur = st.store.cursor(ty.is_some());
+    let mut cur = match st.store.cursor(ty.is_some()) {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe { JS_FreeValue(ctx, entries) };
+            return throw_internal(ctx, &format!("store scan: {e}"));
+        }
+    };
     let rc = if st.writing.get() && !st.wb.borrow().is_empty() {
         let wb = st.wb.borrow();
         let mut pending = wb
@@ -627,7 +641,8 @@ unsafe extern "C" fn native_log(
 pub struct Options {
     pub store: Rc<Store>,
     pub env_names: Vec<String>,
-    pub hasher: Box<dyn Fn(&str) -> Option<String>>,
+    pub hasher: HashFn,
+    pub call_limit: Duration,
 }
 
 impl Host {
@@ -661,6 +676,7 @@ impl Host {
                 bundle_file: bundle_path.to_string(),
                 source_map: JS_UNDEFINED,
                 map_stack: JS_UNDEFINED,
+                call_limit: o.call_limit,
             };
             h.load(bundle_path)?;
             Ok(h)
@@ -808,8 +824,19 @@ impl Host {
         }
     }
 
-    /// the pending exception, formatted with its stack
+    /* The pending exception, formatted with its stack.  Formatting runs JS, the message's
+    conversion and the source map's mapping, under a deadline of its own, since the exception is
+    often the call's deadline passing; a formatting that runs past it leaves the message or the
+    stack as they are. */
     fn exception(&self) -> String {
+        let st = self.state();
+        let deadline = st.deadline.replace(Some(Instant::now() + MAP_STACK_LIMIT));
+        let out = self.format_exception();
+        st.deadline.set(deadline);
+        out
+    }
+
+    fn format_exception(&self) -> String {
         let ctx = self.ctx;
         unsafe {
             let exc = Owned::new(ctx, JS_GetException(ctx));
@@ -890,7 +917,7 @@ impl Host {
     ) -> Result<Owned, String> {
         let st = self.state();
         st.slot.set(Some(slot));
-        let r = self.timed(Some(CALL_LIMIT), || self.call_host(name, args));
+        let r = self.timed(Some(self.call_limit), || self.call_host(name, args));
         st.slot.set(None);
         r
     }
@@ -936,7 +963,7 @@ impl Host {
     /// The decider over the state's write buffer, which holds what it wrote when it returns: None
     /// when it carried the mutation out, and the reason when it rejected it; Err when it threw.
     pub fn decide(&self, data: JSValue, principal: JSValue) -> Result<Option<String>, String> {
-        let r = self.call_writing("decide", &[data, principal], Some(CALL_LIMIT))?;
+        let r = self.call_writing("decide", &[data, principal], Some(self.call_limit))?;
 
         // null carried the mutation out, and a reason, text to show, which a U+0000 in it ends,
         // rejected it
@@ -971,8 +998,9 @@ impl Host {
         let mut out = Vec::new();
         for i in 0..n {
             let e = Owned::new(ctx, unsafe { JS_GetPropertyUint32(ctx, r.v, i as u32) });
-            let mut s = self.strings_of(e.v)?.into_iter();
-            let (Some(a), Some(b), Some(c)) = (s.next(), s.next(), s.next()) else { continue };
+            let s = self.strings_of(e.v)?;
+            let [a, b, c] = <[String; 3]>::try_from(s)
+                .map_err(|s| format!("cron entry {i} is {s:?}, not [install, entry, spec]"))?;
             out.push((a, b, c));
         }
         Ok(out)
@@ -988,7 +1016,7 @@ impl Host {
             Owned::new(ctx, JS_NewFloat64(now as f64)),
         ];
         let raw: Vec<JSValue> = args.iter().map(|a| a.v).collect();
-        self.call_writing("tick", &raw, Some(CALL_LIMIT)).map(|_| ())
+        self.call_writing("tick", &raw, Some(self.call_limit)).map(|_| ())
     }
 
     pub fn grant(&self, principal: JSValue) -> Result<Vec<String>, String> {

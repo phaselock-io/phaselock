@@ -27,7 +27,7 @@ pub async fn serve(srv: Arc<Server>, listener: TcpListener, tls: Option<TlsAccep
                 Ok(a) => a,
                 Err(_) => continue,
             },
-            _ = crate::hash::until(&mut done) => break,
+            _ = crate::pool::until(&mut done) => break,
         };
         let _ = stream.set_nodelay(true);
         let s = srv.clone();

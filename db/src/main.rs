@@ -173,6 +173,7 @@ async fn run(f: Flags, certs: Option<Arc<tlscert::CertFiles>>) -> i32 {
         data_dir: f.data,
         bundle: f.bundle,
         dev_auth: f.dev_auth,
+        hasher: None,
         hash_workers: 0,
         auth_burst: 0,
         auth_rate: 0.0,
@@ -185,6 +186,7 @@ async fn run(f: Flags, certs: Option<Arc<tlscert::CertFiles>>) -> i32 {
         max_stream_backlog: f.max_stream_backlog.max(0) as usize,
         principal_ttl: f.principal_ttl,
         heartbeat: Duration::ZERO,
+        call_limit: Duration::ZERO,
         clock: None,
     };
     let srv = match Server::open(o).await {

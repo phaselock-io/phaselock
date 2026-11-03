@@ -4,8 +4,12 @@
 mod common;
 
 use std::ffi::OsString;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use common::*;
+use phaselockdb::hash::{Answer, Hasher, Wait};
 
 // the tests that set the bootstrap's variables, which are the process's, take turns
 static ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -178,6 +182,45 @@ async fn bootstrap_seeds_an_empty_log() {
         "after a restart, the next mutation lands at {next}, want 2: bootstrap ran again"
     );
     h.stop().await;
+}
+
+// a hasher that counts the passwords it hashes, hashing them on a pool of its own
+struct Counting {
+    local: phaselockdb::hash::Local,
+    hashed: std::sync::atomic::AtomicUsize,
+}
+
+impl phaselockdb::hash::Hasher for Counting {
+    fn hash(&self, password: String, wait: Wait) -> Answer<'_, String> {
+        self.hashed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.local.hash(password, wait)
+    }
+
+    fn verify(&self, stored: Option<String>, password: String, wait: Wait) -> Answer<'_, bool> {
+        self.local.verify(stored, password, wait)
+    }
+
+    fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.local.stop()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bootstrap_hashes_through_the_servers_hasher() {
+    let _turn = ENV.lock().await;
+    let _env = Env::set(&[("BOOTSTRAP_ADMIN", "boss"), ("BOOTSTRAP_PASSWORD", "pw")]);
+    let hasher = Arc::new(Counting {
+        local: phaselockdb::hash::Local::new(1, 2),
+        hashed: Default::default(),
+    });
+    let h = start_with(|o| {
+        o.bootstrap_env = vec!["BOOTSTRAP_ADMIN".into(), "BOOTSTRAP_PASSWORD".into()];
+        o.hasher = Some(hasher.clone());
+    })
+    .await;
+    assert_eq!(hasher.hashed.load(std::sync::atomic::Ordering::SeqCst), 1, "bootstrap's hash");
+    h.stop().await;
+    hasher.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -12,6 +12,7 @@ pub mod keys;
 pub mod listen;
 pub mod mp;
 pub mod names;
+pub mod pool;
 pub mod scan;
 pub mod server;
 pub mod store;

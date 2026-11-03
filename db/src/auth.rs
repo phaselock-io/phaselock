@@ -9,7 +9,7 @@ use ed25519_dalek::{Signer, SigningKey, Verifier};
 use serde::{Deserialize, Serialize};
 
 use crate::core::{MAX_BOUNCES, Proof, Req, Verdict, unix_ms, unix_s};
-use crate::hash::{self, HashError};
+use crate::hash::{HashError, Wait};
 use crate::keys::{KEY_ROTATION_MS, TOKEN_LIFETIME_MS, TokenKey};
 use crate::mp::{self, Node, Val};
 use crate::server::{ERR_REVOKED, Principal, Request, Resp, Server, hash_failed, http_error};
@@ -198,39 +198,32 @@ impl Server {
         Ok(Principal { anonymous: false, user: c.sub, generation: c.generation, exp: c.exp })
     }
 
-    /// hashes a password for a client, within its budget, on the pool
-    pub async fn hash_for(
-        &self,
-        client: &str,
-        pw: String,
-    ) -> Result<String, crate::core::HashRefusal> {
-        use crate::core::HashRefusal;
+    /// hashes a password for a client, within its budget
+    pub async fn hash_for(&self, client: &str, pw: String) -> Result<String, HashError> {
         if !self.limit.allow(client) {
-            return Err(HashRefusal::Limited);
+            return Err(HashError::Limited);
         }
-        self.hashes.try_run(move || hash::hash_password(&pw)).await.map_err(|_| HashRefusal::Busy)
+        self.hasher.hash(pw, Wait::Refuse).await
     }
 
-    // runs a password check for a client, within its budget, on the pool
+    // checks a password for a client, within its budget
     async fn verify_for(
         &self,
         client: &str,
-        check: impl FnOnce() -> bool + Send + 'static,
+        stored: Option<String>,
+        pw: String,
     ) -> Result<bool, HashError> {
         if !self.limit.allow(client) {
             return Err(HashError::Limited);
         }
-        self.hashes.try_run(check).await
+        self.hasher.verify(stored, pw, Wait::Refuse).await
     }
 
-    // runs a password check again after the credentials it was checked against changed: outside
-    // any client's budget, since the change was not the check's doing, and waiting for room on
-    // the pool, since its call may already have decided mutations
-    async fn recheck(
-        &self,
-        check: impl FnOnce() -> bool + Send + 'static,
-    ) -> Result<bool, HashError> {
-        self.hashes.queue_run(check).await
+    // checks a password again after the credentials it was checked against changed: outside any
+    // client's budget, since the change was not the check's doing, and waiting for room at the
+    // hasher, since its call may already have decided mutations
+    async fn recheck(&self, stored: Option<String>, pw: String) -> Result<bool, HashError> {
+        self.hasher.verify(stored, pw, Wait::Queue).await
     }
 
     /// the password hash lookup answers for a principal's token, which its MutationAuth proofs
@@ -267,12 +260,11 @@ impl Server {
             for password in passwords {
                 let mut ok = false;
                 if let Some(h) = &hash {
-                    let (h, pw) = (h.clone(), password.clone());
-                    let check = move || hash::verify_password(&h, &pw);
+                    let (h, pw) = (Some(h.clone()), password.clone());
                     ok = if first {
-                        self.verify_for(client, check).await?
+                        self.verify_for(client, h, pw).await?
                     } else {
-                        self.recheck(check).await?
+                        self.recheck(h, pw).await?
                     };
                 }
                 if !ok {
@@ -370,14 +362,10 @@ impl Server {
                     // a wrong password and spends the same budget
                     let pw = password.clone();
                     let hash = a.as_ref().and_then(|a| a.password_hash.clone());
-                    let check = move || match hash {
-                        Some(h) => hash::verify_password(&h, &pw),
-                        None => hash::dummy_verify(&pw),
-                    };
                     let r = if attempt == 0 {
-                        self.verify_for(&self.client_of(&r), check).await
+                        self.verify_for(&self.client_of(&r), hash, pw).await
                     } else {
-                        self.recheck(check).await
+                        self.recheck(hash, pw).await
                     };
                     ok = match r {
                         Ok(ok) => ok,

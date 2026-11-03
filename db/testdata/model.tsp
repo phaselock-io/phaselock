@@ -191,6 +191,11 @@ model Notify {
   reject?: boolean;
 }
 
+// a mutation whose decider never returns, so the call's deadline interrupts it
+model Spin {
+  type: "spin";
+}
+
 // the audiences //
 
 union TestMutations {
@@ -217,6 +222,7 @@ union DbMutations {
   ChangePassword,
   AuthenticatedMutation,
   Notify,
+  Spin,
 }
 
 interface TestDB extends Database<[TestEngine], [AccountSlice], DbMutations> {}
