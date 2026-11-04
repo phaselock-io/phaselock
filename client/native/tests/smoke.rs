@@ -1,10 +1,10 @@
-//! The host runs the library's native bundle: an Engine it builds asks Kotlin to connect.
+//! The host runs the library's native bundle: an Engine it builds asks the client to connect.
 
 use phaselock_core::mp;
-use phaselock_jni::host::{Host, Limits};
+use phaselock_native::host::{Host, Limits};
 
 const BUNDLE: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../examples/library/model/native.dev.bundle.js");
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/library/model/native.dev.bundle.js");
 
 #[test]
 fn an_engine_starts_and_asks_to_connect() {

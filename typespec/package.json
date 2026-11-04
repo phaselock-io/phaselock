@@ -3,10 +3,10 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "build": "pnpm --filter @phaselock/typespec-core --filter @phaselock/typespec-ts --filter @phaselock/typespec-kt build",
+    "build": "pnpm --filter @phaselock/typespec-core --filter @phaselock/typespec-ts --filter @phaselock/typespec-kt --filter @phaselock/typespec-swift build",
     "test": "pnpm --filter @phaselock/typespec-tests gen && pnpm --filter @phaselock/typespec-tests test",
     "check": "pnpm check:tsc && pnpm check:lint && pnpm check:fmt",
-    "check:tsc": "tsc -p core --noEmit && tsc -p ts --noEmit && tsc -p kt --noEmit && tsc -p tests",
+    "check:tsc": "tsc -p core --noEmit && tsc -p ts --noEmit && tsc -p kt --noEmit && tsc -p swift --noEmit && tsc -p tests",
     "check:lint": "eslint .",
     "check:fmt": "prettier --check \"**/*.ts\"",
     "fmt": "prettier --write \"**/*.ts\" && eslint --fix ."

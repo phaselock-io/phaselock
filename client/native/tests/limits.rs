@@ -5,12 +5,12 @@
 use std::time::{Duration, Instant};
 
 use phaselock_core::mp;
-use phaselock_jni::host::{Host, Limits};
-use phaselock_jni::jni;
+use phaselock_native::host::{Host, Limits};
+use phaselock_native::api;
 use serde_json::{Value, json};
 
 const BUNDLE: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../examples/library/model/native.dev.bundle.js");
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/library/model/native.dev.bundle.js");
 
 fn open(limits: Limits) -> Host {
     let bundle = std::fs::read(BUNDLE).unwrap_or_else(|e| panic!("{BUNDLE}: {e}"));
@@ -65,7 +65,7 @@ fn a_call_past_its_deadline_ends_the_host() {
         }, 0), 0)"#,
     );
     let started = Instant::now();
-    let err = jni::call(&h, &pump()).unwrap_err();
+    let err = api::call(&h, &pump()).unwrap_err();
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "interrupted late: {:?}",
@@ -87,7 +87,7 @@ fn a_call_past_its_deadline_ends_the_host() {
     close_query.int(1);
     for request in [pump(), close_query.into_vec()] {
         let started = Instant::now();
-        assert_eq!(jni::call(&h, &request).unwrap_err(), err);
+        assert_eq!(api::call(&h, &request).unwrap_err(), err);
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 }

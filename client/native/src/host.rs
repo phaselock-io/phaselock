@@ -1,12 +1,12 @@
 //! The native host: one QuickJS runtime running host.js and the model's native bundle, and every
 //! engine the bundle builds in it, each over an LMDB store or the skeleton's in-memory one.
 //!
-//! The host is sans-IO.  Kotlin drives it from one thread with calls (Kotlin's half of every
-//! contract: frames, backfill deliveries, mutation outcomes, the app's mutations and queries),
-//! and each call answers with the events the JS side raised meanwhile (connect, backfill, send,
-//! query results, ...) and how long until the next timer is due, after which Kotlin calls `pump`.
-//! JS reaches Rust through the natives on `__pl`, and Rust reaches JS through the methods of
-//! `__host`; Kotlin holds numbers only, ids in tables on the JS side.
+//! The host is sans-IO.  The client drives it from one thread with calls (the client's half of
+//! every contract: frames, backfill deliveries, mutation outcomes, the app's mutations and
+//! queries), and each call answers with the events the JS side raised meanwhile (connect,
+//! backfill, send, query results, ...) and how long until the next timer is due, after which the
+//! client calls `pump`.  JS reaches Rust through the natives on `__pl`, and Rust reaches JS through
+//! the methods of `__host`; the client holds numbers only, ids in tables on the JS side.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -36,7 +36,7 @@ pub struct State {
     pub u8_ctor: Cell<JSValue>,
     /// the bundle's DEV: a stored value that fails to decode throws rather than reading absent
     pub dev: Cell<bool>,
-    /// the events raised since the call from Kotlin began, each encoded
+    /// the events raised since the call from the client began, each encoded
     events: RefCell<Vec<Vec<u8>>>,
     /// each timer's deadline, by id
     timers: RefCell<HashMap<i64, Instant>>,
@@ -47,7 +47,7 @@ pub struct State {
     /// each open transaction, by id: its store's registry and the transaction
     pub txns: RefCell<HashMap<i64, (Arc<Schema>, lmdb::Txn)>>,
     pub next_txn: Cell<i64>,
-    /// when the call from Kotlin that is running must end, past which JS is interrupted
+    /// when the call from the client that is running must end, past which JS is interrupted
     deadline: Cell<Option<Instant>>,
     /// whether the interrupt has fired, and the first exception taken after it, as its text
     interrupted: Cell<bool>,
@@ -61,7 +61,7 @@ pub unsafe fn state<'a>(ctx: *mut JSContext) -> &'a State {
 }
 
 /// How far the JS may run: the stack it may take below the frame that calls into it, the heap of
-/// the runtime, and how long one call from Kotlin may run before its JS is interrupted.
+/// the runtime, and how long one call from the client may run before its JS is interrupted.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub stack: usize,
@@ -181,7 +181,7 @@ unsafe fn args<'a>(argv: *mut JSValue, n: usize) -> &'a [JSValue] {
     unsafe { std::slice::from_raw_parts(argv, n) }
 }
 
-// pl.emit(event): an event for Kotlin, a plain array
+// pl.emit(event): an event for the client, a plain array
 unsafe extern "C" fn native_emit(
     ctx: *mut JSContext,
     _: JSValue,
@@ -314,8 +314,8 @@ const NATIVES: &[Native] = &[
 
 // the host ///////////////////////////////////////////////////////////////////
 
-/// One of a connection's hooks, as Kotlin hears it from the transport.  An edits frame carries the
-/// msgpack array of its raw edits, and an end's fatal names a refused session, which ends the
+/// One of a connection's hooks, as the client hears it from the transport.  An edits frame carries
+/// the msgpack array of its raw edits, and an end's fatal names a refused session, which ends the
 /// engine.
 pub enum Hook<'a> {
     Open { epoch: &'a str, head: i64 },
@@ -326,7 +326,7 @@ pub enum Hook<'a> {
     End { code: i64, reason: &'a str, fatal: Option<&'a str> },
 }
 
-/// One backfill delivery from Kotlin, which the Engine parks.
+/// One backfill delivery from the client, which the Engine parks.
 pub enum Push<'a> {
     Length(i64),
     Header { position: i64, seqs: &'a [u8], visible: i64 },
@@ -403,7 +403,7 @@ impl Host {
         unsafe { &*self.state }
     }
 
-    /* Runs f as one call from Kotlin, under the call deadline.  JS still running when it passes
+    /* Runs f as one call from the client, under the call deadline.  JS still running when it passes
     is interrupted, which no JS can catch, so whatever the JS was doing stops halfway: the host
     ends.  Every store transaction still open is aborted, the call fails with why, naming the
     limit and the interrupted JS's backtrace, and so does every call after it, which runs no JS. */
@@ -576,7 +576,7 @@ impl Host {
         }
     }
 
-    // a log event for Kotlin
+    // a log event for the client
     fn log(&self, text: &str) {
         let mut w = mp::Writer::new();
         w.array(2);

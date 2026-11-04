@@ -79,10 +79,16 @@ client/ts/        @phaselock/client: the JS host's transport over HTTP
                   (logins, sessions, connections), its msgpack cursor,
                   and the Registry that walks the generated type
                   registry.
+client/native/    The native host every native client shares: Rust over
+                  core/ that runs the TS Engine in QuickJS over LMDB,
+                  behind a msgpack request protocol.  See
+                  client/native/README.md.
 client/kotlin/    The Kotlin host: the transport, sessions, the Kotlin
-                  registry walk, and the native host (native/, Rust over
-                  core/) that runs the TS Engine in QuickJS over LMDB.
-                  See client/kotlin/README.md.
+                  registry walk, and the native host's JNI binding
+                  (native/).  See client/kotlin/README.md.
+client/swift/     The Swift host: the same pieces as client/kotlin, over the
+                  native host's C ABI binding (native/).  See
+                  client/swift/README.md.
 plugins/          @phaselock/plugins: the plugins we ship, as a
                   database's bundle installs them; cron so far.
 core/             phaselock-core: the Rust code every Rust host builds

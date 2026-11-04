@@ -14,6 +14,7 @@
         "@phaselock/plugins": "^0.2.0",
         "@phaselock/typespec-core": "^0.2.0",
         "@phaselock/typespec-kt": "^0.2.0",
+        "@phaselock/typespec-swift": "^0.2.0",
         "@phaselock/typespec-ts": "^0.2.0",
         "@typespec/compiler": "^1.0.0",
         "esbuild": "^0.25.0"

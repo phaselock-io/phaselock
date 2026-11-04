@@ -134,4 +134,4 @@ distribute verbatim copies of this document is granted.
 
 Used for the store of the native client hosts, in these files:
 
-    - client/kotlin/native/third_party/lmdb/
+    - client/native/third_party/lmdb/

@@ -1,7 +1,7 @@
 // @phaselock/client's Kotlin counterpart: the transport over HTTP, sessions, msgpack, the Kotlin
 // walk of the generated type registry, and the host that runs the Engine in QuickJS through the
-// native library built from native/.  A plain JVM library, so an Android app and a JVM test use
-// the same jar.
+// native library built from native/, the JNI binding of ../native.  A plain JVM library, so an
+// Android app and a JVM test use the same jar.
 
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
@@ -33,12 +33,12 @@ kotlin {
     compilerOptions { jvmTarget.set(JvmTarget.JVM_17) }
 }
 
-// the native library for this machine, which the tests load, built from the native crate and the
-// shared Rust crate beneath it
+// the native library for this machine, which the tests load, built from the JNI binding and the
+// shared native host and Rust core beneath it
 val repo = rootDir.resolve("../..").canonicalFile
 val cargoBuild = tasks.register<Exec>("cargoBuild") {
     workingDir = rootDir.resolve("native")
-    for (crate in listOf("client/kotlin/native", "core")) {
+    for (crate in listOf("client/kotlin/native", "client/native", "core")) {
         inputs.files(fileTree(repo.resolve(crate)) { exclude("target/**") })
     }
     outputs.files(fileTree(rootDir.resolve("native/target/release")) { include("libphaselock_jni.*") })

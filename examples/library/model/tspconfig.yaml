@@ -1,6 +1,7 @@
 emit:
   - "@phaselock/typespec-ts"
   - "@phaselock/typespec-kt"
+  - "@phaselock/typespec-swift"
 options:
   "@phaselock/typespec-ts":
     emitter-output-dir: "{project-root}"
@@ -8,3 +9,6 @@ options:
   "@phaselock/typespec-kt":
     emitter-output-dir: "{project-root}/kotlin"
     package: "io.phaselock.examples.library"
+  "@phaselock/typespec-swift":
+    emitter-output-dir: "{project-root}/LibraryModel/Sources/LibraryModel"
+    module: "LibraryModel"

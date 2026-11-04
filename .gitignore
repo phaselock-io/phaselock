@@ -5,3 +5,5 @@ dist/
 *.so
 .claude
 *.gen.ts
+.build/
+.swiftpm/

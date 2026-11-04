@@ -1,11 +1,11 @@
 // The JS half of the native host, which runs before the model's native bundle.  It installs what
-// the Engine needs of its host (timers, AbortController, randomness), and it adapts the Kotlin
-// side to the Engine's contracts: a Transport whose every call becomes an event for Kotlin, a
+// the Engine needs of its host (timers, AbortController, randomness), and it adapts the client's
+// side to the Engine's contracts: a Transport whose every call becomes an event for the client, a
 // Store over the native LMDB store, and a Registry over the native conversion kernel.
 //
-// The natives are on `__pl`.  Everything Kotlin delivers arrives through `__host`, whose methods
-// the native host calls by name.  Kotlin holds numbers, never JS values: every connection,
-// backfill, send, push, engine, and query is an id in a table here.
+// The natives are on `__pl`.  Everything the client delivers arrives through `__host`, whose
+// methods the native host calls by name.  The client holds numbers, never JS values: every
+// connection, backfill, send, push, engine, and query is an id in a table here.
 
 'use strict';
 
@@ -16,7 +16,7 @@
   const JS = 1;
   const MSGPACK = 3;
 
-  // an event for Kotlin, which the native host hands over when the call that raised it returns
+  // an event for the client, which the native host hands over when the call that raised it returns
   const emit = (...event) => pl.emit(event);
 
   // what an error says, with its stack when it has one
@@ -156,7 +156,7 @@
 
   // the transport ///////////////////////////////////////////////////////////
 
-  // the live calls Kotlin answers, by id
+  // the live calls the client answers, by id
   const connections = new Map();
   const backfills = new Map();
   const sends = new Map();
@@ -165,8 +165,8 @@
   let nextSend = 1;
 
   /* The Transport an engine is built over.  connect, backfill, and sendMutations each become an
-     event for Kotlin, which answers through __host; an abort becomes one too.  Kotlin settles
-     every backfill and send it was handed, an aborted one included. */
+     event for the client, which answers through __host; an abort becomes one too.  The client
+     settles every backfill and send it was handed, an aborted one included. */
   function transportFor(hosted) {
     return {
       buildRegistry(schema) {
@@ -239,7 +239,7 @@
     });
   }
 
-  // what Kotlin calls //////////////////////////////////////////////////////
+  // what the client calls //////////////////////////////////////////////////////
 
   globalThis.__host = {
     fire(id) {
@@ -352,7 +352,7 @@
       hooks.onEnd(code, reason, err);
     },
 
-    // one delivery of a backfill, settled for Kotlin once the Engine has committed it
+    // one delivery of a backfill, settled for the client once the Engine has committed it
     push(id, push, item) {
       const call = backfills.get(id);
       if (call === undefined) {

@@ -1,11 +1,11 @@
-//! A query's results reach Kotlin only when their bytes change: the first result always, and a
+//! A query's results reach the client only when their bytes change: the first result always, and a
 //! re-run whose encoding is byte for byte the last one's not at all.
 
 use phaselock_core::mp;
-use phaselock_jni::host::{Host, Limits};
+use phaselock_native::host::{Host, Limits};
 
 const BUNDLE: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../examples/library/model/native.dev.bundle.js");
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/library/model/native.dev.bundle.js");
 
 fn eval(h: &Host, js: &str) {
     h.eval_json(js).unwrap_or_else(|e| panic!("{e}"));

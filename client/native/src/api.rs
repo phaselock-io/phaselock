@@ -1,12 +1,13 @@
-//! The JNI surface: three functions of `io.phaselock.client.Native`, every argument and answer a
-//! byte array of msgpack, so no Java string crosses JNI (whose modified UTF-8 would change a
-//! key's bytes) and the surface stays one function per lifetime step.
+//! The request protocol every binding serves: three calls, every argument and answer msgpack
+//! bytes, so no platform string ever crosses (JNI's modified UTF-8, for one, would change a key's
+//! bytes) and a binding stays one function per lifetime step.
 //!
 //! - `open(bundle, name, limits)` loads the native bundle under `[stack, memory, callMillis]`,
-//!   the JS stack and heap in bytes and each call's deadline, answering `["ok", host]`;
+//!   the JS stack and heap in bytes and each call's deadline, answering `["ok", host]`, the host
+//!   being the binding's handle for it;
 //! - `call(host, request)` runs one request, `[op, ...args]`, answering `["ok", delay, events]`,
 //!   delay being the milliseconds until the next timer is due, or nil for none.  The request
-//!   `["connHooks", hooks]` carries every connection hook Kotlin has queued, each
+//!   `["connHooks", hooks]` carries every connection hook the client has queued, each
 //!   `[op, connection, ...args]`, so that the frames among them commit together;
 //! - `close(host)` frees the host.
 //!
@@ -15,7 +16,6 @@
 //! interrupted JS's backtrace, every store transaction is aborted, and every call after it
 //! answers the same without running any JS.  A host is used only from the thread that opened it.
 
-use jni_sys::{JNIEnv, jbyteArray, jclass, jlong};
 use phaselock_core::mp::{self, Node};
 
 use std::time::Duration;
@@ -84,6 +84,31 @@ impl<'a> Args<'a> {
             })
             .collect()
     }
+}
+
+/// Opens a host, answering `["ok", handle]` with the handle `keep` makes of it, or
+/// `["error", message]`.
+pub fn open(bundle: &[u8], name: &str, limits: &[u8], keep: impl FnOnce(Host) -> i64) -> Vec<u8> {
+    let mut w = mp::Writer::new();
+    match self::limits(limits).and_then(|l| Host::open(bundle, name, l)) {
+        Ok(h) => {
+            w.array(2);
+            w.str(b"ok");
+            w.int(keep(h));
+        }
+        Err(e) => {
+            w.array(2);
+            w.str(b"error");
+            w.str(e.as_bytes());
+        }
+    }
+    w.into_vec()
+}
+
+/// Runs one request, answering as the protocol does.
+pub fn respond(h: &Host, request: &[u8]) -> Vec<u8> {
+    let r = call(h, request);
+    answer(r, h.ended().is_some())
 }
 
 /// Runs one request against the host under the call deadline, answering its events.
@@ -183,81 +208,4 @@ fn answer(r: Result<Vec<u8>>, ended: bool) -> Vec<u8> {
         }
     }
     w.into_vec()
-}
-
-// the bytes of a Java byte array
-unsafe fn read(env: *mut JNIEnv, arr: jbyteArray) -> Vec<u8> {
-    unsafe {
-        let f = &(**env).v1_1;
-        let n = (f.GetArrayLength)(env, arr).max(0) as usize;
-        let mut buf = vec![0u8; n];
-        (f.GetByteArrayRegion)(env, arr, 0, n as i32, buf.as_mut_ptr().cast());
-        buf
-    }
-}
-
-// a new Java byte array holding bytes
-unsafe fn write(env: *mut JNIEnv, bytes: &[u8]) -> jbyteArray {
-    unsafe {
-        let f = &(**env).v1_1;
-        let arr = (f.NewByteArray)(env, bytes.len() as i32);
-        if !arr.is_null() {
-            (f.SetByteArrayRegion)(env, arr, 0, bytes.len() as i32, bytes.as_ptr().cast());
-        }
-        arr
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_phaselock_client_Native_open(
-    env: *mut JNIEnv,
-    _: jclass,
-    bundle: jbyteArray,
-    name: jbyteArray,
-    limits: jbyteArray,
-) -> jbyteArray {
-    unsafe {
-        let bundle = read(env, bundle);
-        let name = String::from_utf8_lossy(&read(env, name)).into_owned();
-        let mut w = mp::Writer::new();
-        match self::limits(&read(env, limits)).and_then(|l| Host::open(&bundle, &name, l)) {
-            Ok(h) => {
-                w.array(2);
-                w.str(b"ok");
-                w.int(Box::into_raw(Box::new(h)) as jlong);
-            }
-            Err(e) => {
-                w.array(2);
-                w.str(b"error");
-                w.str(e.as_bytes());
-            }
-        }
-        write(env, &w.buf)
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_phaselock_client_Native_call(
-    env: *mut JNIEnv,
-    _: jclass,
-    host: jlong,
-    request: jbyteArray,
-) -> jbyteArray {
-    unsafe {
-        let h = &*(host as *const Host);
-        let request = read(env, request);
-        let r = call(h, &request);
-        write(env, &answer(r, h.ended().is_some()))
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_phaselock_client_Native_close(
-    _: *mut JNIEnv,
-    _: jclass,
-    host: jlong,
-) {
-    if host != 0 {
-        drop(unsafe { Box::from_raw(host as *mut Host) });
-    }
 }

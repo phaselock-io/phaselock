@@ -2,12 +2,12 @@
 //! every frame among them in one store write transaction.
 
 use phaselock_core::mp;
-use phaselock_jni::host::{Host, Limits};
-use phaselock_jni::jni;
+use phaselock_native::host::{Host, Limits};
+use phaselock_native::api;
 use serde_json::{Value, json};
 
 const BUNDLE: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../examples/library/model/native.dev.bundle.js");
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/library/model/native.dev.bundle.js");
 
 fn eval(h: &Host, js: &str) -> Value {
     let out = h.eval_json(js).unwrap_or_else(|e| panic!("{e}"));
@@ -75,7 +75,7 @@ fn a_batch_of_frames_commits_in_one_write_transaction() {
     w.str(b"connLive");
     w.int(conn);
     w.int(3);
-    jni::call(&h, &w.into_vec()).unwrap();
+    api::call(&h, &w.into_vec()).unwrap();
 
     // one transaction, which applied every frame and moved the cursor to the last
     let got = eval(

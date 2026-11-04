@@ -1,0 +1,21 @@
+[package]
+name = "phaselock-swift"
+version = "0.1.0"
+edition = "2024"
+description = "The C ABI binding of PhaseLock's native host, for the Swift client"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "phaselock_swift"
+crate-type = ["staticlib"]
+
+[dependencies]
+phaselock-native = { path = "../../native" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = "thin"

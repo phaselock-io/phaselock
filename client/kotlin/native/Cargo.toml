@@ -2,21 +2,17 @@
 name = "phaselock-jni"
 version = "0.1.0"
 edition = "2024"
-description = "The native host of PhaseLock's Kotlin client: QuickJS running the Engine, an LMDB store, and their JNI surface"
+description = "The JNI binding of PhaseLock's native host, for the Kotlin client"
 license = "Apache-2.0"
 publish = false
 
 [lib]
 name = "phaselock_jni"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 [dependencies]
-getrandom = "0.3"
 jni-sys = "0.4"
-phaselock-core = { path = "../../../core" }
-
-[build-dependencies]
-cc = "1"
+phaselock-native = { path = "../../native" }
 
 [profile.dev]
 panic = "abort"
@@ -24,7 +20,3 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 lto = "thin"
-
-[dev-dependencies]
-serde_json = "1"
-tempfile = "3"

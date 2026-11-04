@@ -1,0 +1,5 @@
+module CPhaseLock {
+    header "phaselock.h"
+    link "phaselock_swift"
+    export *
+}

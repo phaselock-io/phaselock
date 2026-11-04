@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vendor LMDB into client/kotlin/native/third_party, for build.rs to compile.
+"""Vendor LMDB into client/native/third_party, for build.rs to compile.
 
     update.py lmdb <checkout>    an LMDB git checkout at the release tag to vendor
 
@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 NATIVE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NOTICE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(NATIVE))), "NOTICE")
+NOTICE = os.path.join(os.path.dirname(os.path.dirname(NATIVE)), "NOTICE")
 
 
 def comment(lines):
@@ -88,7 +88,7 @@ def lmdb(checkout):
         "",
         "Used for the store of the native client hosts, in these files:",
         "",
-        "    - client/kotlin/native/third_party/lmdb/",
+        "    - client/native/third_party/lmdb/",
     ]))
 
 

@@ -1,5 +1,5 @@
-// The app, with its two native parts built beside it: the native host, by cargo-ndk from
-// client/kotlin/native for each ABI the app ships, and the model's native bundle, by the
+// The app, with its two native parts built beside it: the native host, by cargo-ndk from its JNI
+// binding in client/kotlin/native for each ABI the app ships, and the model's native bundle, by the
 // model's own scripts, which also regenerate the model's Kotlin.  A debug APK's bundle runs the
 // skeleton in development mode, and a release APK's in production.
 
@@ -68,13 +68,13 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
 }
 
-// the native host for each ABI, where the app's jniLibs are, built from the native crate and the
-// shared Rust crate beneath it
+// the native host for each ABI, where the app's jniLibs are, built from the JNI binding and the
+// shared native host and Rust core beneath it
 val nativeHost = tasks.register<Exec>("nativeHost") {
     val out = layout.buildDirectory.dir("jniLibs").get().asFile
     val ndk = androidComponents.sdkComponents.ndkDirectory
     workingDir = repo.resolve("client/kotlin/native")
-    for (crate in listOf("client/kotlin/native", "core")) {
+    for (crate in listOf("client/kotlin/native", "client/native", "core")) {
         inputs.files(fileTree(repo.resolve(crate)) { exclude("target/**") })
     }
     outputs.dir(out)
