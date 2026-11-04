@@ -10,8 +10,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use phaselock_core::scan::Span;
+
 use crate::js::Reads;
-use crate::scan::Span;
 
 /// which of a registration's cached calls
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -155,7 +156,7 @@ impl ReadIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::test_span;
+    use phaselock_core::scan::test_span;
 
     const A: Call = Call { reg: 0, what: Cached::Grant };
     const B: Call = Call { reg: 1, what: Cached::Account };

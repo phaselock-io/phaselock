@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use phaselockdb::mp::{self, Node};
+use phaselock_core::mp::{self, Node};
 
 #[derive(Clone, PartialEq)]
 pub enum V {

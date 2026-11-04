@@ -1,6 +1,6 @@
-//! Key patterns: the skeleton's KeyPattern compiled from the bundle's object, the skip-scan walk
-//! of the keys a pattern picks out over the kv cursor, and the spans the grantor's scans read.  It
-//! follows the skeleton's "key patterns" section step for step.  Keys and bounds are UTF-8 and
+//! Key patterns: the skeleton's KeyPattern compiled from its JS object, the skip-scan walk of the
+//! keys a pattern picks out over a store's cursor, and the spans a scan reads.  It follows the
+//! skeleton's "key patterns" section step for step.  Keys and bounds are UTF-8 and
 //! compare bytewise, which is code-point order, the order the skeleton's comparisons keep.  A
 //! bound's successor is its last byte incremented, and no valid key lies between that and the
 //! skeleton's code-point successor.
@@ -8,10 +8,33 @@
 use std::cmp::Ordering;
 
 use crate::js::{self, ffi::*};
-use crate::store::{Cursor, prefix_bound};
 
-/// the keys a walk steps through before it seeks: a SQLite seek costs about as much as 16 steps
-pub const SCAN_STEP_BUDGET: usize = 16;
+/// The exclusive upper bound of the keys sharing prefix, its last byte incremented past any
+/// trailing 0xFF bytes; None when no text lies above them all.
+pub fn prefix_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut b = prefix.to_vec();
+    while let Some(&last) = b.last() {
+        if last != 0xff {
+            *b.last_mut().unwrap() += 1;
+            return Some(b);
+        }
+        b.pop();
+    }
+    None
+}
+
+/// A store's cursor over its keys in key order, which a walk moves.  A seek forward moves to the
+/// first key at or after target, strictly after it when strict, and one in reverse to the last key
+/// at or before it; no target moves to the first or last key of all.  A step moves one key on in
+/// the seek's direction.  Each answers true at a key and false past the end of the walk.  The key
+/// and value at the cursor last until the cursor moves.
+pub trait Cursor {
+    fn seek(&mut self, reverse: bool, target: Option<&[u8]>, strict: bool) -> Result<bool, String>;
+    fn step(&mut self) -> Result<bool, String>;
+    fn key(&self) -> &[u8];
+    /// the value at the cursor, empty when the cursor was opened for keys only
+    fn value(&self) -> &[u8];
+}
 
 /// A field of a compiled pattern, in key order: a literal, the local template's name with the ':'
 /// after it when it has parameters, matched as text; or a value field per parameter, with its
@@ -178,7 +201,7 @@ impl Pattern {
     }
 
     /// the skeleton's compilePattern of a KeyPattern; Err with a JS exception for a malformed one
-    pub(crate) fn from_js(ctx: *mut JSContext, v: JSValue) -> Result<Pattern, ()> {
+    pub fn from_js(ctx: *mut JSContext, v: JSValue) -> Result<Pattern, ()> {
         let mut p = Pattern::compile(ctx, v)?;
         p.fixed = p.fixed_prefix();
         Ok(p)
@@ -426,7 +449,7 @@ fn past(target: &[u8], strict: bool, key: &[u8], reverse: bool) -> bool {
 /// more than a few steps over the short gaps between matches.  visit sees each key and its value;
 /// a visit's failure fails the walk, as the store's does.
 pub fn walk(
-    cur: &mut Cursor<'_>,
+    cur: &mut impl Cursor,
     p: &Pattern,
     reverse: bool,
     after: Option<&[u8]>,
@@ -521,8 +544,8 @@ pub fn push_span(
 }
 
 /// tests only: a span of the keys starting with head, over the stretch from just past from to to
-#[cfg(test)]
-pub(crate) fn test_span(head: &str, from: Option<Vec<u8>>, to: Option<Vec<u8>>) -> Span {
+#[doc(hidden)]
+pub fn test_span(head: &str, from: Option<Vec<u8>>, to: Option<Vec<u8>>) -> Span {
     let head = head.as_bytes().to_vec();
     let pattern = Pattern { fixed: head.clone(), head, fields: Vec::new(), named: false };
     Span { pattern, reverse: false, from, to }

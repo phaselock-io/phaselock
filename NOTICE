@@ -55,6 +55,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
-Used for the JavaScript runtime in the database, in these files:
+Used for the JavaScript runtime of the Rust hosts, in these files:
 
-    - db/third_party/quickjs/
+    - core/third_party/quickjs/

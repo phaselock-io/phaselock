@@ -1,5 +1,5 @@
-# Building needs only a Rust toolchain and a C compiler: build.rs compiles the vendored QuickJS,
-# and every other dependency is a crate.
+# Building needs only a Rust toolchain and a C compiler: ../core's build.rs compiles the vendored
+# QuickJS, and every other dependency is a crate.
 
 all:
 	cargo build --release
@@ -17,8 +17,9 @@ testdata/node_modules: testdata/package.json ../plugins/package.json
 bundle: testdata/node_modules
 	cd testdata && pnpm gen
 
-# the unit tests and the feature tests
+# the unit tests, ../core's with them, and the feature tests
 test: bundle
+	cargo test --release --manifest-path ../core/Cargo.toml
 	cargo test --release
 
 clean:

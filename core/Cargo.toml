@@ -1,0 +1,11 @@
+[package]
+name = "phaselock-core"
+version = "0.1.0"
+edition = "2024"
+description = "PhaseLock's shared Rust core: QuickJS, msgpack, the conversion kernel, and key patterns"
+license = "Apache-2.0"
+publish = false
+
+[build-dependencies]
+cc = "1"
+

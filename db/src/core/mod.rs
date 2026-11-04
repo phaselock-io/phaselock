@@ -24,12 +24,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use bytes::Bytes;
+use phaselock_core::walk::Schema;
 use tokio::sync::mpsc;
 
 pub use prepare::{PrepareError, Prepared, prepare};
 pub use reader::Reader;
-
-use crate::walk::Schema;
 
 /// the length of a mutation's id, a label the client mints
 pub const ID_LEN: usize = 16;

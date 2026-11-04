@@ -123,7 +123,7 @@ plan above take precedence over it.
   contract): the app's `db.ts` calling the generated `define{Database}`,
   bundled with the generated module.
 - Every typed value crosses through the conversion kernel
-  (`src/walk.rs`): a source, either a msgpack tree that borrows the
+  (`../core/src/walk.rs`): a source, either a msgpack tree that borrows the
   bytes it was parsed from or a tokenization of a QuickJS value, a
   walk over the registry the bundle carries, and a sink that builds
   JS values, writes msgpack, or discards.  The kernel builds rich
@@ -132,7 +132,8 @@ plan above take precedence over it.
   to it.  The registry is compiled once at open
   from the bundle's schema, `{nodes, ids, mutations}`; every read and
   write of the store names one of its identities, the value's type.
-  Untyped values, `lookup`'s traffic, go through `src/js/mpjs.rs`.
+  Untyped values, `lookup`'s traffic, go through
+  `../core/src/js/mpjs.rs`.
 - A call into the bundle is interrupted after 30 seconds, bootstrap
   excepted, and the bundle's heap is capped at 4 GiB; either failure
   is the call's bug.  Formatting a failed call's error, its stack
@@ -1217,8 +1218,8 @@ app's slots:
   not fit its type fails the call.  A scan names one type too, or
   `false` for keys only, so a scan with values picks out one key
   template's keys.
-- A scan walks the kv table (`src/scan.rs`) the way the skeleton's
-  `walkPattern` does: a skip scan that places each key against the
+- A scan walks the kv table (`../core/src/scan.rs`) the way the
+  skeleton's `walkPattern` does: a skip scan that places each key against the
   pattern's fields and seeks past the keys that cannot match, after
   stepping up to 16 keys toward the target, since a SQLite seek costs
   about as much as 16 steps.  The kv cursor steps one SQLite statement
@@ -1250,7 +1251,11 @@ app's slots:
 ### Layout and build
 
 The database is one Rust crate, `phaselockdb`, rooted at `db/`: a
-library, and the binary over it.
+library, and the binary over it.  It depends on `phaselock-core`
+(`../core/`), the Rust code every Rust host builds on: the conversion
+kernel, key patterns and their skip-scan walk over a store's cursor,
+msgpack, slice names, and the QuickJS C API, with the vendored QuickJS
+its build.rs compiles.
 
     src/lib.rs        the library the binary and the feature tests share
     src/main.rs       the binary: flags, TLS, and signals
@@ -1274,20 +1279,11 @@ library, and the binary over it.
                       readsets.rs the index of what registrations
                       read; prepare.rs the mutation check; reader.rs
                       the reader thread
-    src/walk.rs       the conversion kernel
-    src/scan.rs       key patterns, their skip-scan walk, and spans
     src/buffer.rs     a mutation's write buffer
-    src/store.rs      SQLite: kv, log, series, token keys, slices
-    src/js/           the QuickJS host (mod.rs), the QuickJS C API
-                      (ffi.rs), and untyped msgpack<->JS (mpjs.rs)
-    src/mp.rs         msgpack: a borrowing parser and a writer of the
-                      smallest encodings
-    src/names.rs      slice names, selectors, the characters of a key
+    src/store.rs      SQLite: kv, log, series, token keys, slices, and
+                      the kv cursor a scan walks
+    src/js/           the QuickJS host
     host.js           the JS glue, embedded in the binary
-    build.rs          compiles the vendored QuickJS
-    third_party/      QuickJS, each file headed with its origin and
-                      license; update.py vendors a new one and rewrites
-                      its NOTICE entry
     tests/            the feature tests, a file per area, over the harness
                       in tests/common/
     testdata/         the test bundle: model.tsp and db.ts, generated
@@ -1296,25 +1292,26 @@ library, and the binary over it.
                       esbuild, with @phaselock/plugins from plugins/
 
 Building needs a Rust toolchain with edition 2024 and a C compiler:
-build.rs compiles upstream QuickJS, not the quickjs-ng fork, with
-`-fwrapv`, which QuickJS relies on.  `src/js/ffi.rs` declares the
-QuickJS C API by hand and writes out the header's inline functions,
-the refcounting and value construction, over the 64-bit `JSValue`, a
-payload word and a tag word; vendoring a QuickJS that changes the
-value's layout means changing them too.  Every other dependency is a
-crate: tokio, hyper, and rustls for HTTP and TLS, rusqlite with its
-bundled SQLite, ed25519-dalek, argon2, and chrono-tz.  Both profiles
-build with `panic = "abort"`, so no panic unwinds across the FFI.
+`../core`'s build.rs compiles upstream QuickJS, not the quickjs-ng
+fork, with `-fwrapv`, which QuickJS relies on.  `../core/src/js/ffi.rs`
+declares the QuickJS C API by hand and writes out the header's inline
+functions, the refcounting and value construction, over the 64-bit
+`JSValue`, a payload word and a tag word; vendoring a QuickJS that
+changes the value's layout means changing them too.  Every other
+dependency is a crate: tokio, hyper, and rustls for HTTP and TLS,
+rusqlite with its bundled SQLite, ed25519-dalek, argon2, and
+chrono-tz.  Both profiles build with `panic = "abort"`, so no panic
+unwinds across the FFI.
 
 The tests need pnpm: `make -C db test` rebuilds the test bundle from the
-emitter's and `plugins/`'s sources and runs the unit tests and the feature
-tests in `tests/`, a file per area of the database over a shared harness
-in `tests/common/`.  A feature test runs its server in the test's own
-process, serving a loopback port as the binary serves its listener, so it speaks
-HTTP to it as a client does and reaches its core and its hooks directly.
-The hooks, `src/hooks.rs`, are points a test holds the server at: each is
-an async function the server awaits there when a test has set one, and
-none is set otherwise.
+emitter's and `plugins/`'s sources and runs the unit tests, `../core`'s
+with them, and the feature tests in `tests/`, a file per area of the
+database over a shared harness in `tests/common/`.  A feature test runs
+its server in the test's own process, serving a loopback port as the
+binary serves its listener, so it speaks HTTP to it as a client does and
+reaches its core and its hooks directly.  The hooks, `src/hooks.rs`, are
+points a test holds the server at: each is an async function the server
+awaits there when a test has set one, and none is set otherwise.
 
     make -C db          build db/target/release/phaselockdb
     make -C db test     build the test bundle, run the unit and feature tests

@@ -6,6 +6,7 @@ use std::cell::{RefCell, RefMut};
 use std::ffi::{CStr, c_int};
 use std::ptr::{self, NonNull};
 
+use phaselock_core::scan::{self, prefix_bound};
 use rusqlite::types::{ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, ToSql, ffi, params};
 
@@ -42,20 +43,6 @@ impl ToSql for T<'_> {
 
 fn bytes(r: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<Vec<u8>> {
     Ok(r.get_ref(i)?.as_bytes().map(|b| b.to_vec()).unwrap_or_default())
-}
-
-/// The exclusive upper bound of the keys sharing prefix, its last byte incremented past any
-/// trailing 0xFF bytes; None when no text lies above them all.
-pub fn prefix_bound(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut b = prefix.to_vec();
-    while let Some(&last) = b.last() {
-        if last != 0xff {
-            *b.last_mut().unwrap() += 1;
-            return Some(b);
-        }
-        b.pop();
-    }
-    None
 }
 
 /// one row of the log: the position of its mutation, the slice it edits, and its wire encoding
@@ -580,11 +567,11 @@ impl Seeks {
     }
 }
 
-/// The kv cursor walks the kv table's keys one way.  A seek forward moves to the first key at or
-/// after target, strictly after it when strict, and one in reverse to the last key at or before
-/// it; no target moves to the first or last key of all.  A step moves one key on in the seek's
-/// direction.  Each answers true at a key and false past the end of the walk.  The key and value
-/// at the cursor are SQLite's own row, read in place, so they last until the cursor moves.
+/// the keys a walk steps through before it seeks: a SQLite seek costs about as much as 16 steps
+pub const SCAN_STEP_BUDGET: usize = 16;
+
+/// The kv cursor walks the kv table's keys, a scan's cursor.  The key and value at the cursor are
+/// SQLite's own row, read in place.
 pub struct Cursor<'s> {
     seeks: RefMut<'s, Seeks>,
     want_values: bool,
@@ -623,7 +610,20 @@ impl Cursor<'_> {
         }
     }
 
-    pub fn seek(&mut self, reverse: bool, target: Option<&[u8]>, strict: bool) -> Result<bool> {
+    // a column of the row at the cursor, as SQLite holds it
+    fn column(&self, col: c_int) -> &[u8] {
+        let Some(i) = self.at else { return &[] };
+        let st = self.stmt(i);
+        unsafe {
+            let p = ffi::sqlite3_column_blob(st, col);
+            let n = ffi::sqlite3_column_bytes(st, col);
+            if p.is_null() { &[] } else { std::slice::from_raw_parts(p.cast(), n as usize) }
+        }
+    }
+}
+
+impl scan::Cursor for Cursor<'_> {
+    fn seek(&mut self, reverse: bool, target: Option<&[u8]>, strict: bool) -> Result<bool> {
         self.end();
         let i = match (target, reverse, strict) {
             (None, false, _) => FIRST,
@@ -654,27 +654,15 @@ impl Cursor<'_> {
         self.land()
     }
 
-    pub fn step(&mut self) -> Result<bool> {
+    fn step(&mut self) -> Result<bool> {
         self.land()
     }
 
-    // a column of the row at the cursor, as SQLite holds it
-    fn column(&self, col: c_int) -> &[u8] {
-        let Some(i) = self.at else { return &[] };
-        let st = self.stmt(i);
-        unsafe {
-            let p = ffi::sqlite3_column_blob(st, col);
-            let n = ffi::sqlite3_column_bytes(st, col);
-            if p.is_null() { &[] } else { std::slice::from_raw_parts(p.cast(), n as usize) }
-        }
-    }
-
-    pub fn key(&self) -> &[u8] {
+    fn key(&self) -> &[u8] {
         self.column(0)
     }
 
-    /// the value at the cursor, empty when the cursor was opened for keys only
-    pub fn value(&self) -> &[u8] {
+    fn value(&self) -> &[u8] {
         if self.want_values { self.column(1) } else { &[] }
     }
 }

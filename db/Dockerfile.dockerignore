@@ -1,0 +1,11 @@
+*
+!core/
+!db/
+core/target/
+db/target/
+db/data/
+db/tests/
+db/testdata/node_modules/
+db/testdata/bundle.js
+db/testdata/bundle.prod.js
+db/testdata/model.gen.ts

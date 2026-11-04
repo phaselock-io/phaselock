@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use phaselockdb::mp::Writer;
+use phaselock_core::mp::Writer;
 use std::time::Duration;
 
 /// a slice's edits, all of them

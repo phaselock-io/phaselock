@@ -1,4 +1,4 @@
-// Compiles the QuickJS the database runs bundles in: upstream QuickJS, not the quickjs-ng fork,
+// Compiles the QuickJS every host runs bundles in: upstream QuickJS, not the quickjs-ng fork,
 // vendored under third_party/quickjs, with the defines its own build passes.  -fwrapv makes
 // signed overflow wrap, which QuickJS relies on.
 

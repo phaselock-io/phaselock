@@ -96,7 +96,7 @@ pub struct JsEnv {
 }
 
 impl JsEnv {
-    pub(crate) fn new(ctx: *mut JSContext) -> Option<JsEnv> {
+    pub fn new(ctx: *mut JSContext) -> Option<JsEnv> {
         let learn = |expr: &str| unsafe {
             let src = CString::new(expr).unwrap();
             let v = JS_Eval(ctx, src.as_ptr(), expr.len(), c"<class-id>".as_ptr(), 0);
@@ -121,7 +121,7 @@ fn drop_exception(ctx: *mut JSContext) {
 }
 
 /// a JS string's UTF-8 bytes, or None with the exception left pending
-pub(crate) fn js_string(ctx: *mut JSContext, v: JSValue) -> Option<Vec<u8>> {
+pub fn js_string(ctx: *mut JSContext, v: JSValue) -> Option<Vec<u8>> {
     unsafe {
         let mut len = 0usize;
         let p = JS_ToCStringLen2(ctx, &mut len, v, 0);

@@ -3,11 +3,12 @@
 //! writer.  The check is plain CPU work over the body, so the caller decides where it runs; it
 //! waits on nothing, and each password it needs hashed is left as a hole the caller fills.
 
+use phaselock_core::mp::{self, Node};
+use phaselock_core::names;
+use phaselock_core::walk::{self, Intake, Schema};
+
 use super::ID_LEN;
 use super::writer::{EXPECT_MAX, series_key};
-use crate::mp::{self, Node};
-use crate::names;
-use crate::walk::{self, Intake, Schema};
 
 /// the longest series id a mutation may carry, in bytes
 const SERIES_MAX: usize = 64;

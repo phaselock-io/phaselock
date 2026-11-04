@@ -13,6 +13,8 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Response, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::{Frame as BodyFrame, Incoming, SizeHint};
+use phaselock_core::mp::{self, Val};
+use phaselock_core::names::{self, covers};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use crate::core::unix_ms;
@@ -22,8 +24,6 @@ use crate::hash::{HashError, Hasher, Limiter, Local, Wait};
 use crate::hooks::Hooks;
 use crate::js;
 use crate::keys::Keyring;
-use crate::mp::{self, Val};
-use crate::names::{self, covers};
 use crate::pool::{Pool, PoolError};
 
 #[derive(Default)]

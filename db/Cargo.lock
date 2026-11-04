@@ -623,13 +623,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "phaselock-core"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "phaselockdb"
 version = "0.1.0"
 dependencies = [
  "argon2",
  "base64",
  "bytes",
- "cc",
  "chrono",
  "chrono-tz",
  "ed25519-dalek",
@@ -639,6 +645,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "phaselock-core",
  "rcgen",
  "rusqlite",
  "rustls",

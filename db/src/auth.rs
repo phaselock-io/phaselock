@@ -6,12 +6,12 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use base64::Engine;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use ed25519_dalek::{Signer, SigningKey, Verifier};
+use phaselock_core::mp::{self, Node, Val};
 use serde::{Deserialize, Serialize};
 
 use crate::core::{MAX_BOUNCES, Proof, Req, Verdict, unix_ms, unix_s};
 use crate::hash::{HashError, Wait};
 use crate::keys::{KEY_ROTATION_MS, TOKEN_LIFETIME_MS, TokenKey};
-use crate::mp::{self, Node, Val};
 use crate::server::{ERR_REVOKED, Principal, Request, Resp, Server, hash_failed, http_error};
 
 pub use crate::hash::hash_password;

@@ -1,12 +1,12 @@
-//! Msgpack <-> plain JS values, for the untyped traffic of `lookup`.  Values are the JSON
-//! projection: maps with string keys, arrays, strings, integers, floats, booleans, nil.  bin
-//! decodes to an ArrayBuffer, and an ArrayBuffer encodes to bin.
+//! Msgpack <-> plain JS values, for untyped traffic such as the database's `lookup`.  Values are
+//! the JSON projection: maps with string keys, arrays, strings, integers, floats, booleans, nil.
+//! bin decodes to an ArrayBuffer, and an ArrayBuffer encodes to bin.
 
 use super::ffi::*;
 use crate::mp::{self, Node};
 use crate::walk::js_string;
 
-pub(crate) fn decode(ctx: *mut JSContext, node: &Node<'_>) -> Result<JSValue, String> {
+pub fn decode(ctx: *mut JSContext, node: &Node<'_>) -> Result<JSValue, String> {
     unsafe {
         Ok(match node {
             Node::Nil => JS_NULL,
@@ -63,7 +63,7 @@ pub(crate) fn decode(ctx: *mut JSContext, node: &Node<'_>) -> Result<JSValue, St
     }
 }
 
-pub(crate) fn encode(
+pub fn encode(
     ctx: *mut JSContext,
     v: JSValue,
     w: &mut mp::Writer,

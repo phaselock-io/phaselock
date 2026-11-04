@@ -6,7 +6,7 @@ mod common;
 use std::time::SystemTime;
 
 use common::*;
-use phaselockdb::mp::Writer;
+use phaselock_core::mp::Writer;
 
 /// posts a request body as it is, answering the outcomes; any status but 200 fails the test
 async fn mutations_raw(h: &Harness, token: &str, body: Vec<u8>) -> Vec<Outcome> {

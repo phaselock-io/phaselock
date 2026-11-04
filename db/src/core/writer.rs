@@ -7,6 +7,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use phaselock_core::js::Owned;
+use phaselock_core::mp::{self, Node};
+use phaselock_core::names;
+use phaselock_core::walk::Schema;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
@@ -16,10 +20,7 @@ use super::{
 };
 use crate::buffer::Touched;
 use crate::js::{self, Host};
-use crate::mp::{self, Node};
-use crate::names;
 use crate::store::Store;
-use crate::walk::Schema;
 
 /// the most slices one mutation's expectations may name
 pub const EXPECT_MAX: usize = 1024;
@@ -837,10 +838,10 @@ impl Writer {
         b: &mut Batch,
         w: &mut mp::Writer,
         id: &[u8],
-        data: &js::Owned,
+        data: &Owned,
         expect: Option<&Node<'_>>,
         user: Option<&str>,
-        principal: &js::Owned,
+        principal: &Owned,
     ) {
         // the client's expectations of its slices
         if self.check_expect(b, w, expect, user) {
@@ -925,10 +926,10 @@ impl Writer {
         w: &mut mp::Writer,
         series: Option<(&str, u64)>,
         id: &[u8],
-        data: &js::Owned,
+        data: &Owned,
         expect: Option<&Node<'_>>,
         user: Option<&str>,
-        principal: &js::Owned,
+        principal: &Owned,
         verdict: Option<&Verdict>,
         attempt: i32,
     ) -> Option<Option<String>> {

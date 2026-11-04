@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vendor QuickJS into db/third_party, for build.rs to compile.
+"""Vendor QuickJS into core/third_party, for build.rs to compile.
 
     update.py quickjs <checkout>    a QuickJS git checkout at the commit to vendor
 
@@ -12,8 +12,8 @@ import os
 import subprocess
 import sys
 
-DB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NOTICE = os.path.join(os.path.dirname(DB), "NOTICE")
+CORE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+NOTICE = os.path.join(os.path.dirname(CORE), "NOTICE")
 
 
 def comment(lines):
@@ -28,7 +28,7 @@ def header(origin, spdx, license_text):
 
 def vendor(lib, files, src, origin_of, spdx, license_text):
     """copy each file from src into third_party/<lib>, headed"""
-    out = os.path.join(DB, "third_party", lib)
+    out = os.path.join(CORE, "third_party", lib)
     os.makedirs(out, exist_ok=True)
     for name in os.listdir(out):
         os.remove(os.path.join(out, name))
@@ -81,9 +81,9 @@ def quickjs(checkout):
         "",
         license_text.strip(),
         "",
-        "Used for the JavaScript runtime in the database, in these files:",
+        "Used for the JavaScript runtime of the Rust hosts, in these files:",
         "",
-        "    - db/third_party/quickjs/",
+        "    - core/third_party/quickjs/",
     ]))
 
 

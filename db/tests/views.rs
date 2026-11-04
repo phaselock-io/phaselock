@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use phaselockdb::names::valid_selector;
+use phaselock_core::names::valid_selector;
 
 use common::*;
 

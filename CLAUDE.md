@@ -81,9 +81,12 @@ client/ts/        @phaselock/client: the JS host's transport over HTTP
                   registry.
 plugins/          @phaselock/plugins: the plugins we ship, as a
                   database's bundle installs them; cron so far.
-db/               The v0 database: one Rust crate (QuickJS, SQLite,
-                  the conversion kernel, the HTTP layer), a library
-                  and the binary over it, with its feature tests in
+core/             phaselock-core: the Rust code every Rust host builds
+                  on (QuickJS, msgpack, the conversion kernel, slice
+                  names, key patterns).  See core/README.md.
+db/               The v0 database: one Rust crate over core/ (SQLite,
+                  the QuickJS host, the HTTP layer), a library and
+                  the binary over it, with its feature tests in
                   db/tests/.  See db/README.md.
 agents/           The "phaselock" agent plugin; canonical skill at
                   agents/skills/phaselock/.
@@ -132,9 +135,10 @@ TypeSpec tooling (`cd typespec`):
 Database (`cd db`; a Rust toolchain and a C compiler):
 
 - `make` — build `db/target/release/phaselockdb` (plain
-  `cargo build --release`; build.rs compiles the vendored QuickJS)
-- `make test` — rebuild the test bundle, run the unit tests and the
-  feature tests in `db/tests/`
+  `cargo build --release`; core's build.rs compiles the vendored
+  QuickJS)
+- `make test` — rebuild the test bundle, run core's and the database's
+  unit tests and the feature tests in `db/tests/`
 
 Examples (`cd examples/todo-basic` or `library`):
 
@@ -167,7 +171,7 @@ An example's `pnpm gen` regenerates every time it runs, so after work on
 - The generic query hook, `useLocalQuery.ts`, is library-quality.
 - Wrap new documentation files at 80 columns.
 - Vendored third-party code lives under a `vendor/` directory
-  (`db/third_party/` in the database's crate, since `vendor/` is where
+  (`core/third_party/` in the Rust core, since `vendor/` is where
   `cargo vendor` writes crates), each file headed with its origin,
   version, commit, any modification, SPDX id, and full license text
   (see `client/ts/src/vendor/`), and gets an entry in the root

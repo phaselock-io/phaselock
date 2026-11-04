@@ -3,25 +3,25 @@
 //! call running, and calls the bundle's slots through `__host`.  The runtime is single-threaded:
 //! the core thread creates the host and is the only thread that touches it.
 
-pub(crate) mod ffi;
-pub(crate) mod mpjs;
-
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
-use std::ffi::{CStr, CString, c_int, c_void};
+use std::ffi::{CStr, c_int, c_void};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use phaselock_core::js::ffi::*;
+use phaselock_core::js::{
+    Owned, cstring, mpjs, new_string, throw_error, throw_internal, throw_range, throw_type,
+};
+use phaselock_core::mp;
+use phaselock_core::names;
+use phaselock_core::scan::{self, Pattern, Span, Visit};
+use phaselock_core::walk::{self, JsEnv, Schema, js_string};
 
-use self::ffi::*;
 use crate::buffer::WriteBuffer;
-use crate::mp;
-use crate::names;
-use crate::scan::{self, Pattern, Span, Visit};
-use crate::store::Store;
-use crate::walk::{self, JsEnv, Schema, js_string};
+use crate::store::{SCAN_STEP_BUDGET, Store};
 
 /// the JS host's own source, which runs before the bundle
 const HOST_JS: &str = include_str!("../../host.js");
@@ -47,76 +47,6 @@ const MAP_STACK_LIMIT: Duration = Duration::from_millis(100);
 const MEMORY_LIMIT: usize = 4 << 30;
 
 // values /////////////////////////////////////////////////////////////////////
-
-/// A JS value this code owns a reference to, released when it drops.
-pub struct Owned {
-    ctx: *mut JSContext,
-    pub v: JSValue,
-}
-
-impl Owned {
-    pub fn new(ctx: *mut JSContext, v: JSValue) -> Owned {
-        Owned { ctx, v }
-    }
-}
-
-impl Drop for Owned {
-    fn drop(&mut self) {
-        unsafe { JS_FreeValue(self.ctx, self.v) }
-    }
-}
-
-/// a JS value's text, as the string it converts to; None with the exception pending
-pub(crate) fn text_of(ctx: *mut JSContext, v: JSValue) -> Option<Vec<u8>> {
-    js_string(ctx, v)
-}
-
-fn cstring(s: &str) -> CString {
-    CString::new(s.replace('\0', "\\0")).unwrap()
-}
-
-pub(crate) fn throw_type(ctx: *mut JSContext, msg: &str) -> JSValue {
-    let m = cstring(msg);
-    unsafe { JS_ThrowTypeError(ctx, c"%s".as_ptr(), m.as_ptr()) }
-}
-
-fn throw_range(ctx: *mut JSContext, msg: &str) -> JSValue {
-    let m = cstring(msg);
-    unsafe { JS_ThrowRangeError(ctx, c"%s".as_ptr(), m.as_ptr()) }
-}
-
-fn throw_internal(ctx: *mut JSContext, msg: &str) -> JSValue {
-    let m = cstring(msg);
-    unsafe { JS_ThrowInternalError(ctx, c"%s".as_ptr(), m.as_ptr()) }
-}
-
-/// throws a plain Error, as the skeleton's own checks do
-pub(crate) fn throw_error(ctx: *mut JSContext, msg: &str) -> JSValue {
-    unsafe {
-        let e = JS_NewError(ctx);
-        JS_SetPropertyStr(
-            ctx,
-            e,
-            c"message".as_ptr(),
-            JS_NewStringLen(ctx, msg.as_ptr() as *const _, msg.len()),
-        );
-        JS_Throw(ctx, e)
-    }
-}
-
-/// whether obj has the property name, as `name in obj` answers; -1 with an exception
-pub(crate) fn has_prop(ctx: *mut JSContext, obj: JSValue, name: &str) -> c_int {
-    unsafe {
-        let atom = JS_NewAtomLen(ctx, name.as_ptr() as *const _, name.len());
-        let has = JS_HasProperty(ctx, obj, atom);
-        JS_FreeAtom(ctx, atom);
-        has
-    }
-}
-
-fn new_string(ctx: *mut JSContext, s: &[u8]) -> JSValue {
-    unsafe { JS_NewStringLen(ctx, s.as_ptr() as *const _, s.len()) }
-}
 
 /// A name (a key, a slice, a variable) and whether it holds U+0000.  Its text stops at the first
 /// U+0000, as a message naming it shows it.
@@ -660,7 +590,7 @@ impl Host {
                 writing: Cell::new(false),
                 slot: Cell::new(None),
                 track: RefCell::new(None),
-                scan_budget: Cell::new(scan::SCAN_STEP_BUDGET),
+                scan_budget: Cell::new(SCAN_STEP_BUDGET),
                 env_names: o.env_names,
                 hasher: o.hasher,
                 deadline: Cell::new(None),
