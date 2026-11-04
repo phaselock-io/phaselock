@@ -3,7 +3,8 @@
     "type": "module",
     "scripts": {
         "gen": "tsp compile model.tsp",
-        "bundle": "esbuild db.ts --bundle --format=iife --log-level=warning --define:process.env.NODE_ENV=\\\"development\\\" --outfile=bundle.js"
+        "bundle": "esbuild db.ts --bundle --format=iife --log-level=warning --define:process.env.NODE_ENV=\\\"development\\\" --outfile=bundle.js",
+        "bundle:native": "esbuild native.ts --bundle --format=iife --log-level=warning --define:process.env.NODE_ENV=\\\"development\\\" --outfile=native.bundle.js"
     },
     "exports": {
         "./ui": "./ui.ts"
@@ -11,6 +12,7 @@
     "devDependencies": {
         "@phaselock/plugins": "^0.2.0",
         "@phaselock/typespec-core": "^0.2.0",
+        "@phaselock/typespec-kt": "^0.2.0",
         "@phaselock/typespec-ts": "^0.2.0",
         "@typespec/compiler": "^1.0.0",
         "esbuild": "^0.25.0"

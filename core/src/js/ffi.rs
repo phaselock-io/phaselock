@@ -190,6 +190,22 @@ unsafe extern "C" {
     pub fn JS_IsFunction(ctx: *mut JSContext, v: JSValue) -> JS_BOOL;
     pub fn JS_IsArray(ctx: *mut JSContext, v: JSValue) -> c_int;
     pub fn JS_GetClassID(v: JSValue) -> JSClassID;
+
+    pub fn JS_CallConstructor(
+        ctx: *mut JSContext,
+        func: JSValue,
+        argc: c_int,
+        argv: *const JSValue,
+    ) -> JSValue;
+    pub fn JS_GetTypedArrayBuffer(
+        ctx: *mut JSContext,
+        obj: JSValue,
+        pbyte_offset: *mut usize,
+        pbyte_length: *mut usize,
+        pbytes_per_element: *mut usize,
+    ) -> JSValue;
+    pub fn JS_IsJobPending(rt: *mut JSRuntime) -> JS_BOOL;
+    pub fn JS_ExecutePendingJob(rt: *mut JSRuntime, pctx: *mut *mut JSContext) -> c_int;
 }
 
 // the header's inline functions and macros

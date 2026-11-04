@@ -480,6 +480,10 @@ interface AdminQueries extends Queries {
   allPatronIds(): Uuid[];
   allPatrons(): Patron[];
   allEditions(): AdminEditionInfo[];
+  // the librarians' notices, each of a checkout that failed after it was queued
+  notices(): Notice[];
+  // when the room was created, or null until it syncs and once the reaper erases it
+  roomCreated(): utcDateTime | null;
 }
 
 model UserCheckoutInfo {
@@ -510,4 +514,6 @@ model UserPatronInfo {
 interface UserQueries extends Queries {
   allBooks(): UserBookInfo[];
   myPatron(): UserPatronInfo;
+  // the patron's notices, each of a hold that closed or failed without them
+  notices(): Notice[];
 }

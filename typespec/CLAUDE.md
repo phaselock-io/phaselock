@@ -71,7 +71,9 @@ layout, build commands, and the test suite.
   identities a Registry answers for and its mutations union (`{engine}Schema`,
   `{database}Schema`, each `{ nodes, ids, mutations }`).  A host converts by walking it, reading
   and writing, checked against the schema both ways: `client/ts`'s `buildRegistry` in JS,
-  `core/src/walk.rs` in Rust.  A new type kind is a new node kind, handled in every walker.
+  `core/src/walk.rs` in Rust, and `client/kotlin`'s `Registry` in Kotlin.  Every emitter prints
+  the node table from one `buildSchema` (`typespec/core/src/schema.ts`).  A new type kind is a
+  new node kind, handled in every walker.
 - **`skeleton.ts` has no library dependencies.**  It is pure logic: every codec, transport, and
   store with outside dependencies comes from the host (`client/ts`, `db/`), reaching the
   Engine through the `Registry`, `Transport`, and `Store` interfaces.  A session is opaque here:

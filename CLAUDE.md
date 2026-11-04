@@ -67,18 +67,22 @@ Two kinds of work happen here; orient first:
 ```
 typespec/         The product: TypeSpec vocabulary (core/), the
                   TypeScript emitter (ts/, with its runtime skeleton in
-                  assets/), and their tests. See typespec/CLAUDE.md and
-                  typespec/README.md.
+                  assets/), the Kotlin emitter (kt/), and their tests.
+                  See typespec/CLAUDE.md and typespec/README.md.
 examples/
   todo-basic/     Smallest loop: browser engines + the v0 database (db/).
   library/        Full architecture on the v0 database: signed-in patrons
                   and librarians, per-audience views, predictions, and a
                   cron daily sheet, hosted as a demo with a room per
-                  visitor.
+                  visitor; android/ is its Android app.
 client/ts/        @phaselock/client: the JS host's transport over HTTP
                   (logins, sessions, connections), its msgpack cursor,
                   and the Registry that walks the generated type
                   registry.
+client/kotlin/    The Kotlin host: the transport, sessions, the Kotlin
+                  registry walk, and the native host (native/, Rust over
+                  core/) that runs the TS Engine in QuickJS over LMDB.
+                  See client/kotlin/README.md.
 plugins/          @phaselock/plugins: the plugins we ship, as a
                   database's bundle installs them; cron so far.
 core/             phaselock-core: the Rust code every Rust host builds

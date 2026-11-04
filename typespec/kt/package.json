@@ -1,0 +1,38 @@
+{
+  "name": "@phaselock/typespec-kt",
+  "version": "0.2.0",
+  "description": "Kotlin emitter for PhaseLock TypeSpec models",
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public",
+    "main": "dist/index.js",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "prepack": "rm -rf dist && pnpm run build"
+  },
+  "peerDependencies": {
+    "@phaselock/typespec-core": "workspace:*",
+    "@typespec/compiler": "^1.0.0"
+  },
+  "devDependencies": {
+    "@phaselock/typespec-core": "workspace:*",
+    "@types/node": "^22.0.0",
+    "@typespec/compiler": "^1.0.0",
+    "typescript": "^5.6.0"
+  },
+  "files": [
+    "dist/**"
+  ]
+}

@@ -7,6 +7,7 @@ import type {
   AdminEngineQueryTxn,
   AdminQueryDefs,
   Book,
+  Notice,
   PatronHold,
   UserBookInfo,
   UserEngineQueryTxn,
@@ -78,6 +79,10 @@ export const userQueries: UserQueryDefs<UserEngineQueryTxn> = {
     }
     return { name: '', color: '', researcher: false, holds: [], checkouts: [] };
   },
+
+  notices(qx): Notice[] {
+    return [...qx.scan.patron_notice()].map(([, notice]) => notice);
+  },
 };
 
 /** the librarians' queries; their Engine syncs every patron */
@@ -128,5 +133,15 @@ export const adminQueries: AdminQueryDefs<AdminEngineQueryTxn> = {
       out.push({ isbn, title: edition.title, books });
     }
     return out.sort((a, b) => a.title.localeCompare(b.title));
+  },
+
+  notices(qx): Notice[] {
+    return [...qx.scan.admin_notice()].map(([, notice]) => notice);
+  },
+
+  // room stuff: the room's own record, which the reaper erases with the rest of the room
+  roomCreated(qx) {
+    for (const [, created] of qx.scan.room_created()) return created;
+    return null;
   },
 };

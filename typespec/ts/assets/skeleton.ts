@@ -4901,4 +4901,37 @@ export async function postWithSchema(
   return result;
 }
 
+// native hosts //////////////////////////////////////////////////////////////
+
+/** How a native host builds one of the model's Engines: over the host's transport and store,
+    syncing as the session it hands in, ended by the signal it holds, and reporting the error
+    that ended it.  An app's native bundle passes its predictors here. */
+export type HostedEngineFactory = (
+  transport: Transport,
+  options: {
+    session: Session | null;
+    store?: StoreFactory;
+    signal: Signal;
+    onError: (e: unknown) => void;
+  },
+) => Engine<any, any, any, any>;
+
+/** The declared queries an Engine serves to its native host: a call arrives as msgpack under
+    wire, the queries interface's union of call tuples, and serve runs it over the Engine; each
+    result goes back converted under the call's query id plus `#result`. */
+export type HostedQueries = {
+  wire: string;
+  serve: (engine: any, call: any) => Query<unknown>;
+};
+
+/** One Engine of a native bundle: how to build it, and the declared queries it serves. */
+export type HostedEngine = { create: HostedEngineFactory; queries?: HostedQueries };
+
+/** Installs a native bundle's Engines as `globalThis.__engines`, by the names the host's
+    generated code builds them under: what a host that runs the Engine in an embedded JS engine
+    loads, as a database loads its `Bundle`. */
+export function installEngines(engines: Record<string, HostedEngine>): void {
+  (globalThis as { __engines?: Record<string, HostedEngine> }).__engines = engines;
+}
+
 // end of skeleton ////////////////////////////////////////////////////////////

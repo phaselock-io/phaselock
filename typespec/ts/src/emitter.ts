@@ -12,15 +12,18 @@
  */
 
 import {
+  buildSchema,
   CheckJsonType,
   CheckLength,
   CheckLiteral,
+  databaseMutationUnions,
   Denter,
   GetField,
   GetIndex,
   HasField,
   type LoweredProgram,
   Match,
+  type NodeData,
   PArray,
   PBool,
   type PDatabase,
@@ -44,8 +47,12 @@ import {
   PType,
   PTypeRegistry,
   PUnion,
+  queryId,
+  queryStem,
+  queryWireType,
   type Solution,
   solveUnion,
+  storeTypeName,
 } from '@phaselock/typespec-core';
 
 type Annos = Map<PType, string>;
@@ -241,151 +248,9 @@ function walkSolution(d: Denter, solution: Solution, onMatch: (t: PType) => stri
    database a Schema naming that table, the identities a Registry answers for, and its mutations
    union.  Hosts walk it to convert values. */
 
-/** the type identities a Schema answers for, each to its type */
-type Identities = Map<string, PType>;
-
-/** the node table being built: each type's index, in visiting order */
-class NodeTable {
-  readonly index = new Map<PType, number>();
-  readonly order: PType[] = [];
-  // each union's solution, and the key each struct writes first: the field a union tells it
-  // apart from its other members by, the first union to name one winning
-  readonly #solutions = new Map<PUnion, Solution>();
-  readonly #discriminators = new Map<PType, string>();
-  private readonly registry: PTypeRegistry;
-
-  constructor(registry: PTypeRegistry) {
-    this.registry = registry;
-  }
-
-  /** the index of a type's node, visiting its children first; a result is its base's node */
-  visit(t: PType): number {
-    if (t instanceof PResult) return this.visit(t.base);
-    const seen = this.index.get(t);
-    if (seen !== undefined) return seen;
-    const i = this.order.length;
-    this.index.set(t, i);
-    this.order.push(t);
-    if (t instanceof PStruct) for (const ft of t.fields.values()) this.visit(ft);
-    else if (t instanceof PObject) this.visit(t.valueType);
-    else if (t instanceof PArray) this.visit(t.itemType);
-    else if (t instanceof PTuple) for (const it of t.itemTypes) this.visit(it);
-    else if (t instanceof PUnion) for (const ut of t.types) this.visit(ut);
-    else if (t instanceof PIntake) this.visit(t.wire);
-    return i;
-  }
-
-  /** solve every union in the table, and learn the discriminator of each struct a `field` test
-      tells apart */
-  learn(): void {
-    const visit = (sln: Solution, key: string | null): void => {
-      if (sln instanceof Match) {
-        if (key !== null && !this.#discriminators.has(sln.typ)) {
-          this.#discriminators.set(sln.typ, key);
-        }
-      } else if (sln instanceof CheckJsonType || sln instanceof CheckLiteral) {
-        for (const sub of sln.options.values()) visit(sub, key);
-      } else if (sln instanceof CheckLength) {
-        for (const sub of sln.options.values()) visit(sub, key);
-        if (sln.default !== null) visit(sln.default, key);
-      } else if (sln instanceof GetIndex) {
-        visit(sln.solution, null);
-      } else if (sln instanceof GetField) {
-        visit(sln.solution, key ?? sln.key);
-      } else if (sln instanceof HasField) {
-        for (const [, sub] of sln.solutions) visit(sub, key);
-      }
-    };
-    for (const t of this.order) {
-      if (!(t instanceof PUnion)) continue;
-      const sln = solveUnion(this.registry, t.types);
-      this.#solutions.set(t, sln);
-      visit(sln, null);
-    }
-  }
-
-  /** a solution as data */
-  solution(sln: Solution): string {
-    if (sln instanceof Match) return `["match", ${this.visit(sln.typ)}]`;
-    if (sln instanceof CheckJsonType) {
-      const opts = [...sln.options].map(
-        ([jt, sub]) => `[${JSON.stringify(jt)}, ${this.solution(sub)}]`,
-      );
-      return `["jsontype", [${opts.join(', ')}]]`;
-    }
-    if (sln instanceof CheckLiteral) {
-      const opts = [...sln.options].map(
-        ([lit, sub]) => `[${JSON.stringify(lit)}, ${this.solution(sub)}]`,
-      );
-      return `["literal", [${opts.join(', ')}]]`;
-    }
-    if (sln instanceof CheckLength) {
-      const opts = [...sln.options].map(([n, sub]) => `[${n}, ${this.solution(sub)}]`);
-      const dflt = sln.default === null ? 'null' : this.solution(sln.default);
-      return `["length", [${opts.join(', ')}], ${dflt}]`;
-    }
-    if (sln instanceof GetIndex) return `["index", ${sln.i}, ${this.solution(sln.solution)}]`;
-    if (sln instanceof GetField) {
-      return `["field", ${JSON.stringify(sln.key)}, ${this.solution(sln.solution)}]`;
-    }
-    if (sln instanceof HasField) {
-      const opts = sln.solutions.map(([k, sub]) => `[${JSON.stringify(k)}, ${this.solution(sub)}]`);
-      return `["hasfield", [${opts.join(', ')}]]`;
-    }
-    throw new Error(`unrecognized solution type: ${(sln as Solution).constructor.name}`);
-  }
-
-  /** one node as data; children were visited when the type was */
-  node(t: PType): string {
-    const name = JSON.stringify(t.name);
-    const at = (c: PType) => this.index.get(c instanceof PResult ? c.base : c)!;
-    if (t instanceof PNull) return '["null"]';
-    if (t instanceof PInt) return '["int"]';
-    if (t instanceof PString) return '["str"]';
-    if (t instanceof PBool) return '["bool"]';
-    if (t instanceof PDate) return '["date"]';
-    if (t instanceof PJson) return '["json"]';
-    if (t instanceof PLiteral) return `["lit", ${JSON.stringify(t.value)}]`;
-    if (t instanceof PStruct) {
-      const fields = [...t.fields].map(
-        ([k, ft]) => `[${JSON.stringify(k)}, ${at(ft)}, ${t.maybes.has(k)}]`,
-      );
-      const key = this.#discriminators.get(t);
-      const disc = key === undefined ? -1 : [...t.fields.keys()].indexOf(key);
-      return `["struct", ${name}, [${fields.join(', ')}], ${disc}]`;
-    }
-    if (t instanceof PObject) return `["record", ${name}, ${at(t.valueType)}]`;
-    if (t instanceof PArray) return `["array", ${name}, ${at(t.itemType)}]`;
-    if (t instanceof PTuple) return `["tuple", ${name}, [${t.itemTypes.map(at).join(', ')}]]`;
-    if (t instanceof PUnion) {
-      return `["union", ${name}, ${this.solution(this.#solutions.get(t)!)}]`;
-    }
-    if (t instanceof PIntake) return `["intake", ${JSON.stringify(t.kind)}, ${at(t.wire)}]`;
-    throw new Error(`unhandled type in the registry: ${t.constructor.name}`);
-  }
-}
-
-/** the type identity of a type: its name, or a result's vocabulary name */
-function identityOf(t: PType): string {
-  if (t instanceof PResult) return t.kind;
-  if (t.name === null) throw new Error(`a type with no identity: ${t}`);
-  return t.name;
-}
-
-/** the identities of an engine's or a database's slices and mutations, the type of each key
-    template and the mutations union, answering the mutations union's */
-function audienceIdentities(
-  ids: Identities,
-  slices: readonly PSlice[],
-  mutationType: PType | undefined,
-): string | null {
-  for (const slice of slices) {
-    for (const item of slice.store.items) ids.set(storeTypeName(slice, item), item.type);
-  }
-  if (mutationType === undefined) return null;
-  const mutations = identityOf(mutationType);
-  ids.set(mutations, mutationType);
-  return mutations;
+// a node or a solution as TypeScript source
+function show(v: NodeData): string {
+  return Array.isArray(v) ? `[${v.map(show).join(', ')}]` : JSON.stringify(v);
 }
 
 /** the node table, the identity map, and a Schema per engine and per database */
@@ -398,35 +263,18 @@ function generateSchema(
   mutationUnions: Map<PDatabase, PType>,
   queries: readonly PQueries[],
 ): void {
-  const ids: Identities = new Map();
-  for (const t of roots) ids.set(identityOf(t), t);
-
-  // each audience's own identities
-  const audiences: [string, string | null][] = [];
-  for (const e of engines) {
-    audiences.push([e.name, audienceIdentities(ids, e.slices, e.mutationType)]);
-  }
-  for (const db of databases) {
-    audiences.push([db.name, audienceIdentities(ids, db.slices, mutationUnions.get(db))]);
-  }
-
-  // every query's wire type, and each result under the query's id plus #result
-  for (const kq of queries) {
-    if (!kq.queries.length) continue;
-    const wire = queryWireType(registry, kq);
-    ids.set(identityOf(wire), wire);
-    for (const q of kq.queries) ids.set(`${queryId(kq, q)}#result`, q.result);
-  }
-
-  // the table, in identity order
-  const table = new NodeTable(registry);
-  for (const t of ids.values()) table.visit(t);
-  table.learn();
-
+  const { table, ids, audiences } = buildSchema(
+    registry,
+    roots,
+    engines,
+    databases,
+    mutationUnions,
+    queries,
+  );
   d.print('\n// the type registry: one node table, and the schema of each engine and database\n');
   d.print('const schemaNodes: SchemaNode[] = [\n');
   d.indent('  ');
-  for (const t of table.order) d.print(`${table.node(t)},\n`);
+  for (const t of table.order) d.print(`${show(table.node(t))},\n`);
   d.dedent();
   d.print('];\n');
   d.print('const schemaIds: Record<string, number> = {\n');
@@ -520,12 +368,6 @@ function generateDispatch(
    assignable to each of its engines', writes included. */
 
 /** the type a store value travels under: its own name, or failing that the key it is kept at */
-function storeTypeName(slice: PSlice, item: PStoreItem): string {
-  const t = item.type;
-  if (t.name !== null) return t.name;
-  if (t instanceof PResult) return t.kind;
-  return `${slice.family}/${item.name}`;
-}
 
 /** one accessor: its name and parameters, the key it names, and its value's annotation and type */
 type Accessor = {
@@ -1069,35 +911,6 @@ export function ${post}(
 // queries ///////////////////////////////////////////////////////////////////
 
 /** "AdminQueries" → "Admin"; the stem names the per-interface artifacts */
-function queryStem(name: string): string {
-  return name.endsWith('Queries') ? name.slice(0, -'Queries'.length) : name;
-}
-
-/** the wire id of one query: unique across all interfaces a connection may carry */
-function queryId(kq: PQueries, q: PQuery): string {
-  return `${kq.name}.${q.name}`;
-}
-
-/**
- * Build the wire message type for a queries interface: a union of `[id, ...args]` tuples,
- * discriminated by the id literal.  Optional arguments are nullable on the wire (a JSON array
- * has no way to omit an element).  Naming the union routes it through the same annotation,
- * decoder, and checker generation as any declared type, which is what gives the serving side
- * `check<Stem>Query` for ingress and `decode<Stem>Query` for typed dispatch.
- */
-function queryWireType(registry: PTypeRegistry, kq: PQueries): PType {
-  const wire = registry.union(
-    kq.queries.map((q) =>
-      registry.tuple([
-        registry.literal(queryId(kq, q)),
-        ...q.args.map(([, at, opt]) => (opt ? registry.union([at, registry.null_()]) : at)),
-      ]),
-    ),
-  );
-  if (wire.name === null) wire.name = queryStem(kq.name!) + 'Query';
-  return wire;
-}
-
 /**
  * Generate the typed query layer for one Queries interface: the wire id constants, the defs
  * interface an author implements, the provider interface call sites consume, the local and
@@ -1221,14 +1034,11 @@ export function generateTs(lowered: LoweredProgram, skeleton: string): string {
 
   // A database needs the PasswordHash its bootstrap makes, and the union of its mutations, which
   // its bundle checks and dispatches on.
-  const mutationUnions = new Map<PDatabase, PType>();
+  const mutationUnions = databaseMutationUnions(registry, databases);
   for (const db of databases) {
     typesToVisit.push(registry.result('PasswordHash', registry.string()));
-    if (db.mutations.length === 0) continue;
-    const union = registry.union(db.mutations.map((m) => m.type));
-    if (union.name === null) union.name = `${db.name}Mutation`;
-    mutationUnions.set(db, union);
-    typesToVisit.push(union);
+    const union = mutationUnions.get(db);
+    if (union !== undefined) typesToVisit.push(union);
   }
 
   // Queries need their wire message type (which carries the arg types inside it) and their

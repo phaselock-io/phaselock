@@ -81,3 +81,16 @@ Steps to run the example:
 - generate code: `pnpm gen`
 - run the demo in dev mode: `pnpm dev`
 - visit `http://localhost:3000` in your browser
+
+## Run the Android app
+
+The Android app in `android/` runs each window in a tab, its Engines in
+QuickJS over LMDB through the Kotlin client (`client/kotlin`).  It needs a
+Rust toolchain with the Android targets and cargo-ndk, JDK 21, and the
+Android SDK with the NDK.
+
+- build and install: `cd android && ./gradlew :app:installDebug`
+- the app opens rooms on the hosted demo by default, and a room's id from
+  the web demo at demo.phaselock.io joins its room
+- for a database of your own, enter its address instead: from the
+  emulator, `pnpm dev`'s is `http://10.0.2.2:8080/phaselock`

@@ -122,6 +122,61 @@ pub fn parse_whole(data: &[u8]) -> Result<Node<'_>, ParseError> {
     Ok(n)
 }
 
+/// The length of the msgpack value data starts with, read from its headers alone: no part of it
+/// is decoded, and nothing is allocated, however large or deep the value.
+pub fn skip(data: &[u8]) -> Result<usize, ParseError> {
+    let mut p = Parser { data, at: 0, left: usize::MAX };
+
+    // the values still to pass, each container adding its elements to them
+    let mut pending: usize = 1;
+    while pending > 0 {
+        pending -= 1;
+        let c = p.take(1)?[0];
+        let (payload, items) = match c {
+            0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => (0, 0),
+            0x80..=0x8f => (0, 2 * (c & 0x0f) as usize),
+            0x90..=0x9f => (0, (c & 0x0f) as usize),
+            0xa0..=0xbf => ((c & 0x1f) as usize, 0),
+            0xc4 | 0xd9 => (p.be(1)? as usize, 0),
+            0xc5 | 0xda => (p.be(2)? as usize, 0),
+            0xc6 | 0xdb => (p.be(4)? as usize, 0),
+            0xc7..=0xc9 => (p.be(1 << (c - 0xc7))? as usize + 1, 0),
+            0xcc | 0xd0 => (1, 0),
+            0xcd | 0xd1 => (2, 0),
+            0xca | 0xce | 0xd2 => (4, 0),
+            0xcb | 0xcf | 0xd3 => (8, 0),
+            0xd4..=0xd8 => (1 + (1 << (c - 0xd4)), 0),
+            0xdc => (0, p.be(2)? as usize),
+            0xdd => (0, p.be(4)? as usize),
+            0xde => (0, 2 * p.be(2)? as usize),
+            0xdf => (0, 2 * p.be(4)? as usize),
+            _ => return Err(ParseError::Invalid),
+        };
+        p.take(payload)?;
+
+        // every element takes a byte at least, so a count past the bytes left is truncated
+        pending = pending.checked_add(items).ok_or(ParseError::Truncated)?;
+        if pending > data.len() - p.at {
+            return Err(ParseError::Truncated);
+        }
+    }
+    Ok(p.at)
+}
+
+/// The element count of the array data starts with, and the length of its header; its elements
+/// follow the header.
+pub fn array_header(data: &[u8]) -> Result<(usize, usize), ParseError> {
+    let mut p = Parser { data, at: 0, left: usize::MAX };
+    let c = p.take(1)?[0];
+    let n = match c {
+        0x90..=0x9f => (c & 0x0f) as usize,
+        0xdc => p.be(2)? as usize,
+        0xdd => p.be(4)? as usize,
+        _ => return Err(ParseError::Invalid),
+    };
+    Ok((n, p.at))
+}
+
 struct Parser<'a> {
     data: &'a [u8],
     at: usize,
@@ -473,5 +528,42 @@ mod tests {
             b.extend_from_slice(&(5 * (levels - 1 - i) as u32).to_be_bytes());
         }
         assert_eq!(parse(&b).unwrap_err(), ParseError::TooDeep);
+    }
+
+    #[test]
+    fn a_skip_passes_what_a_parse_takes() {
+        // one value of every encoding, alone and inside containers
+        let mut w = Writer::new();
+        w.array(3);
+        w.map(2);
+        w.str(b"k");
+        w.bin(&[1u8; 300]);
+        w.str(b"s");
+        w.str(&[b'x'; 40]);
+        w.timestamp(1, 2);
+        w.array(5);
+        w.int(-1);
+        w.uint(70000);
+        w.double(1.5);
+        w.int(i64::MIN);
+        w.bool(true);
+        let mut b = w.into_vec();
+        let whole = b.len();
+        b.extend_from_slice(&[0xc0, 0xc0]);
+        assert_eq!(skip(&b), Ok(whole));
+        assert_eq!(parse(&b).unwrap().1, whole);
+
+        // a header claiming more than the bytes left is truncated, however deep
+        assert_eq!(skip(&nils(5)[..4]), Err(ParseError::Truncated));
+        let deep = [0x91u8; 100_000];
+        assert_eq!(skip(&deep), Err(ParseError::Truncated));
+        assert_eq!(skip(&[0xc1]), Err(ParseError::Invalid));
+    }
+
+    #[test]
+    fn an_array_header_counts_its_elements() {
+        assert_eq!(array_header(&nils(3)), Ok((3, 1)));
+        assert_eq!(array_header(&nils(70000)), Ok((70000, 5)));
+        assert_eq!(array_header(&[0xc0]), Err(ParseError::Invalid));
     }
 }

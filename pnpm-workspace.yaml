@@ -2,6 +2,7 @@ packages:
   - typespec
   - typespec/core
   - typespec/ts
+  - typespec/kt
   - typespec/py
   - typespec/go
   - typespec/tests

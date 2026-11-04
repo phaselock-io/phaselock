@@ -23,7 +23,7 @@ main({
     db: {
       pre: [
         // build the phaselockdb image
-        exec("docker", "build", "-t", "phaselockdb", "../../db"),
+        exec("docker", "build", "-t", "phaselockdb", "-f", "../../db/Dockerfile", "../.."),
         // build the bundle.js
         exec("pnpm", "--dir", "model", "bundle"),
       ],

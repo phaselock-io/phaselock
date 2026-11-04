@@ -4,4 +4,5 @@ export { $decorators, isOnline } from './decorators.ts';
 export * from './ptypes.ts';
 export * from './solver.ts';
 export * from './denter.ts';
+export * from './schema.ts';
 export { lowerProgram, type LoweredProgram } from './lower.ts';
