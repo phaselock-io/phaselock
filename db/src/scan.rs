@@ -35,6 +35,9 @@ pub struct Pattern {
     head: Vec<u8>, // the text every key the pattern picks out starts with
     fields: Vec<Field>,
     named: bool,
+    // the head and each leading field that admits one value, with the separator after it: the
+    // longest text every key the pattern picks out starts with
+    fixed: Vec<u8>,
 }
 
 // compiling //////////////////////////////////////////////////////////////////
@@ -176,7 +179,14 @@ impl Pattern {
 
     /// the skeleton's compilePattern of a KeyPattern; Err with a JS exception for a malformed one
     pub(crate) fn from_js(ctx: *mut JSContext, v: JSValue) -> Result<Pattern, ()> {
-        let mut p = Pattern { head: Vec::new(), fields: Vec::new(), named: false };
+        let mut p = Pattern::compile(ctx, v)?;
+        p.fixed = p.fixed_prefix();
+        Ok(p)
+    }
+
+    fn compile(ctx: *mut JSContext, v: JSValue) -> Result<Pattern, ()> {
+        let mut p =
+            Pattern { head: Vec::new(), fields: Vec::new(), named: false, fixed: Vec::new() };
         if !is_object(v) {
             js::throw_type(ctx, "a scan's pattern is an object");
             return Err(());
@@ -227,6 +237,26 @@ impl Pattern {
         p.named = true;
         p.value_fields(ctx, local.v, n, b',', 0)?;
         Ok(p)
+    }
+
+    // the text every key the pattern picks out starts with, through its fields that admit one
+    // value: an eq match, or a range closed at both ends on one value
+    fn fixed_prefix(&self) -> Vec<u8> {
+        let mut out = self.head.clone();
+        for f in &self.fields {
+            if f.literal {
+                out.extend_from_slice(&f.lit);
+                continue;
+            }
+            let one = f.single || (f.lo.is_some() && f.lo == f.hi && !f.lo_open && !f.hi_open);
+            let Some(v) = f.lo.as_ref().filter(|_| one) else { break };
+            out.extend_from_slice(v);
+            if f.sep == 0 {
+                break;
+            }
+            out.push(f.sep);
+        }
+        out
     }
 
     /// whether the pattern names a local template, so that its keys share one type
@@ -493,23 +523,24 @@ pub fn push_span(
 /// tests only: a span of the keys starting with head, over the stretch from just past from to to
 #[cfg(test)]
 pub(crate) fn test_span(head: &str, from: Option<Vec<u8>>, to: Option<Vec<u8>>) -> Span {
-    let pattern = Pattern { head: head.as_bytes().to_vec(), fields: Vec::new(), named: false };
+    let head = head.as_bytes().to_vec();
+    let pattern = Pattern { fixed: head.clone(), head, fields: Vec::new(), named: false };
     Span { pattern, reverse: false, from, to }
 }
 
 impl Span {
-    /// The longest text every key the span covers starts with: its pattern's head, or what both
-    /// ends of its stretch share when that is longer, since every key between two texts starts
-    /// with what they share.
+    /// The longest text every key the span covers starts with: the longer of what every key the
+    /// pattern picks out starts with and what both ends of its stretch share, since every key
+    /// between two texts starts with what they share.  An open end is the pattern's own.
     pub fn prefix(&self) -> &[u8] {
-        let head = &self.pattern.head;
+        let fixed = &self.pattern.fixed;
         if let (Some(f), Some(t)) = (&self.from, &self.to) {
             let n = f.iter().zip(t).take_while(|(a, b)| a == b).count();
-            if n > head.len() {
+            if n > fixed.len() {
                 return &f[..n];
             }
         }
-        head
+        fixed
     }
 
     /// whether a key written lies inside what the scan batch read
@@ -562,5 +593,54 @@ impl Span {
             return false;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eq(v: &str, sep: u8) -> Field {
+        let v = Some(v.as_bytes().to_vec());
+        Field { lo: v.clone(), hi: v, single: true, sep, ..Default::default() }
+    }
+
+    fn range(lo: &str, hi: &str, lo_open: bool, hi_open: bool, sep: u8) -> Field {
+        let (lo, hi) = (Some(lo.as_bytes().to_vec()), Some(hi.as_bytes().to_vec()));
+        Field { lo, hi, lo_open, hi_open, sep, ..Default::default() }
+    }
+
+    fn any(sep: u8) -> Field {
+        Field { sep, ..Default::default() }
+    }
+
+    // a span of family fam:{a},{b} with the matches given, over the stretch between from and to
+    fn span(a: Field, b: Field, from: Option<&str>, to: Option<&str>) -> Span {
+        let mut pattern =
+            Pattern { head: b"fam:".to_vec(), fields: vec![a, b], named: false, fixed: Vec::new() };
+        pattern.fixed = pattern.fixed_prefix();
+        let end = |s: Option<&str>| s.map(|s| s.as_bytes().to_vec());
+        Span { pattern, reverse: false, from: end(from), to: end(to) }
+    }
+
+    #[test]
+    fn a_spans_prefix_runs_through_the_fields_that_admit_one_value() {
+        let cases = [
+            // a single batch, its ends open, fixed through its leading eq match
+            (span(eq("p1", b','), any(b'!'), None, None), "fam:p1,"),
+            (span(eq("p1", b','), eq("p2", b'!'), None, None), "fam:p1,p2!"),
+            // a range closed on one value is one value; any other range is not
+            (span(range("p1", "p1", false, false, b','), any(b'!'), None, None), "fam:p1,"),
+            (span(range("p1", "p1", true, true, b','), any(b'!'), None, None), "fam:"),
+            (span(range("p1", "p2", false, true, b','), any(b'!'), None, None), "fam:"),
+            // a field that admits many ends it, whatever follows
+            (span(any(b','), eq("p2", b'!'), None, None), "fam:"),
+            // what the stretch's ends share, when that is longer
+            (span(eq("p1", b','), any(b'!'), Some("fam:p1,xa!k"), Some("fam:p1,xb!k")), "fam:p1,x"),
+            (span(any(b','), any(b'!'), Some("fam:p1,a!k"), Some("fam:p1,b!k")), "fam:p1,"),
+        ];
+        for (s, want) in &cases {
+            assert_eq!(s.prefix(), want.as_bytes(), "want {want:?}");
+        }
     }
 }

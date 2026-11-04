@@ -1046,7 +1046,12 @@ Atomicity:
   under the longest prefix of a slice name that ends at a separator
   and that every key the span covers starts with: `""` for a scan of
   every slice, `fam:` for an unbounded family scan, `fam:p1,` for one
-  bounded within its first parameter, `slice!` for one slice.  A
+  bounded within its first parameter, `slice!` for one slice.  That
+  prefix is the longer of what the two ends of the span's stretch
+  share and what the pattern fixes: its head and each leading field
+  that admits one value, an `eq` match or a range closed on one
+  value, so a scan whose batch left its ends open is filed by its
+  pattern.  A
   written key looks in the buckets of its own such prefixes, and a
   cleared slice in those of `<slice>!`.  An answer's entries change
   only when it runs again, is forgotten, or expires, never during a
