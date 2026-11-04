@@ -1,15 +1,15 @@
 //! The host runs the library's native bundle: an Engine it builds asks Kotlin to connect.
 
 use phaselock_core::mp;
-use phaselock_jni::host::Host;
+use phaselock_jni::host::{Host, Limits};
 
 const BUNDLE: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../examples/library/model/native.bundle.js");
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../examples/library/model/native.dev.bundle.js");
 
 #[test]
 fn an_engine_starts_and_asks_to_connect() {
     let bundle = std::fs::read(BUNDLE).unwrap_or_else(|e| panic!("{BUNDLE}: {e}"));
-    let h = Host::open(&bundle, "native.bundle.js").unwrap();
+    let h = Host::open(&bundle, "native.dev.bundle.js", Limits::default()).unwrap();
     let out = h.create_engine(1, "UserEngine", Some(7), None).unwrap();
 
     // [delay, [["connect", engine, connection, since, view, wants, session]]]

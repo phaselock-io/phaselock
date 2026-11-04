@@ -2,6 +2,7 @@
 
 package io.phaselock.examples.library.android
 
+import androidx.annotation.StringRes
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -12,9 +13,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
@@ -28,10 +33,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.phaselock.client.ConnectionStatus
+import io.phaselock.client.EngineStatus
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 
 /** a patron's marker: the first letter of their name, in their color */
 @Composable
@@ -66,13 +77,30 @@ private fun stateColor(state: ConnectionStatus.State?): Color = when (state) {
     ConnectionStatus.State.CONNECTING, null -> Palette.muted
 }
 
-/** the state of a window's connection, and the switch that takes it offline */
+// what each state of a connection is called
+@StringRes
+private fun stateName(state: ConnectionStatus.State?): Int = when (state) {
+    ConnectionStatus.State.LIVE -> R.string.state_live
+    ConnectionStatus.State.SYNCING -> R.string.state_syncing
+    ConnectionStatus.State.OFFLINE -> R.string.state_offline
+    ConnectionStatus.State.CONNECTING, null -> R.string.state_connecting
+}
+
+/** The state of a window's connection, and the switch that takes it offline and back, which
+    reconnects at once.  It reads the connection's state alone from the Engine's status, so a
+    status that changes otherwise, as progress does through a sync, recomposes nothing. */
 @Composable
-fun ConnectionSwitch(state: ConnectionStatus.State?, online: Boolean, onOnline: (Boolean) -> Unit) {
+fun ConnectionSwitch(status: Flow<EngineStatus>, transport: SwitchedTransport, reconnectNow: () -> Unit) {
+    val state by remember(status) { status.map { it.connection.state }.distinctUntilChanged() }
+        .collectAsStateWithLifecycle(null)
+    val online by transport.online.collectAsStateWithLifecycle()
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Box(Modifier.size(8.dp).background(stateColor(state), CircleShape))
-        Text((state ?: ConnectionStatus.State.CONNECTING).name.lowercase(), color = Palette.muted, fontSize = 13.sp)
-        Switch(checked = online, onCheckedChange = onOnline)
+        Text(stringResource(stateName(state)), color = Palette.muted, fontSize = 13.sp)
+        Switch(checked = online, onCheckedChange = { on ->
+            transport.setOnline(on)
+            if (on) reconnectNow()
+        })
     }
 }
 
@@ -85,7 +113,7 @@ fun NoticeCard(text: String, onDismiss: () -> Unit) {
     ) {
         Row(Modifier.padding(horizontal = 12.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(text, color = Palette.amber, modifier = Modifier.weight(1f))
-            TextButton(onClick = onDismiss) { Text("Dismiss") }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.notice_dismiss)) }
         }
     }
 }
@@ -103,10 +131,16 @@ fun NameDialog(title: String, value: String, onSave: (String) -> Unit, onClose: 
                 val name = draft.trim()
                 if (name.isNotEmpty() && name != value) onSave(name)
                 onClose()
-            }) { Text("Save") }
+            }) { Text(stringResource(R.string.name_save)) }
         },
-        dismissButton = { TextButton(onClick = onClose) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = onClose) { Text(stringResource(R.string.name_cancel)) } },
     )
+}
+
+/** a pencil that edits what it follows, described by what it does */
+@Composable
+fun EditButton(description: String, onClick: () -> Unit) {
+    IconButton(onClick = onClick) { Icon(Icons.Default.Edit, contentDescription = description) }
 }
 
 /** a row's gap before what follows it at the right */

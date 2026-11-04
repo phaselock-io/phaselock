@@ -143,6 +143,10 @@ fun decodeAny(b: ByteArray): Any? = MsgReader(b).run { any().also { if (!done) t
 
 class MsgpackError(message: String) : Exception(message)
 
+/** The kinds of msgpack value, as a value's type byte tells them; EXT is an extension, a
+    timestamp among them, or a byte no value starts with. */
+enum class MsgKind { NIL, BOOL, INT, FLOAT, STR, BIN, ARRAY, MAP, EXT }
+
 /** A pull reader over msgpack bytes.  Each read takes one value at the cursor, or fails. */
 class MsgReader(private val b: ByteArray, var at: Int = 0, private val end: Int = b.size) {
     val done: Boolean get() = at >= end
@@ -170,6 +174,22 @@ class MsgReader(private val b: ByteArray, var at: Int = 0, private val end: Int 
     }
 
     fun isNil(): Boolean = peek() == 0xc0
+
+    /** the kind of the value at the cursor, without consuming it */
+    fun kind(): MsgKind {
+        val c = peek()
+        return when {
+            c == 0xc0 -> MsgKind.NIL
+            c == 0xc2 || c == 0xc3 -> MsgKind.BOOL
+            c <= 0x7f || c >= 0xe0 || c in 0xcc..0xd3 -> MsgKind.INT
+            c == 0xca || c == 0xcb -> MsgKind.FLOAT
+            c in 0xa0..0xbf || c in 0xd9..0xdb -> MsgKind.STR
+            c in 0xc4..0xc6 -> MsgKind.BIN
+            c in 0x90..0x9f || c == 0xdc || c == 0xdd -> MsgKind.ARRAY
+            c in 0x80..0x8f || c == 0xde || c == 0xdf -> MsgKind.MAP
+            else -> MsgKind.EXT
+        }
+    }
 
     fun nil() {
         if (u8() != 0xc0) throw MsgpackError("expected nil")
@@ -309,24 +329,21 @@ class MsgReader(private val b: ByteArray, var at: Int = 0, private val end: Int 
 
     /** A plain value: nil as null, booleans, integers as Long, floats as Double, strings, bin as
         ByteArray, a timestamp as an Instant, arrays as List, maps as Map with String keys. */
-    fun any(): Any? {
-        val c = peek()
-        return when {
-            c == 0xc0 -> { nil(); null }
-            c == 0xc2 || c == 0xc3 -> bool()
-            c <= 0x7f || c >= 0xe0 || c in 0xcc..0xd3 -> long()
-            c == 0xca || c == 0xcb -> double()
-            c in 0xa0..0xbf || c in 0xd9..0xdb -> str()
-            c in 0xc4..0xc6 -> bin()
-            c in 0x90..0x9f || c == 0xdc || c == 0xdd -> List(arrayHeader()) { any() }
-            c in 0x80..0x8f || c == 0xde || c == 0xdf -> {
-                val n = mapHeader()
-                val m = LinkedHashMap<String, Any?>(n)
-                repeat(n) { m[str()] = any() }
-                m
-            }
-            else -> timestamp()
+    fun any(): Any? = when (kind()) {
+        MsgKind.NIL -> { nil(); null }
+        MsgKind.BOOL -> bool()
+        MsgKind.INT -> long()
+        MsgKind.FLOAT -> double()
+        MsgKind.STR -> str()
+        MsgKind.BIN -> bin()
+        MsgKind.ARRAY -> List(arrayHeader()) { any() }
+        MsgKind.MAP -> {
+            val n = mapHeader()
+            val m = LinkedHashMap<String, Any?>(n)
+            repeat(n) { m[str()] = any() }
+            m
         }
+        MsgKind.EXT -> timestamp()
     }
 }
 

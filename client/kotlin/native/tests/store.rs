@@ -2,18 +2,18 @@
 //! walks identically, and the store's conversions and applies, driven through the natives as
 //! the host's Store calls them.
 
-use phaselock_jni::host::Host;
+use phaselock_jni::host::{Host, Limits};
 use serde_json::{Value, json};
 
 const BUNDLE: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../examples/library/model/native.bundle.js");
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../examples/library/model/native.dev.bundle.js");
 const FIXTURE: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../../typespec/tests/fixtures/scan-conformance.json");
 
 /// a host with the library's bundle loaded, and an LMDB store under id 1 in a fresh directory
 fn host() -> (Host, tempfile::TempDir) {
     let bundle = std::fs::read(BUNDLE).unwrap_or_else(|e| panic!("{BUNDLE}: {e}"));
-    let h = Host::open(&bundle, "native.bundle.js").unwrap();
+    let h = Host::open(&bundle, "native.dev.bundle.js", Limits::default()).unwrap();
     let dir = tempfile::tempdir().unwrap();
     h.open_store(1, &dir.path().display().to_string()).unwrap();
     (h, dir)

@@ -14,7 +14,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -24,6 +23,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -44,13 +44,16 @@ import java.time.format.DateTimeFormatter
 private val DAY = DateTimeFormatter.ofPattern("MMM d").withZone(ZoneId.systemDefault())
 
 /** what the patron's hold on a title, or the title's unrestricted copies, come to, in a few words */
+@Composable
 private fun availability(book: UserBookInfo): String {
     val hold = book.hold
+    val expires = hold?.expires
     return when {
-        hold?.pending == true -> "Placing a hold…"
-        hold != null -> hold.expires?.let { "On hold for you until ${DAY.format(it)}" } ?: "On hold for you"
-        book.availableNormal > 0 -> "${book.availableNormal} available"
-        else -> "every copy is taken"
+        hold?.pending == true -> stringResource(R.string.book_placing_hold)
+        hold != null && expires != null -> stringResource(R.string.book_held_until, DAY.format(expires))
+        hold != null -> stringResource(R.string.book_held)
+        book.availableNormal > 0 -> stringResource(R.string.book_available, book.availableNormal)
+        else -> stringResource(R.string.book_taken)
     }
 }
 
@@ -61,8 +64,6 @@ fun PatronWindow(room: String, window: Window<UserEngine>) {
     val patron by remember(eng) { queries.myPatron() }.collectAsStateWithLifecycle(null)
     val books by remember(eng) { queries.allBooks() }.collectAsStateWithLifecycle(null)
     val notices by remember(eng) { queries.notices() }.collectAsStateWithLifecycle(emptyList())
-    val status by remember(eng) { eng.status }.collectAsStateWithLifecycle(null)
-    val online by window.transport.online.collectAsStateWithLifecycle()
     var renaming by remember { mutableStateOf(false) }
 
     fun hold(target: HoldTarget) =
@@ -79,42 +80,43 @@ fun PatronWindow(room: String, window: Window<UserEngine>) {
                     PatronAvatar(p.name, p.color)
                     Gap()
                     Text(p.name, fontWeight = FontWeight.SemiBold)
-                    IconButton(onClick = { renaming = true }) { Text("✎") }
-                    if (p.researcher) Muted("researcher")
+                    EditButton(stringResource(R.string.patron_rename)) { renaming = true }
+                    if (p.researcher) Muted(stringResource(R.string.researcher))
                 }
                 Row(Modifier.weight(1f), horizontalArrangement = Arrangement.End) {
-                    ConnectionSwitch(status?.connection?.state, online) { on ->
-                        window.transport.setOnline(on)
-                        if (on) eng.reconnectNow()
-                    }
+                    ConnectionSwitch(eng.status, window.transport, eng::reconnectNow)
                 }
             }
         }
 
         // holds that closed or failed without the patron, each dismissed on its own
-        items(notices, key = { it.id }) { notice ->
+        items(notices, key = { "notice:${it.id}" }) { notice ->
             NoticeCard(notice.reason) { eng.sendMutation(PatronDismissNotice(room, notice.id, window.user)) }
         }
 
         // the books the patron has out, each with when it is due
         val checkouts = patron?.checkouts.orEmpty()
         if (checkouts.isNotEmpty()) {
-            item { SectionTitle("Checked out") }
-            items(checkouts, key = { it.id }) { c ->
+            item { SectionTitle(stringResource(R.string.patron_checked_out)) }
+            items(checkouts, key = { "checkout:${it.id}" }) { c ->
                 Row(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
                     Text(c.title, Modifier.weight(1f))
-                    if (c.overdue) Text("overdue", color = Palette.alarm) else Muted("due ${DAY.format(c.expires)}")
+                    if (c.overdue) {
+                        Text(stringResource(R.string.patron_overdue), color = Palette.alarm)
+                    } else {
+                        Muted(stringResource(R.string.patron_due, DAY.format(c.expires)))
+                    }
                 }
             }
         }
 
         // the catalog: each title, with a hold, or the hold's cancel
-        item { SectionTitle("Catalog") }
+        item { SectionTitle(stringResource(R.string.section_catalog)) }
         val list = books
         if (list == null) {
             item { CircularProgressIndicator(Modifier.padding(16.dp)) }
         } else {
-            items(list, key = { it.isbn }) { book ->
+            items(list, key = { "book:${it.isbn}" }) { book ->
                 BookRow(
                     book = book,
                     researcher = patron?.researcher == true,
@@ -128,7 +130,7 @@ fun PatronWindow(room: String, window: Window<UserEngine>) {
 
     if (renaming) {
         val p = patron
-        NameDialog("Rename yourself", p?.name.orEmpty(), { name ->
+        NameDialog(stringResource(R.string.patron_rename), p?.name.orEmpty(), { name ->
             eng.sendMutation(RenamePatron(room, window.user, name, Instant.now()))
         }) { renaming = false }
     }
@@ -157,16 +159,16 @@ private fun BookRow(
                     CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
                     Gap()
                 }
-                Text("Cancel hold")
+                Text(stringResource(R.string.book_cancel_hold))
             }
         } else {
             Column(horizontalAlignment = Alignment.End) {
                 FilledTonalButton(onClick = { onHold(HoldTarget.Edition(book.isbn)) }, enabled = book.availableNormal > 0) {
-                    Text("Hold")
+                    Text(stringResource(R.string.book_hold))
                 }
                 val restricted = book.availableRestricted.firstOrNull()
                 if (researcher && restricted != null) {
-                    OutlinedButton(onClick = { onHold(HoldTarget.Book(restricted)) }) { Text("Hold restricted") }
+                    OutlinedButton(onClick = { onHold(HoldTarget.Book(restricted)) }) { Text(stringResource(R.string.book_hold_restricted)) }
                 }
             }
         }

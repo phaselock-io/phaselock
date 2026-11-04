@@ -1,4 +1,74 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">PhaseLock Library</string>
+
+    <!-- choosing a room -->
+    <string name="choose_title">PhaseLock Library Demo</string>
+    <string name="choose_about">A room is a private copy of the library for an hour.  Paste a room\'s id from the web demo to join it, or leave it blank for a room of your own.</string>
+    <string name="choose_database">Database</string>
+    <string name="choose_room">Room</string>
+    <string name="choose_new">New room</string>
+    <string name="choose_open">Open room</string>
+    <string name="choose_clear">Clear</string>
+    <string name="room_reset">The room has reset.</string>
+    <string name="room_ended">The room closed: %1$s</string>
+
+    <!-- the room's banner and tabs -->
+    <string name="banner_room">Room %1$s</string>
+    <string name="banner_syncing">syncing…</string>
+    <string name="banner_resets">resets in %1$d min</string>
+    <string name="banner_clip_label">room id</string>
+    <string name="banner_copy">Copy id</string>
+    <string name="banner_leave">Leave</string>
+    <string name="tab_desk">Front Desk</string>
+    <string name="tab_alice">Alice</string>
+    <string name="tab_bob">Bob</string>
+
+    <!-- every window -->
+    <string name="state_live">live</string>
+    <string name="state_syncing">syncing</string>
+    <string name="state_offline">offline</string>
+    <string name="state_connecting">connecting</string>
+    <string name="notice_dismiss">Dismiss</string>
+    <string name="name_save">Save</string>
+    <string name="name_cancel">Cancel</string>
+    <string name="section_catalog">Catalog</string>
+    <string name="researcher">researcher</string>
+
+    <!-- the front desk -->
+    <string name="desk_title">Front Desk</string>
+    <string name="desk_checkout_failed">Checkout failed: %1$s</string>
+    <string name="desk_patrons">Patrons</string>
+    <string name="desk_rename_patron">Rename patron</string>
+    <string name="desk_new_edition">New edition</string>
+    <string name="desk_add_edition">+ edition</string>
+    <string name="desk_rename_edition">Rename edition</string>
+    <string name="desk_add_copy">+ copy</string>
+    <string name="copy_available">available</string>
+    <string name="copy_on_hold">on hold</string>
+    <string name="copy_checked_out">checked out</string>
+    <string name="copy_restricted">restricted</string>
+    <string name="copy_check_out_to">Check out to</string>
+    <string name="copy_on_hold_for">On hold for %1$s</string>
+    <string name="copy_check_out_to_holder">Check out to %1$s</string>
+    <string name="copy_release_hold">Release hold</string>
+    <string name="copy_checked_out_by">Checked out by %1$s</string>
+    <string name="copy_check_in">Check in</string>
+    <string name="copy_open">Open to everyone</string>
+    <string name="copy_restrict">Restrict to researchers</string>
+    <string name="copy_close">Close</string>
+
+    <!-- a patron's window -->
+    <string name="patron_rename">Rename yourself</string>
+    <string name="patron_checked_out">Checked out</string>
+    <string name="patron_overdue">overdue</string>
+    <string name="patron_due">due %1$s</string>
+    <string name="book_placing_hold">Placing a hold…</string>
+    <string name="book_held_until">On hold for you until %1$s</string>
+    <string name="book_held">On hold for you</string>
+    <string name="book_available">%1$d available</string>
+    <string name="book_taken">every copy is taken</string>
+    <string name="book_cancel_hold">Cancel hold</string>
+    <string name="book_hold">Hold</string>
+    <string name="book_hold_restricted">Hold restricted</string>
 </resources>

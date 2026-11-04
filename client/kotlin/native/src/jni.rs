@@ -2,18 +2,25 @@
 //! byte array of msgpack, so no Java string crosses JNI (whose modified UTF-8 would change a
 //! key's bytes) and the surface stays one function per lifetime step.
 //!
-//! - `open(bundle, name)` loads the native bundle, answering `["ok", host]`;
+//! - `open(bundle, name, limits)` loads the native bundle under `[stack, memory, callMillis]`,
+//!   the JS stack and heap in bytes and each call's deadline, answering `["ok", host]`;
 //! - `call(host, request)` runs one request, `[op, ...args]`, answering `["ok", delay, events]`,
-//!   delay being the milliseconds until the next timer is due, or nil for none;
+//!   delay being the milliseconds until the next timer is due, or nil for none.  The request
+//!   `["connHooks", hooks]` carries every connection hook Kotlin has queued, each
+//!   `[op, connection, ...args]`, so that the frames among them commit together;
 //! - `close(host)` frees the host.
 //!
-//! A request that fails answers `["error", message]`.  A host is used only from the thread that
-//! opened it.
+//! A request that fails answers `["error", message]`.  A call whose deadline passes while JS runs
+//! ends the host: it answers `["ended", message]`, the message naming the limit and the
+//! interrupted JS's backtrace, every store transaction is aborted, and every call after it
+//! answers the same without running any JS.  A host is used only from the thread that opened it.
 
 use jni_sys::{JNIEnv, jbyteArray, jclass, jlong};
 use phaselock_core::mp::{self, Node};
 
-use crate::host::{Host, Push};
+use std::time::Duration;
+
+use crate::host::{Hook, Host, Limits, Push};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -79,8 +86,13 @@ impl<'a> Args<'a> {
     }
 }
 
-/// Runs one request against the host, answering its events.
+/// Runs one request against the host under the call deadline, answering its events.
 pub fn call(h: &Host, request: &[u8]) -> Result<Vec<u8>> {
+    h.timed(|| dispatch(h, request))
+}
+
+// one request, to the host method that serves it
+fn dispatch(h: &Host, request: &[u8]) -> Result<Vec<u8>> {
     let node = mp::parse_whole(request).map_err(|e| format!("request: {e}"))?;
     let items = node.array().ok_or("request: not an array")?;
     let op = items.first().and_then(Node::as_str).ok_or("request: no op")?;
@@ -95,12 +107,11 @@ pub fn call(h: &Host, request: &[u8]) -> Result<Vec<u8>> {
         b"query" => h.query(a.int(0)?, a.int(1)?, a.bin(2)?),
         b"statusQuery" => h.status_query(a.int(0)?, a.int(1)?),
         b"closeQuery" => h.close_query(a.int(0)?),
-        b"connOpen" => h.conn_open(a.int(0)?, a.str(1)?, a.int(2)?),
-        b"connView" => h.conn_view(a.int(0)?, a.str(1)?, a.int(2)?, &a.strings(3)?),
-        b"connEdits" => h.conn_edits(a.int(0)?, a.bin(1)?),
-        b"connLive" => h.conn_live(a.int(0)?, a.int(1)?),
-        b"connVouch" => h.conn_vouch(a.int(0)?, a.int(1)?),
-        b"connEnd" => h.conn_end(a.int(0)?, a.int(1)?, a.str(2)?, a.opt_str(3)?),
+        b"connHooks" => {
+            // every hook read before any is delivered, so a malformed one fails the request whole
+            let list = a.get(0)?.array().ok_or("connHooks: argument 0 is no array")?;
+            h.conn_hooks(&list.iter().map(hook).collect::<Result<Vec<_>>>()?)
+        }
         b"push" => {
             let item = match a.str(2)? {
                 "length" => Push::Length(a.int(3)?),
@@ -121,8 +132,41 @@ pub fn call(h: &Host, request: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-// an answer: ok and the events a call returned, or the error
-fn answer(r: Result<Vec<u8>>) -> Vec<u8> {
+// one hook of a connHooks request, [op, connection, ...args]
+fn hook<'a>(request: &'a Node<'a>) -> Result<(i64, Hook<'a>)> {
+    let items = request.array().ok_or("connHooks: a hook is not an array")?;
+    let op = items.first().and_then(Node::as_str).ok_or("connHooks: a hook has no op")?;
+    let a = Args { op, items };
+    let hook = match op {
+        b"connOpen" => Hook::Open { epoch: a.str(1)?, head: a.int(2)? },
+        b"connView" => {
+            Hook::View { token: a.str(1)?, position: a.int(2)?, selectors: a.strings(3)? }
+        }
+        b"connEdits" => Hook::Edits(a.bin(1)?),
+        b"connLive" => Hook::Live(a.int(1)?),
+        b"connVouch" => Hook::Vouch(a.int(1)?),
+        b"connEnd" => Hook::End { code: a.int(1)?, reason: a.str(2)?, fatal: a.opt_str(3)? },
+        _ => return Err(format!("connHooks: unknown hook {}", a.name())),
+    };
+    Ok((a.int(0)?, hook))
+}
+
+// the limits open takes, [stack, memory, callMillis]
+fn limits(bytes: &[u8]) -> Result<Limits> {
+    let node = mp::parse_whole(bytes).map_err(|e| format!("limits: {e}"))?;
+    let items = node.array().ok_or("limits: not an array")?;
+    let int = |i: usize| -> Result<u64> {
+        items.get(i).and_then(Node::as_u64).ok_or_else(|| format!("limits: item {i} is no count"))
+    };
+    Ok(Limits {
+        stack: int(0)? as usize,
+        memory: int(1)? as usize,
+        call: Duration::from_millis(int(2)?),
+    })
+}
+
+// an answer: ok and the events a call returned, the error, or why the host ended
+fn answer(r: Result<Vec<u8>>, ended: bool) -> Vec<u8> {
     let mut w = mp::Writer::new();
     match r {
         Ok(events) => {
@@ -134,7 +178,7 @@ fn answer(r: Result<Vec<u8>>) -> Vec<u8> {
         }
         Err(e) => {
             w.array(2);
-            w.str(b"error");
+            w.str(if ended { b"ended" } else { b"error" });
             w.str(e.as_bytes());
         }
     }
@@ -170,12 +214,13 @@ pub unsafe extern "system" fn Java_io_phaselock_client_Native_open(
     _: jclass,
     bundle: jbyteArray,
     name: jbyteArray,
+    limits: jbyteArray,
 ) -> jbyteArray {
     unsafe {
         let bundle = read(env, bundle);
         let name = String::from_utf8_lossy(&read(env, name)).into_owned();
         let mut w = mp::Writer::new();
-        match Host::open(&bundle, &name) {
+        match self::limits(&read(env, limits)).and_then(|l| Host::open(&bundle, &name, l)) {
             Ok(h) => {
                 w.array(2);
                 w.str(b"ok");
@@ -201,7 +246,8 @@ pub unsafe extern "system" fn Java_io_phaselock_client_Native_call(
     unsafe {
         let h = &*(host as *const Host);
         let request = read(env, request);
-        write(env, &answer(call(h, &request)))
+        let r = call(h, &request);
+        write(env, &answer(r, h.ended().is_some()))
     }
 }
 

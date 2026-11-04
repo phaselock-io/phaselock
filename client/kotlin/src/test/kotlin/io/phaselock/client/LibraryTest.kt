@@ -9,6 +9,7 @@ import java.time.Instant
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -58,16 +59,19 @@ class LibraryTest {
     private val model = File(Database.repo, "examples/library/model")
     private val db = Database(File(model, "bundle.js"))
     private val transport = HttpTransport(db.url)
-    private val host = EngineHost(File(model, "native.bundle.js").readBytes(), "native.bundle.js", transport)
+    private val host = runBlocking { openHost() }
     private val stores = Files.createTempDirectory("stores").toFile()
 
     @AfterTest
     fun close() {
-        host.close()
+        runBlocking { host.closeAndJoin() }
         transport.close()
         db.close()
         stores.deleteRecursively()
     }
+
+    private suspend fun openHost(): EngineHost =
+        EngineHost.open(File(model, "native.dev.bundle.js").readBytes(), "native.dev.bundle.js", transport)
 
     // a room the database seeded
     private suspend fun room(): String {
@@ -85,7 +89,7 @@ class LibraryTest {
         withTimeout(30_000) {
             val room = room()
             val session = signIn(room, "alice")
-            val alice = UserEngine(host, session, File(stores, "alice"))
+            val alice = UserEngine.open(host, session, File(stores, "alice"))
             var ended: EngineEnded? = null
             alice.onEnded { ended = it }
             val queries = UserQueries(alice)
@@ -121,8 +125,8 @@ class LibraryTest {
         withTimeout(30_000) {
             val room = room()
             val bobSession = signIn(room, "bob")
-            val bob = UserEngine(host, bobSession, File(stores, "bob"))
-            val admin = AdminEngine(host, signIn(room, "admin"), null)
+            val bob = UserEngine.open(host, bobSession, File(stores, "bob"))
+            val admin = AdminEngine.open(host, signIn(room, "admin"), null)
             val adminQueries = AdminQueries(admin)
 
             // the librarian sees both patrons, and checks out an unrestricted copy to Bob
@@ -141,6 +145,33 @@ class LibraryTest {
             val checkouts = UserQueries(bob).myPatron().first { it.checkouts.isNotEmpty() }.checkouts
             assertEquals("War and Peace", checkouts[0].title)
             assertTrue(adminQueries.roomCreated().first() != null)
+        }
+    }
+
+    @Test
+    fun aStoreOpensAgainInAnotherHostOnceItsHostHasClosed() = runBlocking<Unit> {
+        withTimeout(30_000) {
+            val room = room()
+            val session = signIn(room, "alice")
+            val store = File(stores, "alice")
+
+            // the catalog, synced into the store
+            val first = UserEngine.open(host, session, store)
+            UserQueries(first).allBooks().first { it.size == 4 }
+            host.closeAndJoin()
+
+            // a closed host fails what it is asked
+            assertFailsWith<HostError> { UserEngine.open(host, session, null) }
+            assertFailsWith<HostError> { first.sendMutation(CancelHold(room, generateUuid(), session.user.substringAfter('.'))) }
+
+            // another host opens the same directory, since the first host's close has completed
+            val next = openHost()
+            try {
+                val again = UserEngine.open(next, session, store)
+                UserQueries(again).allBooks().first { it.size == 4 }
+            } finally {
+                next.closeAndJoin()
+            }
         }
     }
 }

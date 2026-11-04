@@ -219,17 +219,22 @@
     return e;
   }
 
-  // a query's results as events, each encoded by encode
+  // a query's results as events, each encoded by encode as an ArrayBuffer; a result whose bytes
+  // are the last result's is not sent again
   function serve(id, query, encode) {
     queries.set(id, query);
+    let last = null;
     query.subscribe((value) => {
       let bytes;
       try {
         bytes = encode(value);
       } catch (e) {
+        last = null;
         emit('queryFailed', id, describe(e));
         return;
       }
+      if (last !== null && pl.equal(last, bytes)) return;
+      last = bytes;
       emit('queryResult', id, bytes);
     });
   }

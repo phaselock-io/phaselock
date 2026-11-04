@@ -33,11 +33,14 @@ The native host is sans-IO.  One thread, the engine thread, calls into it;
 each call answers with the events the JS side raised (connect, backfill,
 send, query results) and when its next timer is due.  `EngineHost` acts on
 the events, running the transport's work on the IO dispatcher and handing
-its results back to the engine thread.  Kotlin holds ids, never JS values,
-and no string crosses JNI: every argument and answer is msgpack.
+its results back to the engine thread.  The connections' hooks queue, and
+each drain of the queue is one call, so the Engine commits the frames that
+arrive together in one transaction.  Kotlin holds ids, never JS values, and
+no string crosses JNI: every argument and answer is msgpack.
 
-Each Engine's store is an LMDB environment in a directory of its own,
-opened without LMDB's lock file, since only the engine thread touches it.
+Each Engine's store is an LMDB environment in a directory of its own, with
+LMDB's lock file, so LMDB itself keeps one writer at a time and frees no page
+a reader still uses.
 
 ## Build and test
 

@@ -353,7 +353,9 @@ Every frame is an array whose first element is a tag.
         mean nothing across epochs, and a copy of a data directory
         that is to diverge must get a fresh one),
         PhaseLock-Time (unix ms), PhaseLock-View (token),
-        PhaseLock-Position (the position the token is the view at)
+        PhaseLock-Position (the position the token is the view at),
+        PhaseLock-Heartbeat (ms between vouches, the longest the
+        stream stays silent)
       → 400 on malformed wants
 
     ["view", token, position, selectors]    the whole view: first, when the

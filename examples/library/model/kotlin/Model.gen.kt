@@ -7,6 +7,7 @@ package io.phaselock.examples.library
 import io.phaselock.client.EngineEnded
 import io.phaselock.client.EngineHost
 import io.phaselock.client.EngineStatus
+import io.phaselock.client.HostedEngine
 import io.phaselock.client.Mutation
 import io.phaselock.client.MutationResult
 import io.phaselock.client.QuerySource
@@ -312,16 +313,9 @@ sealed interface UserEngineOnlineMutation
 sealed interface AdminEngineMutation
 
 /** The Engine of UserEngine, syncing BookSlice, PatronSlice, RoomSlice, which the native host
-    runs over an LMDB store in the directory store, or in memory without one, and through the
-    host's transport unless given one of its own. */
-class UserEngine(
-    host: EngineHost,
-    session: Session?,
-    store: File? = null,
-    transport: Transport? = null,
-) : QuerySource, AutoCloseable {
-    private val hosted = host.createEngine("UserEngine", session, store, transport)
-
+    runs.  Open one with open, and close it to end it and close its store. */
+class UserEngine private constructor(private val hosted: HostedEngine) :
+    QuerySource, AutoCloseable {
     /** sends a mutation, after predicting it and saving it to the outbox */
     fun sendMutation(mutation: UserEngineMutation) =
         hosted.sendMutation(registry.encode("UserMutations", mutation))
@@ -339,20 +333,33 @@ class UserEngine(
 
     override fun query(call: ByteArray): Flow<ByteArray> = hosted.query(call)
 
+    /** ends the Engine and closes its store after the work already queued for it, returning at
+        once */
     override fun close() = hosted.close()
+
+    /** closes the Engine, suspending until its store is closed */
+    suspend fun closeAndJoin() = hosted.closeAndJoin()
+
+    companion object {
+        /** Opens UserEngine, syncing as the session or as anonymous, over an LMDB store in the
+            directory store, or in memory without one, and through the host's transport unless
+            given one of its own; it returns once the Engine has booted and loaded its store.  A
+            directory holds one Engine's store, and only while that Engine runs: a new Engine may
+            open it only once the last one's close has completed, which closeAndJoin awaits. */
+        suspend fun open(
+            host: EngineHost,
+            session: Session?,
+            store: File? = null,
+            transport: Transport? = null,
+        ): UserEngine =
+            UserEngine(host.createEngine("UserEngine", session, store, transport))
+    }
 }
 
 /** The Engine of AdminEngine, syncing BookSlice, PatronSlice, AdminSlice, RoomSlice, which the
-    native host runs over an LMDB store in the directory store, or in memory without one, and
-    through the host's transport unless given one of its own. */
-class AdminEngine(
-    host: EngineHost,
-    session: Session?,
-    store: File? = null,
-    transport: Transport? = null,
-) : QuerySource, AutoCloseable {
-    private val hosted = host.createEngine("AdminEngine", session, store, transport)
-
+    native host runs.  Open one with open, and close it to end it and close its store. */
+class AdminEngine private constructor(private val hosted: HostedEngine) :
+    QuerySource, AutoCloseable {
     /** sends a mutation, after predicting it and saving it to the outbox */
     fun sendMutation(mutation: AdminEngineMutation) =
         hosted.sendMutation(registry.encode("AdminMutations", mutation))
@@ -366,7 +373,27 @@ class AdminEngine(
 
     override fun query(call: ByteArray): Flow<ByteArray> = hosted.query(call)
 
+    /** ends the Engine and closes its store after the work already queued for it, returning at
+        once */
     override fun close() = hosted.close()
+
+    /** closes the Engine, suspending until its store is closed */
+    suspend fun closeAndJoin() = hosted.closeAndJoin()
+
+    companion object {
+        /** Opens AdminEngine, syncing as the session or as anonymous, over an LMDB store in the
+            directory store, or in memory without one, and through the host's transport unless
+            given one of its own; it returns once the Engine has booted and loaded its store.  A
+            directory holds one Engine's store, and only while that Engine runs: a new Engine may
+            open it only once the last one's close has completed, which closeAndJoin awaits. */
+        suspend fun open(
+            host: EngineHost,
+            session: Session?,
+            store: File? = null,
+            transport: Transport? = null,
+        ): AdminEngine =
+            AdminEngine(host.createEngine("AdminEngine", session, store, transport))
+    }
 }
 
 // queries ///////////////////////////////////////////////////////////////////////

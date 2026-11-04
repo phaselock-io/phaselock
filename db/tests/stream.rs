@@ -28,6 +28,7 @@ async fn edits_arrive_live_one_frame_per_mutation() {
         "missing view or time header: {:?}",
         s.headers
     );
+    assert_eq!(s.header("phaselock-heartbeat"), HEARTBEAT.as_millis().to_string());
     let live = s.live().await;
 
     // a new patron: one birth edit, its writes in key order, one frame
@@ -335,6 +336,15 @@ async fn read_vouched(s: &mut Conn, vouched: &mut i64) -> V {
         _ => {}
     }
     f
+}
+
+// the stream names its heartbeat interval, which a client times its silence by
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stream_names_its_heartbeat() {
+    let h = start_with(|o| o.heartbeat = Duration::from_millis(250)).await;
+    let admin = h.admin().await;
+    let s = h.connect(&admin, -1, &[]).await;
+    assert_eq!(s.header("phaselock-heartbeat"), "250");
 }
 
 // a vouch at N follows every edit at or below N that the connection can see

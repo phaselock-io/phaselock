@@ -6,6 +6,7 @@ package io.phaselock.client
 
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CancellationException
@@ -54,6 +55,13 @@ private const val SEND_RETRY_DELAY = 100L
 private const val MAX_RETRY_DELAY = 30_000L
 // a session is refreshed once it has lived this share of its lifetime
 private const val REFRESH_AFTER = 0.5
+// a read that waits longer than this fails: every read on a client the transport makes itself,
+// and the stream's until the database names its heartbeat interval, 15 seconds by default, so a
+// stream silent this long is a dead link
+private const val READ_TIMEOUT = 20_000L
+// a stream silent for this many heartbeat intervals is a dead link: one heartbeat late by up to
+// a whole interval, as under a congested or waking mobile radio, still arrives in time
+private const val HEARTBEATS_OF_SILENCE = 2
 
 private val MSGPACK = "application/msgpack".toMediaType()
 
@@ -80,11 +88,13 @@ private class TooManyMutations(val max: Int, message: String) : StatusError(413,
 // defaults, until a 413 names the database's own
 private class MutationLimits(@Volatile var session: Int = 128, @Volatile var anonymous: Int = 8)
 
-/** one call, its response once it arrives; cancelling the coroutine cancels the call */
+/** one call, its response once it arrives; cancelling the coroutine cancels the call, and closes
+    a response that arrives as it is cancelled */
 private suspend fun Call.await(): Response = suspendCancellableCoroutine { cont ->
     cont.invokeOnCancellation { cancel() }
     enqueue(object : Callback {
-        override fun onResponse(call: Call, response: Response) = cont.resume(response)
+        override fun onResponse(call: Call, response: Response) =
+            cont.resume(response) { _, r, _ -> r.close() }
         override fun onFailure(call: Call, e: IOException) = cont.resumeWithException(e)
     })
 }
@@ -94,9 +104,30 @@ private fun Response.headerLong(name: String): Long? = header(name)?.takeIf { it
 
 /** The Transport to a database over HTTP, at its base URL: its origin and the path its routes are
     under, such as `https://example.com/phaselock`.  It signs in and refreshes sessions, and
-    refreshes a session it is handed once the session has lived half its lifetime. */
-class HttpTransport(url: String, private val client: OkHttpClient = OkHttpClient()) : Transport {
+    refreshes a session it is handed once the session has lived half its lifetime.
+
+    It runs over an OkHttpClient of its own, or over the app's, which an app that opens several
+    transports shares among them.  The stream reads under a timeout of its own, twice the
+    heartbeat interval the database last named, which is how the stream finds out its link is
+    dead; a stream opened before the database has named one waits 20 seconds.  close shuts down
+    a client the transport made itself, and leaves the app's to the app. */
+class HttpTransport private constructor(
+    url: String,
+    private val client: OkHttpClient,
+    private val ownsClient: Boolean,
+) : Transport {
+    /** a transport over a client of its own */
+    constructor(url: String) :
+        this(url, OkHttpClient.Builder().readTimeout(READ_TIMEOUT, TimeUnit.MILLISECONDS).build(), true)
+
+    /** a transport over the app's client, which close leaves running */
+    constructor(url: String, client: OkHttpClient) : this(url, client, false)
+
     private val base: String = url.trimEnd('/')
+    // the client the stream reads through, under the timeout its heartbeat calls for; it shares
+    // the client's connections and threads
+    @Volatile private var streamClient: OkHttpClient =
+        client.newBuilder().readTimeout(READ_TIMEOUT, TimeUnit.MILLISECONDS).build()
     // each session's refresh in flight, which every caller that wants it refreshed meanwhile shares
     private val refreshes = ConcurrentHashMap<Session, Deferred<Unit>>()
     // shared with every connection, so a limit one request learns holds for all of them
@@ -232,6 +263,17 @@ class HttpTransport(url: String, private val client: OkHttpClient = OkHttpClient
 
     internal fun call(req: Request): Call = client.newCall(req)
 
+    internal fun streamCall(req: Request): Call = streamClient.newCall(req)
+
+    // the heartbeat interval a stream's response named, in milliseconds, which the streams
+    // opened after it read under
+    internal fun heartbeat(interval: Long) {
+        val timeout = interval * HEARTBEATS_OF_SILENCE
+        if (interval > 0 && streamClient.readTimeoutMillis.toLong() != timeout) {
+            streamClient = client.newBuilder().readTimeout(timeout, TimeUnit.MILLISECONDS).build()
+        }
+    }
+
     /* Mutations in requests of at most the sender's limit each, one after another so that a
        series' mutations reach the database in order, answered with their outcomes in order.  A
        413 names the limit the database held the request to, which the mutations not yet answered
@@ -291,9 +333,14 @@ class HttpTransport(url: String, private val client: OkHttpClient = OkHttpClient
         }
     }
 
-    /** ends every connection's work this transport started and the refreshes in flight */
+    /** ends every connection's work this transport started and the refreshes in flight, and shuts
+        down the client when the transport made it */
     fun close() {
         scope.cancel()
+        if (ownsClient) {
+            client.dispatcher.executorService.shutdown()
+            client.connectionPool.evictAll()
+        }
     }
 }
 
@@ -353,6 +400,9 @@ private class HttpConnection(
 ) : Connection {
     // every request of the connection; aborting it cancels them all
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // the stream's call, whose body reads block past the scope's cancellation, so stopping the
+    // connection cancels the call itself
+    @Volatile private var stream: Call? = null
     @Volatile private var ended = false
     private val endLock = Any()
     // the log's epoch once the stream opens, or a failure when the connection ends before that
@@ -388,12 +438,18 @@ private class HttpConnection(
         session?.ended = true
         val err = AuthError(401, message)
         end(401, message, err)
-        scope.cancel()
+        stop()
         return err
     }
 
     override fun abort() {
         end(0, "aborted")
+        stop()
+    }
+
+    // every request of the connection cancelled, the stream's blocked read included
+    private fun stop() {
+        stream?.cancel()
         scope.cancel()
     }
 
@@ -404,7 +460,9 @@ private class HttpConnection(
             q.add("since" to since.toString())
             if (view != null) q.add("view" to view)
             for (w in wants) q.add("want" to w)
-            val resp = transport.call(transport.request("/stream", headers(), q)).await()
+            val call = transport.streamCall(transport.request("/stream", headers(), q))
+            stream = call
+            val resp = call.await()
             resp.use {
                 if (resp.code == 401) {
                     refuse(resp.body.string())
@@ -424,13 +482,15 @@ private class HttpConnection(
                     end(resp.code, "stream: no position")
                     return
                 }
+                resp.headerLong("PhaseLock-Heartbeat")?.let(transport::heartbeat)
                 hooks.onOpen(e, head)
                 epoch.complete(e)
                 val src = resp.body.source()
                 val buf = Buffer()
                 while (true) {
+                    // a frame read as the connection ended is never delivered
                     buf.clear()
-                    if (!readValue(src, buf)) break
+                    if (!readValue(src, buf) || ended) break
                     val f = parseFrame(buf.readByteArray())
                     when (f) {
                         is Frame.Edits -> hooks.onEdits(f.edits)
@@ -774,7 +834,7 @@ private class HttpConnection(
             return
         }
         end((e as? StatusError)?.status ?: 0, e.message ?: e.toString())
-        scope.cancel()
+        stop()
     }
 }
 

@@ -47,10 +47,34 @@ pub struct State {
     /// each open transaction, by id: its store's registry and the transaction
     pub txns: RefCell<HashMap<i64, (Arc<Schema>, lmdb::Txn)>>,
     pub next_txn: Cell<i64>,
+    /// when the call from Kotlin that is running must end, past which JS is interrupted
+    deadline: Cell<Option<Instant>>,
+    /// whether the interrupt has fired, and the first exception taken after it, as its text
+    interrupted: Cell<bool>,
+    trace: RefCell<Option<String>>,
+    /// why the host ended, once a call ran past its deadline; every call after it fails with this
+    ended: RefCell<Option<String>>,
 }
 
 pub unsafe fn state<'a>(ctx: *mut JSContext) -> &'a State {
     unsafe { &*(JS_GetContextOpaque(ctx) as *const State) }
+}
+
+/// How far the JS may run: the stack it may take below the frame that calls into it, the heap of
+/// the runtime, and how long one call from Kotlin may run before its JS is interrupted.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub stack: usize,
+    pub memory: usize,
+    pub call: Duration,
+}
+
+impl Default for Limits {
+    /// QuickJS's own stack limit, which suits a thread of a platform's default size, a heap of
+    /// 1 GiB, and calls of up to a minute
+    fn default() -> Limits {
+        Limits { stack: 1 << 20, memory: 1 << 30, call: Duration::from_secs(60) }
+    }
 }
 
 /// The runtime with host.js and the bundle loaded.
@@ -59,6 +83,17 @@ pub struct Host {
     ctx: *mut JSContext,
     host: JSValue,
     state: *mut State,
+    call_limit: Duration,
+}
+
+// QuickJS's interrupt check: whether the call running has passed its deadline
+unsafe extern "C" fn interrupt(_rt: *mut JSRuntime, opaque: *mut c_void) -> c_int {
+    let st = unsafe { &*(opaque as *const State) };
+    let passed = st.deadline.get().is_some_and(|d| Instant::now() > d);
+    if passed {
+        st.interrupted.set(true);
+    }
+    passed as c_int
 }
 
 // values ///////////////////////////////////////////////////////////////////////
@@ -79,11 +114,17 @@ pub fn new_u8(ctx: *mut JSContext, bytes: &[u8]) -> JSValue {
 
 /// the bytes of a Uint8Array or an ArrayBuffer, or None with a TypeError pending
 pub fn bytes_of(ctx: *mut JSContext, v: JSValue) -> Option<Vec<u8>> {
+    with_bytes(ctx, v, <[u8]>::to_vec)
+}
+
+/// f over the bytes of a Uint8Array or an ArrayBuffer, read in place, or None with a TypeError
+/// pending
+pub fn with_bytes<R>(ctx: *mut JSContext, v: JSValue, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
     unsafe {
         let mut size = 0usize;
         let p = JS_GetArrayBuffer(ctx, &mut size, v);
         if !p.is_null() {
-            return Some(std::slice::from_raw_parts(p, size).to_vec());
+            return Some(f(std::slice::from_raw_parts(p, size)));
         }
         JS_FreeValue(ctx, JS_GetException(ctx));
         let (mut off, mut len, mut per) = (0usize, 0usize, 0usize);
@@ -98,7 +139,7 @@ pub fn bytes_of(ctx: *mut JSContext, v: JSValue) -> Option<Vec<u8>> {
         if p.is_null() {
             return None;
         }
-        Some(std::slice::from_raw_parts(p.add(off), len).to_vec())
+        Some(f(std::slice::from_raw_parts(p.add(off), len)))
     }
 }
 
@@ -231,6 +272,20 @@ unsafe extern "C" fn native_encode(
     unsafe { JS_NewArrayBufferCopy(ctx, w.buf.as_ptr(), w.buf.len()) }
 }
 
+// pl.equal(a, b): whether two ArrayBuffers or Uint8Arrays hold the same bytes
+unsafe extern "C" fn native_equal(
+    ctx: *mut JSContext,
+    _: JSValue,
+    _: c_int,
+    argv: *mut JSValue,
+) -> JSValue {
+    let a = unsafe { args(argv, 2) };
+    match with_bytes(ctx, a[0], |x| with_bytes(ctx, a[1], |y| x == y)).flatten() {
+        Some(same) => JS_NewBool(same),
+        None => JS_EXCEPTION,
+    }
+}
+
 type Native = (&'static CStr, JSCFunction, c_int);
 
 const NATIVES: &[Native] = &[
@@ -240,6 +295,7 @@ const NATIVES: &[Native] = &[
     (c"clearTimer", native_clear_timer, 1),
     (c"random", native_random, 1),
     (c"encode", native_encode, 1),
+    (c"equal", native_equal, 2),
     (c"registry", registry::native_registry, 1),
     (c"convert", registry::native_convert, 5),
     (c"ops", registry::native_ops, 2),
@@ -258,6 +314,18 @@ const NATIVES: &[Native] = &[
 
 // the host ///////////////////////////////////////////////////////////////////
 
+/// One of a connection's hooks, as Kotlin hears it from the transport.  An edits frame carries the
+/// msgpack array of its raw edits, and an end's fatal names a refused session, which ends the
+/// engine.
+pub enum Hook<'a> {
+    Open { epoch: &'a str, head: i64 },
+    View { token: &'a str, position: i64, selectors: Vec<String> },
+    Edits(&'a [u8]),
+    Live(i64),
+    Vouch(i64),
+    End { code: i64, reason: &'a str, fatal: Option<&'a str> },
+}
+
 /// One backfill delivery from Kotlin, which the Engine parks.
 pub enum Push<'a> {
     Length(i64),
@@ -269,11 +337,15 @@ pub enum Push<'a> {
 }
 
 impl Host {
-    /// Opens the runtime: host.js, then the bundle, a script that installs the model's engines as
-    /// `globalThis.__engines`.  Errors name the script that failed.
-    pub fn open(bundle: &[u8], name: &str) -> Result<Host> {
+    /// Opens the runtime under its limits: host.js, then the bundle, a script that installs the
+    /// model's engines as `globalThis.__engines`.  Errors name the script that failed.  The stack
+    /// limit counts down from each call into JS, so the thread that drives the host needs that
+    /// much stack free beneath its own frames, and room for the natives JS calls.
+    pub fn open(bundle: &[u8], name: &str, limits: Limits) -> Result<Host> {
         unsafe {
             let rt = JS_NewRuntime();
+            JS_SetMaxStackSize(rt, limits.stack);
+            JS_SetMemoryLimit(rt, limits.memory);
             let ctx = JS_NewContext(rt);
             let st = Box::into_raw(Box::new(State {
                 env: Cell::new(None),
@@ -285,9 +357,14 @@ impl Host {
                 stores: RefCell::new(HashMap::new()),
                 txns: RefCell::new(HashMap::new()),
                 next_txn: Cell::new(1),
+                deadline: Cell::new(None),
+                interrupted: Cell::new(false),
+                trace: RefCell::new(None),
+                ended: RefCell::new(None),
             }));
             JS_SetContextOpaque(ctx, st as *mut c_void);
-            let mut h = Host { rt, ctx, host: JS_UNDEFINED, state: st };
+            JS_SetInterruptHandler(rt, Some(interrupt), st as *mut c_void);
+            let mut h = Host { rt, ctx, host: JS_UNDEFINED, state: st, call_limit: limits.call };
 
             // the natives, on __pl
             let global = Owned::new(ctx, JS_GetGlobalObject(ctx));
@@ -304,9 +381,11 @@ impl Host {
             };
             h.state().env.set(Some(env));
 
-            // host.js, then the bundle
-            h.eval(HOST_JS.as_bytes(), "host.js").map_err(|e| format!("host.js: {e}"))?;
-            h.eval(bundle, name).map_err(|e| format!("bundle: {e}"))?;
+            // host.js, then the bundle, under one call's deadline
+            h.timed(|| {
+                h.eval(HOST_JS.as_bytes(), "host.js").map_err(|e| format!("host.js: {e}"))?;
+                h.eval(bundle, name).map_err(|e| format!("bundle: {e}"))
+            })?;
             h.host = JS_GetPropertyStr(ctx, global.v, c"__host".as_ptr());
             let engines = Owned::new(ctx, JS_GetPropertyStr(ctx, global.v, c"__engines".as_ptr()));
             if !is_object(engines.v) {
@@ -322,6 +401,38 @@ impl Host {
 
     fn state(&self) -> &State {
         unsafe { &*self.state }
+    }
+
+    /* Runs f as one call from Kotlin, under the call deadline.  JS still running when it passes
+    is interrupted, which no JS can catch, so whatever the JS was doing stops halfway: the host
+    ends.  Every store transaction still open is aborted, the call fails with why, naming the
+    limit and the interrupted JS's backtrace, and so does every call after it, which runs no JS. */
+    pub fn timed<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let st = self.state();
+        if let Some(why) = self.ended() {
+            return Err(why);
+        }
+
+        // the call, under its deadline
+        st.deadline.set(Some(Instant::now() + self.call_limit));
+        let r = f();
+        st.deadline.set(None);
+        if !st.interrupted.get() {
+            return r;
+        }
+
+        // the call was interrupted, which ends the host
+        st.txns.borrow_mut().clear();
+        let trace =
+            st.trace.borrow_mut().take().unwrap_or_else(|| "InternalError: interrupted".into());
+        let why = format!("the call ran past its limit of {:?}: {trace}", self.call_limit);
+        *st.ended.borrow_mut() = Some(why.clone());
+        Err(why)
+    }
+
+    /// why the host ended, once a call ran past its deadline
+    pub fn ended(&self) -> Option<String> {
+        self.state().ended.borrow().clone()
     }
 
     fn eval_value(&self, text: &[u8]) -> Result<JSValue> {
@@ -356,8 +467,18 @@ impl Host {
         Ok(())
     }
 
-    /// the pending exception, as its message and stack
+    /// The pending exception, as its message and stack.  The first taken after the interrupt
+    /// fired is the interrupt's own, whose text the host keeps as the backtrace of why it ended.
     fn exception(&self) -> String {
+        let text = self.exception_text();
+        let st = self.state();
+        if st.interrupted.get() && st.trace.borrow().is_none() {
+            *st.trace.borrow_mut() = Some(text.clone());
+        }
+        text
+    }
+
+    fn exception_text(&self) -> String {
         let ctx = self.ctx;
         unsafe {
             let e = Owned::new(ctx, JS_GetException(ctx));
@@ -399,6 +520,11 @@ impl Host {
     fn settle(&self) -> Result<Vec<u8>> {
         loop {
             self.run_jobs();
+
+            // an interrupted call runs nothing more
+            if self.state().interrupted.get() {
+                break;
+            }
             let now = Instant::now();
             let due: Vec<i64> = {
                 let timers = self.state().timers.borrow();
@@ -414,6 +540,9 @@ impl Host {
                 self.state().timers.borrow_mut().remove(&id);
                 self.call(c"fire", vec![JS_NewInt64(id)])?;
                 self.run_jobs();
+                if self.state().interrupted.get() {
+                    break;
+                }
             }
         }
 
@@ -434,21 +563,26 @@ impl Host {
         Ok(w.into_vec())
     }
 
-    // every pending promise job; one that throws is logged, since no caller awaits it
+    // every pending promise job, until the interrupt fires; one that throws is logged, since no
+    // caller awaits it
     fn run_jobs(&self) {
         unsafe {
-            while JS_IsJobPending(self.rt) != 0 {
+            while !self.state().interrupted.get() && JS_IsJobPending(self.rt) != 0 {
                 let mut jctx = std::ptr::null_mut();
                 if JS_ExecutePendingJob(self.rt, &mut jctx) < 0 {
-                    let msg = self.exception();
-                    let mut w = mp::Writer::new();
-                    w.array(2);
-                    w.str(b"log");
-                    w.str(format!("a promise job threw: {msg}").as_bytes());
-                    self.state().events.borrow_mut().push(w.into_vec());
+                    self.log(&format!("a promise job threw: {}", self.exception()));
                 }
             }
         }
+    }
+
+    // a log event for Kotlin
+    fn log(&self, text: &str) {
+        let mut w = mp::Writer::new();
+        w.array(2);
+        w.str(b"log");
+        w.str(text.as_bytes());
+        self.state().events.borrow_mut().push(w.into_vec());
     }
 
     // one call into __host, then whatever it left runnable
@@ -525,57 +659,54 @@ impl Host {
         self.deliver(c"closeQuery", vec![JS_NewInt64(id)])
     }
 
-    pub fn conn_open(&self, conn: i64, epoch: &str, head: i64) -> Result<Vec<u8>> {
-        let args =
-            vec![JS_NewInt64(conn), new_string(self.ctx, epoch.as_bytes()), JS_NewInt64(head)];
-        self.deliver(c"connOpen", args)
+    /// Delivers connections' hooks, each by connection, in order and then settles once, so the
+    /// Engine takes every frame among them in one store transaction.  A hook that fails is logged
+    /// as an event and the rest are still delivered, as each would be in a call of its own.
+    pub fn conn_hooks(&self, hooks: &[(i64, Hook<'_>)]) -> Result<Vec<u8>> {
+        // each hook, which only queues it for the Engine's advancer
+        for (conn, hook) in hooks {
+            if let Err(e) = self.conn_hook(*conn, hook) {
+                self.log(&format!("a connection hook failed: {e}"));
+            }
+        }
+
+        // then the advancer, once for them all
+        self.settle()
     }
 
-    pub fn conn_view(
-        &self,
-        conn: i64,
-        token: &str,
-        position: i64,
-        selectors: &[String],
-    ) -> Result<Vec<u8>> {
+    // one hook's call into __host, the work it leaves unsettled
+    fn conn_hook(&self, conn: i64, hook: &Hook<'_>) -> Result<()> {
         let ctx = self.ctx;
-        let sel = new_array(ctx, selectors.iter().map(|s| new_string(ctx, s.as_bytes())).collect());
-        let args =
-            vec![JS_NewInt64(conn), new_string(ctx, token.as_bytes()), JS_NewInt64(position), sel];
-        self.deliver(c"connView", args)
-    }
-
-    /// a frame's edits, the msgpack array of raw edits it carries
-    pub fn conn_edits(&self, conn: i64, edits: &[u8]) -> Result<Vec<u8>> {
-        let arr = registry::wire_edits(self.ctx, edits)?;
-        self.deliver(c"connEdits", vec![JS_NewInt64(conn), arr])
-    }
-
-    pub fn conn_live(&self, conn: i64, position: i64) -> Result<Vec<u8>> {
-        self.deliver(c"connLive", vec![JS_NewInt64(conn), JS_NewInt64(position)])
-    }
-
-    pub fn conn_vouch(&self, conn: i64, position: i64) -> Result<Vec<u8>> {
-        self.deliver(c"connVouch", vec![JS_NewInt64(conn), JS_NewInt64(position)])
-    }
-
-    /// The connection's end, as its one onEnd: fatal names a refused session, which ends the
-    /// engine.
-    pub fn conn_end(
-        &self,
-        conn: i64,
-        code: i64,
-        reason: &str,
-        fatal: Option<&str>,
-    ) -> Result<Vec<u8>> {
-        let ctx = self.ctx;
-        let args = vec![
-            JS_NewInt64(conn),
-            JS_NewInt64(code),
-            new_string(ctx, reason.as_bytes()),
-            opt_str(ctx, fatal),
-        ];
-        self.deliver(c"connEnd", args)
+        let id = JS_NewInt64(conn);
+        match hook {
+            Hook::Open { epoch, head } => {
+                let args = vec![id, new_string(ctx, epoch.as_bytes()), JS_NewInt64(*head)];
+                self.call(c"connOpen", args)
+            }
+            Hook::View { token, position, selectors } => {
+                let sel = new_array(
+                    ctx,
+                    selectors.iter().map(|s| new_string(ctx, s.as_bytes())).collect(),
+                );
+                let args = vec![id, new_string(ctx, token.as_bytes()), JS_NewInt64(*position), sel];
+                self.call(c"connView", args)
+            }
+            Hook::Edits(edits) => {
+                let arr = registry::wire_edits(ctx, edits)?;
+                self.call(c"connEdits", vec![id, arr])
+            }
+            Hook::Live(position) => self.call(c"connLive", vec![id, JS_NewInt64(*position)]),
+            Hook::Vouch(position) => self.call(c"connVouch", vec![id, JS_NewInt64(*position)]),
+            Hook::End { code, reason, fatal } => {
+                let args = vec![
+                    id,
+                    JS_NewInt64(*code),
+                    new_string(ctx, reason.as_bytes()),
+                    opt_str(ctx, *fatal),
+                ];
+                self.call(c"connEnd", args)
+            }
+        }
     }
 
     /// one delivery of a backfill, settled under push once the Engine commits it
@@ -646,6 +777,12 @@ impl Host {
         let env = lmdb::Env::open(dir)?;
         self.state().stores.borrow_mut().insert(id, env);
         Ok(())
+    }
+
+    /// tests only: how many store transactions are open
+    #[doc(hidden)]
+    pub fn open_transactions(&self) -> usize {
+        self.state().txns.borrow().len()
     }
 
     /// tests only: the JSON of what an expression evaluates to, any jobs it queued run first

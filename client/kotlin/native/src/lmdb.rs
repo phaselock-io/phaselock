@@ -1,7 +1,17 @@
 //! LMDB: the C API the store uses, declared by hand from lmdb.h, and an environment, its
 //! transactions, and a cursor over them.  One environment holds one store, its keys in LMDB's
-//! unnamed database, which compares them bytewise: the order of UTF-8 keys by code point.  Only
-//! the engine thread ever opens it, so it opens without LMDB's lock file (MDB_NOLOCK).
+//! unnamed database, which compares them bytewise: the order of UTF-8 keys by code point.  It
+//! opens with LMDB's lock file, so LMDB keeps one writer at a time and frees no page a reader
+//! still uses, whoever opens it; MDB_NOTLS ties a read transaction to no thread.
+//!
+//! A write commits with MDB_NOMETASYNC, its data pages fsynced and its meta page written but not,
+//! unless it put a row of the Engine's outbox, which commits fully synced.  A process that
+//! crashes loses nothing either way, since the writes are in the page cache.  On power loss or a
+//! kernel panic, MDB_NOMETASYNC keeps the store whole and loses at most the last transaction:
+//! each commit's data fsync makes the meta page before it durable, and LMDB never reuses the
+//! last two transactions' pages.  State built from edits alone (the edits, the cursor, the
+//! checkpoint) rolls back together, and the database's log sends it again; an outbox insert is
+//! always durable once it commits, so a mutation the Engine has said it saved stays saved.
 
 #![allow(non_camel_case_types)]
 
@@ -55,7 +65,8 @@ struct MDB_stat {
 }
 
 const MDB_RDONLY: c_uint = 0x20000;
-const MDB_NOLOCK: c_uint = 0x400000;
+const MDB_NOMETASYNC: c_uint = 0x40000;
+const MDB_NOTLS: c_uint = 0x200000;
 const MDB_NOTFOUND: c_int = -30798;
 
 // the cursor operations, as lmdb.h's MDB_cursor_op numbers them
@@ -73,6 +84,8 @@ unsafe extern "C" {
     fn mdb_env_set_mapsize(env: *mut MDB_env, size: usize) -> c_int;
     fn mdb_env_info(env: *mut MDB_env, info: *mut MDB_envinfo) -> c_int;
     fn mdb_env_stat(env: *mut MDB_env, stat: *mut MDB_stat) -> c_int;
+    fn mdb_reader_check(env: *mut MDB_env, dead: *mut c_int) -> c_int;
+    fn mdb_env_set_flags(env: *mut MDB_env, flags: c_uint, onoff: c_int) -> c_int;
     fn mdb_txn_begin(
         env: *mut MDB_env,
         parent: *mut MDB_txn,
@@ -152,7 +165,11 @@ impl Env {
             check("env_create", mdb_env_create(&mut env))?;
             let mut e = Env { env, dbi: 0, map_size: MAP_START };
             check("set_mapsize", mdb_env_set_mapsize(env, MAP_START))?;
-            check("env_open", mdb_env_open(env, path.as_ptr(), MDB_NOLOCK, 0o600))?;
+            check("env_open", mdb_env_open(env, path.as_ptr(), MDB_NOTLS, 0o600))?;
+
+            // the reader slots of a process that died holding them, freed
+            let mut dead = 0;
+            check("reader_check", mdb_reader_check(env, &mut dead))?;
 
             // the unnamed database, opened once in a transaction of its own
             let mut txn = ptr::null_mut();
@@ -178,7 +195,7 @@ impl Env {
             let mut txn = ptr::null_mut();
             let flags = if write { 0 } else { MDB_RDONLY };
             check("txn_begin", mdb_txn_begin(self.env, ptr::null_mut(), flags, &mut txn))?;
-            Ok(Txn { txn, dbi: self.dbi, write })
+            Ok(Txn { txn, env: self.env, dbi: self.dbi, write, outbox: false })
         }
     }
 
@@ -206,11 +223,19 @@ impl Drop for Env {
     }
 }
 
-/// A transaction, aborted when it drops uncommitted.
+/// The prefix of the Engine's outbox rows, `!mutation:{ordinal}`, as the skeleton's `mutationKey`
+/// writes them (typespec/ts/assets/skeleton.ts), whose puts a commit fully syncs.
+const OUTBOX: &[u8] = b"!mutation:";
+
+/// A transaction, aborted when it drops uncommitted.  A write remembers whether it put an outbox
+/// row, which decides how its commit syncs.
 pub struct Txn {
     txn: *mut MDB_txn,
+    // the environment the transaction is in, whose sync mode its commit sets
+    env: *mut MDB_env,
     dbi: MDB_dbi,
     pub write: bool,
+    outbox: bool,
 }
 
 impl Txn {
@@ -230,6 +255,10 @@ impl Txn {
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        // an outbox row, which the commit syncs fully; a delete of one releases a mutation the
+        // database has answered, which may be lost, since a lost release resends the mutation
+        // and the database answers it again by its series and number
+        self.outbox |= key.starts_with(OUTBOX);
         unsafe {
             let mut k = val(key);
             let mut d = val(value);
@@ -272,7 +301,13 @@ impl Txn {
         }
     }
 
+    /// Commits, a write without its meta page's fsync unless it put an outbox row.  The engine
+    /// thread is the store's one writer, so the mode set here holds for this commit alone.
     pub fn commit(mut self) -> Result<()> {
+        if self.write {
+            let lazy = !self.outbox as c_int;
+            check("env_set_flags", unsafe { mdb_env_set_flags(self.env, MDB_NOMETASYNC, lazy) })?;
+        }
         let txn = std::mem::replace(&mut self.txn, ptr::null_mut());
         check("txn_commit", unsafe { mdb_txn_commit(txn) })
     }
@@ -355,5 +390,48 @@ impl scan::Cursor for Cursor<'_> {
 impl Drop for Cursor<'_> {
     fn drop(&mut self) {
         unsafe { mdb_cursor_close(self.c) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" {
+        fn mdb_env_get_flags(env: *mut MDB_env, flags: *mut c_uint) -> c_int;
+    }
+
+    // whether the environment's last commit skipped its meta page's fsync
+    fn lazy(env: &Env) -> bool {
+        let mut flags = 0;
+        check("env_get_flags", unsafe { mdb_env_get_flags(env.env, &mut flags) }).unwrap();
+        flags & MDB_NOMETASYNC != 0
+    }
+
+    #[test]
+    fn only_a_commit_that_puts_an_outbox_row_syncs_fully() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::open(&dir.path().display().to_string()).unwrap();
+        let outbox = b"!mutation:00000000000000000001";
+
+        // edits alone
+        let mut t = env.begin(true).unwrap();
+        t.put(b"room:r1!name", b"x").unwrap();
+        t.put(b"!checkpoint", b"y").unwrap();
+        t.commit().unwrap();
+        assert!(lazy(&env), "an edit-only commit");
+
+        // an outbox insert, among edits
+        let mut t = env.begin(true).unwrap();
+        t.put(b"room:r1!name", b"z").unwrap();
+        t.put(outbox, b"m").unwrap();
+        t.commit().unwrap();
+        assert!(!lazy(&env), "an outbox insert");
+
+        // the outbox row's release
+        let mut t = env.begin(true).unwrap();
+        assert!(t.del(outbox).unwrap());
+        t.commit().unwrap();
+        assert!(lazy(&env), "an outbox delete");
     }
 }

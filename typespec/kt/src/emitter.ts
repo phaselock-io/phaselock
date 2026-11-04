@@ -434,19 +434,13 @@ function printEngine(d: Denter, e: PEngine): void {
   d.print('\n');
   doc(
     d,
-    `The Engine of ${e.name}, syncing ${slices}, which the native host runs over an LMDB store ` +
-      "in the directory store, or in memory without one, and through the host's transport " +
-      'unless given one of its own.',
+    `The Engine of ${e.name}, syncing ${slices}, which the native host runs.  Open one with ` +
+      'open, and close it to end it and close its store.',
   );
-  d.print(`class ${e.name}(\n`);
-  d.print('    host: EngineHost,\n');
-  d.print('    session: Session?,\n');
-  d.print('    store: File? = null,\n');
-  d.print('    transport: Transport? = null,\n');
-  d.print(') : QuerySource, AutoCloseable {\n');
+  d.print(`class ${e.name} private constructor(private val hosted: HostedEngine) :\n`);
+  d.print('    QuerySource, AutoCloseable {\n');
   d.indent('    ');
-  d.print(`private val hosted = host.createEngine(${str(e.name)}, session, store, transport)\n`);
-  d.print('\n/** sends a mutation, after predicting it and saving it to the outbox */\n');
+  d.print('/** sends a mutation, after predicting it and saving it to the outbox */\n');
   d.print(`fun sendMutation(mutation: ${e.name}Mutation) =\n`);
   d.print(`    hosted.sendMutation(registry.encode(${str(mutations)}, mutation))\n`);
   if (online) {
@@ -461,7 +455,37 @@ function printEngine(d: Denter, e: PEngine): void {
   d.print('\nfun reconnectNow() = hosted.reconnectNow()\n');
   d.print('\nfun onEnded(fn: (EngineEnded) -> Unit) = hosted.onEnded(fn)\n');
   d.print('\noverride fun query(call: ByteArray): Flow<ByteArray> = hosted.query(call)\n');
-  d.print('\noverride fun close() = hosted.close()\n');
+  d.print('\n');
+  doc(
+    d,
+    'ends the Engine and closes its store after the work already queued for it, returning at once',
+    4,
+  );
+  d.print('override fun close() = hosted.close()\n');
+  d.print('\n/** closes the Engine, suspending until its store is closed */\n');
+  d.print('suspend fun closeAndJoin() = hosted.closeAndJoin()\n');
+
+  // the factory, which suspends while the Engine boots
+  d.print('\ncompanion object {\n');
+  d.indent('    ');
+  doc(
+    d,
+    `Opens ${e.name}, syncing as the session or as anonymous, over an LMDB store in the ` +
+      "directory store, or in memory without one, and through the host's transport unless " +
+      'given one of its own; it returns once the Engine has booted and loaded its store.  A ' +
+      "directory holds one Engine's store, and only while that Engine runs: a new Engine may " +
+      "open it only once the last one's close has completed, which closeAndJoin awaits.",
+    8,
+  );
+  d.print('suspend fun open(\n');
+  d.print('    host: EngineHost,\n');
+  d.print('    session: Session?,\n');
+  d.print('    store: File? = null,\n');
+  d.print('    transport: Transport? = null,\n');
+  d.print(`): ${e.name} =\n`);
+  d.print(`    ${e.name}(host.createEngine(${str(e.name)}, session, store, transport))\n`);
+  d.dedent();
+  d.print('}\n');
   d.dedent();
   d.print('}\n');
 }
@@ -547,6 +571,7 @@ export function generateKotlin(lowered: LoweredProgram, pkg: string): string {
   d.print('\nimport io.phaselock.client.EngineEnded\n');
   d.print('import io.phaselock.client.EngineHost\n');
   d.print('import io.phaselock.client.EngineStatus\n');
+  d.print('import io.phaselock.client.HostedEngine\n');
   d.print('import io.phaselock.client.Mutation\n');
   d.print('import io.phaselock.client.MutationResult\n');
   d.print('import io.phaselock.client.QuerySource\n');

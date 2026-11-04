@@ -4,7 +4,8 @@
     "scripts": {
         "gen": "tsp compile model.tsp",
         "bundle": "esbuild db.ts --bundle --format=iife --log-level=warning --define:process.env.NODE_ENV=\\\"development\\\" --outfile=bundle.js",
-        "bundle:native": "esbuild native.ts --bundle --format=iife --log-level=warning --define:process.env.NODE_ENV=\\\"development\\\" --outfile=native.bundle.js"
+        "bundle:native": "esbuild native.ts --bundle --format=iife --log-level=warning --define:process.env.NODE_ENV=\\\"production\\\" --outfile=native.bundle.js",
+        "bundle:native:dev": "esbuild native.ts --bundle --format=iife --log-level=warning --define:process.env.NODE_ENV=\\\"development\\\" --outfile=native.dev.bundle.js"
     },
     "exports": {
         "./ui": "./ui.ts"

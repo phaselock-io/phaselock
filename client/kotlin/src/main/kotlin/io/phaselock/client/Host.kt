@@ -2,26 +2,37 @@
 // Engines the bundle builds.  Every call into the native library happens on that thread, and
 // every call answers with the events the JS side raised (see native/src/jni.rs); the host acts
 // on them here, starting the transport's work on the IO dispatcher and handing its results back
-// to the engine thread.
+// to the engine thread.  The connections' hooks queue, and each drain of the queue is one call,
+// so the frames that arrive together commit together.
 
 package io.phaselock.client
 
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** The native library: three functions, every argument and answer msgpack. */
 internal object Native {
@@ -29,7 +40,7 @@ internal object Native {
         System.loadLibrary("phaselock_jni")
     }
 
-    @JvmStatic external fun open(bundle: ByteArray, name: ByteArray): ByteArray
+    @JvmStatic external fun open(bundle: ByteArray, name: ByteArray, limits: ByteArray): ByteArray
     @JvmStatic external fun call(host: Long, request: ByteArray): ByteArray
     @JvmStatic external fun close(host: Long)
 }
@@ -45,20 +56,48 @@ data class EngineEnded(val reason: String, val auth: Boolean)
 /** A declared query failed to run or to convert its result. */
 class QueryError(message: String) : Exception(message)
 
+/** How far the model's JS may run, which is the app's own code over its own data, so the limits
+    are generous.  Each call into the runtime runs for at most callTimeout: JS still running then
+    is interrupted where no JS can catch it, which ends the host and every Engine it runs, each
+    with a reason naming the limit and the backtrace of the JS that ran away.  The runtime's heap
+    holds at most memory bytes, past which an allocation throws in JS, which ends the Engine that
+    does not catch it. */
+data class EngineLimits(
+    val callTimeout: Duration = 60.seconds,
+    val memory: Long = 1L shl 30,
+)
+
+/* The engine thread's stack, and the part of it JS may take, counted down from each call into
+   the runtime.  The 2 MiB between them hold the frames beneath the JS (the executor's, JNI's,
+   and the native host's own, well under 256 KiB) and the natives JS calls, so a recursion that
+   runs deep throws a stack overflow in JS before it reaches the end of the thread's stack. */
+private const val ENGINE_STACK = 8L shl 20
+private const val JS_STACK = 6L shl 20
+
 /** The native host of a model's Engines: the bundle, loaded once into one QuickJS runtime on one
-    thread, and the transport every Engine it builds syncs through.  Close it to end every
-    Engine. */
-class EngineHost(
-    bundle: ByteArray,
-    bundleName: String,
+    thread, and the transport every Engine it builds syncs through.  Open one with open, and close
+    it to end every Engine; a call on a host that is closed or closing fails with a HostError.
+    The host also ends on its own when a call into its runtime runs past the call limit
+    (EngineLimits): every Engine's onEnded hears why, and the host closes as close closes it. */
+class EngineHost private constructor(
     private val transport: Transport,
-    private val log: (String) -> Unit = { System.err.println("phaselock: $it") },
+    private val log: (String) -> Unit,
 ) : AutoCloseable {
     private val executor = Executors.newSingleThreadScheduledExecutor { r ->
-        Thread(r, "phaselock-engine").apply { isDaemon = true }
+        Thread(null, r, "phaselock-engine", ENGINE_STACK).apply { isDaemon = true }
     }
+    // the engine thread, for suspending on
+    private val engineThread = executor.asCoroutineDispatcher()
+    // whether close has begun, and its completion once the native host is freed
+    private val closing = AtomicBoolean()
+    private val freed = CompletableDeferred<Unit>()
+    // why the host ended on its own, once a call into it ran past its limit
+    @Volatile private var endedWhy: String? = null
     // the transport's work for the Engines, which runs off the engine thread
     private val work = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // every connection's hooks in arrival order, each a hook of a connHooks request, queued from
+    // the transport's threads for the next drain; guarded by itself
+    private val queued = ArrayList<List<Any?>>()
 
     // everything below is the engine thread's alone
     private var handle = 0L
@@ -74,29 +113,81 @@ class EngineHost(
     private val onlines = HashMap<Long, CompletableDeferred<MutationResult>>()
     private val ended = HashMap<Long, (EngineEnded) -> Unit>()
 
-    init {
-        val opened = onThread {
-            val r = MsgReader(Native.open(bundle, bundleName.encodeToByteArray()))
-            r.arrayHeader()
-            if (r.str() == "error") throw HostError(r.str())
-            handle = r.long()
+    companion object {
+        /** Loads the model's native bundle, named bundleName in its errors, into a host of its own,
+            whose Engines sync through transport unless given one of their own.  The bundle loads
+            on the engine thread; a bundle that will not load fails with a HostError.  JS that
+            passes a limit throws: past the call timeout, the host ends, and with it every
+            Engine; past the memory limit, the allocation throws in JS, and an Engine that does
+            not catch it ends with the error as its reason. */
+        suspend fun open(
+            bundle: ByteArray,
+            bundleName: String,
+            transport: Transport,
+            limits: EngineLimits = EngineLimits(),
+            log: (String) -> Unit = { System.err.println("phaselock: $it") },
+        ): EngineHost {
+            val host = EngineHost(transport, log)
+            val w = MsgWriter()
+            w.array(3)
+            w.int(JS_STACK)
+            w.int(limits.memory)
+            w.int(limits.callTimeout.inWholeMilliseconds)
+            try {
+                withContext(host.engineThread) {
+                    val r = MsgReader(Native.open(bundle, bundleName.encodeToByteArray(), w.bytes()))
+                    r.arrayHeader()
+                    if (r.str() == "error") throw HostError(r.str())
+                    host.handle = r.long()
+                }
+            } catch (e: Throwable) {
+                // a host that failed to open still holds its thread, and its runtime too when
+                // the caller was cancelled after the bundle loaded
+                host.close()
+                throw e
+            }
+            return host
         }
-        opened.get()
     }
 
-    // runs fn on the engine thread, answering its future
-    private fun <T> onThread(fn: () -> T) = executor.submit<T>(fn)
+    private fun closedError() =
+        HostError(endedWhy?.let { "the engine host has ended: $it" } ?: "the engine host is closed")
 
-    // runs fn on the engine thread, reporting what it throws
-    private fun post(fn: () -> Unit) {
-        if (executor.isShutdown) return
-        executor.execute {
-            try {
+    // runs fn on the engine thread and answers what it returns, failing on a host that is closed
+    // or closing
+    private suspend fun <T> onThread(fn: () -> T): T {
+        if (closing.get()) throw closedError()
+        try {
+            return withContext(engineThread) {
+                if (handle == 0L) throw closedError()
                 fn()
-            } catch (e: Exception) {
-                log("${e::class.simpleName}: ${e.message}")
             }
+        } catch (e: CancellationException) {
+            // either the caller was cancelled, or the host shut its thread down as the call
+            // began, which rejects the call and cancels it alone
+            currentCoroutineContext().ensureActive()
+            throw closedError()
         }
+    }
+
+    // runs fn on the engine thread, reporting what it throws; a host that has shut its thread
+    // down has nothing left for fn to act on, so fn is dropped
+    private fun post(fn: () -> Unit) {
+        try {
+            executor.execute {
+                try {
+                    fn()
+                } catch (e: Exception) {
+                    log("${e::class.simpleName}: ${e.message}")
+                }
+            }
+        } catch (e: RejectedExecutionException) {}
+    }
+
+    // posts a caller's request, failing on a host that is closed or closing
+    private fun request(fn: () -> Unit) {
+        if (closing.get()) throw closedError()
+        post(fn)
     }
 
     private fun id(): Long = nextId++
@@ -112,7 +203,10 @@ class EngineHost(
         for (a in args) w.any(a)
         val r = MsgReader(Native.call(handle, w.bytes()))
         r.arrayHeader()
-        if (r.str() == "error") throw HostError(r.str())
+        when (r.str()) {
+            "error" -> throw HostError(r.str())
+            "ended" -> end(r.str())
+        }
         val delay = if (r.isNil()) { r.nil(); null } else r.long()
         timer?.cancel(false)
         timer = delay?.let { executor.schedule({ post { call("pump") } }, it, TimeUnit.MILLISECONDS) }
@@ -158,20 +252,37 @@ class EngineHost(
     // a connection the Engine asked for, whose hooks hand everything back to the engine thread
     private fun connect(engine: Long, id: Long, since: Long, view: String?, wants: List<*>, session: Number?) {
         val hooks = object : ConnectionHooks {
-            override fun onOpen(epoch: String, head: Long) = post { call("connOpen", id, epoch, head) }
+            override fun onOpen(epoch: String, head: Long) = hook("connOpen", id, epoch, head)
             override fun onView(token: String, position: Long, selectors: List<String>) =
-                post { call("connView", id, token, position, selectors) }
-            override fun onEdits(edits: ByteArray) = post { call("connEdits", id, edits) }
-            override fun onLive(position: Long) = post { call("connLive", id, position) }
-            override fun onVouch(position: Long) = post { call("connVouch", id, position) }
-            override fun onEnd(code: Int, reason: String, fatal: AuthError?) = post {
-                connections.remove(id)
-                call("connEnd", id, code, reason, fatal?.message)
-            }
+                hook("connView", id, token, position, selectors)
+            override fun onEdits(edits: ByteArray) = hook("connEdits", id, edits)
+            override fun onLive(position: Long) = hook("connLive", id, position)
+            override fun onVouch(position: Long) = hook("connVouch", id, position)
+            override fun onEnd(code: Int, reason: String, fatal: AuthError?) =
+                hook("connEnd", id, code, reason, fatal?.message)
         }
         val s = session?.let { sessions[it.toLong()] }
         val t = transports[engine] ?: transport
         connections[id] = t.connect(since, view, wants.map { it as String }, s, hooks)
+    }
+
+    // a hook for the next drain, which the first hook into an empty queue posts
+    private fun hook(vararg request: Any?) {
+        val first = synchronized(queued) {
+            queued.add(request.asList())
+            queued.size == 1
+        }
+        if (first) post(::drainHooks)
+    }
+
+    /* Every hook queued so far, in one call, so the Engine commits the frames among them in one
+       transaction; hooks that arrive during the call queue for the next drain. */
+    private fun drainHooks() {
+        val hooks = synchronized(queued) { ArrayList(queued).also { queued.clear() } }
+
+        // a connection whose end is among them leaves the table before the Engine hears of it
+        for (h in hooks) if (h[0] == "connEnd") connections.remove(h[1] as Long)
+        call("connHooks", hooks)
     }
 
     // a backfill call on a connection, settled however it ends; a push waits for the Engine's
@@ -269,51 +380,69 @@ class EngineHost(
 
     /** Builds the bundle's Engine called name, syncing as the session or as anonymous, over an
         LMDB store in the directory store, or in memory without one, and through a transport of
-        its own when given one.  A directory holds one Engine's store, and only while that Engine
-        runs. */
-    fun createEngine(
+        its own when given one.  The Engine boots on the engine thread, loading its store, before
+        this returns.  A directory holds one Engine's store, and only while that Engine runs: a
+        new Engine may open it only once the last one's close has completed, which closeAndJoin
+        awaits. */
+    suspend fun createEngine(
         name: String,
         session: Session?,
         store: File? = null,
         transport: Transport? = null,
     ): HostedEngine {
-        store?.mkdirs()
         val id = onThread {
+            store?.mkdirs()
             val id = id()
             if (transport != null) transports[id] = transport
             val s = session?.let { val sid = id(); sessions[sid] = it; sid }
             call("createEngine", id, name, s, store?.path)
             id
-        }.get()
+        }
         return HostedEngine(this, id)
     }
 
-    internal fun sendMutation(engine: Long, mutation: ByteArray) = post { call("sendMutation", engine, mutation) }
+    internal fun sendMutation(engine: Long, mutation: ByteArray) = request { call("sendMutation", engine, mutation) }
 
     internal suspend fun sendOnlineMutation(engine: Long, mutation: ByteArray): MutationResult {
         val done = CompletableDeferred<MutationResult>()
-        post {
+        onThread {
             val c = id()
             onlines[c] = done
-            call("sendOnlineMutation", engine, c, mutation)
+            try {
+                call("sendOnlineMutation", engine, c, mutation)
+            } catch (e: Exception) {
+                onlines.remove(c)
+                throw e
+            }
         }
         return done.await()
     }
 
-    internal fun reconnectNow(engine: Long) = post { call("reconnectNow", engine) }
+    internal fun reconnectNow(engine: Long) = request { call("reconnectNow", engine) }
 
-    internal fun onEnded(engine: Long, fn: (EngineEnded) -> Unit) = post { ended[engine] = fn }
+    internal fun onEnded(engine: Long, fn: (EngineEnded) -> Unit) = request { ended[engine] = fn }
 
-    internal fun closeEngine(engine: Long) = post {
-        ended.remove(engine)
-        call("closeEngine", engine)
-        transports.remove(engine)
+    // ends an Engine, completing done once its store is closed, by this or by the host's close
+    internal fun closeEngine(engine: Long, done: CompletableDeferred<Unit>) {
+        val byHost = freed.invokeOnCompletion { done.complete(Unit) }
+        post {
+            try {
+                ended.remove(engine)
+                call("closeEngine", engine)
+                transports.remove(engine)
+            } finally {
+                done.complete(Unit)
+                byHost.dispose()
+            }
+        }
     }
 
-    // a query's results as they come, each its msgpack; the query runs while the flow is collected
+    /* A query's results as they come, each its msgpack; the query runs while the flow is
+       collected.  The flow is conflated: a result that arrives while the collector is busy
+       replaces the one still waiting, so a collector that falls behind skips to the newest. */
     internal fun results(engine: Long, start: (Long) -> Array<Any?>): Flow<ByteArray> = callbackFlow {
         var qid = 0L
-        post {
+        onThread {
             qid = id()
             queries[qid] = { r -> r.fold({ trySend(it) }, { close(it) }) }
             val args = start(qid)
@@ -325,16 +454,62 @@ class EngineHost(
                 call("closeQuery", qid)
             }
         }
+    }.buffer(Channel.CONFLATED)
+
+    /** Ends every Engine and frees the native host, closing every store, once the work already
+        queued for the engine thread has run.  It returns at once; closeAndJoin waits. */
+    override fun close() {
+        if (!closing.compareAndSet(false, true)) return
+        work.cancel()
+        executor.execute(::shutDown)
     }
 
-    override fun close() {
+    /* The host's end, once a call into it ran past its limit, which the native host answered by
+       aborting every store transaction; it runs no JS again.  Every Engine's onEnded hears why,
+       the host closes as close closes it, and the call fails with why. */
+    private fun end(why: String): Nothing {
+        endedWhy = why
+        closing.set(true)
         work.cancel()
-        onThread {
+
+        // each Engine's end, every callback heard even when one throws
+        val ends = ArrayList(ended.values)
+        ended.clear()
+        for (fn in ends) {
+            try {
+                fn(EngineEnded(why, auth = false))
+            } catch (e: Exception) {
+                log("onEnded: ${e::class.simpleName}: ${e.message}")
+            }
+        }
+
+        // the close, at once
+        shutDown()
+        throw HostError(why)
+    }
+
+    // the host's close on the engine thread, which both close and the host's end run, so a
+    // second run is harmless
+    private fun shutDown() {
+        try {
+            // an @online mutation still waiting has no answer coming
+            for (d in onlines.values) d.completeExceptionally(closedError())
+            onlines.clear()
+
+            // the runtime, and every store with it
             timer?.cancel(false)
             if (handle != 0L) Native.close(handle)
             handle = 0L
-        }.get()
-        executor.shutdown()
+        } finally {
+            executor.shutdown()
+            freed.complete(Unit)
+        }
+    }
+
+    /** closes the host, suspending until the native host is freed and every store closed */
+    suspend fun closeAndJoin() {
+        close()
+        freed.await()
     }
 }
 
@@ -348,6 +523,10 @@ interface QuerySource {
     types, which generated code converts.  Closing it ends it and closes its store. */
 class HostedEngine internal constructor(private val host: EngineHost, private val id: Long) :
     QuerySource, AutoCloseable {
+    // whether close has begun, and its completion once the store is closed
+    private val closing = AtomicBoolean()
+    private val closed = CompletableDeferred<Unit>()
+
     /** a mutation for the outbox, as msgpack under the Engine's mutations union */
     fun sendMutation(mutation: ByteArray) = host.sendMutation(id, mutation)
 
@@ -364,8 +543,20 @@ class HostedEngine internal constructor(private val host: EngineHost, private va
     /** connect now rather than when the backoff timer fires */
     fun reconnectNow() = host.reconnectNow(id)
 
-    /** calls fn, on the engine thread, if the Engine ends with an error */
+    /** Calls fn, on the engine thread, if the Engine ends with an error, or when its host ends
+        because a call into the runtime ran past the call limit (EngineLimits), which ends every
+        Engine of the host with a reason naming the limit. */
     fun onEnded(fn: (EngineEnded) -> Unit) = host.onEnded(id, fn)
 
-    override fun close() = host.closeEngine(id)
+    /** ends the Engine and closes its store after the work already queued for it, returning at
+        once */
+    override fun close() {
+        if (closing.compareAndSet(false, true)) host.closeEngine(id, closed)
+    }
+
+    /** closes the Engine, suspending until its store is closed */
+    suspend fun closeAndJoin() {
+        close()
+        closed.await()
+    }
 }

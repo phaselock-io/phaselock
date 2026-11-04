@@ -1070,6 +1070,7 @@ impl Server {
         set(h, "phaselock-time", unix_ms(SystemTime::now()).to_string());
         set(h, "phaselock-view", &view.token);
         set(h, "phaselock-position", view.position.to_string());
+        set(h, "phaselock-heartbeat", self.heartbeat.as_millis().to_string());
 
         let presented = r.q("view").unwrap_or("").to_string();
         let out = Out { tx, first: self.hooks.after_first_frame.get() };

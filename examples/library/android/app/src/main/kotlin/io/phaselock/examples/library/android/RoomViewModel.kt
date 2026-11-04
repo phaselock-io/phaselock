@@ -6,6 +6,11 @@
 package io.phaselock.examples.library.android
 
 import android.app.Application
+import android.content.Context
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.phaselock.client.Backfill
@@ -13,6 +18,7 @@ import io.phaselock.client.BackfillOutcome
 import io.phaselock.client.Connection
 import io.phaselock.client.ConnectionHooks
 import io.phaselock.client.Credentials
+import io.phaselock.client.EngineEnded
 import io.phaselock.client.EngineHost
 import io.phaselock.client.HttpTransport
 import io.phaselock.client.Mutation
@@ -26,9 +32,22 @@ import io.phaselock.examples.library.UserEngine
 import io.phaselock.examples.library.postLibraryMutation
 import java.io.File
 import java.io.IOException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+
+// what the app keeps between runs: the server and room it was last in, and each login's token
+private val Context.keptData by preferencesDataStore("room")
+private val SERVER = stringPreferencesKey("server")
+private val ROOM = stringPreferencesKey("room")
+private fun tokenKey(room: String, login: String) = stringPreferencesKey("token:$room:$login")
 
 /** A window's own way to the database, with a switch that takes it offline as a dropped network
     would: the live connection ends, every attempt after it fails at once, and the Engine queues
@@ -85,8 +104,11 @@ class Windows(
     val bob: Window<UserEngine>,
 )
 
+/** the server and room the app was last in */
+class Last(val server: String, val room: String)
+
 /** The room the app is in, and getting into one. */
-class Room(app: Application) : AndroidViewModel(app) {
+class RoomViewModel(app: Application) : AndroidViewModel(app) {
     sealed interface State {
         data object Choosing : State
         data object Opening : State
@@ -97,19 +119,29 @@ class Room(app: Application) : AndroidViewModel(app) {
     private val _state = MutableStateFlow<State>(State.Choosing)
     val state: StateFlow<State> = _state
 
-    private val prefs = app.getSharedPreferences("room", Application.MODE_PRIVATE)
+    private val kept = app.keptData
+    // the one HTTP client of every room the app opens, whose connections outlast a room's
+    private val client = OkHttpClient()
     private var host: EngineHost? = null
     private var http: HttpTransport? = null
+    // the last room's host, whose close the next room awaits, since it opens the same stores
+    private var left: EngineHost? = null
 
-    /** the server and room the app was last in */
-    val lastServer: String get() = prefs.getString("server", DEFAULT_SERVER)!!
-    val lastRoom: String get() = prefs.getString("room", "")!!
+    /** the server and room the app was last in, once they have loaded */
+    val last: StateFlow<Last?> = kept.data
+        .map { Last(it[SERVER] ?: DEFAULT_SERVER, it[ROOM].orEmpty()) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     /** Opens a room on the server, a new one when room is blank.  For a room that exists,
-        CreateRoom writes nothing. */
+        CreateRoom writes nothing.  The app is in one room at a time, so an open while a room
+        opens or is open does nothing. */
     fun open(server: String, room: String) {
+        if (_state.value == State.Opening || _state.value is State.Open) return
         _state.value = State.Opening
         viewModelScope.launch {
+            // the last room's stores are closed before any of them opens again
+            left?.closeAndJoin()
+
             try {
                 _state.value = State.Open(windows(server.trim(), room.trim().ifEmpty { generateUuid() }))
             } catch (e: Exception) {
@@ -126,20 +158,25 @@ class Room(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun windows(server: String, room: String): Windows {
-        prefs.edit().putString("server", server).putString("room", room).apply()
-        val http = HttpTransport(server).also { this.http = it }
+        kept.edit {
+            it[SERVER] = server
+            it[ROOM] = room
+        }
+        val http = HttpTransport(server, client).also { this.http = it }
 
         // the room exists before anyone signs in to it; offline, a room opened before still opens
         try {
             val created = postLibraryMutation(http, CreateRoom(room))
             if (created !is MutationResult.Ok) throw IOException("the room was not created: $created")
         } catch (e: IOException) {
-            if (prefs.getString(tokenKey(room, "admin"), null) == null) throw e
+            if (kept.data.first()[tokenKey(room, "admin")] == null) throw e
         }
 
         // the host, with the model's native bundle
-        val bundle = getApplication<Application>().assets.open("native.bundle.js").use { it.readBytes() }
-        val host = EngineHost(bundle, "native.bundle.js", http).also { this.host = it }
+        val bundle = withContext(Dispatchers.IO) {
+            getApplication<Application>().assets.open("native.bundle.js").use { it.readBytes() }
+        }
+        val host = EngineHost.open(bundle, "native.bundle.js", http).also { this.host = it }
 
         // each window signs itself in, as the web demo's do
         fun store(login: String) = File(getApplication<Application>().filesDir, "stores/$room/$login")
@@ -150,16 +187,31 @@ class Room(app: Application) : AndroidViewModel(app) {
         val (bobSession, bobWay) = window("bob")
         val windows = Windows(
             room,
-            Window(AdminEngine(host, deskSession, store("admin"), deskWay), deskWay, userOf(deskSession)),
-            Window(UserEngine(host, aliceSession, store("alice"), aliceWay), aliceWay, userOf(aliceSession)),
-            Window(UserEngine(host, bobSession, store("bob"), bobWay), bobWay, userOf(bobSession)),
+            Window(AdminEngine.open(host, deskSession, store("admin"), deskWay), deskWay, userOf(deskSession)),
+            Window(UserEngine.open(host, aliceSession, store("alice"), aliceWay), aliceWay, userOf(aliceSession)),
+            Window(UserEngine.open(host, bobSession, store("bob"), bobWay), bobWay, userOf(bobSession)),
         )
 
-        // a room an hour old is erased, which refuses its tokens; the app goes back to choosing
-        windows.desk.engine.onEnded { ended ->
-            if (ended.auth) _state.value = State.Failed("The room has reset.")
+        /* A window whose Engine ends takes the room with it, and the app goes back to choosing.  A
+           room an hour old is erased, which refuses its tokens; any other end names its own
+           reason.  The ends are heard on the engine thread and acted on here. */
+        val app = getApplication<Application>()
+        fun ended(e: EngineEnded) {
+            val reason = if (e.auth) app.getString(R.string.room_reset) else app.getString(R.string.room_ended, e.reason)
+            viewModelScope.launch { end(windows, reason) }
         }
+        windows.desk.engine.onEnded(::ended)
+        windows.alice.engine.onEnded(::ended)
+        windows.bob.engine.onEnded(::ended)
         return windows
+    }
+
+    // leaves a room whose Engine ended; the first of its windows to end leaves it, and the
+    // others find it already left
+    private fun end(windows: Windows, reason: String) {
+        if ((_state.value as? State.Open)?.windows !== windows) return
+        close()
+        _state.value = State.Failed(reason)
     }
 
     /* Signs a login in with the demo's shared password (see the seed in the model's bundle), and
@@ -169,14 +221,14 @@ class Room(app: Application) : AndroidViewModel(app) {
         val session = try {
             http.login(Credentials.Password("$room:$login", "password"))
         } catch (e: IOException) {
-            prefs.getString(key, null)?.let { Session.restore(it) } ?: throw e
+            kept.data.first()[key]?.let { Session.restore(it) } ?: throw e
         }
-        prefs.edit().putString(key, session.token).apply()
-        session.onRefresh = { prefs.edit().putString(key, it.token).apply() }
+        keep(key, session.token)
+        session.onRefresh = { viewModelScope.launch { keep(key, it.token) } }
         return session
     }
 
-    private fun tokenKey(room: String, login: String) = "token:$room:$login"
+    private suspend fun keep(key: Preferences.Key<String>, token: String) = kept.edit { it[key] = token }
 
     // the user id's own half, the patron's id for a patron
     private fun userOf(session: Session): String = session.user.substringAfter('.')
@@ -189,11 +241,16 @@ class Room(app: Application) : AndroidViewModel(app) {
         }
         host?.close()
         http?.close()
+        left = host
         host = null
         http = null
     }
 
-    override fun onCleared() = close()
+    override fun onCleared() {
+        close()
+        client.dispatcher.executorService.shutdown()
+        client.connectionPool.evictAll()
+    }
 
     companion object {
         /** the hosted demo's database, which the web demo at demo.phaselock.io uses */
