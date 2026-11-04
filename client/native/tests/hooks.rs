@@ -2,8 +2,8 @@
 //! every frame among them in one store write transaction.
 
 use phaselock_core::mp;
-use phaselock_native::host::{Host, Limits};
 use phaselock_native::api;
+use phaselock_native::host::{Host, Limits};
 use serde_json::{Value, json};
 
 const BUNDLE: &str =

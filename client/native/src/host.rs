@@ -121,12 +121,17 @@ pub fn bytes_of(ctx: *mut JSContext, v: JSValue) -> Option<Vec<u8>> {
 /// pending
 pub fn with_bytes<R>(ctx: *mut JSContext, v: JSValue, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
     unsafe {
+        // an ArrayBuffer by its class, since a test that throws builds a backtrace inside a native
         let mut size = 0usize;
-        let p = JS_GetArrayBuffer(ctx, &mut size, v);
-        if !p.is_null() {
+        if state(ctx).env.get().is_some_and(|env| env.is_array_buffer(v)) {
+            let p = JS_GetArrayBuffer(ctx, &mut size, v);
+            if p.is_null() {
+                return None;
+            }
             return Some(f(std::slice::from_raw_parts(p, size)));
         }
-        JS_FreeValue(ctx, JS_GetException(ctx));
+
+        // otherwise a typed array's view of its buffer, or no bytes at all
         let (mut off, mut len, mut per) = (0usize, 0usize, 0usize);
         let buf = JS_GetTypedArrayBuffer(ctx, v, &mut off, &mut len, &mut per);
         if is_exception(buf) {
@@ -189,8 +194,11 @@ unsafe extern "C" fn native_emit(
     argv: *mut JSValue,
 ) -> JSValue {
     let a = unsafe { args(argv, 1) };
+    let Some(env) = unsafe { state(ctx) }.env.get() else {
+        return throw_error(ctx, "no js environment");
+    };
     let mut w = mp::Writer::new();
-    if let Err(e) = mpjs::encode(ctx, a[0], &mut w, 0) {
+    if let Err(e) = mpjs::encode(env, a[0], &mut w, 0) {
         return throw_type(ctx, &format!("an event: {e}"));
     }
     unsafe { state(ctx) }.events.borrow_mut().push(w.into_vec());
@@ -265,8 +273,11 @@ unsafe extern "C" fn native_encode(
     argv: *mut JSValue,
 ) -> JSValue {
     let a = unsafe { args(argv, 1) };
+    let Some(env) = unsafe { state(ctx) }.env.get() else {
+        return throw_error(ctx, "no js environment");
+    };
     let mut w = mp::Writer::new();
-    if let Err(e) = mpjs::encode(ctx, a[0], &mut w, 0) {
+    if let Err(e) = mpjs::encode(env, a[0], &mut w, 0) {
         return throw_type(ctx, &e);
     }
     unsafe { JS_NewArrayBufferCopy(ctx, w.buf.as_ptr(), w.buf.len()) }

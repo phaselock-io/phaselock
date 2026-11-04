@@ -963,8 +963,9 @@ impl Host {
         if is_null(r.v) || is_undefined(r.v) {
             return Ok(None);
         }
+        let env = self.state().env.get().ok_or("no js environment")?;
         let mut w = mp::Writer::new();
-        mpjs::encode(ctx, r.v, &mut w, 0)?;
+        mpjs::encode(env, r.v, &mut w, 0)?;
         Ok(Some(w.into_vec()))
     }
 

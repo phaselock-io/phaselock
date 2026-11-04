@@ -154,8 +154,9 @@ pub fn decode(
 pub fn encode(ctx: *mut JSContext, sc: &Schema, ty: &[u8], v: JSValue) -> Result<Vec<u8>, String> {
     match ty {
         b".json" => {
+            let env = unsafe { state(ctx) }.env.get().ok_or("no js environment")?;
             let mut w = mp::Writer::new();
-            mpjs::encode(ctx, v, &mut w, 0)?;
+            mpjs::encode(env, v, &mut w, 0)?;
             Ok(w.into_vec())
         }
         b".mutation" => mutation_bytes(ctx, v).ok_or_else(|| "malformed outbox row".to_string()),

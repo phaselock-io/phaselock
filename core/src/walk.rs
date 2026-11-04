@@ -86,13 +86,15 @@ impl TokBuf {
     }
 }
 
-/// The JS classes the tokenizer tells apart, learned once per context.
+/// The JS classes the tokenizer and the hosts' natives tell apart, learned once per context, so
+/// that no type test throws.
 #[derive(Clone, Copy)]
 pub struct JsEnv {
     pub ctx: *mut JSContext,
     date: JSClassID,
     set: JSClassID,
     map: JSClassID,
+    buffer: JSClassID,
 }
 
 impl JsEnv {
@@ -112,7 +114,13 @@ impl JsEnv {
             date: learn("new Date(0)")?,
             set: learn("new Set()")?,
             map: learn("new Map()")?,
+            buffer: learn("new ArrayBuffer(0)")?,
         })
+    }
+
+    /// whether a value is an ArrayBuffer
+    pub fn is_array_buffer(&self, v: JSValue) -> bool {
+        is_object(v) && unsafe { JS_GetClassID(v) } == self.buffer
     }
 }
 

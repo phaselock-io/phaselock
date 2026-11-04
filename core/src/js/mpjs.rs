@@ -4,7 +4,7 @@
 
 use super::ffi::*;
 use crate::mp::{self, Node};
-use crate::walk::js_string;
+use crate::walk::{JsEnv, js_string};
 
 pub fn decode(ctx: *mut JSContext, node: &Node<'_>) -> Result<JSValue, String> {
     unsafe {
@@ -63,12 +63,8 @@ pub fn decode(ctx: *mut JSContext, node: &Node<'_>) -> Result<JSValue, String> {
     }
 }
 
-pub fn encode(
-    ctx: *mut JSContext,
-    v: JSValue,
-    w: &mut mp::Writer,
-    depth: usize,
-) -> Result<(), String> {
+pub fn encode(env: JsEnv, v: JSValue, w: &mut mp::Writer, depth: usize) -> Result<(), String> {
+    let ctx = env.ctx;
     if depth > 64 {
         return Err("value nested too deeply".into());
     }
@@ -104,20 +100,22 @@ pub fn encode(
                         if is_exception(item) {
                             return Err("reading an array element".into());
                         }
-                        let r = encode(ctx, item, w, depth + 1);
+                        let r = encode(env, item, w, depth + 1);
                         JS_FreeValue(ctx, item);
                         r?;
                     }
                     return Ok(());
                 }
-                let mut size = 0usize;
-                let bytes = JS_GetArrayBuffer(ctx, &mut size, v);
-                if !bytes.is_null() {
+                if env.is_array_buffer(v) {
+                    let mut size = 0usize;
+                    let bytes = JS_GetArrayBuffer(ctx, &mut size, v);
+                    if bytes.is_null() {
+                        return Err("reading an ArrayBuffer".into());
+                    }
                     w.bin(std::slice::from_raw_parts(bytes, size));
                     return Ok(());
                 }
-                JS_FreeValue(ctx, JS_GetException(ctx)); // not an ArrayBuffer
-                encode_object(ctx, v, w, depth)?;
+                encode_object(env, v, w, depth)?;
             }
             _ => return Err("value not encodable".into()),
         }
@@ -126,11 +124,12 @@ pub fn encode(
 }
 
 unsafe fn encode_object(
-    ctx: *mut JSContext,
+    env: JsEnv,
     v: JSValue,
     w: &mut mp::Writer,
     depth: usize,
 ) -> Result<(), String> {
+    let ctx = env.ctx;
     unsafe {
         let mut tab: *mut JSPropertyEnum = std::ptr::null_mut();
         let mut n = 0u32;
@@ -166,7 +165,7 @@ unsafe fn encode_object(
                 }
                 w.str(std::slice::from_raw_parts(k as *const u8, klen));
                 JS_FreeCString(ctx, k);
-                out = encode(ctx, val, w, depth + 1);
+                out = encode(env, val, w, depth + 1);
                 if out.is_err() {
                     break;
                 }
