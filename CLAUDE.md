@@ -67,14 +67,16 @@ Two kinds of work happen here; orient first:
 ```
 typespec/         The product: TypeSpec vocabulary (core/), the
                   TypeScript emitter (ts/, with its runtime skeleton in
-                  assets/), the Kotlin emitter (kt/), and their tests.
+                  assets/), the Kotlin and Swift emitters (kt/, swift/),
+                  and their tests.
                   See typespec/CLAUDE.md and typespec/README.md.
 examples/
   todo-basic/     Smallest loop: browser engines + the v0 database (db/).
   library/        Full architecture on the v0 database: signed-in patrons
                   and librarians, per-audience views, predictions, and a
                   cron daily sheet, hosted as a demo with a room per
-                  visitor; android/ is its Android app.
+                  visitor; android/ and ios/ are its Android and iOS
+                  apps.
 client/ts/        @phaselock/client: the JS host's transport over HTTP
                   (logins, sessions, connections), its msgpack cursor,
                   and the Registry that walks the generated type

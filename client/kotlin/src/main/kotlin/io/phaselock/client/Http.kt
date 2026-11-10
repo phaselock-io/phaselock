@@ -44,6 +44,9 @@ private const val PAGE_OPS = 1000
 private const val PAGE_BYTES = 256 * 1024
 // a blob operation longer than this is corruption, since a key and a value are each at most 16 MiB
 private const val MAX_OPERATION = 32L * 1024 * 1024
+// a blob header longer than this is corruption: at this length its slices name half a million
+// slices or more, which is more than one client holds
+private const val MAX_HEADER = 64L * 1024 * 1024
 // a blob's set opcode, and the first byte of its end marker, which sits where an opcode would
 private const val SET = 0x00
 private const val END = 0xff
@@ -640,6 +643,7 @@ private class HttpConnection(
                 val version = src.readByte().toInt()
                 if (version != 1) throw IOException("snapshot ${b.selector}: version $version")
                 val hlen = src.readInt().toLong() and 0xffffffffL
+                if (hlen > MAX_HEADER) throw IOException("snapshot ${b.selector}: header too long")
                 val hdr = src.readByteArray(hlen)
                 val crc = src.readInt().toLong() and 0xffffffffL
                 if (crc != crc32c(hdr)) throw IOException("snapshot ${b.selector}: header crc")
@@ -708,10 +712,13 @@ private class HttpConnection(
                 // one set operation, whole: its opcode, key, and value
                 if (next != SET) throw IOException("snapshot ${b.selector}: corrupt operation")
                 op.clear()
-                withContext(Dispatchers.IO) {
-                    repeat(3) { if (!readValue(src, op)) throw IOException("body ended early") }
+                try {
+                    withContext(Dispatchers.IO) {
+                        repeat(3) { if (!readValue(src, op, MAX_OPERATION)) throw IOException("body ended early") }
+                    }
+                } catch (e: PastLimit) {
+                    throw IOException("snapshot ${b.selector}: corrupt operation")
                 }
-                if (op.size > MAX_OPERATION) throw IOException("snapshot ${b.selector}: corrupt operation")
                 val bytes = op.readByteArray()
                 reading.fnv.update(bytes)
                 page.write(bytes)

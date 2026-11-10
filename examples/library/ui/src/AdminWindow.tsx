@@ -40,6 +40,11 @@ const COPY_STATES = {
   out: 'checked out',
 };
 
+/* A modal renders in place inside the window, which frames it (styles.css), so it covers and
+   centers on the window it acts for.  Kept off the page's body, it also leaves the page's
+   scrolling alone. */
+const IN_WINDOW = { getContainer: false, rootClassName: 'in-window', centered: true } as const;
+
 // a copy of an edition, as the modal that acts on it holds it
 type Selected = { book: AdminBookInfo; title: string };
 
@@ -98,6 +103,7 @@ function CopyActions({
 
   return (
     <Modal
+      {...IN_WINDOW}
       open={selected !== null}
       onCancel={onClose}
       footer={null}
@@ -380,6 +386,7 @@ export default function AdminWindow({ client }: { client: Client<AdminEngine> })
       />
 
       <Modal
+        {...IN_WINDOW}
         title="New edition"
         open={addingEdition}
         okText="Add"

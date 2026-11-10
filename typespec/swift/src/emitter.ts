@@ -51,7 +51,7 @@ import {
 const KEYWORDS = new Set(
   (
     'associatedtype class deinit enum extension fileprivate func import init inout internal let ' +
-    'open operator private precedencegroup protocol public rethrows static struct subscript ' +
+    'operator private precedencegroup protocol public rethrows static struct subscript ' +
     'typealias var break case catch continue default defer do else fallthrough for guard if in ' +
     'repeat return throw switch where while Any as await false is nil self Self super throws ' +
     'true try Type Protocol'
@@ -578,8 +578,10 @@ function printEngine(d: Denter, e: PEngine): void {
   d.print('public func onEnded(_ fn: @escaping @Sendable (EngineEnded) -> Void) throws {\n');
   d.print('    try hosted.onEnded(fn)\n');
   d.print('}\n');
-  d.print('\npublic func query(_ call: [UInt8]) -> AsyncThrowingStream<[UInt8], any Error> {\n');
-  d.print('    hosted.query(call)\n');
+  d.print(
+    '\npublic func query(_ call: [UInt8], ejectable: Bool) -> AsyncThrowingStream<[UInt8], any Error> {\n',
+  );
+  d.print('    hosted.query(call, ejectable: ejectable)\n');
   d.print('}\n');
   d.print('\n');
   doc(

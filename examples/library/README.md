@@ -94,3 +94,20 @@ Android SDK with the NDK.
   the web demo at demo.phaselock.io joins its room
 - for a database of your own, enter its address instead: from the
   emulator, `pnpm dev`'s is `http://10.0.2.2:8080/phaselock`
+
+## Run the iOS app
+
+The iOS app in `ios/` is the Android app's twin, one universal app for
+iPhone and iPad, its Engines in QuickJS over LMDB through the Swift client
+(`client/swift`).  It builds on a Mac with Xcode, the Rust targets
+`aarch64-apple-ios`, `aarch64-apple-ios-sim`, and `aarch64-apple-darwin`,
+pnpm, and XcodeGen.
+
+- prepare: `ios/prepare.sh`, which generates the model's code and native
+  bundles, builds the native library as an XCFramework, and writes
+  `Library.xcodeproj`
+- build and run: open `ios/Library.xcodeproj` in Xcode, or build with
+  `xcodebuild -project ios/Library.xcodeproj -scheme Library`
+- the app opens rooms on the hosted demo by default; from the simulator,
+  `pnpm dev`'s database is `http://127.0.0.1:8080/phaselock`, and from a
+  device, the Mac's address on the network

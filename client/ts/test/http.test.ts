@@ -1361,6 +1361,8 @@ describe('backfill', () => {
     ['content hash', (b: Uint8Array) => (b[built.opEnds[5] - 1] ^= 1)],
     ['footer crc', (b: Uint8Array) => (b[b.length - 1] ^= 1)],
     ['bad magic', (b: Uint8Array) => (b[0] = 0x58)],
+    // a header length of 4 GiB
+    ['header too long', (b: Uint8Array) => b.fill(0xff, 5, 9)],
   ])('corruption is detected: %s', async (what, corrupt) => {
     const bytes = built.bytes.slice();
     corrupt(bytes);

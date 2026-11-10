@@ -180,15 +180,15 @@ public struct TryHold: Sendable, Hashable {
     public let id: String
     public let patron: String
     public let target: HoldTarget
-    public let `open`: Bool
+    public let open: Bool
     public let timestamp: Date
 
-    public init(room: String, id: String, patron: String, target: HoldTarget, `open`: Bool, timestamp: Date) {
+    public init(room: String, id: String, patron: String, target: HoldTarget, open: Bool, timestamp: Date) {
         self.room = room
         self.id = id
         self.patron = patron
         self.target = target
-        self.`open` = `open`
+        self.open = open
         self.timestamp = timestamp
     }
 }
@@ -482,7 +482,7 @@ public struct AdminBookInfo: Sendable, Hashable {
 }
 
 public enum AdminBookInfoState: String, Sendable, Hashable, CaseIterable {
-    case `open` = "open"
+    case open = "open"
     case restricted = "restricted"
     case held = "held"
     case out = "out"
@@ -516,19 +516,37 @@ public struct UserCheckoutInfo: Sendable, Hashable {
     }
 }
 
+public struct UserHoldInfo: Sendable, Hashable {
+    public let id: String
+    public let target: HoldTarget
+    public let expires: Date?
+    public let pending: Bool?
+    public let restricted: Bool
+
+    public init(id: String, target: HoldTarget, expires: Date? = nil, pending: Bool? = nil, restricted: Bool) {
+        self.id = id
+        self.target = target
+        self.expires = expires
+        self.pending = pending
+        self.restricted = restricted
+    }
+}
+
 public struct UserBookInfo: Sendable, Hashable {
     public let isbn: String
     public let title: String
     public let availableNormal: Int
     public let availableRestricted: [String]
-    public let hold: PatronHold?
+    public let hold: UserHoldInfo?
+    public let checkout: Checkout?
 
-    public init(isbn: String, title: String, availableNormal: Int, availableRestricted: [String], hold: PatronHold?) {
+    public init(isbn: String, title: String, availableNormal: Int, availableRestricted: [String], hold: UserHoldInfo?, checkout: Checkout?) {
         self.isbn = isbn
         self.title = title
         self.availableNormal = availableNormal
         self.availableRestricted = availableRestricted
         self.hold = hold
+        self.checkout = checkout
     }
 }
 
@@ -627,8 +645,8 @@ public final class UserEngine: QuerySource, Sendable {
         try hosted.onEnded(fn)
     }
 
-    public func query(_ call: [UInt8]) -> AsyncThrowingStream<[UInt8], any Error> {
-        hosted.query(call)
+    public func query(_ call: [UInt8], ejectable: Bool) -> AsyncThrowingStream<[UInt8], any Error> {
+        hosted.query(call, ejectable: ejectable)
     }
 
     /** ends the Engine and closes its store after the work already queued for it, returning at
@@ -684,8 +702,8 @@ public final class AdminEngine: QuerySource, Sendable {
         try hosted.onEnded(fn)
     }
 
-    public func query(_ call: [UInt8]) -> AsyncThrowingStream<[UInt8], any Error> {
-        hosted.query(call)
+    public func query(_ call: [UInt8], ejectable: Bool) -> AsyncThrowingStream<[UInt8], any Error> {
+        hosted.query(call, ejectable: ejectable)
     }
 
     /** ends the Engine and closes its store after the work already queued for it, returning at
@@ -788,7 +806,7 @@ public func postLibraryMutation(
 
 let registry: Registry = {
     var n: [SchemaNode] = []
-    n.reserveCapacity(111)
+    n.reserveCapacity(113)
     n.append(.structure(StructNode("Edition", [SchemaField("isbn", 1, false), SchemaField("title", 1, false)], -1, Edition.self, make: { a in Edition(isbn: a[0] as! String, title: a[1] as! String) }, get: { v in let s = v as! Edition; return [s.isbn, s.title] }))) // 0
     n.append(.str) // 1
     n.append(.structure(StructNode("Book", [SchemaField("id", 1, false), SchemaField("isbn", 1, false), SchemaField("restricted", 3, false), SchemaField("timestamp", 4, false), SchemaField("status", 5, true)], -1, Book.self, make: { a in Book(id: a[0] as! String, isbn: a[1] as! String, restricted: a[2] as! Bool, timestamp: a[3] as! Date, status: a[4] as? BookStatus) }, get: { v in let s = v as! Book; return [s.id, s.isbn, s.restricted, s.timestamp, s.status] }))) // 2
@@ -812,7 +830,7 @@ let registry: Registry = {
     n.append(.lit(.str("update-book-restricted"))) // 20
     n.append(.structure(StructNode("RemoveBook", [SchemaField("type", 22, false), SchemaField("room", 1, false), SchemaField("id", 1, false), SchemaField("timestamp", 4, false)], 0, RemoveBook.self, make: { a in RemoveBook(room: a[0] as! String, id: a[1] as! String, timestamp: a[2] as! Date) }, get: { v in let s = v as! RemoveBook; return [s.room, s.id, s.timestamp] }))) // 21
     n.append(.lit(.str("remove-book"))) // 22
-    n.append(.structure(StructNode("TryHold", [SchemaField("type", 24, false), SchemaField("room", 1, false), SchemaField("id", 1, false), SchemaField("patron", 1, false), SchemaField("target", 9, false), SchemaField("open", 3, false), SchemaField("timestamp", 4, false)], 0, TryHold.self, make: { a in TryHold(room: a[0] as! String, id: a[1] as! String, patron: a[2] as! String, target: a[3] as! HoldTarget, `open`: a[4] as! Bool, timestamp: a[5] as! Date) }, get: { v in let s = v as! TryHold; return [s.room, s.id, s.patron, s.target, s.`open`, s.timestamp] }))) // 23
+    n.append(.structure(StructNode("TryHold", [SchemaField("type", 24, false), SchemaField("room", 1, false), SchemaField("id", 1, false), SchemaField("patron", 1, false), SchemaField("target", 9, false), SchemaField("open", 3, false), SchemaField("timestamp", 4, false)], 0, TryHold.self, make: { a in TryHold(room: a[0] as! String, id: a[1] as! String, patron: a[2] as! String, target: a[3] as! HoldTarget, open: a[4] as! Bool, timestamp: a[5] as! Date) }, get: { v in let s = v as! TryHold; return [s.room, s.id, s.patron, s.target, s.open, s.timestamp] }))) // 23
     n.append(.lit(.str("try-hold"))) // 24
     n.append(.structure(StructNode("CancelHold", [SchemaField("type", 26, false), SchemaField("room", 1, false), SchemaField("id", 1, false), SchemaField("patron", 1, false)], 0, CancelHold.self, make: { a in CancelHold(room: a[0] as! String, id: a[1] as! String, patron: a[2] as! String) }, get: { v in let s = v as! CancelHold; return [s.room, s.id, s.patron] }))) // 25
     n.append(.lit(.str("cancel-hold"))) // 26
@@ -859,7 +877,7 @@ let registry: Registry = {
     n.append(.union(UnionNode("UserMutations", .jsonType([("object", .field("type", .literal([(.str("rename-patron"), .match(36)), (.str("try-hold"), .match(23)), (.str("cancel-hold"), .match(25)), (.str("patron-dismiss-notice"), .match(40)), (.str("change-password"), .match(48)), (.str("delete-account"), .match(62))])))])))) // 67
     n.append(.union(UnionNode("AdminMutations", .jsonType([("object", .field("type", .literal([(.str("rename-patron"), .match(36)), (.str("try-hold"), .match(23)), (.str("patron-dismiss-notice"), .match(40)), (.str("library-cancel-hold"), .match(27)), (.str("add-edition"), .match(13)), (.str("update-edition-title"), .match(15)), (.str("add-book"), .match(17)), (.str("update-book-restricted"), .match(19)), (.str("remove-book"), .match(21)), (.str("assign-patron"), .match(38)), (.str("try-checkout"), .match(29)), (.str("end-checkout"), .match(31)), (.str("dismiss-notice"), .match(42))])))])))) // 68
     n.append(.structure(StructNode("AdminBookInfo", [SchemaField("id", 1, false), SchemaField("restricted", 3, false), SchemaField("state", 70, false), SchemaField("pending", 3, true), SchemaField("patronId", 1, true), SchemaField("holdId", 1, true), SchemaField("checkoutId", 1, true)], -1, AdminBookInfo.self, make: { a in AdminBookInfo(id: a[0] as! String, restricted: a[1] as! Bool, state: a[2] as! AdminBookInfoState, pending: a[3] as? Bool, patronId: a[4] as? String, holdId: a[5] as? String, checkoutId: a[6] as? String) }, get: { v in let s = v as! AdminBookInfo; return [s.id, s.restricted, s.state, s.pending, s.patronId, s.holdId, s.checkoutId] }))) // 69
-    n.append(.union(UnionNode(nil, .jsonType([("string", .literal([(.str("open"), .match(71)), (.str("restricted"), .match(72)), (.str("held"), .match(73)), (.str("out"), .match(74))]))]), wrap: { _, v in AdminBookInfoState(rawValue: v as! String)! }, unwrap: { v in (v as? AdminBookInfoState).map { e in switch e { case .`open`: (71, "open"); case .restricted: (72, "restricted"); case .held: (73, "held"); case .out: (74, "out") } } }))) // 70
+    n.append(.union(UnionNode(nil, .jsonType([("string", .literal([(.str("open"), .match(71)), (.str("restricted"), .match(72)), (.str("held"), .match(73)), (.str("out"), .match(74))]))]), wrap: { _, v in AdminBookInfoState(rawValue: v as! String)! }, unwrap: { v in (v as? AdminBookInfoState).map { e in switch e { case .open: (71, "open"); case .restricted: (72, "restricted"); case .held: (73, "held"); case .out: (74, "out") } } }))) // 70
     n.append(.lit(.str("open"))) // 71
     n.append(.lit(.str("restricted"))) // 72
     n.append(.lit(.str("held"))) // 73
@@ -867,39 +885,41 @@ let registry: Registry = {
     n.append(.structure(StructNode("AdminEditionInfo", [SchemaField("isbn", 1, false), SchemaField("title", 1, false), SchemaField("books", 76, false)], -1, AdminEditionInfo.self, make: { a in AdminEditionInfo(isbn: a[0] as! String, title: a[1] as! String, books: a[2] as! [AdminBookInfo]) }, get: { v in let s = v as! AdminEditionInfo; return [s.isbn, s.title, s.books] }))) // 75
     n.append(.array(nil, 69)) // 76
     n.append(.structure(StructNode("UserCheckoutInfo", [SchemaField("id", 1, false), SchemaField("book", 1, false), SchemaField("title", 1, false), SchemaField("expires", 4, false), SchemaField("overdue", 3, false)], -1, UserCheckoutInfo.self, make: { a in UserCheckoutInfo(id: a[0] as! String, book: a[1] as! String, title: a[2] as! String, expires: a[3] as! Date, overdue: a[4] as! Bool) }, get: { v in let s = v as! UserCheckoutInfo; return [s.id, s.book, s.title, s.expires, s.overdue] }))) // 77
-    n.append(.structure(StructNode("UserBookInfo", [SchemaField("isbn", 1, false), SchemaField("title", 1, false), SchemaField("availableNormal", 79, false), SchemaField("availableRestricted", 80, false), SchemaField("hold", 81, false)], -1, UserBookInfo.self, make: { a in UserBookInfo(isbn: a[0] as! String, title: a[1] as! String, availableNormal: a[2] as! Int, availableRestricted: a[3] as! [String], hold: a[4] as? PatronHold) }, get: { v in let s = v as! UserBookInfo; return [s.isbn, s.title, s.availableNormal, s.availableRestricted, s.hold] }))) // 78
-    n.append(.int) // 79
-    n.append(.array(nil, 1)) // 80
-    n.append(.union(UnionNode(nil, .jsonType([("object", .match(34)), ("null", .match(82))])))) // 81
-    n.append(.null) // 82
-    n.append(.structure(StructNode("UserPatronInfo", [SchemaField("name", 1, false), SchemaField("color", 1, false), SchemaField("researcher", 3, false), SchemaField("holds", 84, false), SchemaField("checkouts", 85, false)], -1, UserPatronInfo.self, make: { a in UserPatronInfo(name: a[0] as! String, color: a[1] as! String, researcher: a[2] as! Bool, holds: a[3] as! [PatronHold], checkouts: a[4] as! [UserCheckoutInfo]) }, get: { v in let s = v as! UserPatronInfo; return [s.name, s.color, s.researcher, s.holds, s.checkouts] }))) // 83
-    n.append(.array(nil, 34)) // 84
-    n.append(.array(nil, 77)) // 85
-    n.append(.lit(.bool(true))) // 86
-    n.append(.union(UnionNode("LibraryDBMutation", .jsonType([("object", .field("type", .literal([(.str("rename-patron"), .match(36)), (.str("try-hold"), .match(23)), (.str("cancel-hold"), .match(25)), (.str("patron-dismiss-notice"), .match(40)), (.str("change-password"), .match(48)), (.str("delete-account"), .match(62)), (.str("library-cancel-hold"), .match(27)), (.str("add-edition"), .match(13)), (.str("update-edition-title"), .match(15)), (.str("add-book"), .match(17)), (.str("update-book-restricted"), .match(19)), (.str("remove-book"), .match(21)), (.str("assign-patron"), .match(38)), (.str("try-checkout"), .match(29)), (.str("end-checkout"), .match(31)), (.str("dismiss-notice"), .match(42)), (.str("create-account"), .match(45)), (.str("create-room"), .match(65))])))])))) // 87
-    n.append(.union(UnionNode("AdminQuery", .jsonType([("array", .length([(1, .index(0, .jsonType([("string", .literal([(.str("AdminQueries.allPatronIds"), .match(89)), (.str("AdminQueries.allPatrons"), .match(91)), (.str("AdminQueries.allEditions"), .match(93)), (.str("AdminQueries.notices"), .match(95)), (.str("AdminQueries.roomCreated"), .match(97))]))])))], nil))])))) // 88
-    n.append(.tuple(nil, [90])) // 89
-    n.append(.lit(.str("AdminQueries.allPatronIds"))) // 90
+    n.append(.structure(StructNode("UserHoldInfo", [SchemaField("id", 1, false), SchemaField("target", 9, false), SchemaField("expires", 4, true), SchemaField("pending", 3, true), SchemaField("restricted", 3, false)], -1, UserHoldInfo.self, make: { a in UserHoldInfo(id: a[0] as! String, target: a[1] as! HoldTarget, expires: a[2] as? Date, pending: a[3] as? Bool, restricted: a[4] as! Bool) }, get: { v in let s = v as! UserHoldInfo; return [s.id, s.target, s.expires, s.pending, s.restricted] }))) // 78
+    n.append(.structure(StructNode("UserBookInfo", [SchemaField("isbn", 1, false), SchemaField("title", 1, false), SchemaField("availableNormal", 80, false), SchemaField("availableRestricted", 81, false), SchemaField("hold", 82, false), SchemaField("checkout", 84, false)], -1, UserBookInfo.self, make: { a in UserBookInfo(isbn: a[0] as! String, title: a[1] as! String, availableNormal: a[2] as! Int, availableRestricted: a[3] as! [String], hold: a[4] as? UserHoldInfo, checkout: a[5] as? Checkout) }, get: { v in let s = v as! UserBookInfo; return [s.isbn, s.title, s.availableNormal, s.availableRestricted, s.hold, s.checkout] }))) // 79
+    n.append(.int) // 80
+    n.append(.array(nil, 1)) // 81
+    n.append(.union(UnionNode(nil, .jsonType([("object", .match(78)), ("null", .match(83))])))) // 82
+    n.append(.null) // 83
+    n.append(.union(UnionNode(nil, .jsonType([("object", .match(12)), ("null", .match(83))])))) // 84
+    n.append(.structure(StructNode("UserPatronInfo", [SchemaField("name", 1, false), SchemaField("color", 1, false), SchemaField("researcher", 3, false), SchemaField("holds", 86, false), SchemaField("checkouts", 87, false)], -1, UserPatronInfo.self, make: { a in UserPatronInfo(name: a[0] as! String, color: a[1] as! String, researcher: a[2] as! Bool, holds: a[3] as! [PatronHold], checkouts: a[4] as! [UserCheckoutInfo]) }, get: { v in let s = v as! UserPatronInfo; return [s.name, s.color, s.researcher, s.holds, s.checkouts] }))) // 85
+    n.append(.array(nil, 34)) // 86
+    n.append(.array(nil, 77)) // 87
+    n.append(.lit(.bool(true))) // 88
+    n.append(.union(UnionNode("LibraryDBMutation", .jsonType([("object", .field("type", .literal([(.str("rename-patron"), .match(36)), (.str("try-hold"), .match(23)), (.str("cancel-hold"), .match(25)), (.str("patron-dismiss-notice"), .match(40)), (.str("change-password"), .match(48)), (.str("delete-account"), .match(62)), (.str("library-cancel-hold"), .match(27)), (.str("add-edition"), .match(13)), (.str("update-edition-title"), .match(15)), (.str("add-book"), .match(17)), (.str("update-book-restricted"), .match(19)), (.str("remove-book"), .match(21)), (.str("assign-patron"), .match(38)), (.str("try-checkout"), .match(29)), (.str("end-checkout"), .match(31)), (.str("dismiss-notice"), .match(42)), (.str("create-account"), .match(45)), (.str("create-room"), .match(65))])))])))) // 89
+    n.append(.union(UnionNode("AdminQuery", .jsonType([("array", .length([(1, .index(0, .jsonType([("string", .literal([(.str("AdminQueries.allPatronIds"), .match(91)), (.str("AdminQueries.allPatrons"), .match(93)), (.str("AdminQueries.allEditions"), .match(95)), (.str("AdminQueries.notices"), .match(97)), (.str("AdminQueries.roomCreated"), .match(99))]))])))], nil))])))) // 90
     n.append(.tuple(nil, [92])) // 91
-    n.append(.lit(.str("AdminQueries.allPatrons"))) // 92
+    n.append(.lit(.str("AdminQueries.allPatronIds"))) // 92
     n.append(.tuple(nil, [94])) // 93
-    n.append(.lit(.str("AdminQueries.allEditions"))) // 94
+    n.append(.lit(.str("AdminQueries.allPatrons"))) // 94
     n.append(.tuple(nil, [96])) // 95
-    n.append(.lit(.str("AdminQueries.notices"))) // 96
+    n.append(.lit(.str("AdminQueries.allEditions"))) // 96
     n.append(.tuple(nil, [98])) // 97
-    n.append(.lit(.str("AdminQueries.roomCreated"))) // 98
-    n.append(.array(nil, 33)) // 99
-    n.append(.array(nil, 75)) // 100
-    n.append(.array(nil, 35)) // 101
-    n.append(.union(UnionNode(nil, .jsonType([("string", .match(4)), ("null", .match(82))])))) // 102
-    n.append(.union(UnionNode("UserQuery", .jsonType([("array", .length([(1, .index(0, .jsonType([("string", .literal([(.str("UserQueries.allBooks"), .match(104)), (.str("UserQueries.myPatron"), .match(106)), (.str("UserQueries.notices"), .match(108))]))])))], nil))])))) // 103
-    n.append(.tuple(nil, [105])) // 104
-    n.append(.lit(.str("UserQueries.allBooks"))) // 105
+    n.append(.lit(.str("AdminQueries.notices"))) // 98
+    n.append(.tuple(nil, [100])) // 99
+    n.append(.lit(.str("AdminQueries.roomCreated"))) // 100
+    n.append(.array(nil, 33)) // 101
+    n.append(.array(nil, 75)) // 102
+    n.append(.array(nil, 35)) // 103
+    n.append(.union(UnionNode(nil, .jsonType([("string", .match(4)), ("null", .match(83))])))) // 104
+    n.append(.union(UnionNode("UserQuery", .jsonType([("array", .length([(1, .index(0, .jsonType([("string", .literal([(.str("UserQueries.allBooks"), .match(106)), (.str("UserQueries.myPatron"), .match(108)), (.str("UserQueries.notices"), .match(110))]))])))], nil))])))) // 105
     n.append(.tuple(nil, [107])) // 106
-    n.append(.lit(.str("UserQueries.myPatron"))) // 107
+    n.append(.lit(.str("UserQueries.allBooks"))) // 107
     n.append(.tuple(nil, [109])) // 108
-    n.append(.lit(.str("UserQueries.notices"))) // 109
-    n.append(.array(nil, 78)) // 110
+    n.append(.lit(.str("UserQueries.myPatron"))) // 109
+    n.append(.tuple(nil, [111])) // 110
+    n.append(.lit(.str("UserQueries.notices"))) // 111
+    n.append(.array(nil, 79)) // 112
     let ids: [String: Int] = [
         "Edition": 0,
         "Book": 2,
@@ -933,26 +953,27 @@ let registry: Registry = {
         "AdminBookInfo": 69,
         "AdminEditionInfo": 75,
         "UserCheckoutInfo": 77,
-        "UserBookInfo": 78,
-        "UserPatronInfo": 83,
-        "book/edition_book": 86,
-        "book/edition_hold": 86,
+        "UserHoldInfo": 78,
+        "UserBookInfo": 79,
+        "UserPatronInfo": 85,
+        "book/edition_book": 88,
+        "book/edition_hold": 88,
         "room/room_created": 4,
         "admin/checkout_owner": 1,
         "admin/hold_owner": 1,
         "login/user_login": 1,
         "rooms/room": 4,
-        "LibraryDBMutation": 87,
-        "AdminQuery": 88,
-        "AdminQueries.allPatronIds#result": 80,
-        "AdminQueries.allPatrons#result": 99,
-        "AdminQueries.allEditions#result": 100,
-        "AdminQueries.notices#result": 101,
-        "AdminQueries.roomCreated#result": 102,
-        "UserQuery": 103,
-        "UserQueries.allBooks#result": 110,
-        "UserQueries.myPatron#result": 83,
-        "UserQueries.notices#result": 101,
+        "LibraryDBMutation": 89,
+        "AdminQuery": 90,
+        "AdminQueries.allPatronIds#result": 81,
+        "AdminQueries.allPatrons#result": 101,
+        "AdminQueries.allEditions#result": 102,
+        "AdminQueries.notices#result": 103,
+        "AdminQueries.roomCreated#result": 104,
+        "UserQuery": 105,
+        "UserQueries.allBooks#result": 112,
+        "UserQueries.myPatron#result": 85,
+        "UserQueries.notices#result": 103,
     ]
     return Registry(n, ids)
 }()

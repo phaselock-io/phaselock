@@ -195,18 +195,28 @@ class MsgReader(private val b: ByteArray, var at: Int = 0, private val end: Int 
         if (u8() != 0xc0) throw MsgpackError("expected nil")
     }
 
-    fun arrayHeader(): Int = when (val c = u8()) {
-        in 0x90..0x9f -> c and 0x0f
-        0xdc -> be(2).toInt()
-        0xdd -> be(4).toInt()
-        else -> throw MsgpackError("expected an array")
+    /** an array's count, failing as truncated past what the bytes left hold at a byte an item */
+    fun arrayHeader(): Int {
+        val n = when (val c = u8()) {
+            in 0x90..0x9f -> (c and 0x0f).toLong()
+            0xdc -> be(2)
+            0xdd -> be(4)
+            else -> throw MsgpackError("expected an array")
+        }
+        if (n > end - at) throw MsgpackError("msgpack: truncated")
+        return n.toInt()
     }
 
-    fun mapHeader(): Int = when (val c = u8()) {
-        in 0x80..0x8f -> c and 0x0f
-        0xde -> be(2).toInt()
-        0xdf -> be(4).toInt()
-        else -> throw MsgpackError("expected a map")
+    /** a map's count, failing as truncated past what the bytes left hold at two bytes an entry */
+    fun mapHeader(): Int {
+        val n = when (val c = u8()) {
+            in 0x80..0x8f -> (c and 0x0f).toLong()
+            0xde -> be(2)
+            0xdf -> be(4)
+            else -> throw MsgpackError("expected a map")
+        }
+        if (2 * n > end - at) throw MsgpackError("msgpack: truncated")
+        return n.toInt()
     }
 
     fun long(): Long = when (val c = u8()) {
@@ -347,10 +357,14 @@ class MsgReader(private val b: ByteArray, var at: Int = 0, private val end: Int 
     }
 }
 
+/** a value that would run past the limit its read was given */
+class PastLimit : Exception("msgpack: a value past its limit")
+
 /* Reads one msgpack value from a stream into out, whole and undecoded, blocking until it has
    arrived; false when the stream ends cleanly before the value starts.  Headers alone are
-   decoded, so a value of any size and depth reads in one pass. */
-fun readValue(src: BufferedSource, out: Buffer): Boolean {
+   decoded, so a value of any size and depth reads in one pass.  A value that would take out past
+   limit bytes throws PastLimit before its payload is read. */
+fun readValue(src: BufferedSource, out: Buffer, limit: Long = Long.MAX_VALUE): Boolean {
     if (src.exhausted()) return false
     var pending = 1L
     while (pending > 0) {
@@ -388,6 +402,7 @@ fun readValue(src: BufferedSource, out: Buffer): Boolean {
             0xdf -> 0L to 2 * be(4)
             else -> throw MsgpackError("msgpack: invalid")
         }
+        if (payload > limit - out.size) throw PastLimit()
         src.readFully(out, payload)
         pending += items
     }

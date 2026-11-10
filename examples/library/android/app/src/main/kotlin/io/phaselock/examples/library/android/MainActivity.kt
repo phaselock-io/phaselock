@@ -44,10 +44,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import io.phaselock.examples.library.AdminQueries
 import java.time.Duration
 import java.time.Instant
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 
@@ -68,6 +71,13 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // a fresh launch with the extra `room` opens that room at once, on the last server
+        val launchRoom = intent.getStringExtra("room")
+        if (savedInstanceState == null && launchRoom != null) {
+            lifecycleScope.launch { room.open(room.last.filterNotNull().first().server, launchRoom) }
+        }
+
         setContent {
             LibraryTheme {
                 Scaffold(containerColor = MaterialTheme.colorScheme.background) { padding ->

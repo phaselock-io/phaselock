@@ -494,12 +494,21 @@ model UserCheckoutInfo {
   overdue: boolean;
 }
 
+// a title of the catalog as a patron sees it: what they may hold, and what of it is theirs
 model UserBookInfo {
   isbn: string;
   title: string;
   availableNormal: int32;
   availableRestricted: string[];
-  hold: PatronHold | null;
+  hold: UserHoldInfo | null;
+  // the patron's checkout of a copy, the one due first if they have several out
+  checkout: Checkout | null;
+}
+
+// a patron's hold on a title, and whether the copy it holds is a restricted one
+model UserHoldInfo {
+  ...PatronHold;
+  restricted: boolean;
 }
 
 // the patron profile: their current holds, and their current checkouts including overdue ones

@@ -1,13 +1,12 @@
-import { LoadingOutlined } from '@ant-design/icons';
+import { DownOutlined, LoadingOutlined } from '@ant-design/icons';
 import {
   type Notice,
   type UserBookInfo,
   type UserEngine,
   type UserEngineQueryTxn,
-  type UserPatronInfo,
   userQueries,
 } from '@library/model/ui';
-import { Alert, Button, Card, Flex, Spin, Tag, Typography } from 'antd';
+import { Alert, Button, Card, Dropdown, Flex, Space, Spin, Tag, Typography } from 'antd';
 import { useState } from 'react';
 
 import type { Client, Unroomed } from './engines';
@@ -36,17 +35,25 @@ function day(date: Date): string {
   return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
-/** what the patron's hold on a title, or the title's unrestricted copies, come to, in a few words */
-function availability(book: UserBookInfo): string {
+/** what the patron's checkout or hold of a title, or the copies they may hold, come to, in a few
+    words */
+function availability(book: UserBookInfo, researcher: boolean): string {
   const hold = book.hold;
+  if (book.checkout) return 'checked out';
   if (hold?.pending) return 'Placing a hold…';
-  if (hold) return hold.expires ? `On hold for you until ${day(hold.expires)}` : 'On hold for you';
-  if (book.availableNormal > 0) return `${book.availableNormal} available`;
-  return 'every copy is taken';
+  if (hold) return hold.expires ? `On hold until ${day(hold.expires)}` : 'On hold';
+
+  // the free copies, the restricted ones only for a researcher, who alone may hold them
+  const free: string[] = [];
+  if (book.availableNormal > 0) free.push(`${book.availableNormal} available`);
+  const restricted = researcher ? book.availableRestricted.length : 0;
+  if (restricted > 0) free.push(`${restricted} restricted`);
+  return free.length > 0 ? free.join(' · ') : 'every copy is taken';
 }
 
-/** One title of the catalog: its availability and its actions, a hold or the hold's cancel.  A
-    researcher may also hold a free restricted copy, with a second button beneath the first. */
+/** One title of the catalog: what of it the patron may hold or has, and one control, which keeps
+    the row one height whatever it shows.  A book the patron has out shows when it is due, a hold
+    shows its cancel, and otherwise the Hold button offers what is free. */
 function BookRow({
   book,
   researcher,
@@ -58,61 +65,82 @@ function BookRow({
   onHold: (target: { book: string } | { edition: string }) => void;
   onCancelHold: (hold: string) => void;
 }) {
-  const hold = book.hold;
-  const restricted = book.availableRestricted[0];
+  const { hold, checkout } = book;
   return (
     <Flex align="center" gap="small" className="row">
+      {/* each line keeps to one line, so the row keeps one height */}
       <Flex vertical className="grow">
-        <Text>{book.title}</Text>
-        <Text type="secondary" className="small">
-          {availability(book)}
+        <Text ellipsis>{book.title}</Text>
+        <Text type="secondary" className="small" ellipsis>
+          {availability(book, researcher)}
         </Text>
       </Flex>
 
+      {/* a checkout shows when it is due, in red once it is overdue */}
+      {checkout && (
+        <Text className="small" style={{ color: checkout.overdue ? PALETTE.alarm : PALETTE.muted }}>
+          due {day(checkout.expires)}
+        </Text>
+      )}
+
       {/* a hold, pending or decided, may be canceled */}
-      {hold ? (
+      {!checkout && hold && (
         <Button
           size="small"
           icon={hold.pending ? <LoadingOutlined /> : undefined}
           onClick={() => onCancelHold(hold.id)}>
           Cancel hold
         </Button>
-      ) : (
-        <Flex vertical gap={4} className="actions">
-          <Button
-            size="small"
-            disabled={book.availableNormal < 1}
-            onClick={() => onHold({ edition: book.isbn })}>
-            Hold
-          </Button>
-          {researcher && restricted !== undefined && (
-            <Button size="small" onClick={() => onHold({ book: restricted })}>
-              Hold restricted
-            </Button>
-          )}
-        </Flex>
+      )}
+
+      {!checkout && !hold && (
+        <HoldButton
+          isbn={book.isbn}
+          ordinary={book.availableNormal > 0}
+          restricted={researcher ? book.availableRestricted[0] : undefined}
+          onHold={onHold}
+        />
       )}
     </Flex>
   );
 }
 
-/** the books the patron has out, each with when it is due */
-function Checkouts({ patron }: { patron: UserPatronInfo }) {
+/** The Hold button: it holds an ordinary copy if one is free, or else the free restricted copy
+    offered, and it is disabled when neither is.  When both are free, an arrow joined to its right
+    edge offers the choice. */
+function HoldButton({
+  isbn,
+  ordinary,
+  restricted,
+  onHold,
+}: {
+  isbn: string;
+  ordinary: boolean;
+  restricted: string | undefined;
+  onHold: (target: { book: string } | { edition: string }) => void;
+}) {
+  const holdOrdinary = () => onHold({ edition: isbn });
+  const holdRestricted = restricted === undefined ? undefined : () => onHold({ book: restricted });
+  const hold = ordinary ? holdOrdinary : holdRestricted;
+  const button = (
+    <Button size="small" disabled={!hold} onClick={hold}>
+      Hold
+    </Button>
+  );
+  if (!ordinary || !holdRestricted) return button;
+
+  // both kinds of copy are free, so the arrow offers the choice
+  const items = [
+    { key: 'ordinary', label: 'Hold an ordinary copy', onClick: holdOrdinary },
+    { key: 'restricted', label: 'Hold a restricted copy', onClick: holdRestricted },
+  ];
   return (
-    <Section title="Checked out">
-      {patron.checkouts.map((c) => (
-        <Flex key={c.id} align="center" gap="small" className="row">
-          <Text className="grow">{c.title}</Text>
-          {c.overdue ? (
-            <Tag style={tinted(PALETTE.alarm)}>overdue</Tag>
-          ) : (
-            <Text type="secondary" className="small">
-              due {day(c.expires)}
-            </Text>
-          )}
-        </Flex>
-      ))}
-    </Section>
+    <Space.Compact>
+      {button}
+      <Dropdown menu={{ items }} trigger={['click']} placement="bottomRight">
+        <Button size="small" icon={<DownOutlined />} aria-label="Choose a copy to hold" />
+      </Dropdown>
+    </Space.Compact>
   );
 }
 
@@ -195,8 +223,6 @@ export default function PatronWindow({
           ))}
         </Flex>
       )}
-
-      {patron !== undefined && patron.checkouts.length > 0 && <Checkouts patron={patron} />}
 
       <Section title="Catalog">
         {books ? (

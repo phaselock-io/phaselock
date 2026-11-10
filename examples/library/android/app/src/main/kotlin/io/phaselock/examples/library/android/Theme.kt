@@ -19,6 +19,12 @@ object Palette {
     val onAccent = Color(0xFF0A1F18)
     val amber = Color(0xFFF2D98C)
     val alarm = Color(0xFFE5786D)
+    // a button's ground, and its ground while pressed, a dark shade of the accent
+    val buttonGround = Color(0xFF0E0E0E)
+    val buttonPressed = Color(0xFF04120D)
+    // a disabled button's border and text
+    val disabledBorder = Color(0xFF2A2A2A)
+    val disabledText = Color(0xFF5C5C5C)
 }
 
 /** a color from the #rrggbb a patron's record holds, or muted gray for anything else */

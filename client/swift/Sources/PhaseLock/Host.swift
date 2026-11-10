@@ -7,6 +7,9 @@
 
 import CPhaseLock
 import Foundation
+#if canImport(os)
+import os
+#endif
 
 /** The native library: three functions, every argument and answer msgpack. */
 enum Native {
@@ -35,6 +38,20 @@ enum Native {
     }
 }
 
+#if canImport(os)
+private let logger = Logger(subsystem: "io.phaselock", category: "engine")
+#endif
+
+/** Where a host's messages go unless its open names a log: the unified logging system on Apple's
+    platforms, and stderr elsewhere. */
+public let defaultLog: @Sendable (String) -> Void = { message in
+    #if canImport(os)
+    logger.log("\(message)")
+    #else
+    FileHandle.standardError.write(Data("phaselock: \(message)\n".utf8))
+    #endif
+}
+
 /** The native host failed a call: the bundle would not load, or JS threw where nothing could
     catch it. */
 public struct HostError: Error, CustomStringConvertible {
@@ -57,12 +74,12 @@ public struct QueryError: Error, CustomStringConvertible {
     public let description: String
 }
 
-/** How far the model's JS may run, which is the app's own code over its own data, so the limits
-    are generous.  Each call into the runtime runs for at most callTimeout: JS still running then
-    is interrupted where no JS can catch it, which ends the host and every Engine it runs, each
-    with a reason naming the limit and the backtrace of the JS that ran away.  The runtime's heap
-    holds at most memory bytes, past which an allocation throws in JS, which ends the Engine that
-    does not catch it. */
+/** How far the model's JS may run, which is the app's own code over its own data, so the limits are
+    generous.  Each call into the runtime takes at most callTimeout of the engine thread's CPU time,
+    so time the app spends suspended does not count: JS still running then is interrupted where no
+    JS can catch it, which ends the host and every Engine it runs, each with a reason naming the
+    limit and the backtrace of the JS that ran away.  The runtime's heap holds at most memory bytes,
+    past which an allocation throws in JS, which ends the Engine that does not catch it. */
 public struct EngineLimits: Sendable {
     public var callTimeout: Duration
     public var memory: Int
@@ -129,35 +146,42 @@ final class EngineThread: @unchecked Sendable {
         cond.unlock()
     }
 
+    /* The thread's loop.  A closure it runs is let go of before the lock is taken again, and the
+       queue holds none that ran, since letting go of a closure may free a host, whose deinit
+       posts. */
     private func run() {
         cond.lock()
         while true {
-            // the next closure, run without the lock
+            // the next closure, taken out of the queue and run without the lock
             if head < jobs.count {
-                let fn = jobs[head]
+                var fn: (() -> Void)? = jobs[head]
+                jobs[head] = {}
                 head += 1
                 if head == jobs.count {
                     jobs.removeAll(keepingCapacity: true)
                     head = 0
                 }
                 cond.unlock()
-                fn()
+                fn?()
+                fn = nil
                 cond.lock()
                 continue
             }
             if stopping { break }
 
             // otherwise the timer when it is due, and a wait until it is or until work arrives
-            if let t = timer {
+            if let at = timer?.at {
                 let now = DispatchTime.now().uptimeNanoseconds
-                if now >= t.at {
+                if now >= at {
+                    var fn = timer?.fn
                     timer = nil
                     cond.unlock()
-                    t.fn()
+                    fn?()
+                    fn = nil
                     cond.lock()
                     continue
                 }
-                _ = cond.wait(until: Date(timeIntervalSinceNow: Double(t.at - now) / 1e9))
+                _ = cond.wait(until: Date(timeIntervalSinceNow: Double(at - now) / 1e9))
             } else {
                 cond.wait()
             }
@@ -169,7 +193,8 @@ final class EngineThread: @unchecked Sendable {
 
 /** The native host of a model's Engines: the bundle, loaded once into one QuickJS runtime on one
     thread, and the transport every Engine it builds syncs through.  Open one with open, and close
-    it to end every Engine; a call on a host that is closed or closing fails with a HostError.
+    it to end every Engine; a call on a host that is closed or closing fails with a HostError.  A
+    host that nothing holds any more, its Engines included, closes as close closes it.
     The host also ends on its own when a call into its runtime runs past the call limit
     (EngineLimits): every Engine's onEnded hears why, and the host closes as close closes it. */
 public final class EngineHost: @unchecked Sendable {
@@ -178,7 +203,7 @@ public final class EngineHost: @unchecked Sendable {
     private let thread = EngineThread(name: "phaselock-engine", stackSize: engineStack)
     // whether close has begun, and its completion once the native host is freed
     private let closing = Locked(false)
-    private let freed = Deferred<Void>()
+    let freed = Deferred<Void>()
     // why the host ended on its own, once a call into it ran past its limit
     private let endedWhy = Locked<String?>(nil)
     // the transport's work for the Engines, which runs off the engine thread, by id
@@ -186,6 +211,11 @@ public final class EngineHost: @unchecked Sendable {
     // every connection's hooks in arrival order, each a hook of a connHooks request, queued from
     // the transport's threads for the next drain
     private let queued = Locked<[[Any?]]>([])
+    // the query starts queued for the engine thread, which takes every one queued by then in one
+    // queries request
+    private let starting = Locked<[QueryStart]>([])
+    // what the host follows of its app, once it has opened, until it closes
+    private let follower = Locked<AppFollower?>(nil)
 
     // everything below is the engine thread's alone
     private var handle: Int64 = 0
@@ -198,8 +228,15 @@ public final class EngineHost: @unchecked Sendable {
     private var backfills: [Int: Int] = [:]
     private var pushes: [Int: Deferred<Void>] = [:]
     private var queries: [Int: (Result<[UInt8], any Error>) -> Void] = [:]
+    // each ejectable query's request by its id, which starts it again after an ejection
+    private var ejectables: [Int: (Int) -> [Any?]] = [:]
+    // whether the ejectable queries are ejected, while the app is in the background
+    private var ejected = false
+    private var engines: Set<Int> = []
     private var onlines: [Int: Deferred<MutationResult>] = [:]
     private var ended: [Int: @Sendable (EngineEnded) -> Void] = [:]
+    // each Engine that has ended, and how, for an onEnded that comes after
+    private var endings: [Int: EngineEnded] = [:]
 
     private init(transport: any Transport, log: @escaping @Sendable (String) -> Void) {
         self.transport = transport
@@ -211,13 +248,18 @@ public final class EngineHost: @unchecked Sendable {
         the engine thread; a bundle that will not load fails with a HostError.  JS that passes a
         limit throws: past the call timeout, the host ends, and with it every Engine; past the
         memory limit, the allocation throws in JS, and an Engine that does not catch it ends with
-        the error as its reason. */
+        the error as its reason.
+        A host that follows its app hears what enterBackground, enterForeground, and
+        networkChanged say from the platform: on iOS, the app going to the background and
+        returning, and on Apple's platforms, the network path changing.  A host that does not
+        follow its app hears them only from the app's own calls. */
     public static func open(
         bundle: [UInt8],
         bundleName: String,
         transport: any Transport,
         limits: EngineLimits = EngineLimits(),
-        log: @escaping @Sendable (String) -> Void = { FileHandle.standardError.write(Data("phaselock: \($0)\n".utf8)) }
+        followsApp: Bool = true,
+        log: @escaping @Sendable (String) -> Void = defaultLog
     ) async throws -> EngineHost {
         let host = EngineHost(transport: transport, log: log)
         var w = MsgWriter()
@@ -238,6 +280,7 @@ public final class EngineHost: @unchecked Sendable {
             host.close()
             throw error
         }
+        if followsApp { host.follower.set(await AppFollower.start(host)) }
         return host
     }
 
@@ -340,12 +383,22 @@ public final class EngineHost: @unchecked Sendable {
                 self.log("\(error)")
             }
         }
-        var events: [[Any?]] = []
-        for _ in 0..<(try r.arrayHeader()) {
-            guard let e = try r.any() as? [Any?] else { throw HostError("an event is not an array") }
-            events.append(e)
+        var events: [Any?] = []
+        for _ in 0..<(try r.arrayHeader()) { events.append(try r.any()) }
+
+        // every event is acted on even when one fails, since each settles something of its own,
+        // and the first failure is the call's; a host that has shut down acts on nothing more
+        var failure: (any Error)?
+        for e in events {
+            if handle == 0 { break }
+            do {
+                guard let e = e as? [Any?] else { throw HostError("an event is not an array") }
+                try event(e)
+            } catch {
+                if failure == nil { failure = error } else { log("\(error)") }
+            }
         }
-        for e in events { try event(e) }
+        if let failure { throw failure }
     }
 
     // one event from the JS side
@@ -355,44 +408,52 @@ public final class EngineHost: @unchecked Sendable {
         case "log":
             log(try str(e, 1))
         case "connect":
-            try connect(try int(e, 1), try int(e, 2), try int(e, 3), e[4] as? String, e[5] as? [Any?] ?? [], e[6] as? Int)
+            try connect(try int(e, 1), try int(e, 2), try int(e, 3), at(e, 4) as? String, at(e, 5) as? [Any?] ?? [], at(e, 6) as? Int)
         case "abortConnection":
             connections[try int(e, 1)]?.abort()
         case "backfill":
-            try backfill(try int(e, 1), try int(e, 2), try str(e, 3), try int(e, 4), e[5] as? [String: Any?])
+            try backfill(try int(e, 1), try int(e, 2), try str(e, 3), try int(e, 4), at(e, 5) as? [String: Any?])
         case "abortBackfill":
             if let w = backfills[try int(e, 1)] { cancelWork(w) }
         case "pushSettled":
             let d = pushes.removeValue(forKey: try int(e, 1))
-            if let error = e[2] as? String { d?.fail(HostError(error)) } else { d?.complete() }
+            if let error = at(e, 2) as? String { d?.fail(HostError(error)) } else { d?.complete() }
         case "send":
-            try send(try int(e, 1), try int(e, 2), e[3] as? [Any?] ?? [])
+            try send(try int(e, 1), try int(e, 2), at(e, 3) as? [Any?] ?? [])
         case "queryResult":
-            guard let b = e[2] as? [UInt8] else { throw HostError("queryResult: no bytes") }
+            guard let b = at(e, 2) as? [UInt8] else { throw HostError("queryResult: no bytes") }
             queries[try int(e, 1)]?(.success(b))
         case "queryFailed":
             queries[try int(e, 1)]?(.failure(QueryError(description: try str(e, 2))))
         case "onlineSettled":
             let d = onlines.removeValue(forKey: try int(e, 1))
-            if let error = e[3] as? String {
+            if let error = at(e, 3) as? String {
                 d?.fail(HostError(error))
             } else {
-                d?.complete(try mutationResult(e[2] as? [String: Any?] ?? [:]))
+                d?.complete(try mutationResult(at(e, 2) as? [String: Any?] ?? [:]))
             }
         case "ended":
-            ended[try int(e, 1)]?(EngineEnded(reason: try str(e, 2), auth: e[3] as? Bool ?? false))
+            let engine = try int(e, 1)
+            let end = EngineEnded(reason: try str(e, 2), auth: at(e, 3) as? Bool ?? false)
+            endings[engine] = end
+            ended[engine]?(end)
         default:
             log("unknown event \(op)")
         }
     }
 
+    // an event's argument i, nil past its end
+    private func at(_ e: [Any?], _ i: Int) -> Any? {
+        i < e.count ? e[i] : nil
+    }
+
     private func int(_ e: [Any?], _ i: Int) throws -> Int {
-        guard i < e.count, let v = e[i] as? Int else { throw HostError("\(e.first ?? "event"): argument \(i) is no integer") }
+        guard i < e.count, let v = e[i] as? Int else { throw HostError("\(e.first as? String ?? "event"): argument \(i) is no integer") }
         return v
     }
 
     private func str(_ e: [Any?], _ i: Int) throws -> String {
-        guard i < e.count, let v = e[i] as? String else { throw HostError("\(e.first ?? "event"): argument \(i) is no string") }
+        guard i < e.count, let v = e[i] as? String else { throw HostError("\(e.first as? String ?? "event"): argument \(i) is no string") }
         return v
     }
 
@@ -588,6 +649,7 @@ public final class EngineHost: @unchecked Sendable {
         let id = try await onThread {
             if let store { try FileManager.default.createDirectory(at: store, withIntermediateDirectories: true) }
             let id = self.id()
+            self.engines.insert(id)
             if let transport { self.transports[id] = transport }
             let s = session.map { s in
                 let sid = self.id()
@@ -624,14 +686,31 @@ public final class EngineHost: @unchecked Sendable {
     }
 
     func onEnded(_ engine: Int, _ fn: @escaping @Sendable (EngineEnded) -> Void) throws {
-        try request { self.ended[engine] = fn }
+        do {
+            try request {
+                // an end that has already come is heard at once, the host's before the Engine's
+                if let why = self.endedWhy.get() {
+                    fn(EngineEnded(reason: why, auth: false))
+                } else if let end = self.endings[engine] {
+                    fn(end)
+                } else {
+                    self.ended[engine] = fn
+                }
+            }
+        } catch {
+            // a host that has ended tells a late listener why at once
+            guard let why = endedWhy.get() else { throw error }
+            fn(EngineEnded(reason: why, auth: false))
+        }
     }
 
     // ends an Engine, completing done once its store is closed, by this or by the host's close
     func closeEngine(_ engine: Int, _ done: Deferred<Void>) {
         let posted = post {
             defer { done.complete() }
+            self.engines.remove(engine)
             self.ended.removeValue(forKey: engine)
+            self.endings.removeValue(forKey: engine)
             try self.call("closeEngine", engine)
             self.transports.removeValue(forKey: engine)
         }
@@ -645,12 +724,13 @@ public final class EngineHost: @unchecked Sendable {
 
     /* A query's results as they come, each its msgpack; the query runs while the stream is
        iterated.  The stream keeps only the newest result: one that arrives while the iterating
-       task is busy replaces the one still waiting, so a task that falls behind skips ahead. */
-    func results(_ engine: Int, _ start: @escaping (Int) -> (String, [Any?])) -> AsyncThrowingStream<[UInt8], any Error> {
+       task is busy replaces the one still waiting, so a task that falls behind skips ahead.  An
+       ejectable query is ejected while the app is in the background and keeps its stream, which
+       resumes when the query is registered again. */
+    func results(_ engine: Int, ejectable: Bool, _ start: @escaping (Int) -> [Any?]) -> AsyncThrowingStream<[UInt8], any Error> {
         AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { cont in
             let qid = Locked(0)
-            let posted = !closing.get() && post {
-                if self.handle == 0 { throw self.closedError() }
+            let begin = {
                 let q = self.id()
                 qid.set(q)
                 self.queries[q] = { r in
@@ -659,25 +739,113 @@ public final class EngineHost: @unchecked Sendable {
                     case .failure(let e): cont.finish(throwing: e)
                     }
                 }
-                let (op, args) = start(q)
-                do {
-                    try self.request(op, args)
-                } catch {
-                    cont.finish(throwing: error)
-                    throw error
-                }
+                if ejectable { self.ejectables[q] = start }
+                return (q, ejectable && self.ejected ? nil : start(q))
             }
-            if !posted {
+            if !queue(QueryStart(begin: begin, fail: { cont.finish(throwing: $0) })) {
                 cont.finish(throwing: closedError())
                 return
             }
             cont.onTermination = { _ in
                 self.post {
                     let q = qid.get()
+                    self.ejectables.removeValue(forKey: q)
                     if q == 0 || self.queries.removeValue(forKey: q) == nil { return }
                     try self.call("closeQuery", q)
                 }
             }
+        }
+    }
+
+    /* A query's start, queued for the engine thread: begin registers the query there, answering
+       its id and its request, or nil for a query that waits while the queries are ejected, and
+       fail fails a query that never starts. */
+    private struct QueryStart {
+        let begin: () -> (Int, [Any?]?)
+        let fail: (any Error) -> Void
+    }
+
+    // queues a query's start, answering false on a host that is closed or closing
+    private func queue(_ start: QueryStart) -> Bool {
+        if closing.get() { return false }
+        let first = starting.with {
+            $0.append(start)
+            return $0.count == 1
+        }
+
+        // the first start queued posts the request for every start queued before it runs
+        if first && !post({ try self.startQueued() }) {
+            for s in starting.with({ q in defer { q = [] }; return q }) { s.fail(closedError()) }
+        }
+        return true
+    }
+
+    // starts every query queued, in one request, so the Engine's next run answers them together
+    private func startQueued() throws {
+        let starts = starting.with { q in
+            defer { q = [] }
+            return q
+        }
+        if handle == 0 {
+            for s in starts { s.fail(closedError()) }
+            return
+        }
+
+        // each query registered, and the requests of those that start now
+        var ids: [Int] = []
+        var requests: [Any?] = []
+        for s in starts {
+            let (q, request) = s.begin()
+            ids.append(q)
+            if let request { requests.append(request) }
+        }
+        if requests.isEmpty { return }
+
+        // a request that fails whole fails every query it started
+        do {
+            try request("queries", [requests])
+        } catch {
+            for q in ids {
+                ejectables.removeValue(forKey: q)
+                queries.removeValue(forKey: q)?(.failure(error))
+            }
+            throw error
+        }
+    }
+
+    /** Ejects every ejectable query, a LiveQuery's, which keeps its last result, as an app going to
+        the background does.  A host that follows its app, as open's followsApp has it, is told
+        this by the app. */
+    public func enterBackground() {
+        post {
+            if self.ejected { return }
+            self.ejected = true
+            let closes: [Any?] = self.ejectables.keys.sorted().map { ["closeQuery", $0] }
+            if !closes.isEmpty { try self.request("queries", [closes]) }
+        }
+    }
+
+    /** Registers the ejected queries again, all in one request, so the Engine answers them
+        together, and connects every Engine now rather than when its backoff timer fires, as an
+        app returning to the foreground does. */
+    public func enterForeground() {
+        post {
+            if self.ejected {
+                self.ejected = false
+                let starts: [Any?] = self.ejectables.sorted { $0.key < $1.key }.map { $0.value($0.key) }
+                if !starts.isEmpty { try self.request("queries", [starts]) }
+            }
+            for e in self.engines.sorted() { try self.call("reconnectNow", e) }
+        }
+    }
+
+    /** Ends every Engine's connection and connects again at once, as a change of the network the
+        device is on calls for, since a connection over the last network may never hear that it
+        has gone. */
+    public func networkChanged() {
+        post {
+            for c in self.connections.values { c.abort() }
+            for e in self.engines.sorted() { try self.call("reconnectNow", e) }
         }
     }
 
@@ -690,6 +858,10 @@ public final class EngineHost: @unchecked Sendable {
             return was
         }
         if was { return }
+        follower.with { f in
+            f?.stop()
+            f = nil
+        }
         cancelAllWork()
         if !thread.post({ self.shutDown() }) { freed.complete() }
     }
@@ -732,6 +904,8 @@ public final class EngineHost: @unchecked Sendable {
         // the tables, whose connections hold hooks back to the host
         connections.removeAll()
         queries.removeAll()
+        ejectables.removeAll()
+        engines.removeAll()
         sessions.removeAll()
         transports.removeAll()
         thread.shutDown()
@@ -743,18 +917,37 @@ public final class EngineHost: @unchecked Sendable {
         close()
         _ = try? await freed.value()
     }
+
+    /* A host that nothing holds has no work queued, since every job holds the host, so what is
+       left is the runtime and the thread: the runtime is freed on the thread, which then stops.
+       A host that closed already has neither. */
+    deinit {
+        let handle = handle
+        let thread = thread
+        let freed = freed
+        if handle == 0 { return }
+        thread.post {
+            Native.close(handle)
+            thread.shutDown()
+            freed.complete()
+        }
+    }
 }
 
 /** What runs a model's declared queries: a call as msgpack under its queries' wire type, and each
-    result as msgpack under the query's result type.  Generated query types take one. */
+    result as msgpack under the query's result type.  An ejectable query is a LiveQuery's, which
+    its host ejects while the app is in the background.  Generated query types take one. */
 public protocol QuerySource: Sendable {
-    func query(_ call: [UInt8]) -> AsyncThrowingStream<[UInt8], any Error>
+    func query(_ call: [UInt8], ejectable: Bool) -> AsyncThrowingStream<[UInt8], any Error>
 }
 
 /** A query's results, each decoded into the model's types as the iterating task takes it.  The
-    query runs while the results are iterated, and stops when the iteration ends. */
+    query runs while the results are iterated, and stops when the iteration ends: each iteration
+    runs it afresh, so iterating the same results again, as a view that reappears does, starts the
+    query again.  Making results runs nothing. */
 public struct QueryResults<Element: Sendable>: AsyncSequence, Sendable {
-    private let bytes: AsyncThrowingStream<[UInt8], any Error>
+    // a query of the call, ejectable or not
+    private let start: @Sendable (Bool) -> AsyncThrowingStream<[UInt8], any Error>
     private let decode: @Sendable ([UInt8]) throws -> Element
 
     public init(
@@ -762,17 +955,26 @@ public struct QueryResults<Element: Sendable>: AsyncSequence, Sendable {
         call: () throws -> [UInt8],
         decode: @escaping @Sendable ([UInt8]) throws -> Element
     ) {
-        do {
-            bytes = source.query(try call())
-        } catch {
-            bytes = AsyncThrowingStream { $0.finish(throwing: error) }
+        // the call's bytes once, and a query of them for each iteration
+        switch Result(catching: call) {
+        case .success(let bytes): start = { source.query(bytes, ejectable: $0) }
+        case .failure(let error): start = { _ in AsyncThrowingStream { $0.finish(throwing: error) } }
         }
         self.decode = decode
     }
 
-    init(_ bytes: AsyncThrowingStream<[UInt8], any Error>, decode: @escaping @Sendable ([UInt8]) throws -> Element) {
-        self.bytes = bytes
+    init(
+        _ start: @escaping @Sendable (Bool) -> AsyncThrowingStream<[UInt8], any Error>,
+        decode: @escaping @Sendable ([UInt8]) throws -> Element
+    ) {
+        self.start = start
         self.decode = decode
+    }
+
+    /** each result made into another value, as a view that shows one part of a result wants */
+    public func map<T: Sendable>(_ transform: @escaping @Sendable (Element) -> T) -> QueryResults<T> {
+        let decode = decode
+        return QueryResults<T>(start) { transform(try decode($0)) }
     }
 
     public struct AsyncIterator: AsyncIteratorProtocol {
@@ -786,22 +988,33 @@ public struct QueryResults<Element: Sendable>: AsyncSequence, Sendable {
     }
 
     public func makeAsyncIterator() -> AsyncIterator {
-        AsyncIterator(inner: bytes.makeAsyncIterator(), decode: decode)
+        AsyncIterator(inner: start(false).makeAsyncIterator(), decode: decode)
+    }
+
+    // one run of the query, started now rather than when it is iterated, which iterates once
+    func started(ejectable: Bool) -> QueryResults<Element> {
+        let stream = start(ejectable)
+        return QueryResults({ _ in stream }, decode: decode)
     }
 }
 
 /** One Engine the host runs: its mutations and declared queries as msgpack under the model's
-    types, which generated code converts.  Closing it ends it and closes its store. */
+    types, which generated code converts.  Closing it ends it and closes its store, and so does
+    letting go of it: an Engine that nothing holds any more closes as close closes it. */
 public final class HostedEngine: QuerySource, @unchecked Sendable {
     private let host: EngineHost
-    private let id: Int
+    let id: Int
     // whether close has begun, and its completion once the store is closed
     private let closing = Locked(false)
-    private let closed = Deferred<Void>()
+    let closed = Deferred<Void>()
 
     init(host: EngineHost, id: Int) {
         self.host = host
         self.id = id
+    }
+
+    deinit {
+        close()
     }
 
     /** a mutation for the outbox, as msgpack under the Engine's mutations union */
@@ -815,15 +1028,18 @@ public final class HostedEngine: QuerySource, @unchecked Sendable {
     }
 
     /** each result of a declared query, its call as msgpack under the queries' wire type */
-    public func query(_ call: [UInt8]) -> AsyncThrowingStream<[UInt8], any Error> {
+    public func query(_ call: [UInt8], ejectable: Bool) -> AsyncThrowingStream<[UInt8], any Error> {
         let id = id
-        return host.results(id) { q in ("query", [q, id, call]) }
+        return host.results(id, ejectable: ejectable) { q in ["query", q, id, call] }
     }
 
     /** the Engine's status, each time it changes */
     public var status: QueryResults<EngineStatus> {
-        let id = id
-        return QueryResults(host.results(id) { q in ("statusQuery", [q, id]) }) { try engineStatus(try decodeAny($0)) }
+        // the results hold the Engine, as a declared query's do, so it runs while they are iterated
+        QueryResults({ [self] ejectable in
+            let id = id
+            return host.results(id, ejectable: ejectable) { q in ["statusQuery", q, id] }
+        }) { try engineStatus(try decodeAny($0)) }
     }
 
     /** connect now rather than when the backoff timer fires */
@@ -833,7 +1049,9 @@ public final class HostedEngine: QuerySource, @unchecked Sendable {
 
     /** Calls fn, on the engine thread, if the Engine ends with an error, or when its host ends
         because a call into the runtime ran past the call limit (EngineLimits), which ends every
-        Engine of the host with a reason naming the limit. */
+        Engine of the host with a reason naming the limit.  An Engine that has already ended calls
+        fn with how it ended as soon as fn is given, on the caller's thread once the host has
+        ended. */
     public func onEnded(_ fn: @escaping @Sendable (EngineEnded) -> Void) throws {
         try host.onEnded(id, fn)
     }

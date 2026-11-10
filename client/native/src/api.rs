@@ -8,7 +8,10 @@
 //! - `call(host, request)` runs one request, `[op, ...args]`, answering `["ok", delay, events]`,
 //!   delay being the milliseconds until the next timer is due, or nil for none.  The request
 //!   `["connHooks", hooks]` carries every connection hook the client has queued, each
-//!   `[op, connection, ...args]`, so that the frames among them commit together;
+//!   `[op, connection, ...args]`, so that the frames among them commit together, and the request
+//!   `["queries", requests]` starts and closes queries, each `["query", id, engine, call]`,
+//!   `["statusQuery", id, engine]`, or `["closeQuery", id]`, so that the queries started among
+//!   them are answered together;
 //! - `close(host)` frees the host.
 //!
 //! A request that fails answers `["error", message]`.  A call whose deadline passes while JS runs
@@ -20,7 +23,7 @@ use phaselock_core::mp::{self, Node};
 
 use std::time::Duration;
 
-use crate::host::{Hook, Host, Limits, Push};
+use crate::host::{Hook, Host, Limits, Push, QueryOp};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -132,6 +135,11 @@ fn dispatch(h: &Host, request: &[u8]) -> Result<Vec<u8>> {
         b"query" => h.query(a.int(0)?, a.int(1)?, a.bin(2)?),
         b"statusQuery" => h.status_query(a.int(0)?, a.int(1)?),
         b"closeQuery" => h.close_query(a.int(0)?),
+        b"queries" => {
+            // every request read before any is made, so a malformed one fails the batch whole
+            let list = a.get(0)?.array().ok_or("queries: argument 0 is no array")?;
+            h.queries(&list.iter().map(query_op).collect::<Result<Vec<_>>>()?)
+        }
         b"connHooks" => {
             // every hook read before any is delivered, so a malformed one fails the request whole
             let list = a.get(0)?.array().ok_or("connHooks: argument 0 is no array")?;
@@ -155,6 +163,19 @@ fn dispatch(h: &Host, request: &[u8]) -> Result<Vec<u8>> {
         b"sendSettled" => h.send_settled(a.int(0)?, a.opt_bin(1)?, a.opt_str(2)?),
         _ => Err(format!("unknown request {}", a.name())),
     }
+}
+
+// one request of a queries batch, [op, id, ...args]
+fn query_op<'a>(request: &'a Node<'a>) -> Result<QueryOp<'a>> {
+    let items = request.array().ok_or("queries: a request is not an array")?;
+    let op = items.first().and_then(Node::as_str).ok_or("queries: a request has no op")?;
+    let a = Args { op, items };
+    Ok(match op {
+        b"query" => QueryOp::Query { id: a.int(0)?, engine: a.int(1)?, call: a.bin(2)? },
+        b"statusQuery" => QueryOp::Status { id: a.int(0)?, engine: a.int(1)? },
+        b"closeQuery" => QueryOp::Close { id: a.int(0)? },
+        _ => return Err(format!("queries: unknown request {}", a.name())),
+    })
 }
 
 // one hook of a connHooks request, [op, connection, ...args]

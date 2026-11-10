@@ -28,6 +28,9 @@ const pageOps = 1000;
 const pageBytes = 256 * 1024;
 // a blob operation longer than this is corruption, since a key and a value are each at most 16 MiB
 const maxOperation = 32 * 1024 * 1024;
+// a blob header longer than this is corruption: at this length its slices name half a million
+// slices or more, which is more than one client holds
+const maxHeader = 64 * 1024 * 1024;
 // a blob's set opcode, and the first byte of its end marker, which sits where an opcode would
 const SET = 0x00;
 const END = 0xff;
@@ -499,6 +502,7 @@ class HTTPConnection implements Connection {
       const version = br.take(1)[0];
       if (version !== 1) throw new Error(`snapshot ${b.selector}: version ${version}`);
       const hlen = readU32(br.take(4));
+      if (hlen > maxHeader) throw new Error(`snapshot ${b.selector}: header too long`);
       await br.fill(hlen + 4);
       const hdr = br.take(hlen).slice();
       const crc = readU32(br.take(4));

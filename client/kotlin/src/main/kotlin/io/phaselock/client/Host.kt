@@ -56,12 +56,12 @@ data class EngineEnded(val reason: String, val auth: Boolean)
 /** A declared query failed to run or to convert its result. */
 class QueryError(message: String) : Exception(message)
 
-/** How far the model's JS may run, which is the app's own code over its own data, so the limits
-    are generous.  Each call into the runtime runs for at most callTimeout: JS still running then
-    is interrupted where no JS can catch it, which ends the host and every Engine it runs, each
-    with a reason naming the limit and the backtrace of the JS that ran away.  The runtime's heap
-    holds at most memory bytes, past which an allocation throws in JS, which ends the Engine that
-    does not catch it. */
+/** How far the model's JS may run, which is the app's own code over its own data, so the limits are
+    generous.  Each call into the runtime takes at most callTimeout of the engine thread's CPU time,
+    so time the app spends suspended does not count: JS still running then is interrupted where no
+    JS can catch it, which ends the host and every Engine it runs, each with a reason naming the
+    limit and the backtrace of the JS that ran away.  The runtime's heap holds at most memory bytes,
+    past which an allocation throws in JS, which ends the Engine that does not catch it. */
 data class EngineLimits(
     val callTimeout: Duration = 60.seconds,
     val memory: Long = 1L shl 30,
@@ -98,6 +98,9 @@ class EngineHost private constructor(
     // every connection's hooks in arrival order, each a hook of a connHooks request, queued from
     // the transport's threads for the next drain; guarded by itself
     private val queued = ArrayList<List<Any?>>()
+    // the query starts queued for the engine thread, which takes every one queued by then in one
+    // queries request; guarded by itself
+    private val starting = ArrayList<QueryStart>()
 
     // everything below is the engine thread's alone
     private var handle = 0L
@@ -112,6 +115,9 @@ class EngineHost private constructor(
     private val queries = HashMap<Long, (Result<ByteArray>) -> Unit>()
     private val onlines = HashMap<Long, CompletableDeferred<MutationResult>>()
     private val ended = HashMap<Long, (EngineEnded) -> Unit>()
+    // each Engine that has ended, and how, for an onEnded that comes after
+    private val endings = HashMap<Long, EngineEnded>()
+    private val engines = HashSet<Long>()
 
     companion object {
         /** Loads the model's native bundle, named bundleName in its errors, into a host of its own,
@@ -171,8 +177,8 @@ class EngineHost private constructor(
     }
 
     // runs fn on the engine thread, reporting what it throws; a host that has shut its thread
-    // down has nothing left for fn to act on, so fn is dropped
-    private fun post(fn: () -> Unit) {
+    // down has nothing left for fn to act on, so fn is dropped, and post answers false
+    private fun post(fn: () -> Unit): Boolean {
         try {
             executor.execute {
                 try {
@@ -181,7 +187,10 @@ class EngineHost private constructor(
                     log("${e::class.simpleName}: ${e.message}")
                 }
             }
-        } catch (e: RejectedExecutionException) {}
+            return true
+        } catch (e: RejectedExecutionException) {
+            return false
+        }
     }
 
     // posts a caller's request, failing on a host that is closed or closing
@@ -210,8 +219,20 @@ class EngineHost private constructor(
         val delay = if (r.isNil()) { r.nil(); null } else r.long()
         timer?.cancel(false)
         timer = delay?.let { executor.schedule({ post { call("pump") } }, it, TimeUnit.MILLISECONDS) }
-        val events = List(r.arrayHeader()) { r.any() as List<*> }
-        events.forEach(::event)
+        val events = List(r.arrayHeader()) { r.any() }
+
+        // every event is acted on even when one fails, since each settles something of its own,
+        // and the first failure is the call's; a host that has shut down acts on nothing more
+        var failure: Exception? = null
+        for (e in events) {
+            if (handle == 0L) break
+            try {
+                event(e as? List<*> ?: throw HostError("an event is not an array"))
+            } catch (x: Exception) {
+                if (failure == null) failure = x else log("${x::class.simpleName}: ${x.message}")
+            }
+        }
+        if (failure != null) throw failure
     }
 
     private fun Any?.long(): Long = (this as Number).toLong()
@@ -238,7 +259,11 @@ class EngineHost private constructor(
                 if (error != null) d?.completeExceptionally(java.io.IOException(error))
                 else d?.complete(mutationResult(e[2] as Map<*, *>))
             }
-            "ended" -> ended[e[1].long()]?.invoke(EngineEnded(e[2] as String, e[3] as Boolean))
+            "ended" -> {
+                val end = EngineEnded(e[2] as String, e[3] as Boolean)
+                endings[e[1].long()] = end
+                ended[e[1].long()]?.invoke(end)
+            }
             else -> log("unknown event ${e[0]}")
         }
     }
@@ -393,6 +418,7 @@ class EngineHost private constructor(
         val id = onThread {
             store?.mkdirs()
             val id = id()
+            engines.add(id)
             if (transport != null) transports[id] = transport
             val s = session?.let { val sid = id(); sessions[sid] = it; sid }
             call("createEngine", id, name, s, store?.path)
@@ -420,14 +446,48 @@ class EngineHost private constructor(
 
     internal fun reconnectNow(engine: Long) = request { call("reconnectNow", engine) }
 
-    internal fun onEnded(engine: Long, fn: (EngineEnded) -> Unit) = request { ended[engine] = fn }
+    /** Connects every Engine now rather than when its backoff timer fires, as an app returning to
+        the foreground does. */
+    fun enterForeground() {
+        post { for (e in engines.sorted()) call("reconnectNow", e) }
+    }
+
+    /** Ends every Engine's connection and connects again at once, as a change of the network the
+        device is on calls for, since a connection over the last network may never hear that it
+        has gone. */
+    fun networkChanged() {
+        post {
+            for (c in ArrayList(connections.values)) c.abort()
+            for (e in engines.sorted()) call("reconnectNow", e)
+        }
+    }
+
+    internal fun onEnded(engine: Long, fn: (EngineEnded) -> Unit) {
+        try {
+            request {
+                // an end that has already come is heard at once, the host's before the Engine's
+                val why = endedWhy
+                val end = endings[engine]
+                when {
+                    why != null -> fn(EngineEnded(why, auth = false))
+                    end != null -> fn(end)
+                    else -> ended[engine] = fn
+                }
+            }
+        } catch (e: HostError) {
+            // a host that has ended tells a late listener why at once
+            fn(EngineEnded(endedWhy ?: throw e, auth = false))
+        }
+    }
 
     // ends an Engine, completing done once its store is closed, by this or by the host's close
     internal fun closeEngine(engine: Long, done: CompletableDeferred<Unit>) {
         val byHost = freed.invokeOnCompletion { done.complete(Unit) }
         post {
             try {
+                engines.remove(engine)
                 ended.remove(engine)
+                endings.remove(engine)
                 call("closeEngine", engine)
                 transports.remove(engine)
             } finally {
@@ -440,21 +500,61 @@ class EngineHost private constructor(
     /* A query's results as they come, each its msgpack; the query runs while the flow is
        collected.  The flow is conflated: a result that arrives while the collector is busy
        replaces the one still waiting, so a collector that falls behind skips to the newest. */
-    internal fun results(engine: Long, start: (Long) -> Array<Any?>): Flow<ByteArray> = callbackFlow {
+    internal fun results(engine: Long, start: (Long) -> List<Any?>): Flow<ByteArray> = callbackFlow {
         var qid = 0L
-        onThread {
+        val begin = {
             qid = id()
             queries[qid] = { r -> r.fold({ trySend(it) }, { close(it) }) }
-            val args = start(qid)
-            call(args[0] as String, *args.copyOfRange(1, args.size))
+            qid to start(qid)
         }
+        if (!queue(QueryStart(begin) { close(it) })) close(closedError())
         awaitClose {
             post {
-                queries.remove(qid)
+                if (qid == 0L || queries.remove(qid) == null) return@post
                 call("closeQuery", qid)
             }
         }
     }.buffer(Channel.CONFLATED)
+
+    /* A query's start, queued for the engine thread: begin registers the query there, answering
+       its id and its request, and fail fails a query that never starts. */
+    private class QueryStart(val begin: () -> Pair<Long, List<Any?>>, val fail: (Exception) -> Unit)
+
+    // queues a query's start, answering false on a host that is closed or closing
+    private fun queue(start: QueryStart): Boolean {
+        if (closing.get()) return false
+        val first = synchronized(starting) {
+            starting.add(start)
+            starting.size == 1
+        }
+
+        // the first start queued posts the request for every start queued before it runs
+        if (first && !post(::startQueued)) {
+            for (s in takeStarts()) s.fail(closedError())
+        }
+        return true
+    }
+
+    private fun takeStarts(): List<QueryStart> = synchronized(starting) { ArrayList(starting).also { starting.clear() } }
+
+    // starts every query queued, in one request, so the Engine's next run answers them together
+    private fun startQueued() {
+        val starts = takeStarts()
+        if (handle == 0L) {
+            for (s in starts) s.fail(closedError())
+            return
+        }
+
+        // each query registered, and then all of them started; a request that fails whole fails
+        // every query it started
+        val begun = starts.map { it.begin() }
+        try {
+            call("queries", begun.map { it.second })
+        } catch (e: Exception) {
+            for ((q, _) in begun) queries.remove(q)?.invoke(Result.failure(e))
+            throw e
+        }
+    }
 
     /** Ends every Engine and frees the native host, closing every store, once the work already
         queued for the engine thread has run.  It returns at once; closeAndJoin waits. */
@@ -500,6 +600,7 @@ class EngineHost private constructor(
             timer?.cancel(false)
             if (handle != 0L) Native.close(handle)
             handle = 0L
+            engines.clear()
         } finally {
             executor.shutdown()
             freed.complete(Unit)
@@ -521,7 +622,7 @@ interface QuerySource {
 
 /** One Engine the host runs: its mutations and declared queries as msgpack under the model's
     types, which generated code converts.  Closing it ends it and closes its store. */
-class HostedEngine internal constructor(private val host: EngineHost, private val id: Long) :
+class HostedEngine internal constructor(private val host: EngineHost, internal val id: Long) :
     QuerySource, AutoCloseable {
     // whether close has begun, and its completion once the store is closed
     private val closing = AtomicBoolean()
@@ -534,18 +635,20 @@ class HostedEngine internal constructor(private val host: EngineHost, private va
     suspend fun sendOnlineMutation(mutation: ByteArray): MutationResult = host.sendOnlineMutation(id, mutation)
 
     /** each result of a declared query, its call as msgpack under the queries' wire type */
-    override fun query(call: ByteArray): Flow<ByteArray> = host.results(id) { q -> arrayOf("query", q, id, call) }
+    override fun query(call: ByteArray): Flow<ByteArray> = host.results(id) { q -> listOf("query", q, id, call) }
 
     /** the Engine's status, each time it changes */
     val status: Flow<EngineStatus> =
-        host.results(id) { q -> arrayOf("statusQuery", q, id) }.map { engineStatus(decodeAny(it)) }
+        host.results(id) { q -> listOf("statusQuery", q, id) }.map { engineStatus(decodeAny(it)) }
 
     /** connect now rather than when the backoff timer fires */
     fun reconnectNow() = host.reconnectNow(id)
 
     /** Calls fn, on the engine thread, if the Engine ends with an error, or when its host ends
         because a call into the runtime ran past the call limit (EngineLimits), which ends every
-        Engine of the host with a reason naming the limit. */
+        Engine of the host with a reason naming the limit.  An Engine that has already ended calls
+        fn with how it ended as soon as fn is given, on the caller's thread once the host has
+        ended. */
     fun onEnded(fn: (EngineEnded) -> Unit) = host.onEnded(id, fn)
 
     /** ends the Engine and closes its store after the work already queued for it, returning at

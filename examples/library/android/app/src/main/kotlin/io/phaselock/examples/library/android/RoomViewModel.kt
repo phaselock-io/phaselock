@@ -123,6 +123,8 @@ class RoomViewModel(app: Application) : AndroidViewModel(app) {
     // the one HTTP client of every room the app opens, whose connections outlast a room's
     private val client = OkHttpClient()
     private var host: EngineHost? = null
+    // what tells the host of the app's returns to the foreground and of network changes
+    private var follower: AppFollower? = null
     private var http: HttpTransport? = null
     // the last room's host, whose close the next room awaits, since it opens the same stores
     private var left: EngineHost? = null
@@ -177,6 +179,7 @@ class RoomViewModel(app: Application) : AndroidViewModel(app) {
             getApplication<Application>().assets.open("native.bundle.js").use { it.readBytes() }
         }
         val host = EngineHost.open(bundle, "native.bundle.js", http).also { this.host = it }
+        follower = AppFollower(getApplication(), host)
 
         // each window signs itself in, as the web demo's do
         fun store(login: String) = File(getApplication<Application>().filesDir, "stores/$room/$login")
@@ -239,8 +242,10 @@ class RoomViewModel(app: Application) : AndroidViewModel(app) {
             it.alice.engine.close()
             it.bob.engine.close()
         }
+        follower?.close()
         host?.close()
         http?.close()
+        follower = null
         left = host
         host = null
         http = null

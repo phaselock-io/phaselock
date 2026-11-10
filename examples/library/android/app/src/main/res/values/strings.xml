@@ -60,15 +60,18 @@
 
     <!-- a patron's window -->
     <string name="patron_rename">Rename yourself</string>
-    <string name="patron_checked_out">Checked out</string>
-    <string name="patron_overdue">overdue</string>
-    <string name="patron_due">due %1$s</string>
+    <string name="book_checked_out">checked out</string>
+    <string name="book_due">due %1$s</string>
     <string name="book_placing_hold">Placing a hold…</string>
-    <string name="book_held_until">On hold for you until %1$s</string>
-    <string name="book_held">On hold for you</string>
+    <string name="book_held_until">On hold until %1$s</string>
+    <string name="book_held">On hold</string>
     <string name="book_available">%1$d available</string>
+    <string name="book_available_restricted">%1$d available · %2$d restricted</string>
+    <string name="book_restricted">%1$d restricted</string>
     <string name="book_taken">every copy is taken</string>
     <string name="book_cancel_hold">Cancel hold</string>
     <string name="book_hold">Hold</string>
-    <string name="book_hold_restricted">Hold restricted</string>
+    <string name="book_hold_choose">Choose a copy to hold</string>
+    <string name="book_hold_ordinary">Hold an ordinary copy</string>
+    <string name="book_hold_restricted">Hold a restricted copy</string>
 </resources>

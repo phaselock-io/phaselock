@@ -62,8 +62,23 @@ h1 {
 /* The windows' layout: one spacing unit of 4px, and a small type scale of 11px section labels,
    12px secondary lines, and 14px text.  Rows in a section are divided by a thin rule. */
 .window {
-  width: 32em;
+  /* about as narrow as keeps a Front Desk row of a held copy, a free restricted one, and "+ copy"
+     on one line */
+  width: 29em;
   max-width: 100%;
+}
+
+/* a window frames the modals it renders, whose fixed overlay then covers the window alone */
+.window {
+  contain: layout;
+}
+
+.in-window .ant-modal-mask {
+  border-radius: 8px;
+}
+
+.in-window .ant-modal {
+  max-width: calc(100% - 32px);
 }
 
 /* a phone's screen is narrower than a window, so the page keeps a slim gutter and each window
@@ -125,11 +140,6 @@ h1 {
 .restricted {
   color: #f2d98c;
   opacity: 0.8;
-}
-
-/* a row's stacked actions share one width */
-.actions .ant-btn {
-  width: 100%;
 }
 
 /* a rename pencil stays faint until it is pointed at */

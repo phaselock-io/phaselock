@@ -6,6 +6,7 @@ import io.phaselock.examples.library.AdminEditionInfo
 import io.phaselock.examples.library.Book
 import io.phaselock.examples.library.BookStatus
 import io.phaselock.examples.library.ChangePassword
+import io.phaselock.examples.library.Checkout
 import io.phaselock.examples.library.Edition
 import io.phaselock.examples.library.HoldTarget
 import io.phaselock.examples.library.MutationAuth
@@ -13,6 +14,7 @@ import io.phaselock.examples.library.PatronHold
 import io.phaselock.examples.library.TryHold
 import io.phaselock.examples.library.UserBookInfo
 import io.phaselock.examples.library.UserCheckoutInfo
+import io.phaselock.examples.library.UserHoldInfo
 import io.phaselock.examples.library.UserPatronInfo
 import io.phaselock.examples.library.registry as library
 import java.time.Instant
@@ -61,8 +63,8 @@ class LibraryRegistryTest {
 
     @Test
     fun unionsOfAStructOrNull() {
-        roundTrip("UserBookInfo", UserBookInfo("978-0", "T", 2, listOf("b1", "b2"), null))
-        roundTrip("UserBookInfo", UserBookInfo("978-0", "T", 0, listOf(), PatronHold("h1", HoldTarget.Edition("978-0"))))
+        roundTrip("UserBookInfo", UserBookInfo("978-0", "T", 2, listOf("b1", "b2"), null, null))
+        roundTrip("UserBookInfo", UserBookInfo("978-0", "T", 0, listOf(), UserHoldInfo("h1", HoldTarget.Edition("978-0"), restricted = false), null))
     }
 
     @Test
@@ -82,7 +84,7 @@ class LibraryRegistryTest {
             listOf(UserCheckoutInfo("c1", "b3", "T", at, true)),
         )
         roundTrip("UserQueries.myPatron#result", patron)
-        roundTrip("UserQueries.allBooks#result", listOf(UserBookInfo("978-0", "T", 1, listOf("b1"), null)))
+        roundTrip("UserQueries.allBooks#result", listOf(UserBookInfo("978-0", "T", 1, listOf("b1"), null, Checkout("c1", "b2", at, false))))
     }
 
     @Test
@@ -257,5 +259,20 @@ class RegistryTest {
         assertMismatch("$.c.x: expected an integer") { reg.encode("S", listOf(1, null, mapOf("x" to "bad"))) }
         assertMismatch("$[0][1]: expected an integer") { reg.encode("grid", listOf(listOf(1, "x"))) }
         assertMismatch("$: expected string keys") { reg.encode("record", mapOf(1 to 1)) }
+    }
+}
+
+/** The msgpack reader, over bytes no writer makes. */
+class MsgpackTest {
+    // a count the bytes cannot hold fails as truncated, before anything is allocated for it
+    @Test
+    fun aCountPastTheBytesFails() {
+        for (head in listOf(0xdd, 0xdf)) {
+            for (count in listOf(0x7f, 0xff)) {
+                val b = intArrayOf(head, count, 0xff, 0xff, 0xff, 0xc0, 0xc0).map { it.toByte() }.toByteArray()
+                val e = assertFailsWith<MsgpackError> { MsgReader(b).any() }
+                assertEquals("msgpack: truncated", e.message)
+            }
+        }
     }
 }

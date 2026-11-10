@@ -33,7 +33,9 @@ no reference cycle crosses its collector and QuickJS's.
 
 The connection hooks the client has queued travel in one `connHooks`
 request, which settles once, so the frames that arrive together commit in
-one store transaction.
+one store transaction.  Likewise the query starts and closes the client has
+queued travel in one `queries` request, so the queries that start together,
+as a screen's do, are answered by the Engine's same run.
 
 Each Engine's store is an LMDB environment in a directory of its own, with
 LMDB's lock file, so LMDB itself keeps one writer at a time and frees no page

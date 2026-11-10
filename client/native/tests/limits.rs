@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use phaselock_core::mp;
 use phaselock_native::api;
-use phaselock_native::host::{Host, Limits};
+use phaselock_native::host::{Host, Limits, thread_cpu};
 use serde_json::{Value, json};
 
 const BUNDLE: &str =
@@ -90,6 +90,30 @@ fn a_call_past_its_deadline_ends_the_host() {
         assert_eq!(api::call(&h, &request).unwrap_err(), err);
         assert!(started.elapsed() < Duration::from_millis(100));
     }
+}
+
+/* The deadline counts only the time a call spends running, so a call whose thread stops past the
+limit, as an app's threads stop while it is suspended, runs on when the thread resumes. */
+#[test]
+fn a_call_stopped_past_its_limit_runs_on() {
+    let h = open(Limits { call: Duration::from_millis(100), ..Limits::default() });
+    let got = h.timed(|| {
+        std::thread::sleep(Duration::from_millis(300));
+        h.eval_json("(() => { let n = 0; for (let i = 0; i < 1e6; i++) n += i; return n; })()")
+    });
+    assert_eq!(got.as_deref(), Ok("499999500000"));
+    assert_eq!(h.ended(), None);
+}
+
+// the thread's CPU time advances while the thread runs, and not while it sleeps
+#[test]
+fn thread_cpu_counts_running_not_sleeping() {
+    let start = thread_cpu();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(thread_cpu() - start < Duration::from_millis(50), "a sleep counted");
+    let busy = Instant::now();
+    while busy.elapsed() < Duration::from_millis(200) {}
+    assert!(thread_cpu() - start > Duration::from_millis(100), "running did not count");
 }
 
 // an allocation past the heap limit throws, which JS may catch, and the host runs on

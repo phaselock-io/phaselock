@@ -47,8 +47,9 @@ pub struct State {
     /// each open transaction, by id: its store's registry and the transaction
     pub txns: RefCell<HashMap<i64, (Arc<Schema>, lmdb::Txn)>>,
     pub next_txn: Cell<i64>,
-    /// when the call from the client that is running must end, past which JS is interrupted
-    deadline: Cell<Option<Instant>>,
+    /// the thread's CPU time at which the call from the client that is running must end, past
+    /// which JS is interrupted
+    deadline: Cell<Option<Duration>>,
     /// whether the interrupt has fired, and the first exception taken after it, as its text
     interrupted: Cell<bool>,
     trace: RefCell<Option<String>>,
@@ -61,7 +62,8 @@ pub unsafe fn state<'a>(ctx: *mut JSContext) -> &'a State {
 }
 
 /// How far the JS may run: the stack it may take below the frame that calls into it, the heap of
-/// the runtime, and how long one call from the client may run before its JS is interrupted.
+/// the runtime, and how much of its thread's CPU time one call from the client may take before its
+/// JS is interrupted.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub stack: usize,
@@ -86,10 +88,18 @@ pub struct Host {
     call_limit: Duration,
 }
 
+/// The calling thread's CPU time, which advances only while the thread runs, so a thread stopped
+/// with its app, as a suspended app's are, adds nothing to it.
+pub fn thread_cpu() -> Duration {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
+    Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
+}
+
 // QuickJS's interrupt check: whether the call running has passed its deadline
 unsafe extern "C" fn interrupt(_rt: *mut JSRuntime, opaque: *mut c_void) -> c_int {
     let st = unsafe { &*(opaque as *const State) };
-    let passed = st.deadline.get().is_some_and(|d| Instant::now() > d);
+    let passed = st.deadline.get().is_some_and(|d| thread_cpu() > d);
     if passed {
         st.interrupted.set(true);
     }
@@ -337,6 +347,14 @@ pub enum Hook<'a> {
     End { code: i64, reason: &'a str, fatal: Option<&'a str> },
 }
 
+/// One query request of a `queries` batch: a declared query's start, its call as msgpack under the
+/// queries' wire type, a status query's start, or a query's close.
+pub enum QueryOp<'a> {
+    Query { id: i64, engine: i64, call: &'a [u8] },
+    Status { id: i64, engine: i64 },
+    Close { id: i64 },
+}
+
 /// One backfill delivery from the client, which the Engine parks.
 pub enum Push<'a> {
     Length(i64),
@@ -414,10 +432,12 @@ impl Host {
         unsafe { &*self.state }
     }
 
-    /* Runs f as one call from the client, under the call deadline.  JS still running when it passes
-    is interrupted, which no JS can catch, so whatever the JS was doing stops halfway: the host
-    ends.  Every store transaction still open is aborted, the call fails with why, naming the
-    limit and the interrupted JS's backtrace, and so does every call after it, which runs no JS. */
+    /* Runs f as one call from the client, under the call deadline, which is measured in the
+    thread's CPU time, so only the time the call spends running counts against it.  JS still
+    running when it passes is interrupted, which no JS can catch, so whatever the JS was doing
+    stops halfway: the host ends.  Every store transaction still open is aborted, the call fails
+    with why, naming the limit and the interrupted JS's backtrace, and so does every call after it,
+    which runs no JS. */
     pub fn timed<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let st = self.state();
         if let Some(why) = self.ended() {
@@ -425,7 +445,7 @@ impl Host {
         }
 
         // the call, under its deadline
-        st.deadline.set(Some(Instant::now() + self.call_limit));
+        st.deadline.set(Some(thread_cpu() + self.call_limit));
         let r = f();
         st.deadline.set(None);
         if !st.interrupted.get() {
@@ -668,6 +688,43 @@ impl Host {
 
     pub fn close_query(&self, id: i64) -> Result<Vec<u8>> {
         self.deliver(c"closeQuery", vec![JS_NewInt64(id)])
+    }
+
+    /// Starts and closes queries in order and then settles once, so the Engine's next run answers
+    /// every query started among them together.  A start that fails fails its query alone, with a
+    /// queryFailed event, and the rest still start.
+    pub fn queries(&self, ops: &[QueryOp<'_>]) -> Result<Vec<u8>> {
+        let ctx = self.ctx;
+
+        // each request, which only registers its query with the Engine
+        for op in ops {
+            let (id, r) = match *op {
+                QueryOp::Query { id, engine, call } => {
+                    let args = vec![JS_NewInt64(id), JS_NewInt64(engine), new_u8(ctx, call)];
+                    (id, self.call(c"query", args))
+                }
+                QueryOp::Status { id, engine } => {
+                    (id, self.call(c"statusQuery", vec![JS_NewInt64(id), JS_NewInt64(engine)]))
+                }
+                QueryOp::Close { id } => (id, self.call(c"closeQuery", vec![JS_NewInt64(id)])),
+            };
+            if let Err(e) = r {
+                self.query_failed(id, &e);
+            }
+        }
+
+        // then the Engine's run, once for them all
+        self.settle()
+    }
+
+    // a queryFailed event, for a query that failed to start
+    fn query_failed(&self, id: i64, why: &str) {
+        let mut w = mp::Writer::new();
+        w.array(3);
+        w.str(b"queryFailed");
+        w.int(id);
+        w.str(why.as_bytes());
+        self.state().events.borrow_mut().push(w.into_vec());
     }
 
     /// Delivers connections' hooks, each by connection, in order and then settles once, so the

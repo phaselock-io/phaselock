@@ -7,10 +7,12 @@ import type {
   AdminEngineQueryTxn,
   AdminQueryDefs,
   Book,
+  Checkout,
   Notice,
   PatronHold,
   UserBookInfo,
   UserEngineQueryTxn,
+  UserHoldInfo,
   UserQueryDefs,
 } from './model.gen';
 
@@ -26,7 +28,7 @@ function booksOf(qx: UserEngineQueryTxn, room: string, isbn: string): Book[] {
 
 /** a patron's queries; a patron's Engine syncs the catalog and that patron alone */
 export const userQueries: UserQueryDefs<UserEngineQueryTxn> = {
-  // every edition, with how many copies the patron can hold and their own hold on it, if any
+  // every edition, with how many copies the patron can hold, and their own hold and checkout of it
   allBooks(qx) {
     // the patron's holds, by what they target
     const byEdition = new Map<string, PatronHold>();
@@ -39,14 +41,26 @@ export const userQueries: UserQueryDefs<UserEngineQueryTxn> = {
       }
     }
 
+    // the patron's checkouts, by book
+    const checkouts = new Map<string, Checkout>();
+    for (const [, checkout] of qx.scan.patron_checkout()) checkouts.set(checkout.book, checkout);
+
     // each edition
     const out: UserBookInfo[] = [];
     for (const [{ room, isbn }, edition] of qx.scan.edition()) {
       let availableNormal = 0;
       const availableRestricted: string[] = [];
-      let hold = byEdition.get(isbn) ?? null;
+      const editionHold = byEdition.get(isbn);
+      let hold: UserHoldInfo | null = editionHold ? { ...editionHold, restricted: false } : null;
+      let checkout: Checkout | null = null;
       for (const book of booksOf(qx, room, isbn)) {
-        hold = byBook.get(book.id) ?? hold;
+        // the patron's own hold on this copy, and their checkout of it if it is due first
+        const bookHold = byBook.get(book.id);
+        if (bookHold) hold = { ...bookHold, restricted: book.restricted };
+        const ours = checkouts.get(book.id);
+        if (ours && (checkout === null || ours.expires < checkout.expires)) checkout = ours;
+
+        // a free copy
         if (book.status !== undefined) continue;
         if (book.restricted) {
           availableRestricted.push(book.id);
@@ -57,7 +71,14 @@ export const userQueries: UserQueryDefs<UserEngineQueryTxn> = {
 
       // edition-level holds claim free unrestricted copies
       availableNormal -= [...qx.scan.edition_hold({ room, isbn }, { keys: true })].length;
-      out.push({ isbn, title: edition.title, availableNormal, availableRestricted, hold });
+      out.push({
+        isbn,
+        title: edition.title,
+        availableNormal,
+        availableRestricted,
+        hold,
+        checkout,
+      });
     }
     return out.sort((a, b) => a.title.localeCompare(b.title));
   },

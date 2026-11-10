@@ -52,10 +52,10 @@ private func expectMismatch(_ message: String, _ fn: () throws -> Any?) {
     }
 
     @Test func unionsOfAStructOrNull() throws {
-        try roundTrip("UserBookInfo", UserBookInfo(isbn: "978-0", title: "T", availableNormal: 2, availableRestricted: ["b1", "b2"], hold: nil))
+        try roundTrip("UserBookInfo", UserBookInfo(isbn: "978-0", title: "T", availableNormal: 2, availableRestricted: ["b1", "b2"], hold: nil, checkout: nil))
         try roundTrip(
             "UserBookInfo",
-            UserBookInfo(isbn: "978-0", title: "T", availableNormal: 0, availableRestricted: [], hold: PatronHold(id: "h1", target: .edition(.init(edition: "978-0"))))
+            UserBookInfo(isbn: "978-0", title: "T", availableNormal: 0, availableRestricted: [], hold: UserHoldInfo(id: "h1", target: .edition(.init(edition: "978-0")), restricted: false), checkout: nil)
         )
     }
 
@@ -79,7 +79,8 @@ private func expectMismatch(_ message: String, _ fn: () throws -> Any?) {
             checkouts: [UserCheckoutInfo(id: "c1", book: "b3", title: "T", expires: at, overdue: true)]
         )
         try roundTrip("UserQueries.myPatron#result", patron)
-        try roundTrip("UserQueries.allBooks#result", [UserBookInfo(isbn: "978-0", title: "T", availableNormal: 1, availableRestricted: ["b1"], hold: nil)])
+        let out = Checkout(id: "c1", book: "b2", expires: at, overdue: false)
+        try roundTrip("UserQueries.allBooks#result", [UserBookInfo(isbn: "978-0", title: "T", availableNormal: 1, availableRestricted: ["b1"], hold: nil, checkout: out)])
     }
 
     @Test func aUnionOfTuplesByLengthAndAnItemsLiteral() throws {

@@ -248,22 +248,28 @@ public struct MsgReader {
         if try u8() != 0xc0 { throw MsgpackError("expected nil") }
     }
 
+    /** an array's count, failing as truncated past what the bytes left hold at a byte an item */
     public mutating func arrayHeader() throws -> Int {
-        switch try u8() {
+        let n = switch try u8() {
         case let c where c >= 0x90 && c <= 0x9f: Int(c & 0x0f)
         case 0xdc: Int(try be(2))
         case 0xdd: Int(try be(4))
         default: throw MsgpackError("expected an array")
         }
+        try need(n)
+        return n
     }
 
+    /** a map's count, failing as truncated past what the bytes left hold at two bytes an entry */
     public mutating func mapHeader() throws -> Int {
-        switch try u8() {
+        let n = switch try u8() {
         case let c where c >= 0x80 && c <= 0x8f: Int(c & 0x0f)
         case 0xde: Int(try be(2))
         case 0xdf: Int(try be(4))
         default: throw MsgpackError("expected a map")
         }
+        try need(2 * n)
+        return n
     }
 
     public mutating func int() throws -> Int {

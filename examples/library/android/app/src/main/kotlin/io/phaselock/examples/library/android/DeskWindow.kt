@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
@@ -102,23 +103,25 @@ fun DeskWindow(room: String, window: Window<AdminEngine>) {
         if (patrons == null) {
             item { CircularProgressIndicator(Modifier.padding(16.dp)) }
         } else {
-            items(patrons, key = { "patron:${it.id}" }) { patron ->
-                val rename = stringResource(R.string.desk_rename_patron)
-                Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    PatronAvatar(patron.name, patron.color)
-                    Gap()
-                    Text(patron.name)
-                    EditButton(rename) {
-                        renaming = Renaming(rename, patron.name) { name ->
-                            send(RenamePatron(room, patron.id, name, Instant.now()))
-                        }
-                    }
-                    Row(Modifier.weight(1f), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
-                        Muted(stringResource(R.string.researcher))
+            itemsIndexed(patrons, key = { _, patron -> "patron:${patron.id}" }) { i, patron ->
+                SectionRow(i, patrons.size) {
+                    val rename = stringResource(R.string.desk_rename_patron)
+                    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        PatronAvatar(patron.name, patron.color)
                         Gap()
-                        Switch(checked = patron.researcher, onCheckedChange = { researcher ->
-                            send(AssignPatron(room, patron.id, researcher, Instant.now()))
-                        })
+                        Text(patron.name)
+                        EditButton(rename) {
+                            renaming = Renaming(rename, patron.name) { name ->
+                                send(RenamePatron(room, patron.id, name, Instant.now()))
+                            }
+                        }
+                        Row(Modifier.weight(1f), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+                            Muted(stringResource(R.string.researcher))
+                            Gap()
+                            Switch(checked = patron.researcher, onCheckedChange = { researcher ->
+                                send(AssignPatron(room, patron.id, researcher, Instant.now()))
+                            })
+                        }
                     }
                 }
             }
@@ -139,27 +142,28 @@ fun DeskWindow(room: String, window: Window<AdminEngine>) {
         if (list == null) {
             item { CircularProgressIndicator(Modifier.padding(16.dp)) }
         } else {
-            items(list, key = { "edition:${it.isbn}" }) { edition ->
-                val rename = stringResource(R.string.desk_rename_edition)
-                Column(Modifier.padding(vertical = 6.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(edition.title, fontWeight = FontWeight.SemiBold)
-                        EditButton(rename) {
-                            renaming = Renaming(rename, edition.title) { title ->
-                                send(UpdateEditionTitle(room, edition.isbn, title, Instant.now()))
+            itemsIndexed(list, key = { _, edition -> "edition:${edition.isbn}" }) { i, edition ->
+                SectionRow(i, list.size) {
+                    val rename = stringResource(R.string.desk_rename_edition)
+                    Column(Modifier.padding(vertical = 6.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(edition.title, fontWeight = FontWeight.SemiBold)
+                            EditButton(rename) {
+                                renaming = Renaming(rename, edition.title) { title ->
+                                    send(UpdateEditionTitle(room, edition.isbn, title, Instant.now()))
+                                }
                             }
                         }
-                    }
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        for (book in edition.books) {
-                            CopyChip(book, book.patronId?.let(byId::get)) { selected = Selected(book, edition.title) }
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            for (book in edition.books) {
+                                CopyChip(book, book.patronId?.let(byId::get)) { selected = Selected(book, edition.title) }
+                            }
+                            TextButton(onClick = {
+                                send(AddBook(room, generateUuid(), edition.isbn, false, Instant.now()))
+                            }) { Text(stringResource(R.string.desk_add_copy)) }
                         }
-                        TextButton(onClick = {
-                            send(AddBook(room, generateUuid(), edition.isbn, false, Instant.now()))
-                        }) { Text(stringResource(R.string.desk_add_copy)) }
                     }
                 }
-                HorizontalDivider(color = Palette.border)
             }
         }
     }

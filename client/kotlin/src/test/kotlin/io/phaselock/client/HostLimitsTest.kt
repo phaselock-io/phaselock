@@ -19,6 +19,23 @@ private val SPINNER = """
     };
 """.trimIndent().encodeToByteArray()
 
+/* A native bundle of two Engines: an Ender, which ends as it is created, and a Faulty, which
+   when asked to reconnect raises an event that is too short, then one that fails, then its end. */
+private val FAULTS = """
+    globalThis.__engines = {
+      Ender: { create: (_transport, o) => { o.onError(new Error('gone')); return {}; } },
+      Faulty: {
+        create: (_transport, o) => ({
+          reconnectNow() {
+            __pl.emit(['connect', 1, 2, 0]);
+            __pl.emit(['queryResult', 1]);
+            o.onError(new Error('gone'));
+          },
+        }),
+      },
+    };
+""".trimIndent().encodeToByteArray()
+
 // a transport the Spinner never uses
 private object Nowhere : Transport {
     override fun connect(
@@ -58,11 +75,49 @@ class HostLimitsTest {
             }
             assertEquals(2, ends.size)
 
+            // a listener given after the end hears it at once
+            var late: EngineEnded? = null
+            engines[1].onEnded { late = it }
+            assertTrue(late?.reason?.startsWith("the call ran past its limit of 200ms") == true, "$late")
+
             // the host has closed itself: its Engines' closes complete, and a call fails with why
             for (e in engines) e.closeAndJoin()
             host.closeAndJoin()
             val err = assertFailsWith<HostError> { host.createEngine("Spinner", null) }
             assertTrue(err.message!!.startsWith("the engine host has ended: the call ran past its limit"), err.message)
         }
+    }
+
+    // an Engine that ends before anyone listens is heard by the first listener
+    @Test
+    fun anEndBeforeOnEndedIsHeard() = runBlocking<Unit> {
+        val host = EngineHost.open(FAULTS, "faults.js", Nowhere)
+        val e = host.createEngine("Ender", null)
+        val ends = CopyOnWriteArrayList<EngineEnded>()
+        e.onEnded { ends.add(it) }
+
+        // a round trip through the engine thread, after which the listener has been called
+        host.createEngine("Ender", null)
+        assertEquals(1, ends.size)
+        assertTrue(ends[0].reason.startsWith("Error: gone"), ends[0].reason)
+        host.closeAndJoin()
+    }
+
+    // a call's events are each acted on, past one too short to read and one that fails
+    @Test
+    fun everyEventOfACallIsActedOn() = runBlocking<Unit> {
+        val logs = CopyOnWriteArrayList<String>()
+        val host = EngineHost.open(FAULTS, "faults.js", Nowhere, log = { logs.add(it) })
+        val e = host.createEngine("Faulty", null)
+        val ends = CopyOnWriteArrayList<EngineEnded>()
+        e.onEnded { ends.add(it) }
+        e.reconnectNow()
+
+        // a round trip through the engine thread, after which the reconnect's events have been
+        // acted on
+        host.createEngine("Faulty", null)
+        assertTrue(ends.firstOrNull()?.reason?.startsWith("Error: gone") == true, "$ends")
+        assertTrue(logs.any { "IndexOutOfBounds" in it }, "$logs")
+        host.closeAndJoin()
     }
 }

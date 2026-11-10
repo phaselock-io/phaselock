@@ -187,6 +187,14 @@ private struct S: Equatable {
         #expect(r.done)
     }
 
+    // a count the bytes cannot hold fails as truncated, before anything is allocated for it
+    @Test func aCountPastTheBytesFails() {
+        for b: [UInt8] in [[0xdd, 0xff, 0xff, 0xff, 0xff, 0xc0], [0xdf, 0xff, 0xff, 0xff, 0xff, 0xc0, 0xc0]] {
+            var r = MsgReader(b)
+            #expect(throws: MsgpackError.self) { try r.any() }
+        }
+    }
+
     @Test func emptyArraysAreNoBin() throws {
         let empty: [[Any?]] = []
         #expect(try encodeAny(empty) == [0x90])
